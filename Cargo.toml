@@ -1,0 +1,51 @@
+[package]
+name = "minime"
+version = "0.1.0"
+edition = "2024"
+description = "A context-frugal CLI coding agent for 64K context windows on consumer hardware"
+license = "MIT"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for LLM API
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Tree-sitter for AST parsing (Phase 2 — uncomment when ready)
+# tree-sitter = "0.24"
+# tree-sitter-rust = "0.23"
+# tree-sitter-python = "0.23"
+# tree-sitter-javascript = "0.23"
+# tree-sitter-typescript = "0.23"
+# tree-sitter-go = "0.23"
+# tree-sitter-java = "0.23"
+# tree-sitter-c = "0.23"
+# tree-sitter-cpp = "0.23"
+
+# Graph algorithms (PageRank)
+petgraph = "0.7"
+
+# File watching
+notify = "7"
+
+# Misc
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ignore = "0.4"          # respects .gitignore — replaces walkdir
+futures = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+
+[[bin]]
+name = "minime"
+path = "src/main.rs"

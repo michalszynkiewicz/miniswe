@@ -1,0 +1,22 @@
+[model]
+provider = "llama-cpp"
+endpoint = "http://localhost:8080"
+model = "devstral-small-2"
+context_window = 65536
+temperature = 0.15000000596046448
+max_output_tokens = 16384
+
+[context]
+repo_map_budget = 5000
+snippet_budget = 12000
+history_turns = 5
+history_budget = 6000
+scratchpad_budget = 1500
+
+[hardware]
+vram_gb = 24.0
+ram_budget_gb = 80.0
+
+[web]
+search_backend = "duckduckgo"
+fetch_backend = "jina"
