@@ -1,17 +1,21 @@
 //! Context assembler — builds per-turn context within token budget.
 //!
 //! Each turn, assembles a fresh context from:
-//! 1. System prompt (~2K tokens)
-//! 2. Project profile (~500-800 tokens)
+//! 1. System prompt (compressed, ~1.2K tokens)
+//! 2. Project profile (compressed, ~350 tokens)
 //! 3. User guide (optional, ~500 tokens)
 //! 4. Repo map slice (dynamic, 2K-8K tokens)
 //! 5. Scratchpad / task state (~500-2K tokens)
-//! 6. Retrieved snippets (budget-controlled)
-//! 7. Conversation history (summary + last N raw turns)
-//! 8. Active lessons (contextual tips)
-//! 9. Current user message
+//! 6. Conversation history (compressed: summaries + last N raw turns)
+//! 7. Active lessons (contextual tips)
+//! 8. Current user message
+
+pub mod compress;
 
 use crate::config::Config;
+use crate::knowledge::graph::DependencyGraph;
+use crate::knowledge::repo_map;
+use crate::knowledge::ProjectIndex;
 use crate::llm::Message;
 use std::fs;
 
@@ -21,68 +25,55 @@ pub struct AssembledContext {
     pub token_estimate: usize,
 }
 
-/// Build the system prompt for minime.
-fn build_system_prompt(_config: &Config) -> String {
-    let mut prompt = String::new();
-
-    prompt.push_str(
-        "You are minime, a coding agent operating in a terminal. You work on the \
-         project described in the Profile below.\n\n\
-         ## How You Work\n\
-         You operate in a loop: read context → reason → act → update state.\n\
-         Each turn, you receive a fresh context with the project profile, a \
-         relevant slice of the codebase map, your task scratchpad, and any \
-         code snippets retrieved for the current step.\n\n\
-         ## Rules\n\
-         1. Read before writing. Use read_symbol or search to understand code \
-         before making edits. Never guess at APIs or function signatures.\n\
-         2. Small, focused edits. One logical change per edit call. The edit \
-         tool validates syntax — if it rejects your edit, fix the syntax.\n\
-         3. Update state. After meaningful progress, call task_update to save \
-         what you learned and what's next. This is your memory between turns.\n\
-         4. Verify changes. After edits, run tests or type-check. Don't assume \
-         an edit worked — confirm it.\n\
-         5. Work step by step. Follow the plan in your scratchpad. Complete one \
-         step fully before moving to the next.\n\
-         6. If uncertain, explore. Use search and read_symbol to understand the \
-         codebase. The repo map shows you the structure — use it to find \
-         the right files.\n\n",
-    );
-
-    prompt.push_str(
-        "## Tools\n\
-         - read_symbol(name, follow_deps?) → source code of a function/class/type\n\
-         - read_file(path, start_line?, end_line?) → file contents or range\n\
-         - search(query, scope?, max_results?) → grep matches with context\n\
-         - edit(path, old, new) → validated search-and-replace in file\n\
-         - shell(cmd, timeout?) → execute command, return output\n\
-         - task_update(content) → rewrite your task scratchpad\n\
-         - diagnostics(path?) → LSP errors/warnings\n\
-         - web_search(query, max_results?) → DuckDuckGo snippets\n\
-         - web_fetch(url, selector?) → fetch URL as clean markdown\n\
-         - docs_lookup(library, topic?) → search local docs cache\n\n",
-    );
-
-    prompt.push_str(
-        "## Response Format\n\
-         Think through your approach, then act using tools. After each \
-         meaningful step, call task_update with your updated state.\n\
-         When the task is complete, summarize what you changed.\n",
-    );
-
-    prompt
+/// Build the system prompt in compressed structured format.
+fn build_system_prompt() -> String {
+    // Compressed format per design section 13.3 — ~40% shorter than prose
+    String::from(
+        "You are minime, a coding agent in a terminal.\n\
+         \n\
+         [RULES]\n\
+         1.Read before write:use read_symbol/search before edits\n\
+         2.Small edits:one change per edit call;tool validates syntax\n\
+         3.Update state:call task_update after progress(memory between turns)\n\
+         4.Verify:run tests/typecheck after edits\n\
+         5.Step by step:follow scratchpad plan,one step at a time\n\
+         6.If unsure:explore with search/read_symbol;repo map shows structure\n\
+         \n\
+         [TOOLS]\n\
+         read_symbol(name,follow_deps?)→function/class/type source\n\
+         read_file(path,start_line?,end_line?)→file contents\n\
+         search(query,scope?,max_results?)→grep matches\n\
+         edit(path,old,new)→search-and-replace(best for surgical edits in large files)\n\
+         write_file(path,content)→write complete file(preferred for files<200 lines)\n\
+         shell(cmd,timeout?)→execute command\n\
+         task_update(content)→rewrite scratchpad(must have ##Current Task,##Plan)\n\
+         diagnostics(path?)→compiler/linter errors\n\
+         web_search(query,max_results?)→DuckDuckGo snippets\n\
+         web_fetch(url,selector?)→URL as markdown\n\
+         docs_lookup(library,topic?)→local docs cache\n\
+         \n\
+         [WEB]check docs_lookup first→web_search snippets→web_fetch if needed\n\
+         \n\
+         [FORMAT]think→act with tools→task_update→summarize when done\n",
+    )
 }
 
-/// Load the project profile from `.minime/profile.md`.
+/// Load and compress the project profile.
 fn load_profile(config: &Config) -> Option<String> {
     let path = config.minime_path("profile.md");
-    fs::read_to_string(path).ok()
+    let content = fs::read_to_string(path).ok()?;
+    Some(compress::compress_profile(&content))
 }
 
 /// Load the user guide from `.minime/guide.md`.
 fn load_guide(config: &Config) -> Option<String> {
     let path = config.minime_path("guide.md");
-    fs::read_to_string(path).ok()
+    let content = fs::read_to_string(path).ok()?;
+    // Skip if it's just the template
+    if content.contains("<!-- Add project-specific instructions") && content.lines().count() <= 5 {
+        return None;
+    }
+    Some(content)
 }
 
 /// Load the scratchpad from `.minime/scratchpad.md`.
@@ -97,10 +88,35 @@ fn load_plan(config: &Config) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
+/// Load the repo map slice, personalized for the current task.
+fn load_repo_map(config: &Config, task_keywords: &[&str]) -> Option<String> {
+    let minime_dir = config.minime_dir();
+    let index = ProjectIndex::load(&minime_dir).ok()?;
+    let graph = DependencyGraph::load(&minime_dir).ok()?;
+
+    let map = repo_map::render(
+        &index,
+        &graph,
+        config.context.repo_map_budget,
+        task_keywords,
+    );
+
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
+}
+
 /// Load relevant lessons from `.minime/lessons.md` based on keywords.
 fn load_relevant_lessons(config: &Config, keywords: &[&str]) -> Option<String> {
     let path = config.minime_path("lessons.md");
     let content = fs::read_to_string(path).ok()?;
+
+    // Skip if it's just the template
+    if content.contains("<!-- Accumulated tips") && content.lines().count() <= 5 {
+        return None;
+    }
 
     if keywords.is_empty() {
         return Some(content);
@@ -115,7 +131,7 @@ fn load_relevant_lessons(config: &Config, keywords: &[&str]) -> Option<String> {
             let heading_lower = line.to_lowercase();
             in_section = keywords
                 .iter()
-                .any(|kw| heading_lower.contains(&kw.to_lowercase()));
+                .any(|kw| kw.len() >= 3 && heading_lower.contains(&kw.to_lowercase()));
         }
 
         if in_section {
@@ -132,8 +148,94 @@ fn load_relevant_lessons(config: &Config, keywords: &[&str]) -> Option<String> {
 }
 
 /// Rough token estimate: ~4 characters per token for English/code.
-fn estimate_tokens(text: &str) -> usize {
+pub fn estimate_tokens(text: &str) -> usize {
     text.len() / 4
+}
+
+/// Compress older conversation history into one-line summaries.
+///
+/// Keeps the last `keep_raw` messages in full, replaces older tool results
+/// with summaries generated by `compress::summarize_tool_result`.
+pub fn compress_history(
+    history: &[Message],
+    keep_raw: usize,
+) -> Vec<Message> {
+    if history.len() <= keep_raw {
+        return history.to_vec();
+    }
+
+    let split = history.len() - keep_raw;
+    let old = &history[..split];
+    let recent = &history[split..];
+
+    let mut compressed = Vec::new();
+
+    // Compress old messages into a summary block
+    let mut summary_lines = Vec::new();
+    for msg in old {
+        match msg.role.as_str() {
+            "tool" => {
+                // Tool results become one-line summaries
+                let content = msg.content.as_deref().unwrap_or("");
+                let first_line = content.lines().next().unwrap_or("(empty)");
+                // If it's already a summary (starts with [), keep it
+                if first_line.starts_with('[') {
+                    summary_lines.push(first_line.to_string());
+                } else {
+                    // Truncate to first line as a simple summary
+                    let truncated = if first_line.len() > 80 {
+                        format!("{}...", &first_line[..77])
+                    } else {
+                        first_line.to_string()
+                    };
+                    summary_lines.push(truncated);
+                }
+            }
+            "assistant" => {
+                // Keep a brief note of what the assistant did
+                if let Some(tool_calls) = &msg.tool_calls {
+                    let call_names: Vec<&str> = tool_calls
+                        .iter()
+                        .map(|tc| tc.function.name.as_str())
+                        .collect();
+                    summary_lines.push(format!("[called:{}]", call_names.join(",")));
+                } else if let Some(content) = &msg.content {
+                    let first = content.lines().next().unwrap_or("");
+                    let truncated = if first.len() > 60 {
+                        format!("{}...", &first[..57])
+                    } else {
+                        first.to_string()
+                    };
+                    summary_lines.push(truncated);
+                }
+            }
+            "user" => {
+                if let Some(content) = &msg.content {
+                    let truncated = if content.len() > 60 {
+                        format!("user: {}...", &content[..57])
+                    } else {
+                        format!("user: {content}")
+                    };
+                    summary_lines.push(truncated);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !summary_lines.is_empty() {
+        let summary = format!(
+            "[HISTORY SUMMARY — {} earlier messages]\n{}",
+            old.len(),
+            summary_lines.join("\n")
+        );
+        compressed.push(Message::system(&summary));
+    }
+
+    // Keep recent messages in full
+    compressed.extend_from_slice(recent);
+
+    compressed
 }
 
 /// Assemble context for a turn.
@@ -144,87 +246,98 @@ pub fn assemble(
     plan_only: bool,
 ) -> AssembledContext {
     let budget = config.model.context_window;
+    let output_budget = config.model.max_output_tokens;
+    let input_budget = budget.saturating_sub(output_budget);
+
     let mut messages = Vec::new();
     let mut used_tokens = 0;
 
-    // 1. System prompt
-    let system_prompt = build_system_prompt(config);
-    let _system_tokens = estimate_tokens(&system_prompt);
+    // 1. System prompt (compressed)
+    let mut system_context = build_system_prompt();
 
-    // 2. Build the full system context
-    let mut system_context = system_prompt;
-
-    // Add project profile
+    // 2. Project profile (compressed to structured format)
     if let Some(profile) = load_profile(config) {
-        system_context.push_str("\n---\n## Project Profile\n");
+        system_context.push_str("\n");
         system_context.push_str(&profile);
     }
 
-    // Add user guide
+    // 3. User guide
     if let Some(guide) = load_guide(config) {
-        system_context.push_str("\n---\n## Project Guide\n");
+        system_context.push_str("\n[GUIDE]\n");
         system_context.push_str(&guide);
     }
 
-    // Add plan if it exists
+    // 4. Active plan
     if let Some(plan) = load_plan(config) {
-        system_context.push_str("\n---\n## Active Plan\n");
+        system_context.push_str("\n[PLAN]\n");
         system_context.push_str(&plan);
     }
 
-    // Add relevant lessons
-    let keywords: Vec<&str> = user_message.split_whitespace().collect();
+    // 5. Relevant lessons (keyword-matched)
+    let keywords: Vec<&str> = user_message
+        .split_whitespace()
+        .filter(|w| w.len() >= 3)
+        .collect();
     if let Some(lessons) = load_relevant_lessons(config, &keywords) {
-        system_context.push_str("\n---\n## Relevant Lessons\n");
+        system_context.push_str("\n[LESSONS]\n");
         system_context.push_str(&lessons);
+    }
+
+    // 6. Repo map (task-personalized, budget-controlled)
+    if let Some(repo_map) = load_repo_map(config, &keywords) {
+        system_context.push_str("\n[REPO MAP]\n");
+        system_context.push_str(&repo_map);
     }
 
     if plan_only {
         system_context.push_str(
-            "\n---\n## Mode: PLAN ONLY\n\
-             You are in plan mode. Explore the codebase and produce a plan. \
-             Do NOT make any edits. Write your plan to .minime/plan.md using task_update.\n",
+            "\n[MODE:PLAN]\n\
+             Read-only. Explore codebase, produce plan. NO edits/shell.\n\
+             Write plan to .minime/plan.md via task_update.\n",
         );
     }
 
     messages.push(Message::system(&system_context));
     used_tokens += estimate_tokens(&system_context);
 
-    // 3. Conversation history (last N turns within budget)
+    // 7. Conversation history (compressed: old turns summarized, recent kept raw)
     let history_budget = config.context.history_budget;
-    let max_turns = config.context.history_turns;
+    let keep_raw = config.context.history_turns * 2; // user + assistant pairs
+
+    let compressed_history = compress_history(conversation_history, keep_raw);
+
     let mut history_tokens = 0;
-
-    let recent_turns: Vec<&Message> = conversation_history
-        .iter()
-        .rev()
-        .take(max_turns * 2) // user + assistant pairs
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-
-    for msg in &recent_turns {
+    for msg in &compressed_history {
         let msg_tokens = estimate_tokens(msg.content.as_deref().unwrap_or(""));
+        // Also account for tool call content
+        if let Some(tool_calls) = &msg.tool_calls {
+            for tc in tool_calls {
+                let tc_tokens = estimate_tokens(&tc.function.arguments) + 5;
+                if history_tokens + tc_tokens > history_budget {
+                    break;
+                }
+                history_tokens += tc_tokens;
+            }
+        }
         if history_tokens + msg_tokens > history_budget {
             break;
         }
-        messages.push((*msg).clone());
+        messages.push(msg.clone());
         history_tokens += msg_tokens;
     }
     used_tokens += history_tokens;
 
-    // 4. Scratchpad (appended to the tail for recency bias)
+    // 8. Scratchpad at the tail (exploiting recency bias)
     if let Some(scratchpad) = load_scratchpad(config) {
         let scratchpad_msg = format!("[SCRATCHPAD]\n{scratchpad}");
         let scratchpad_tokens = estimate_tokens(&scratchpad_msg);
-        if used_tokens + scratchpad_tokens < budget / 2 {
+        if used_tokens + scratchpad_tokens < input_budget {
             messages.push(Message::system(&scratchpad_msg));
             used_tokens += scratchpad_tokens;
         }
     }
 
-    // 5. Current user message
+    // 9. Current user message
     messages.push(Message::user(user_message));
     used_tokens += estimate_tokens(user_message);
 

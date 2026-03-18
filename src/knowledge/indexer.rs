@@ -72,8 +72,8 @@ pub fn index_project(root: &Path) -> Result<ProjectIndex> {
                     }
                     index.total_symbols += symbols.len();
 
-                    // Generate a one-line summary
-                    let summary = generate_summary(&content, &symbols);
+                    // Generate a one-line summary (prefers doc headers)
+                    let summary = generate_summary(&content, &symbols, ext);
                     index.summaries.insert(rel_str, summary);
                 }
             }
@@ -344,8 +344,18 @@ fn extract_name_after(line: &str, keyword: &str) -> Option<String> {
     }
 }
 
-/// Generate a one-line summary of a file based on its symbols.
-fn generate_summary(content: &str, symbols: &[Symbol]) -> String {
+/// Generate a one-line summary of a file.
+///
+/// Prefers the module-level doc comment (//!, """, /**, etc.) if present —
+/// these are high-signal, human-written descriptions of the file's purpose.
+/// Falls back to a symbol-based summary.
+fn generate_summary(content: &str, symbols: &[Symbol], ext: &str) -> String {
+    // Try to extract a module-level doc header first
+    if let Some(doc) = extract_doc_header(content, ext) {
+        return doc;
+    }
+
+    // Fallback: symbol-based summary
     if symbols.is_empty() {
         let line_count = content.lines().count();
         return format!("{line_count} lines, no exported symbols");
@@ -380,4 +390,190 @@ fn generate_summary(content: &str, symbols: &[Symbol]) -> String {
             String::new()
         }
     )
+}
+
+/// Extract the module-level doc comment from a source file.
+///
+/// Supports:
+/// - Rust: `//!` lines at the top
+/// - Python: module-level `"""..."""` docstring
+/// - JS/TS: `/** ... */` JSDoc at the top
+/// - Go/Java/C/C++: `// ...` or `/* ... */` block at line 1
+///
+/// Returns the first meaningful line (stripped of comment markers),
+/// truncated to ~100 chars.
+fn extract_doc_header(content: &str, ext: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    match ext {
+        "rs" => {
+            // Rust: //! doc comments
+            let mut doc_lines = Vec::new();
+            for line in &lines {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//!") {
+                    let text = trimmed.trim_start_matches("//!").trim();
+                    if !text.is_empty() {
+                        doc_lines.push(text);
+                    }
+                } else if trimmed.is_empty() && doc_lines.is_empty() {
+                    continue; // skip leading blank lines
+                } else {
+                    break;
+                }
+            }
+            if doc_lines.is_empty() {
+                return None;
+            }
+            // Take first line as primary, append second if short
+            let mut summary = doc_lines[0].to_string();
+            if summary.len() < 50 && doc_lines.len() > 1 {
+                summary.push_str(" — ");
+                summary.push_str(doc_lines[1]);
+            }
+            Some(truncate_summary(&summary))
+        }
+        "py" => {
+            // Python: module docstring (""" at start)
+            for line in &lines {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''") {
+                    let quote = &trimmed[..3];
+                    // Single-line docstring: """text"""
+                    if trimmed.len() > 6 && trimmed.ends_with(quote) {
+                        let text = &trimmed[3..trimmed.len() - 3];
+                        return Some(truncate_summary(text));
+                    }
+                    // Multi-line: take first content line
+                    let text = trimmed[3..].trim();
+                    if !text.is_empty() {
+                        return Some(truncate_summary(text));
+                    }
+                    // Content is on next line
+                    for next_line in lines.iter().skip(1) {
+                        let t = next_line.trim();
+                        if !t.is_empty() && !t.starts_with(quote) {
+                            return Some(truncate_summary(t));
+                        }
+                        if t.starts_with(quote) {
+                            break;
+                        }
+                    }
+                    return None;
+                }
+                // If first non-empty line isn't a docstring, no module doc
+                if !trimmed.starts_with('#') {
+                    return None;
+                }
+            }
+            None
+        }
+        "js" | "ts" | "tsx" | "jsx" | "java" | "go" | "c" | "cpp" | "h" | "hpp" => {
+            // JSDoc / block comment at top: /** ... */ or /* ... */
+            // Also: // line comments at the very top
+            for line in &lines {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // /** JSDoc style */
+                if trimmed.starts_with("/**") || trimmed.starts_with("/*") {
+                    let after = trimmed
+                        .trim_start_matches("/**")
+                        .trim_start_matches("/*")
+                        .trim_start_matches('*')
+                        .trim();
+                    if !after.is_empty() && !after.starts_with("*/") {
+                        return Some(truncate_summary(after));
+                    }
+                    // Multi-line: check next lines
+                    for next_line in lines.iter().skip(1) {
+                        let t = next_line.trim();
+                        if t.starts_with("*/") {
+                            break;
+                        }
+                        let text = t.trim_start_matches('*').trim();
+                        if !text.is_empty() && !text.starts_with('@') {
+                            return Some(truncate_summary(text));
+                        }
+                    }
+                    return None;
+                }
+                // // line comment at top
+                if trimmed.starts_with("//") {
+                    let text = trimmed.trim_start_matches("//").trim();
+                    if !text.is_empty() {
+                        return Some(truncate_summary(text));
+                    }
+                }
+                // package/import — no doc comment
+                return None;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn truncate_summary(s: &str) -> String {
+    if s.len() <= 100 {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..97])
+    }
+}
+
+/// Check file sizes and return warnings for large files.
+pub fn audit_file_sizes(root: &Path, max_lines: usize) -> Vec<(String, usize)> {
+    let mut large_files = Vec::new();
+
+    let walker = WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .build();
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        if !SOURCE_EXTENSIONS.contains(&ext) {
+            continue;
+        }
+
+        if let Ok(rel) = path.strip_prefix(root) {
+            let rel_str = rel.to_string_lossy().to_string();
+            if rel_str.starts_with(".minime") {
+                continue;
+            }
+
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let line_count = content.lines().count();
+                if line_count > max_lines {
+                    large_files.push((rel_str, line_count));
+                }
+            }
+        }
+    }
+
+    large_files.sort_by(|a, b| b.1.cmp(&a.1));
+    large_files
 }

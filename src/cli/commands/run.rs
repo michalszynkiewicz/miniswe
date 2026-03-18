@@ -5,18 +5,23 @@
 //! 2. Call the LLM with tools
 //! 3. Parse tool calls from the response
 //! 4. Execute tools
-//! 5. Feed results back and repeat
+//! 5. Apply observation masking (compress old tool results)
+//! 6. Feed results back and repeat
 
 use anyhow::Result;
 
 use crate::config::Config;
 use crate::context;
-use crate::llm::{LlmClient, ChatRequest, Message};
+use crate::context::compress;
+use crate::llm::{ChatRequest, LlmClient, Message};
 use crate::tools;
 use crate::tui;
 
 /// Maximum number of tool-call rounds before stopping.
 const MAX_ROUNDS: usize = 25;
+
+/// After this many tool results in the messages, start masking old ones.
+const MASK_AFTER_RESULTS: usize = 6;
 
 /// Run the agent for a single message.
 pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
@@ -32,6 +37,10 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
     let mut conversation_history: Vec<Message> = Vec::new();
     let mut round = 0;
 
+    // Track tool results for observation masking
+    // Each entry: (tool_name, args, full_content, message_index_in_messages)
+    let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
+
     // Initial context assembly
     let assembled = context::assemble(&config, message, &conversation_history, plan_only);
     tui::print_status(&format!(
@@ -46,6 +55,11 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
         if round > MAX_ROUNDS {
             tui::print_error("Maximum tool rounds reached. Stopping.");
             break;
+        }
+
+        // Apply observation masking: replace old tool results with summaries
+        if tool_result_log.len() > MASK_AFTER_RESULTS {
+            mask_old_tool_results(&mut messages, &tool_result_log);
         }
 
         // Call LLM with streaming
@@ -93,7 +107,6 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
         let tool_calls = match &assistant_msg.tool_calls {
             Some(tc) if !tc.is_empty() => tc.clone(),
             _ => {
-                // No tool calls — the model is done or just responded with text
                 if let Some(finish) = &choice.finish_reason {
                     if finish == "stop" {
                         break;
@@ -103,7 +116,6 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
             }
         };
 
-        // Execute tool calls
         // Add assistant's tool call message to messages
         messages.push(assistant_msg.clone());
 
@@ -115,7 +127,11 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
             tui::print_tool_call(&tc.function.name, &args_summary);
 
             // Block edit tools in plan-only mode
-            if plan_only && (tc.function.name == "edit" || tc.function.name == "shell") {
+            if plan_only
+                && (tc.function.name == "edit"
+                    || tc.function.name == "write_file"
+                    || tc.function.name == "shell")
+            {
                 let result_msg = Message::tool_result(
                     &tc.id,
                     "Blocked: plan mode is read-only. No edits or shell commands allowed.",
@@ -131,25 +147,59 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
                 Err(e) => crate::tools::ToolResult::err(format!("Tool error: {e}")),
             };
 
-            let first_line = result
-                .content
-                .lines()
-                .next()
-                .unwrap_or("(empty)");
+            let first_line = result.content.lines().next().unwrap_or("(empty)");
             tui::print_tool_result(&tc.function.name, result.success, first_line);
+
+            // Log for future observation masking
+            tool_result_log.push((
+                tc.function.name.clone(),
+                args.clone(),
+                result.content.clone(),
+            ));
 
             let result_msg = Message::tool_result(&tc.id, &result.content);
             messages.push(result_msg.clone());
             conversation_history.push(result_msg);
         }
-
-        // Continue the loop — the LLM will process tool results
     }
 
     tui::print_separator();
     tui::print_complete("Done");
 
     Ok(())
+}
+
+/// Replace old tool results in the message list with compressed summaries.
+///
+/// Keeps the most recent MASK_AFTER_RESULTS tool results in full,
+/// replaces older ones with one-line summaries.
+fn mask_old_tool_results(
+    messages: &mut Vec<Message>,
+    tool_result_log: &[(String, serde_json::Value, String)],
+) {
+    let mask_count = tool_result_log.len().saturating_sub(MASK_AFTER_RESULTS);
+    if mask_count == 0 {
+        return;
+    }
+
+    // Build summaries for old results
+    let old_results: Vec<String> = tool_result_log[..mask_count]
+        .iter()
+        .map(|(name, args, content)| compress::summarize_tool_result(name, args, content))
+        .collect();
+
+    // Find tool result messages and replace old ones with summaries
+    let mut tool_msg_count = 0;
+    for msg in messages.iter_mut() {
+        if msg.role == "tool" {
+            if tool_msg_count < mask_count {
+                if let Some(summary) = old_results.get(tool_msg_count) {
+                    msg.content = Some(summary.clone());
+                }
+            }
+            tool_msg_count += 1;
+        }
+    }
 }
 
 /// Create a brief summary of tool arguments for display.
@@ -165,15 +215,13 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                 _ => path.to_string(),
             }
         }
-        "read_symbol" => {
-            args["name"].as_str().unwrap_or("?").to_string()
-        }
+        "read_symbol" => args["name"].as_str().unwrap_or("?").to_string(),
         "search" => {
             let query = args["query"].as_str().unwrap_or("?");
             let scope = args["scope"].as_str().unwrap_or("project");
             format!("\"{query}\" in {scope}")
         }
-        "edit" => {
+        "edit" | "write_file" => {
             let path = args["path"].as_str().unwrap_or("?");
             format!("{path}")
         }
@@ -186,12 +234,8 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
             }
         }
         "task_update" => "scratchpad".to_string(),
-        "web_search" => {
-            args["query"].as_str().unwrap_or("?").to_string()
-        }
-        "web_fetch" => {
-            args["url"].as_str().unwrap_or("?").to_string()
-        }
+        "web_search" => args["query"].as_str().unwrap_or("?").to_string(),
+        "web_fetch" => args["url"].as_str().unwrap_or("?").to_string(),
         "docs_lookup" => {
             let lib = args["library"].as_str().unwrap_or("?");
             let topic = args["topic"].as_str().unwrap_or("");

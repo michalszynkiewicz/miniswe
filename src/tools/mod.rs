@@ -11,6 +11,7 @@ mod search;
 mod shell;
 mod task_update;
 mod web;
+mod write_file;
 
 pub use definitions::tool_definitions;
 
@@ -65,6 +66,7 @@ pub async fn execute_tool(
         }
         "search" => search::execute(args, config).await,
         "edit" => edit::execute(args, config).await,
+        "write_file" => write_file::execute(args, config).await,
         "shell" => shell::execute(args, config).await,
         "task_update" => task_update::execute(args, config).await,
         "diagnostics" => {

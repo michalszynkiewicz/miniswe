@@ -4,12 +4,16 @@ use anyhow::Result;
 
 use crate::config::Config;
 use crate::context;
+use crate::context::compress;
 use crate::llm::{ChatRequest, LlmClient, Message};
 use crate::tools;
 use crate::tui;
 
 /// Maximum tool rounds per user message.
 const MAX_ROUNDS: usize = 25;
+
+/// After this many tool results, start masking old ones.
+const MASK_AFTER_RESULTS: usize = 6;
 
 /// Run the interactive REPL.
 pub async fn run(config: Config) -> Result<()> {
@@ -37,18 +41,24 @@ pub async fn run(config: Config) -> Result<()> {
             break;
         }
 
-        // Assemble context
+        // Assemble context (with compressed history)
         let assembled =
             context::assemble(&config, &input, &conversation_history, false);
 
         let mut messages = assembled.messages;
         let mut round = 0;
+        let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
 
         loop {
             round += 1;
             if round > MAX_ROUNDS {
                 tui::print_error("Maximum tool rounds reached.");
                 break;
+            }
+
+            // Observation masking
+            if tool_result_log.len() > MASK_AFTER_RESULTS {
+                mask_old_tool_results(&mut messages, &tool_result_log);
             }
 
             let request = ChatRequest {
@@ -93,7 +103,8 @@ pub async fn run(config: Config) -> Result<()> {
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.function.arguments).unwrap_or_default();
 
-                tui::print_tool_call(&tc.function.name, &format!("{args}"));
+                let args_summary = summarize_args(&tc.function.name, &args);
+                tui::print_tool_call(&tc.function.name, &args_summary);
 
                 let result =
                     match tools::execute_tool(&tc.function.name, &args, &config).await {
@@ -104,14 +115,21 @@ pub async fn run(config: Config) -> Result<()> {
                 let first_line = result.content.lines().next().unwrap_or("(empty)");
                 tui::print_tool_result(&tc.function.name, result.success, first_line);
 
+                tool_result_log.push((
+                    tc.function.name.clone(),
+                    args.clone(),
+                    result.content.clone(),
+                ));
+
                 let result_msg = Message::tool_result(&tc.id, &result.content);
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
             }
         }
 
-        // Keep conversation history bounded
-        while conversation_history.len() > config.context.history_turns * 4 {
+        // Keep conversation history bounded — context assembler handles compression
+        let max_history = config.context.history_turns * 6;
+        while conversation_history.len() > max_history {
             conversation_history.remove(0);
         }
 
@@ -120,4 +138,76 @@ pub async fn run(config: Config) -> Result<()> {
 
     tui::print_complete("Session ended");
     Ok(())
+}
+
+/// Replace old tool results with compressed summaries.
+fn mask_old_tool_results(
+    messages: &mut Vec<Message>,
+    tool_result_log: &[(String, serde_json::Value, String)],
+) {
+    let mask_count = tool_result_log.len().saturating_sub(MASK_AFTER_RESULTS);
+    if mask_count == 0 {
+        return;
+    }
+
+    let old_results: Vec<String> = tool_result_log[..mask_count]
+        .iter()
+        .map(|(name, args, content)| compress::summarize_tool_result(name, args, content))
+        .collect();
+
+    let mut tool_msg_count = 0;
+    for msg in messages.iter_mut() {
+        if msg.role == "tool" {
+            if tool_msg_count < mask_count {
+                if let Some(summary) = old_results.get(tool_msg_count) {
+                    msg.content = Some(summary.clone());
+                }
+            }
+            tool_msg_count += 1;
+        }
+    }
+}
+
+/// Create a brief summary of tool arguments for display.
+fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
+    match tool_name {
+        "read_file" => {
+            let path = args["path"].as_str().unwrap_or("?");
+            let start = args["start_line"].as_u64();
+            let end = args["end_line"].as_u64();
+            match (start, end) {
+                (Some(s), Some(e)) => format!("{path}:{s}-{e}"),
+                (Some(s), None) => format!("{path}:{s}-"),
+                _ => path.to_string(),
+            }
+        }
+        "read_symbol" => args["name"].as_str().unwrap_or("?").to_string(),
+        "search" => {
+            let query = args["query"].as_str().unwrap_or("?");
+            let scope = args["scope"].as_str().unwrap_or("project");
+            format!("\"{query}\" in {scope}")
+        }
+        "edit" | "write_file" => args["path"].as_str().unwrap_or("?").to_string(),
+        "shell" => {
+            let cmd = args["command"].as_str().unwrap_or("?");
+            if cmd.len() > 50 {
+                format!("{}...", &cmd[..47])
+            } else {
+                cmd.to_string()
+            }
+        }
+        "task_update" => "scratchpad".to_string(),
+        "web_search" => args["query"].as_str().unwrap_or("?").to_string(),
+        "web_fetch" => args["url"].as_str().unwrap_or("?").to_string(),
+        "docs_lookup" => {
+            let lib = args["library"].as_str().unwrap_or("?");
+            let topic = args["topic"].as_str().unwrap_or("");
+            if topic.is_empty() {
+                lib.to_string()
+            } else {
+                format!("{lib}/{topic}")
+            }
+        }
+        _ => format!("{args}"),
+    }
 }
