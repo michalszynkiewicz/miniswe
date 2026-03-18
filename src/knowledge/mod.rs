@@ -5,10 +5,7 @@
 //! - Dependency graph with PageRank scoring
 //! - Pre-computed file summaries
 //! - Project profile auto-generation
-//!
-//! This module is designed to be built incrementally. Phase 1 provides
-//! basic file scanning and simple symbol extraction. Full tree-sitter
-//! integration with PageRank comes in later phases.
+//! - Incremental re-indexing via mtime tracking
 
 pub mod graph;
 pub mod indexer;
@@ -28,8 +25,11 @@ pub struct Symbol {
     pub name: String,
     /// File path relative to project root
     pub file: String,
-    /// Line number (1-indexed)
+    /// Start line number (1-indexed)
     pub line: usize,
+    /// End line number (1-indexed, inclusive). 0 means unknown.
+    #[serde(default)]
+    pub end_line: usize,
     /// Symbol kind: function, struct, enum, trait, type, const, etc.
     pub kind: String,
     /// Signature (e.g., "pub fn createSession(user: User) -> Session")
@@ -50,6 +50,9 @@ pub struct ProjectIndex {
     /// Per-file references: file → list of symbol names referenced in that file
     #[serde(default)]
     pub references: HashMap<String, Vec<String>>,
+    /// Per-file modification times (seconds since epoch) for incremental reindex
+    #[serde(default)]
+    pub mtimes: HashMap<String, u64>,
     /// Total files indexed
     pub total_files: usize,
     /// Total symbols extracted
@@ -62,13 +65,22 @@ impl ProjectIndex {
         let index_dir = minime_dir.join("index");
         std::fs::create_dir_all(&index_dir)?;
 
-        let symbols_path = index_dir.join("symbols.json");
-        let summaries_path = index_dir.join("summaries.json");
-        let tree_path = index_dir.join("file_tree.txt");
-
-        std::fs::write(symbols_path, serde_json::to_string_pretty(&self.symbols)?)?;
-        std::fs::write(summaries_path, serde_json::to_string_pretty(&self.summaries)?)?;
-        std::fs::write(tree_path, self.file_tree.join("\n"))?;
+        std::fs::write(
+            index_dir.join("symbols.json"),
+            serde_json::to_string_pretty(&self.symbols)?,
+        )?;
+        std::fs::write(
+            index_dir.join("summaries.json"),
+            serde_json::to_string_pretty(&self.summaries)?,
+        )?;
+        std::fs::write(
+            index_dir.join("file_tree.txt"),
+            self.file_tree.join("\n"),
+        )?;
+        std::fs::write(
+            index_dir.join("mtimes.json"),
+            serde_json::to_string_pretty(&self.mtimes)?,
+        )?;
 
         Ok(())
     }
@@ -77,23 +89,9 @@ impl ProjectIndex {
     pub fn load(minime_dir: &Path) -> anyhow::Result<Self> {
         let index_dir = minime_dir.join("index");
 
-        let symbols: HashMap<String, Vec<Symbol>> = {
-            let path = index_dir.join("symbols.json");
-            if path.exists() {
-                serde_json::from_str(&std::fs::read_to_string(path)?)?
-            } else {
-                HashMap::new()
-            }
-        };
-
-        let summaries: HashMap<String, String> = {
-            let path = index_dir.join("summaries.json");
-            if path.exists() {
-                serde_json::from_str(&std::fs::read_to_string(path)?)?
-            } else {
-                HashMap::new()
-            }
-        };
+        let symbols: HashMap<String, Vec<Symbol>> = load_json(&index_dir, "symbols.json")?;
+        let summaries: HashMap<String, String> = load_json(&index_dir, "summaries.json")?;
+        let mtimes: HashMap<String, u64> = load_json(&index_dir, "mtimes.json")?;
 
         let file_tree: Vec<String> = {
             let path = index_dir.join("file_tree.txt");
@@ -114,9 +112,39 @@ impl ProjectIndex {
             symbols,
             summaries,
             file_tree,
-            references: HashMap::new(), // not persisted — rebuilt on each index
+            references: HashMap::new(),
+            mtimes,
             total_files,
             total_symbols,
         })
+    }
+
+    /// Look up a symbol by name. Returns all definitions across files.
+    pub fn lookup(&self, name: &str) -> Vec<&Symbol> {
+        self.symbols
+            .get(name)
+            .map(|syms| syms.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Check if a file has been modified since it was last indexed.
+    pub fn is_stale(&self, file: &str, current_mtime: u64) -> bool {
+        match self.mtimes.get(file) {
+            Some(&indexed_mtime) => current_mtime > indexed_mtime,
+            None => true, // not indexed yet
+        }
+    }
+}
+
+/// Helper to load a JSON file, returning Default if it doesn't exist.
+fn load_json<T: serde::de::DeserializeOwned + Default>(
+    dir: &Path,
+    filename: &str,
+) -> anyhow::Result<T> {
+    let path = dir.join(filename);
+    if path.exists() {
+        Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+    } else {
+        Ok(T::default())
     }
 }

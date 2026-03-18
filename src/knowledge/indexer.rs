@@ -18,15 +18,26 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     "swift", "kt", "scala", "zig", "hs", "ml", "ex", "exs", "clj",
 ];
 
-/// Index a project directory.
-pub fn index_project(root: &Path) -> Result<ProjectIndex> {
+/// Get file mtime as seconds since epoch.
+fn file_mtime(path: &Path) -> u64 {
+    path.metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Index a project directory. If `previous` is provided, only re-indexes
+/// files whose mtime has changed (incremental mode).
+pub fn index_project(root: &Path, previous: Option<&ProjectIndex>) -> Result<ProjectIndex> {
     let mut index = ProjectIndex::default();
     let mut file_count = 0;
+    let mut reused = 0;
 
-    // Walk the directory tree, respecting .gitignore
     let walker = WalkBuilder::new(root)
-        .hidden(true) // skip hidden files
-        .git_ignore(true) // respect .gitignore
+        .hidden(true)
+        .git_ignore(true)
         .git_global(true)
         .build();
 
@@ -37,8 +48,6 @@ pub fn index_project(root: &Path) -> Result<ProjectIndex> {
         };
 
         let path = entry.path();
-
-        // Skip directories and non-source files
         if !path.is_file() {
             continue;
         }
@@ -48,26 +57,49 @@ pub fn index_project(root: &Path) -> Result<ProjectIndex> {
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
-        // Record all files in the tree
         if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();
 
-            // Skip .minime directory itself
             if rel_str.starts_with(".minime") {
                 continue;
             }
 
             index.file_tree.push(rel_str.clone());
 
-            // Only extract symbols from source files
             if SOURCE_EXTENSIONS.contains(&ext) {
                 file_count += 1;
+                let mtime = file_mtime(path);
+
+                // Incremental: reuse previous index if file hasn't changed
+                if let Some(prev) = previous {
+                    if !prev.is_stale(&rel_str, mtime) {
+                        // Copy symbols from previous index
+                        for (name, syms) in &prev.symbols {
+                            for sym in syms {
+                                if sym.file == rel_str {
+                                    index
+                                        .symbols
+                                        .entry(name.clone())
+                                        .or_default()
+                                        .push(sym.clone());
+                                    index.total_symbols += 1;
+                                }
+                            }
+                        }
+                        if let Some(summary) = prev.summaries.get(&rel_str) {
+                            index.summaries.insert(rel_str.clone(), summary.clone());
+                        }
+                        index.mtimes.insert(rel_str, mtime);
+                        reused += 1;
+                        continue;
+                    }
+                }
+
+                // (Re-)index this file
                 if let Ok(content) = std::fs::read_to_string(path) {
-                    // Try tree-sitter first, fall back to regex
-                    let symbols = if let Some(ts_result) =
+                    let mut symbols = if let Some(ts_result) =
                         ts_extract::extract(&rel_str, &content, ext)
                     {
-                        // Store references for graph building
                         for sym_ref in &ts_result.references {
                             index
                                 .references
@@ -77,9 +109,11 @@ pub fn index_project(root: &Path) -> Result<ProjectIndex> {
                         }
                         ts_result.symbols
                     } else {
-                        // Regex fallback
                         extract_symbols(&rel_str, &content, ext)
                     };
+
+                    // Compute end_line for each symbol
+                    compute_end_lines(&mut symbols, &content);
 
                     for sym in &symbols {
                         index
@@ -90,9 +124,9 @@ pub fn index_project(root: &Path) -> Result<ProjectIndex> {
                     }
                     index.total_symbols += symbols.len();
 
-                    // Generate a one-line summary (prefers doc headers)
                     let summary = generate_summary(&content, &symbols, ext);
-                    index.summaries.insert(rel_str, summary);
+                    index.summaries.insert(rel_str.clone(), summary);
+                    index.mtimes.insert(rel_str, mtime);
                 }
             }
         }
@@ -101,7 +135,78 @@ pub fn index_project(root: &Path) -> Result<ProjectIndex> {
     index.total_files = file_count;
     index.file_tree.sort();
 
+    if reused > 0 {
+        tracing::info!("Incremental index: {reused} files reused, {} re-indexed", file_count - reused);
+    }
+
     Ok(index)
+}
+
+/// Compute end_line for each symbol by scanning for matching braces/dedent.
+///
+/// Heuristic: from the symbol's start line, track brace depth. When it
+/// returns to 0 (or for Python, when indentation returns to the definition
+/// level), that's the end line.
+fn compute_end_lines(symbols: &mut Vec<Symbol>, content: &str) {
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+
+    // Sort by line number so we can use the next symbol as a boundary hint
+    symbols.sort_by_key(|s| s.line);
+
+    for i in 0..symbols.len() {
+        let start = symbols[i].line.saturating_sub(1); // 0-indexed
+        if start >= total {
+            continue;
+        }
+
+        // Upper bound: next symbol's start or end of file
+        let upper_bound = if i + 1 < symbols.len() {
+            symbols[i + 1].line.saturating_sub(1)
+        } else {
+            total
+        };
+
+        let start_line = lines[start];
+        let start_indent = start_line.len() - start_line.trim_start().len();
+
+        // For brace-delimited languages: track depth
+        if start_line.contains('{') || lines.get(start + 1).is_some_and(|l| l.trim() == "{") {
+            let mut depth = 0;
+            for j in start..upper_bound.min(total) {
+                for ch in lines[j].chars() {
+                    if ch == '{' {
+                        depth += 1;
+                    } else if ch == '}' {
+                        depth -= 1;
+                    }
+                }
+                if depth <= 0 && j > start {
+                    symbols[i].end_line = j + 1;
+                    break;
+                }
+            }
+            if symbols[i].end_line == 0 {
+                symbols[i].end_line = upper_bound;
+            }
+        } else {
+            // For indent-delimited (Python): find where indent returns to start level
+            for j in (start + 1)..upper_bound.min(total) {
+                let line = lines[j];
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let indent = line.len() - line.trim_start().len();
+                if indent <= start_indent {
+                    symbols[i].end_line = j; // line before the dedent
+                    break;
+                }
+            }
+            if symbols[i].end_line == 0 {
+                symbols[i].end_line = upper_bound;
+            }
+        }
+    }
 }
 
 /// Extract symbols from source code using regex patterns.
@@ -139,6 +244,7 @@ fn extract_rust_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     line: line_num + 1,
                     kind: "function".into(),
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
+                    end_line: 0,
                     deps: Vec::new(),
                 });
             }
@@ -155,6 +261,7 @@ fn extract_rust_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     line: line_num + 1,
                     kind: "struct".into(),
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
+                    end_line: 0,
                     deps: Vec::new(),
                 });
             }
@@ -168,6 +275,7 @@ fn extract_rust_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     line: line_num + 1,
                     kind: "enum".into(),
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
+                    end_line: 0,
                     deps: Vec::new(),
                 });
             }
@@ -181,6 +289,7 @@ fn extract_rust_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     line: line_num + 1,
                     kind: "trait".into(),
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
+                    end_line: 0,
                     deps: Vec::new(),
                 });
             }
@@ -194,6 +303,7 @@ fn extract_rust_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     line: line_num + 1,
                     kind: "impl".into(),
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
+                    end_line: 0,
                     deps: Vec::new(),
                 });
             }
@@ -218,6 +328,7 @@ fn extract_python_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) 
                     line: line_num + 1,
                     kind: "function".into(),
                     signature: trimmed.trim_end_matches(':').to_string(),
+                    end_line: 0,
                     deps: Vec::new(),
                 });
             }
@@ -229,6 +340,7 @@ fn extract_python_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) 
                     line: line_num + 1,
                     kind: "class".into(),
                     signature: trimmed.trim_end_matches(':').to_string(),
+                    end_line: 0,
                     deps: Vec::new(),
                 });
             }
@@ -250,6 +362,7 @@ fn extract_js_ts_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     line: line_num + 1,
                     kind: "function".into(),
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
+                    end_line: 0,
                     deps: Vec::new(),
                 });
             }
@@ -263,6 +376,7 @@ fn extract_js_ts_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     line: line_num + 1,
                     kind: "class".into(),
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
+                    end_line: 0,
                     deps: Vec::new(),
                 });
             }
@@ -276,6 +390,7 @@ fn extract_js_ts_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     line: line_num + 1,
                     kind: "interface".into(),
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
+                    end_line: 0,
                     deps: Vec::new(),
                 });
             }
@@ -289,6 +404,7 @@ fn extract_js_ts_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     line: line_num + 1,
                     kind: "type".into(),
                     signature: trimmed.to_string(),
+                    end_line: 0,
                     deps: Vec::new(),
                 });
             }
@@ -319,6 +435,7 @@ fn extract_go_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     line: line_num + 1,
                     kind: "function".into(),
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
+                    end_line: 0,
                     deps: Vec::new(),
                 });
             }
@@ -337,6 +454,7 @@ fn extract_go_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     line: line_num + 1,
                     kind: kind.into(),
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
+                    end_line: 0,
                     deps: Vec::new(),
                 });
             }
