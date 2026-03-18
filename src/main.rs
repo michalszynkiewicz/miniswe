@@ -1,7 +1,4 @@
-//! minime — A context-frugal CLI coding agent
-//!
-//! Designed for 64K context windows on consumer hardware.
-//! Optimized for small LLMs (Devstral Small 2, etc.) running locally.
+//! miniswe — A lightweight CLI coding agent for local LLMs
 
 mod cli;
 mod config;

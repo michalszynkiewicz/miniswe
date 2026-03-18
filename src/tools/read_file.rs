@@ -40,6 +40,17 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         return Ok(ToolResult::err(format!("{path_str} is a directory, not a file. Use search or shell(\"ls\") instead.")));
     }
 
+    // Check file size before reading (reject files > 10MB to avoid OOM)
+    const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+    if let Ok(meta) = fs::metadata(&path) {
+        if meta.len() > MAX_FILE_SIZE {
+            return Ok(ToolResult::err(format!(
+                "{path_str} is too large ({:.1}MB). Use shell(\"head -n 200 {path_str}\") instead.",
+                meta.len() as f64 / 1_048_576.0
+            )));
+        }
+    }
+
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) => return Ok(ToolResult::err(format!("Failed to read {path_str}: {e}"))),

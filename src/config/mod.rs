@@ -1,6 +1,6 @@
-//! Configuration management for minime.
+//! Configuration management for miniswe.
 //!
-//! Loads from `.minime/config.toml` in the project root, with defaults
+//! Loads from `.miniswe/config.toml` in the project root, with defaults
 //! for all values. Supports provider configuration for llama.cpp, Ollama, vLLM,
 //! or any OpenAI-compatible endpoint.
 
@@ -35,7 +35,7 @@ pub struct ModelConfig {
     /// Context window size in tokens
     pub context_window: usize,
     /// Sampling temperature (low for code tasks)
-    pub temperature: f32,
+    pub temperature: f64,
     /// Maximum output tokens per response
     pub max_output_tokens: usize,
 }
@@ -54,6 +54,10 @@ pub struct ContextConfig {
     pub history_budget: usize,
     /// Token budget for the scratchpad
     pub scratchpad_budget: usize,
+    /// Maximum tool call rounds before stopping
+    pub max_rounds: usize,
+    /// Ask user to confirm continuation after this many rounds
+    pub pause_after_rounds: usize,
 }
 
 /// Hardware configuration hints.
@@ -61,11 +65,11 @@ pub struct ContextConfig {
 #[serde(default)]
 pub struct HardwareConfig {
     /// Total VRAM in GB
-    pub vram_gb: f32,
+    pub vram_gb: f64,
     /// VRAM to reserve for OS/display (subtracted from vram_gb for model budget)
-    pub vram_reserve_gb: f32,
+    pub vram_reserve_gb: f64,
     /// RAM budget for KV cache overflow
-    pub ram_budget_gb: f32,
+    pub ram_budget_gb: f64,
 }
 
 /// Web access configuration.
@@ -98,7 +102,7 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             provider: "llama-cpp".into(),
-            endpoint: "http://localhost:8080".into(),
+            endpoint: "http://localhost:8464".into(),
             model: "devstral-small-2".into(),
             context_window: 50000,
             temperature: 0.15,
@@ -115,6 +119,8 @@ impl Default for ContextConfig {
             history_turns: 5,
             history_budget: 6000,
             scratchpad_budget: 1500,
+            max_rounds: 100,
+            pause_after_rounds: 50,
         }
     }
 }
@@ -140,12 +146,12 @@ impl Default for WebConfig {
 }
 
 impl Config {
-    /// Find the project root by looking for `.minime/` directory,
+    /// Find the project root by looking for `.miniswe/` directory,
     /// walking up from the current directory.
     pub fn find_project_root() -> Option<PathBuf> {
         let mut dir = std::env::current_dir().ok()?;
         loop {
-            if dir.join(".minime").is_dir() {
+            if dir.join(".miniswe").is_dir() {
                 return Some(dir);
             }
             if !dir.pop() {
@@ -154,13 +160,13 @@ impl Config {
         }
     }
 
-    /// Load config from `.minime/config.toml` in the project root.
+    /// Load config from `.miniswe/config.toml` in the project root.
     /// Falls back to defaults if the file doesn't exist.
     pub fn load() -> Result<Self> {
         let project_root = Self::find_project_root()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        let config_path = project_root.join(".minime").join("config.toml");
+        let config_path = project_root.join(".miniswe").join("config.toml");
 
         let mut config = if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)
@@ -175,9 +181,9 @@ impl Config {
         Ok(config)
     }
 
-    /// Save configuration to `.minime/config.toml`.
+    /// Save configuration to `.miniswe/config.toml`.
     pub fn save(&self) -> Result<()> {
-        let config_dir = self.project_root.join(".minime");
+        let config_dir = self.project_root.join(".miniswe");
         std::fs::create_dir_all(&config_dir)?;
         let config_path = config_dir.join("config.toml");
         let contents = toml::to_string_pretty(self)?;
@@ -185,18 +191,18 @@ impl Config {
         Ok(())
     }
 
-    /// Path to the `.minime/` directory.
-    pub fn minime_dir(&self) -> PathBuf {
-        self.project_root.join(".minime")
+    /// Path to the `.miniswe/` directory.
+    pub fn miniswe_dir(&self) -> PathBuf {
+        self.project_root.join(".miniswe")
     }
 
-    /// Path to a specific file within `.minime/`.
-    pub fn minime_path(&self, relative: &str) -> PathBuf {
-        self.minime_dir().join(relative)
+    /// Path to a specific file within `.miniswe/`.
+    pub fn miniswe_path(&self, relative: &str) -> PathBuf {
+        self.miniswe_dir().join(relative)
     }
 
     /// Check if this project has been initialized.
     pub fn is_initialized(&self) -> bool {
-        self.minime_dir().is_dir()
+        self.miniswe_dir().is_dir()
     }
 }

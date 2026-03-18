@@ -1,6 +1,6 @@
-# minime
+# miniswe
 
-A context-frugal CLI coding agent designed for 50K token context windows on consumer hardware.
+A lightweight CLI coding agent for local LLMs.
 
 Optimized for quantized small LLMs (Devstral Small 2 Q4_K_M, Qwen 2.5 Coder, etc.) running locally via llama.cpp, Ollama, or vLLM. Works with any OpenAI-compatible API.
 
@@ -15,21 +15,21 @@ cargo build --release --features all-languages
 
 # Initialize in your project
 cd /path/to/your/project
-minime init
+miniswe init
 
 # Run interactively
-minime
+miniswe
 
 # Run with a single message
-minime "fix the bug in auth.rs"
+miniswe "fix the bug in auth.rs"
 
 # Plan mode (read-only exploration)
-minime plan "how should I refactor the auth module?"
+miniswe plan "how should I refactor the auth module?"
 ```
 
 ## Architecture
 
-minime operates on one principle: **assemble exactly the right context for each step — never dump everything in and hope.**
+miniswe operates on one principle: **assemble exactly the right context for each step — never dump everything in and hope.**
 
 ### Core Components
 
@@ -57,14 +57,14 @@ minime operates on one principle: **assemble exactly the right context for each 
 
 | Command | Description |
 |---------|-------------|
-| `minime` | Interactive REPL mode |
-| `minime "message"` | Single-shot agent execution |
-| `minime init` | Initialize project (index, profile, graph) |
-| `minime info` | Show project info and index stats |
-| `minime config` | Show current configuration |
-| `minime plan "question"` | Plan-only mode (no edits) |
-| `minime docs add <url>` | Cache documentation for offline use |
-| `minime docs list` | List cached docs |
+| `miniswe` | Interactive REPL mode |
+| `miniswe "message"` | Single-shot agent execution |
+| `miniswe init` | Initialize project (index, profile, graph) |
+| `miniswe info` | Show project info and index stats |
+| `miniswe config` | Show current configuration |
+| `miniswe plan "question"` | Plan-only mode (no edits) |
+| `miniswe docs add <url>` | Cache documentation for offline use |
+| `miniswe docs list` | List cached docs |
 
 ## Tools
 
@@ -87,7 +87,7 @@ minime operates on one principle: **assemble exactly the right context for each 
 
 ### MCP Tools (unlimited, via `.mcp.json`)
 
-minime supports the standard `.mcp.json` configuration (same format as Claude Code):
+miniswe supports the standard `.mcp.json` configuration (same format as Claude Code):
 
 ```json
 {
@@ -105,7 +105,7 @@ minime supports the standard `.mcp.json` configuration (same format as Claude Co
 }
 ```
 
-**Lazy-loading approach:** On startup, minime connects to MCP servers, fetches tool schemas, and caches them to `.minime/mcp/`. Only a one-line summary per server goes into the LLM context (~10 tokens each). Full schemas are resolved on the Rust side at execution time — zero context waste.
+**Lazy-loading approach:** On startup, miniswe connects to MCP servers, fetches tool schemas, and caches them to `.miniswe/mcp/`. Only a one-line summary per server goes into the LLM context (~10 tokens each). Full schemas are resolved on the Rust side at execution time — zero context waste.
 
 ## Tree-sitter Language Support
 
@@ -128,7 +128,7 @@ cargo build --release --no-default-features
 
 ## Configuration
 
-### `.minime/config.toml`
+### `.miniswe/config.toml`
 
 ```toml
 [model]
@@ -159,7 +159,7 @@ fetch_backend = "jina"          # or "local"
 ## Project Directory Structure
 
 ```
-.minime/
+.miniswe/
 ├── config.toml           # Model, context, and web settings
 ├── profile.md            # Auto-generated project overview
 ├── guide.md              # Your custom instructions (<500 tokens)
@@ -202,7 +202,7 @@ llama-server \
 
 ```bash
 ollama serve
-# In .minime/config.toml:
+# In .miniswe/config.toml:
 # [model]
 # provider = "ollama"
 # endpoint = "http://localhost:11434"

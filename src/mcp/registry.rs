@@ -35,7 +35,7 @@ pub struct McpToolInfo {
 /// Registry of all MCP servers and their tools.
 /// Holds live connections to servers for tool execution.
 pub struct McpRegistry {
-    /// Cached server info (persisted to .minime/mcp/)
+    /// Cached server info (persisted to .miniswe/mcp/)
     pub servers: Vec<McpServerInfo>,
     /// Live client connections (not serialized)
     clients: HashMap<String, McpClient>,

@@ -1,4 +1,4 @@
-//! `minime docs` — Manage documentation cache.
+//! `miniswe docs` — Manage documentation cache.
 
 use std::fs;
 
@@ -10,7 +10,7 @@ use crate::tui;
 
 pub async fn run(subcommand: DocsSubcommand) -> Result<()> {
     let config = Config::load()?;
-    let docs_dir = config.minime_path("docs");
+    let docs_dir = config.miniswe_path("docs");
     fs::create_dir_all(&docs_dir)?;
 
     match subcommand {
@@ -18,7 +18,7 @@ pub async fn run(subcommand: DocsSubcommand) -> Result<()> {
             tui::print_status(&format!("Fetching {url}..."));
 
             let client = reqwest::Client::builder()
-                .user_agent("Mozilla/5.0 (compatible; minime/0.1)")
+                .user_agent("Mozilla/5.0 (compatible; miniswe/0.1)")
                 .build()?;
 
             match client.get(&url).send().await {
@@ -73,12 +73,12 @@ pub async fn run(subcommand: DocsSubcommand) -> Result<()> {
             }
 
             eprintln!();
-            tui::print_status("Add docs: `minime docs add <url>`");
+            tui::print_status("Add docs: `miniswe docs add <url>`");
         }
         DocsSubcommand::Refresh => {
             tui::print_status("Refreshing cached docs...");
             // TODO: Store original URLs and re-fetch
-            tui::print_error("Not yet implemented — re-add docs with `minime docs add <url>`");
+            tui::print_error("Not yet implemented — re-add docs with `miniswe docs add <url>`");
         }
     }
 

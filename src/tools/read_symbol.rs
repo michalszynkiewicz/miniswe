@@ -30,12 +30,12 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     }
 
     // Load the index
-    let minime_dir = config.minime_dir();
-    let index = match ProjectIndex::load(&minime_dir) {
+    let miniswe_dir = config.miniswe_dir();
+    let index = match ProjectIndex::load(&miniswe_dir) {
         Ok(idx) => idx,
         Err(_) => {
             return Ok(ToolResult::err(
-                "Index not available. Run `minime init` first.".into(),
+                "Index not available. Run `miniswe init` first.".into(),
             ));
         }
     };

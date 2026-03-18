@@ -1,6 +1,11 @@
 //! Interactive REPL mode.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
+use reedline::{
+    DefaultPrompt, DefaultPromptSegment, FileBackedHistory, Reedline, Signal,
+};
 
 use crate::config::Config;
 use crate::context;
@@ -8,17 +13,17 @@ use crate::context::compress;
 use crate::llm::{ChatRequest, LlmClient, Message};
 use crate::mcp::{McpConfig, McpRegistry};
 use crate::tools;
+use crate::tools::permissions::{Action, PermissionManager};
 use crate::tui;
 
 /// Maximum tool rounds per user message.
-const MAX_ROUNDS: usize = 25;
-
 /// After this many tool results, start masking old ones.
 const MASK_AFTER_RESULTS: usize = 6;
 
 /// Run the interactive REPL.
 pub async fn run(config: Config) -> Result<()> {
     let client = LlmClient::new(config.model.clone());
+    let perms = PermissionManager::new(&config);
     let mut tool_defs = tools::tool_definitions();
 
     tui::print_header("Interactive Mode");
@@ -30,7 +35,7 @@ pub async fn run(config: Config) -> Result<()> {
     // Initialize MCP servers
     let mcp_config = McpConfig::load(&config.project_root)?;
     let mut mcp_registry = if mcp_config.has_servers() {
-        let cache_dir = config.minime_path("mcp");
+        let cache_dir = config.miniswe_path("mcp");
         match McpRegistry::connect(&mcp_config, &cache_dir) {
             Ok(registry) => {
                 if registry.has_servers() {
@@ -56,16 +61,38 @@ pub async fn run(config: Config) -> Result<()> {
         .as_ref()
         .and_then(|r| r.context_summary());
 
-    tui::print_status("Type your message, or 'quit' to exit.");
+    tui::print_status("Type your message, or 'quit' to exit. Ctrl+R to search history.");
     tui::print_separator();
+
+    // Set up reedline with file-backed history
+    let history_file = config.miniswe_path("sessions/repl_history.txt");
+    if let Some(parent) = history_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let history = Box::new(
+        FileBackedHistory::with_file(1000, history_file)
+            .expect("Failed to create history file"),
+    );
+    let mut editor = Reedline::create().with_history(history);
+    let prompt = DefaultPrompt::new(
+        DefaultPromptSegment::Basic("you".to_string()),
+        DefaultPromptSegment::Empty,
+    );
 
     let mut conversation_history: Vec<Message> = Vec::new();
 
     loop {
-        let input = match tui::read_input("you>") {
-            Some(input) if !input.is_empty() => input,
-            Some(_) => continue,
-            None => break, // EOF
+        let input = match editor.read_line(&prompt) {
+            Ok(Signal::Success(line)) => {
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                trimmed
+            }
+            Ok(Signal::CtrlC) => continue,  // Ctrl+C: cancel current line
+            Ok(Signal::CtrlD) => break,     // Ctrl+D: exit
+            Err(_) => break,
         };
 
         if input == "quit" || input == "exit" || input == "/quit" {
@@ -82,14 +109,42 @@ pub async fn run(config: Config) -> Result<()> {
         );
 
         let mut messages = assembled.messages;
+        let max_rounds = config.context.max_rounds;
+        let pause_at = config.context.pause_after_rounds;
         let mut round = 0;
+        let mut user_continued = false;
         let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
 
         loop {
             round += 1;
-            if round > MAX_ROUNDS {
+            if round > max_rounds {
                 tui::print_error("Maximum tool rounds reached.");
                 break;
+            }
+
+            // Ask user if they want to continue
+            if round == pause_at && !user_continued {
+                tui::print_status(&format!("{pause_at} tool rounds used."));
+                let response = tui::read_input("Continue? [y]es / [n]o:");
+                match response.as_deref() {
+                    Some("y") | Some("yes") | Some("") => {
+                        user_continued = true;
+                    }
+                    _ => {
+                        messages.push(Message::user(
+                            "[SYSTEM: The user has asked you to stop. \
+                             Wrap up immediately and summarize what you've done so far.]"
+                        ));
+                    }
+                }
+            }
+
+            // Warn the LLM when approaching the hard limit
+            if round == max_rounds.saturating_sub(5) {
+                messages.push(Message::user(
+                    "[SYSTEM: You are approaching the tool call limit. \
+                     Wrap up your current task and summarize what you've done.]"
+                ));
             }
 
             // Observation masking
@@ -136,8 +191,19 @@ pub async fn run(config: Config) -> Result<()> {
             messages.push(assistant_msg.clone());
 
             for tc in &tool_calls {
-                let args: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let result_msg = Message::tool_result(
+                            &tc.id,
+                            &format!("Invalid JSON in tool arguments: {e}\nRaw: {}", tc.function.arguments),
+                        );
+                        messages.push(result_msg.clone());
+                        conversation_history.push(result_msg);
+                        tui::print_tool_result(&tc.function.name, false, "invalid JSON args");
+                        continue;
+                    }
+                };
 
                 let args_summary = summarize_args(&tc.function.name, &args);
                 tui::print_tool_call(&tc.function.name, &args_summary);
@@ -147,15 +213,18 @@ pub async fn run(config: Config) -> Result<()> {
                     let server = args["server"].as_str().unwrap_or("");
                     let tool = args["tool"].as_str().unwrap_or("");
                     let tool_args = args.get("arguments").cloned().unwrap_or_default();
-                    match &mut mcp_registry {
-                        Some(registry) => match registry.call_tool(server, tool, tool_args) {
-                            Ok(content) => crate::tools::ToolResult::ok(content),
-                            Err(e) => crate::tools::ToolResult::err(format!("MCP error: {e}")),
+                    match perms.check(&Action::McpUse(server.into(), tool.into())) {
+                        Err(e) => crate::tools::ToolResult::err(e),
+                        Ok(()) => match &mut mcp_registry {
+                            Some(registry) => match registry.call_tool(server, tool, tool_args) {
+                                Ok(content) => crate::tools::ToolResult::ok(content),
+                                Err(e) => crate::tools::ToolResult::err(format!("MCP error: {e}")),
+                            },
+                            None => crate::tools::ToolResult::err("No MCP servers connected".into()),
                         },
-                        None => crate::tools::ToolResult::err("No MCP servers connected".into()),
                     }
                 } else {
-                    match tools::execute_tool(&tc.function.name, &args, &config).await {
+                    match tools::execute_tool(&tc.function.name, &args, &config, &perms).await {
                         Ok(r) => r,
                         Err(e) => crate::tools::ToolResult::err(format!("Tool error: {e}")),
                     }

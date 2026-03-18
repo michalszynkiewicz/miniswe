@@ -60,7 +60,7 @@ pub fn index_project(root: &Path, previous: Option<&ProjectIndex>) -> Result<Pro
         if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();
 
-            if rel_str.starts_with(".minime") {
+            if rel_str.starts_with(".miniswe") {
                 continue;
             }
 
@@ -140,6 +140,74 @@ pub fn index_project(root: &Path, previous: Option<&ProjectIndex>) -> Result<Pro
     }
 
     Ok(index)
+}
+
+/// Re-index a single file in an existing index.
+///
+/// Removes old symbols for that file, re-extracts, recomputes end_lines,
+/// updates mtime, and saves the index to disk. Takes <1ms per file.
+pub fn reindex_file(
+    rel_path: &str,
+    abs_path: &Path,
+    index: &mut ProjectIndex,
+    miniswe_dir: &Path,
+) {
+    let ext = abs_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    if !SOURCE_EXTENSIONS.contains(&ext) {
+        return;
+    }
+
+    let content = match std::fs::read_to_string(abs_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Remove old symbols for this file
+    for syms in index.symbols.values_mut() {
+        syms.retain(|s| s.file != rel_path);
+    }
+    // Remove empty entries
+    index.symbols.retain(|_, v| !v.is_empty());
+
+    // Re-extract symbols
+    let mut symbols = if let Some(ts_result) = ts_extract::extract(rel_path, &content, ext) {
+        for sym_ref in &ts_result.references {
+            index
+                .references
+                .entry(rel_path.to_string())
+                .or_default()
+                .push(sym_ref.name.clone());
+        }
+        ts_result.symbols
+    } else {
+        extract_symbols(rel_path, &content, ext)
+    };
+
+    compute_end_lines(&mut symbols, &content);
+
+    // Insert new symbols
+    for sym in &symbols {
+        index
+            .symbols
+            .entry(sym.name.clone())
+            .or_default()
+            .push(sym.clone());
+    }
+
+    // Update summary and mtime
+    let summary = generate_summary(&content, &symbols, ext);
+    index.summaries.insert(rel_path.to_string(), summary);
+    index.mtimes.insert(rel_path.to_string(), file_mtime(abs_path));
+
+    // Recount
+    index.total_symbols = index.symbols.values().map(|v| v.len()).sum();
+
+    // Save to disk (best-effort, don't fail the tool call)
+    let _ = index.save(miniswe_dir);
 }
 
 /// Compute end_line for each symbol by scanning for matching braces/dedent.
@@ -697,7 +765,7 @@ pub fn audit_file_sizes(root: &Path, max_lines: usize) -> Vec<(String, usize)> {
 
         if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();
-            if rel_str.starts_with(".minime") {
+            if rel_str.starts_with(".miniswe") {
                 continue;
             }
 

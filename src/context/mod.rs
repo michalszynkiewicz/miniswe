@@ -29,7 +29,7 @@ pub struct AssembledContext {
 fn build_system_prompt() -> String {
     // Compressed format per design section 13.3 — ~40% shorter than prose
     String::from(
-        "You are minime, a coding agent in a terminal.\n\
+        "You are miniswe, a coding agent in a terminal.\n\
          \n\
          [RULES]\n\
          1.Read before write:use read_symbol/search before edits\n\
@@ -62,14 +62,14 @@ fn build_system_prompt() -> String {
 
 /// Load and compress the project profile.
 fn load_profile(config: &Config) -> Option<String> {
-    let path = config.minime_path("profile.md");
+    let path = config.miniswe_path("profile.md");
     let content = fs::read_to_string(path).ok()?;
     Some(compress::compress_profile(&content))
 }
 
-/// Load the user guide from `.minime/guide.md`.
+/// Load the user guide from `.miniswe/guide.md`.
 fn load_guide(config: &Config) -> Option<String> {
-    let path = config.minime_path("guide.md");
+    let path = config.miniswe_path("guide.md");
     let content = fs::read_to_string(path).ok()?;
     // Skip if it's just the template
     if content.contains("<!-- Add project-specific instructions") && content.lines().count() <= 5 {
@@ -78,23 +78,23 @@ fn load_guide(config: &Config) -> Option<String> {
     Some(content)
 }
 
-/// Load the scratchpad from `.minime/scratchpad.md`.
+/// Load the scratchpad from `.miniswe/scratchpad.md`.
 fn load_scratchpad(config: &Config) -> Option<String> {
-    let path = config.minime_path("scratchpad.md");
+    let path = config.miniswe_path("scratchpad.md");
     fs::read_to_string(path).ok()
 }
 
-/// Load the plan from `.minime/plan.md`.
+/// Load the plan from `.miniswe/plan.md`.
 fn load_plan(config: &Config) -> Option<String> {
-    let path = config.minime_path("plan.md");
+    let path = config.miniswe_path("plan.md");
     fs::read_to_string(path).ok()
 }
 
 /// Load the repo map slice, personalized for the current task.
 fn load_repo_map(config: &Config, task_keywords: &[&str]) -> Option<String> {
-    let minime_dir = config.minime_dir();
-    let index = ProjectIndex::load(&minime_dir).ok()?;
-    let graph = DependencyGraph::load(&minime_dir).ok()?;
+    let miniswe_dir = config.miniswe_dir();
+    let index = ProjectIndex::load(&miniswe_dir).ok()?;
+    let graph = DependencyGraph::load(&miniswe_dir).ok()?;
 
     let map = repo_map::render(
         &index,
@@ -110,9 +110,9 @@ fn load_repo_map(config: &Config, task_keywords: &[&str]) -> Option<String> {
     }
 }
 
-/// Load relevant lessons from `.minime/lessons.md` based on keywords.
+/// Load relevant lessons from `.miniswe/lessons.md` based on keywords.
 fn load_relevant_lessons(config: &Config, keywords: &[&str]) -> Option<String> {
-    let path = config.minime_path("lessons.md");
+    let path = config.miniswe_path("lessons.md");
     let content = fs::read_to_string(path).ok()?;
 
     // Skip if it's just the template
@@ -225,13 +225,16 @@ pub fn compress_history(
         }
     }
 
+    // Inject the summary as a user message (not system — breaks role alternation)
+    // followed by a brief assistant acknowledgment to maintain user→assistant pairing
     if !summary_lines.is_empty() {
         let summary = format!(
-            "[HISTORY SUMMARY — {} earlier messages]\n{}",
+            "[Earlier in this session — {} messages summarized]\n{}",
             old.len(),
             summary_lines.join("\n")
         );
-        compressed.push(Message::system(&summary));
+        compressed.push(Message::user(&summary));
+        compressed.push(Message::assistant("Understood, continuing from where we left off."));
     }
 
     // Keep recent messages in full
@@ -299,27 +302,37 @@ pub fn assemble(
         system_context.push_str("\nUse mcp_use(server,tool,arguments) to call MCP tools.\n");
     }
 
+    // 7. Scratchpad (folded into system message to avoid role alternation issues)
+    if let Some(scratchpad) = load_scratchpad(config) {
+        system_context.push_str("\n[SCRATCHPAD]\n");
+        system_context.push_str(&scratchpad);
+    }
+
     if plan_only {
         system_context.push_str(
             "\n[MODE:PLAN]\n\
              Read-only. Explore codebase, produce plan. NO edits/shell.\n\
-             Write plan to .minime/plan.md via task_update.\n",
+             Write plan to .miniswe/plan.md via task_update.\n",
         );
     }
 
     messages.push(Message::system(&system_context));
     used_tokens += estimate_tokens(&system_context);
 
-    // 7. Conversation history (compressed: old turns summarized, recent kept raw)
+    // 8. Conversation history (only user/assistant/tool messages — no system)
+    // Devstral requires strict role alternation: user→assistant→user→assistant
     let history_budget = config.context.history_budget;
-    let keep_raw = config.context.history_turns * 2; // user + assistant pairs
+    let keep_raw = config.context.history_turns * 2;
 
     let compressed_history = compress_history(conversation_history, keep_raw);
 
     let mut history_tokens = 0;
     for msg in &compressed_history {
+        // Skip any system messages in history (they break role alternation)
+        if msg.role == "system" {
+            continue;
+        }
         let msg_tokens = estimate_tokens(msg.content.as_deref().unwrap_or(""));
-        // Also account for tool call content
         if let Some(tool_calls) = &msg.tool_calls {
             for tc in tool_calls {
                 let tc_tokens = estimate_tokens(&tc.function.arguments) + 5;
@@ -336,16 +349,6 @@ pub fn assemble(
         history_tokens += msg_tokens;
     }
     used_tokens += history_tokens;
-
-    // 8. Scratchpad at the tail (exploiting recency bias)
-    if let Some(scratchpad) = load_scratchpad(config) {
-        let scratchpad_msg = format!("[SCRATCHPAD]\n{scratchpad}");
-        let scratchpad_tokens = estimate_tokens(&scratchpad_msg);
-        if used_tokens + scratchpad_tokens < input_budget {
-            messages.push(Message::system(&scratchpad_msg));
-            used_tokens += scratchpad_tokens;
-        }
-    }
 
     // 9. Current user message
     messages.push(Message::user(user_message));

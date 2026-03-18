@@ -1,4 +1,4 @@
-//! MCP (Model Context Protocol) client for minime.
+//! MCP (Model Context Protocol) client for miniswe.
 //!
 //! Connects to MCP servers configured in `.mcp.json`, fetches tool schemas,
 //! and provides a lazy-loading bridge: only one-line summaries go into LLM

@@ -190,16 +190,16 @@ impl DependencyGraph {
         scores
     }
 
-    /// Save the graph to `.minime/index/graph.json`.
-    pub fn save(&self, minime_dir: &Path) -> anyhow::Result<()> {
-        let path = minime_dir.join("index").join("graph.json");
+    /// Save the graph to `.miniswe/index/graph.json`.
+    pub fn save(&self, miniswe_dir: &Path) -> anyhow::Result<()> {
+        let path = miniswe_dir.join("index").join("graph.json");
         std::fs::write(path, serde_json::to_string_pretty(self)?)?;
         Ok(())
     }
 
-    /// Load the graph from `.minime/index/graph.json`.
-    pub fn load(minime_dir: &Path) -> anyhow::Result<Self> {
-        let path = minime_dir.join("index").join("graph.json");
+    /// Load the graph from `.miniswe/index/graph.json`.
+    pub fn load(miniswe_dir: &Path) -> anyhow::Result<Self> {
+        let path = miniswe_dir.join("index").join("graph.json");
         if path.exists() {
             Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
         } else {
@@ -231,7 +231,9 @@ fn pagerank(
     // Build reverse adjacency: for each node, who points to it?
     let mut incoming: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
     for edge in graph.edge_indices() {
-        let (src, dst) = graph.edge_endpoints(edge).unwrap();
+        let Some((src, dst)) = graph.edge_endpoints(edge) else {
+            continue;
+        };
         let out_degree = graph
             .neighbors_directed(src, petgraph::Direction::Outgoing)
             .count();

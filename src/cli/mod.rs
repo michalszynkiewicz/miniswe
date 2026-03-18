@@ -2,9 +2,9 @@ pub mod commands;
 
 use clap::{Parser, Subcommand};
 
-/// minime — A context-frugal CLI coding agent for 64K context windows
+/// miniswe — A lightweight CLI coding agent for local LLMs
 #[derive(Parser, Debug)]
-#[command(name = "minime", version, about)]
+#[command(name = "miniswe", version, about)]
 pub struct Cli {
     /// Message to send to the agent (runs in single-shot mode)
     pub message: Option<String>,

@@ -1,8 +1,8 @@
 [package]
-name = "minime"
+name = "miniswe"
 version = "0.1.0"
 edition = "2024"
-description = "A context-frugal CLI coding agent for 64K context windows on consumer hardware"
+description = "A lightweight CLI coding agent for local LLMs"
 license = "MIT"
 
 [features]
@@ -80,6 +80,9 @@ petgraph = "0.7"
 # File watching
 notify = "7"
 
+# Line editor (history, Ctrl+R, fish-style suggestions)
+reedline = "0.38"
+
 # Misc
 anyhow = "1"
 thiserror = "2"
@@ -90,5 +93,5 @@ futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 
 [[bin]]
-name = "minime"
+name = "miniswe"
 path = "src/main.rs"
