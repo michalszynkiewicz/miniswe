@@ -5,6 +5,7 @@ use std::fs;
 use anyhow::Result;
 
 use crate::config::Config;
+use crate::knowledge::graph::{self, DependencyGraph};
 use crate::knowledge::indexer;
 use crate::knowledge::profile;
 use crate::tui;
@@ -70,12 +71,20 @@ pub async fn run() -> Result<()> {
 
     // Run indexer
     tui::print_status("Indexing project files...");
-    let index = indexer::index_project(&root)?;
+    let mut index = indexer::index_project(&root)?;
+
+    // Populate cross-references
+    tui::print_status("Building dependency graph...");
+    graph::populate_symbol_deps(&mut index);
+    let dep_graph = DependencyGraph::build(&index);
+    let edge_count: usize = dep_graph.edges.values().map(|v| v.len()).sum();
+
     index.save(&minime_dir)?;
+    dep_graph.save(&minime_dir)?;
 
     tui::print_complete(&format!(
-        "Indexed {} files, {} symbols",
-        index.total_files, index.total_symbols
+        "Indexed {} files, {} symbols, {} cross-references",
+        index.total_files, index.total_symbols, edge_count
     ));
 
     // Create .gitignore for .minime/
@@ -92,6 +101,22 @@ pub async fn run() -> Result<()> {
              plan.md\n\
              docs/\n",
         )?;
+    }
+
+    // Audit file sizes
+    let large_files = indexer::audit_file_sizes(&root, 200);
+    if !large_files.is_empty() {
+        tui::print_separator();
+        tui::print_status(&format!(
+            "⚠ {} files exceed 200 lines (consider splitting for better agent performance):",
+            large_files.len()
+        ));
+        for (file, lines) in large_files.iter().take(10) {
+            tui::print_status(&format!("  {file}: {lines} lines"));
+        }
+        if large_files.len() > 10 {
+            tui::print_status(&format!("  ... and {} more", large_files.len() - 10));
+        }
     }
 
     tui::print_separator();

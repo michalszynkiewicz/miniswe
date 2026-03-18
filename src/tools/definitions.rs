@@ -81,7 +81,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "edit".into(),
-                description: "Replace old text with new text in a file. Validated search-and-replace.".into(),
+                description: "Replace old text with new text in a file. Best for surgical changes to large files. For small files (<200 lines), prefer write_file.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -99,6 +99,27 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         }
                     },
                     "required": ["path", "old", "new"]
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "write_file".into(),
+                description: "Write complete file contents. More reliable than edit for small files (<200 lines). Preferred for creating new files or rewriting existing ones.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path relative to project root"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Complete file content to write"
+                        }
+                    },
+                    "required": ["path", "content"]
                 }),
             },
         },

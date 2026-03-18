@@ -10,8 +10,10 @@
 //! basic file scanning and simple symbol extraction. Full tree-sitter
 //! integration with PageRank comes in later phases.
 
+pub mod graph;
 pub mod indexer;
 pub mod profile;
+pub mod repo_map;
 
 use std::collections::HashMap;
 use std::path::Path;
