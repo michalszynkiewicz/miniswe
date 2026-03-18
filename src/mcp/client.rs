@@ -3,7 +3,6 @@
 //! Spawns an MCP server as a child process and communicates via
 //! JSON-RPC 2.0 over stdin/stdout.
 
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,7 +83,7 @@ impl McpClient {
         };
 
         // Send initialize request
-        let init_result = client.request(
+        let _init_result = client.request(
             "initialize",
             Some(serde_json::json!({
                 "protocolVersion": "2024-11-05",

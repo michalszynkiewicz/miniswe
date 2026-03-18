@@ -82,6 +82,7 @@ notify = "7"
 
 # Line editor (history, Ctrl+R, fish-style suggestions)
 reedline = "0.38"
+crossterm = "0.28"
 
 # Misc
 anyhow = "1"

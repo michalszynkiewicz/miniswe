@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::config::Config;
@@ -325,13 +325,22 @@ const BLOCKED_COMMANDS: &[&str] = &[
 ];
 
 /// Prompt the user for a decision.
+///
+/// Temporarily disables terminal raw mode (which reedline enables)
+/// so that stdin reads work correctly for permission prompts.
 fn prompt_user(message: &str) -> String {
+    // Ensure terminal is in cooked mode for line input
+    let _ = crossterm::terminal::disable_raw_mode();
+
     eprint!("\x1b[1;33m{message}\x1b[0m");
     io::stderr().flush().ok();
 
     let mut input = String::new();
-    match io::stdin().read_line(&mut input) {
+    let result = match io::stdin().read_line(&mut input) {
         Ok(_) => input.trim().to_lowercase(),
         Err(_) => "n".into(),
-    }
+    };
+
+    // Don't re-enable raw mode — reedline will do that on next read_line()
+    result
 }

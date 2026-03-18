@@ -1,6 +1,7 @@
 //! Interactive REPL mode.
 
-use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use reedline::{
@@ -29,6 +30,10 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         PermissionManager::new(&config)
     };
     let mut tool_defs = tools::tool_definitions();
+
+    // Clear stale scratchpad/plan from previous sessions
+    let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+    let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
 
     tui::print_header("Interactive Mode");
     tui::print_status(&format!(
@@ -65,6 +70,17 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         .as_ref()
         .and_then(|r| r.context_summary());
 
+    // Ctrl+C cancellation flag
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_for_handler = cancelled.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::signal::ctrl_c().await.ok();
+            cancelled_for_handler.store(true, Ordering::Relaxed);
+            eprintln!("\n\x1b[33m(interrupted — finishing current step)\x1b[0m");
+        }
+    });
+
     tui::print_status("Type your message, or 'quit' to exit. Ctrl+R to search history.");
     tui::print_separator();
 
@@ -77,7 +93,9 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         FileBackedHistory::with_file(1000, history_file)
             .expect("Failed to create history file"),
     );
-    let mut editor = Reedline::create().with_history(history);
+    let mut editor = Reedline::create()
+        .with_history(history)
+        .use_bracketed_paste(true);
     let prompt = DefaultPrompt::new(
         DefaultPromptSegment::Basic("you".to_string()),
         DefaultPromptSegment::Empty,
@@ -103,7 +121,33 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
             break;
         }
 
-        // Assemble context (with compressed history)
+        // REPL commands
+        if input == "/clear" || input == "/new" {
+            conversation_history.clear();
+            // Clear scratchpad and plan for a fully fresh start
+            if input == "/new" {
+                let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+                let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+                tui::print_status("Cleared history, scratchpad, and plan.");
+            } else {
+                tui::print_status("Cleared conversation history.");
+            }
+            tui::print_separator();
+            continue;
+        }
+
+        if input == "/help" {
+            tui::print_status("Commands:");
+            tui::print_status("  /clear  — clear conversation history");
+            tui::print_status("  /new    — clear history + scratchpad + plan (fresh start)");
+            tui::print_status("  /help   — show this help");
+            tui::print_status("  quit    — exit");
+            tui::print_separator();
+            continue;
+        }
+
+        // Assemble context using history from previous turns
+        // (current user message is added by the assembler, not from history)
         let assembled = context::assemble(
             &config,
             &input,
@@ -111,6 +155,9 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
             false,
             mcp_summary.as_deref(),
         );
+
+        // Now add user message to history for future turns
+        conversation_history.push(Message::user(&input));
 
         let mut messages = assembled.messages;
         let max_rounds = config.context.max_rounds;
@@ -136,8 +183,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                     }
                     _ => {
                         messages.push(Message::user(
-                            "[SYSTEM: The user has asked you to stop. \
-                             Wrap up immediately and summarize what you've done so far.]"
+                            "[Stop now. Summarize what you've done.]"
                         ));
                     }
                 }
@@ -146,8 +192,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
             // Warn the LLM when approaching the hard limit
             if round == max_rounds.saturating_sub(5) {
                 messages.push(Message::user(
-                    "[SYSTEM: You are approaching the tool call limit. \
-                     Wrap up your current task and summarize what you've done.]"
+                    "[Approaching tool limit. Wrap up and summarize.]"
                 ));
             }
 
@@ -159,20 +204,66 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
             // Sanitize message roles before sending (strict chat template compat)
             context::sanitize_messages(&mut messages);
 
+            // Debug: dump role sequence, context size, and LLM memory
+            if std::env::var("MINISWE_DEBUG").is_ok() {
+                let total_chars: usize = messages.iter().map(|m| {
+                    let content_len = m.content.as_deref().map(|c| c.len()).unwrap_or(0);
+                    let tc_len: usize = m.tool_calls.as_ref()
+                        .map(|tcs| tcs.iter().map(|tc| tc.function.arguments.len() + tc.function.name.len()).sum())
+                        .unwrap_or(0);
+                    content_len + tc_len
+                }).sum();
+                let est_tokens = total_chars / 4;
+                let budget = config.model.context_window;
+
+                // Try to fetch KV cache usage from llama.cpp /metrics
+                let kv_info = fetch_kv_usage(&config.model.endpoint).await;
+
+                eprintln!("\x1b[2m[DEBUG ~{}k/{}k tokens ({} msgs){} roles: {}]\x1b[0m",
+                    est_tokens / 1000,
+                    budget / 1000,
+                    messages.len(),
+                    kv_info.as_deref().unwrap_or(""),
+                    messages.iter().map(|m| {
+                        let r = m.role.as_str();
+                        if r == "assistant" && m.tool_calls.is_some() { "a+tc" }
+                        else { &r[..1] }
+                    }).collect::<Vec<_>>().join("→"));
+            }
+
             let request = ChatRequest {
                 messages: messages.clone(),
                 tools: Some(tool_defs.clone()),
                 tool_choice: None,
             };
 
+            // Reset cancel flag for this round
+            cancelled.store(false, Ordering::Relaxed);
+
+            let mut spinner = tui::Spinner::start("thinking...");
+            let mut first_token = true;
+
             let response = match client
                 .chat_stream(&request, |token| {
+                    if first_token {
+                        spinner.stop();
+                        first_token = false;
+                    }
                     tui::print_token(token);
-                })
+                }, &cancelled)
                 .await
             {
-                Ok(r) => r,
+                Ok(r) => {
+                    spinner.stop();
+                    r
+                }
                 Err(e) => {
+                    spinner.stop();
+                    let err_str = e.to_string();
+                    if err_str.contains("Interrupted") {
+                        tui::print_status("Generation interrupted.");
+                        break;
+                    }
                     tui::print_error(&format!("LLM error: {e}"));
                     break;
                 }
@@ -339,5 +430,43 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
             format!("{server}/{tool}")
         }
         _ => format!("{args}"),
+    }
+}
+
+/// Fetch KV cache usage from llama.cpp's /metrics endpoint (best-effort).
+/// Returns None silently if the endpoint is unavailable or not llama.cpp.
+async fn fetch_kv_usage(endpoint: &str) -> Option<String> {
+    let base = endpoint.trim_end_matches('/');
+    let url = format!("{base}/metrics");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .ok()?;
+
+    let text = client.get(&url).send().await.ok()?.text().await.ok()?;
+
+    // Parse Prometheus format lines
+    let mut kv_usage = None;
+    let mut kv_tokens = None;
+    for line in text.lines() {
+        if line.starts_with("llamacpp:kv_cache_usage_ratio ") {
+            kv_usage = line.split_whitespace().nth(1)
+                .and_then(|v| v.parse::<f64>().ok());
+        }
+        if line.starts_with("llamacpp:kv_cache_tokens ") {
+            kv_tokens = line.split_whitespace().nth(1)
+                .and_then(|v| v.parse::<u64>().ok());
+        }
+    }
+
+    match (kv_usage, kv_tokens) {
+        (Some(usage), Some(tokens)) => {
+            Some(format!(" kv:{:.0}%/{}tok", usage * 100.0, tokens))
+        }
+        (Some(usage), None) => {
+            Some(format!(" kv:{:.0}%", usage * 100.0))
+        }
+        _ => None,
     }
 }

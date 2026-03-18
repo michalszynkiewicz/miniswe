@@ -93,7 +93,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
             .iter()
             .filter(|l| l.is_none())
             .count();
-        let visible_count = (end_line - start_line + 1) - stripped_count;
+        let _visible_count = (end_line - start_line + 1) - stripped_count;
 
         output.push_str(&format!("[{path_str}: {total_lines} lines"));
         if start_line != 1 || end_line != total_lines {

@@ -7,6 +7,9 @@ mod types;
 
 pub use types::*;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use reqwest::Client;
@@ -72,10 +75,13 @@ impl LlmClient {
 
     /// Send a chat completion request with streaming. Calls `on_token` for each
     /// content delta and returns the final assembled response.
+    /// Send a streaming chat request. The `cancelled` flag can be set from
+    /// another task (e.g., Ctrl+C handler) to abort mid-stream.
     pub async fn chat_stream<F>(
         &self,
         request: &ChatRequest,
         mut on_token: F,
+        cancelled: &Arc<AtomicBool>,
     ) -> Result<ChatResponse>
     where
         F: FnMut(&str),
@@ -109,6 +115,9 @@ impl LlmClient {
             std::collections::HashMap::new();
 
         while let Some(chunk) = stream.next().await {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("Interrupted by user");
+            }
             let chunk = chunk.context("Stream read error")?;
             let text = String::from_utf8_lossy(&chunk);
 

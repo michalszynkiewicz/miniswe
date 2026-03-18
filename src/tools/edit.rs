@@ -48,8 +48,22 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     }
 
     if count > 1 {
+        // Show where the matches are so the model can include more context
+        let mut match_lines = Vec::new();
+        let mut search_from = 0;
+        for _ in 0..count.min(5) {
+            if let Some(pos) = content[search_from..].find(old) {
+                let abs_pos = search_from + pos;
+                let line_num = content[..abs_pos].chars().filter(|&c| c == '\n').count() + 1;
+                match_lines.push(format!("L{line_num}"));
+                search_from = abs_pos + 1;
+            }
+        }
         return Ok(ToolResult::err(format!(
-            "old_content matches {count} locations in {path_str}. Provide more context to make it unique."
+            "old_content matches {count} locations in {path_str} (at {}).\n\
+             Include more surrounding lines in 'old' to make the match unique, \
+             or use write_file to rewrite the whole file.",
+            match_lines.join(", ")
         )));
     }
 
