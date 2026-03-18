@@ -1,14 +1,17 @@
 # minime
 
-A context-frugal CLI coding agent designed for 64K context windows on consumer hardware.
+A context-frugal CLI coding agent designed for 50K token context windows on consumer hardware.
 
-Optimized for small LLMs (Devstral Small 2, Qwen 2.5 Coder, etc.) running locally via llama.cpp, Ollama, or vLLM. Works with any OpenAI-compatible API.
+Optimized for quantized small LLMs (Devstral Small 2 Q4_K_M, Qwen 2.5 Coder, etc.) running locally via llama.cpp, Ollama, or vLLM. Works with any OpenAI-compatible API.
 
 ## Quick Start
 
 ```bash
-# Build
+# Build (default: Rust, Python, JS, TS, Go tree-sitter grammars)
 cargo build --release
+
+# Build with all 19 languages
+cargo build --release --features all-languages
 
 # Initialize in your project
 cd /path/to/your/project
@@ -30,23 +33,25 @@ minime operates on one principle: **assemble exactly the right context for each 
 
 ### Core Components
 
-- **Context Assembler** — Per-turn context building within a strict token budget. Each turn gets fresh context assembled from project profile, repo map, scratchpad, code snippets, conversation history, and lessons.
-- **Knowledge Engine** — Offline indexing that scans source files, extracts symbols (functions, structs, types), and builds a file tree. Phase 2 will add tree-sitter AST parsing and PageRank-based dependency graphs.
-- **Tool System** — 10 tools for code navigation, editing, search, shell execution, web access, and state management.
-- **LLM Interface** — OpenAI-compatible API client with streaming support for llama.cpp, Ollama, vLLM, and cloud providers.
-- **TUI** — Terminal output with colored status, tool call tracing, and streaming token display.
+- **Context Assembler** — Per-turn context building within a strict token budget. Compressed system prompt, profile, repo map, scratchpad, history with observation masking.
+- **Knowledge Engine** — Tree-sitter AST parsing (19 languages), PageRank-based dependency graph, doc-header extraction for file summaries.
+- **Compression Pipeline** — 5-layer deterministic compression: code format stripping, structured context format, import elision, history-as-diffs, observation masking. ~1.6x effective context multiplier.
+- **Tool System** — 12 built-in tools + unlimited MCP tools via lazy-loading bridge.
+- **LLM Interface** — OpenAI-compatible API client with streaming and tool call parsing.
+- **MCP Support** — Standard `.mcp.json` config (Claude Code compatible). Lazy-loading: only one-line summaries in context (~10 tokens/server), full schemas resolved at execution time.
 
-### Token Budget (64K window)
+### Token Budget (50K window, Devstral Small 2 Q4_K_M on RTX 3090)
 
 | Component | Tokens | % |
 |-----------|--------|---|
-| System prompt | 2,000 | 3.1% |
-| Project profile | 800 | 1.3% |
-| Repo map slice | 5,000 | 7.8% |
-| Scratchpad | 1,500 | 2.3% |
-| Retrieved snippets | 12,000 | 18.8% |
-| Conversation history | 6,000 | 9.4% |
-| **Available for output** | **~34,000** | **53%** |
+| System prompt (compressed) | 1,200 | 2.4% |
+| Project profile (compressed) | 350 | 0.7% |
+| Repo map (PageRank-ranked) | 5,000 | 10% |
+| MCP summaries | ~50 | 0.1% |
+| Scratchpad | 1,500 | 3% |
+| Retrieved snippets | 12,000 | 24% |
+| Conversation history (compressed) | 6,000 | 12% |
+| **Available for output** | **~24,000** | **48%** |
 
 ## Commands
 
@@ -54,41 +59,83 @@ minime operates on one principle: **assemble exactly the right context for each 
 |---------|-------------|
 | `minime` | Interactive REPL mode |
 | `minime "message"` | Single-shot agent execution |
-| `minime init` | Initialize project knowledge base |
+| `minime init` | Initialize project (index, profile, graph) |
 | `minime info` | Show project info and index stats |
 | `minime config` | Show current configuration |
 | `minime plan "question"` | Plan-only mode (no edits) |
 | `minime docs add <url>` | Cache documentation for offline use |
 | `minime docs list` | List cached docs |
-| `minime docs refresh` | Re-fetch cached docs |
 
 ## Tools
 
-The agent has access to 10 tools:
+### Built-in (12 tools)
 
 | Tool | Purpose |
 |------|---------|
 | `read_file` | Read file contents with line numbers |
 | `read_symbol` | Look up a specific function/class/type by name |
 | `search` | ripgrep-based code search |
-| `edit` | Search-and-replace file editing |
+| `edit` | Search-and-replace editing (best for large files) |
+| `write_file` | Whole-file rewrite (preferred for files <200 lines, more reliable for quantized models) |
 | `shell` | Execute shell commands |
 | `task_update` | Update the task scratchpad (agent's memory) |
 | `diagnostics` | Get compiler/linter errors |
 | `web_search` | DuckDuckGo web search |
 | `web_fetch` | Fetch URL as clean markdown (via Jina Reader) |
 | `docs_lookup` | Search local documentation cache |
+| `mcp_use` | Call any tool on a connected MCP server |
+
+### MCP Tools (unlimited, via `.mcp.json`)
+
+minime supports the standard `.mcp.json` configuration (same format as Claude Code):
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "ghp_..." }
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"]
+    }
+  }
+}
+```
+
+**Lazy-loading approach:** On startup, minime connects to MCP servers, fetches tool schemas, and caches them to `.minime/mcp/`. Only a one-line summary per server goes into the LLM context (~10 tokens each). Full schemas are resolved on the Rust side at execution time — zero context waste.
+
+## Tree-sitter Language Support
+
+AST-based symbol extraction with tree-sitter. Each language is a feature flag:
+
+**Default (Tier 1):** Rust, Python, JavaScript, TypeScript, Go
+
+**Opt-in (Tier 2):** Java, C, C++, Ruby, PHP, C#, Kotlin, Swift, Scala, Zig, Elixir, Haskell, Lua
+
+```bash
+# Build with specific languages
+cargo build --release --features "lang-rust,lang-java,lang-cpp"
+
+# Build with all languages
+cargo build --release --features all-languages
+
+# Build without tree-sitter (regex fallback only)
+cargo build --release --no-default-features
+```
 
 ## Configuration
 
-Configuration lives in `.minime/config.toml`:
+### `.minime/config.toml`
 
 ```toml
 [model]
 provider = "llama-cpp"          # or "ollama", "vllm", "openai-compatible"
 endpoint = "http://localhost:8080"
 model = "devstral-small-2"
-context_window = 65536
+context_window = 50000          # conservative for RTX 3090 + display
 temperature = 0.15
 max_output_tokens = 16384
 
@@ -101,6 +148,7 @@ scratchpad_budget = 1500
 
 [hardware]
 vram_gb = 24
+vram_reserve_gb = 3             # reserved for OS/display (usable: 21GB)
 ram_budget_gb = 80
 
 [web]
@@ -119,25 +167,29 @@ fetch_backend = "jina"          # or "local"
 ├── scratchpad.md         # Current task state (auto-managed)
 ├── plan.md               # Active plan (auto-managed)
 ├── index/
-│   ├── symbols.json      # Extracted symbol index
-│   ├── summaries.json    # One-line file summaries
+│   ├── symbols.json      # Extracted symbol index (tree-sitter)
+│   ├── graph.json        # Dependency graph + PageRank scores
+│   ├── summaries.json    # Doc-header file summaries
 │   └── file_tree.txt     # Project file listing
+├── mcp/                  # Cached MCP server schemas
 ├── snippets/             # Pre-chunked code (future)
 ├── sessions/             # Session logs (future)
-└── docs/                 # Cached documentation
+└── docs/                 # Cached documentation (llms.txt)
+
+.mcp.json                 # MCP server configuration (Claude Code format)
 ```
 
 **Git-committed:** `profile.md`, `guide.md`, `lessons.md`
-**Git-ignored:** Everything else (index, snippets, sessions, scratchpad, plan)
+**Git-ignored:** Everything else (index, mcp, snippets, sessions, scratchpad, plan)
 
 ## LLM Server Setup
 
-### llama.cpp (recommended)
+### llama.cpp (recommended for RTX 3090)
 
 ```bash
 llama-server \
-  --model Devstral-Small-2-24B-UD-Q4_K_XL.gguf \
-  --ctx-size 65536 \
+  --model Devstral-Small-2-24B-UD-Q4_K_M.gguf \
+  --ctx-size 50000 \
   --cache-type-k q8_0 \
   --cache-type-v q8_0 \
   --n-gpu-layers 99 \

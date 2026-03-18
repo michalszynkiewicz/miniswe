@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::knowledge::graph::{self, DependencyGraph};
 use crate::knowledge::indexer;
 use crate::knowledge::profile;
+use crate::knowledge::ts_extract;
 use crate::tui;
 
 pub async fn run() -> Result<()> {
@@ -67,6 +68,17 @@ pub async fn run() -> Result<()> {
              <!-- Use `minime learn \"tip\"` to add entries -->\n",
         )?;
         tui::print_status("  Created lessons.md");
+    }
+
+    // Report tree-sitter status
+    let ts_langs = ts_extract::enabled_languages();
+    if ts_langs.is_empty() {
+        tui::print_status("Parser: regex (tree-sitter not enabled)");
+    } else {
+        tui::print_status(&format!(
+            "Parser: tree-sitter ({})",
+            ts_langs.join(", ")
+        ));
     }
 
     // Run indexer

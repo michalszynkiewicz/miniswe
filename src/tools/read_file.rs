@@ -1,4 +1,7 @@
 //! read_file tool — Read a file or line range with line numbers.
+//!
+//! Applies context compression: strips comments and std imports while
+//! preserving line numbers, so the model sees accurate positions for edits.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -6,10 +9,17 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::config::Config;
+use crate::context::compress;
 use super::ToolResult;
 
 /// Maximum lines to return before truncation.
 const MAX_LINES: usize = 200;
+
+/// File extensions that get compression applied.
+const COMPRESSIBLE: &[&str] = &[
+    "rs", "py", "js", "ts", "tsx", "jsx", "go", "java",
+    "c", "cpp", "h", "hpp", "rb", "sh", "bash",
+];
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let path_str = args["path"]
@@ -35,8 +45,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         Err(e) => return Ok(ToolResult::err(format!("Failed to read {path_str}: {e}"))),
     };
 
-    let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len();
+    let total_lines = content.lines().count();
 
     let start_line = args["start_line"]
         .as_u64()
@@ -55,31 +64,79 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         )));
     }
 
-    let selected: Vec<&str> = lines[(start_line - 1)..end_line].to_vec();
-    let truncated = selected.len() > MAX_LINES;
-    let display_lines = if truncated {
-        &selected[..MAX_LINES]
-    } else {
-        &selected
-    };
+    // Determine if we should compress this file
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let should_compress = COMPRESSIBLE.contains(&ext);
 
     let mut output = String::new();
-    output.push_str(&format!("[{path_str}: {total_lines} lines"));
-    if start_line != 1 || end_line != total_lines {
-        output.push_str(&format!(", showing L{start_line}-{end_line}"));
-    }
-    output.push_str("]\n");
 
-    for (i, line) in display_lines.iter().enumerate() {
-        let line_num = start_line + i;
-        output.push_str(&format!("{line_num:>4}│{line}\n"));
-    }
+    if should_compress {
+        // Compressed output: strip comments + std imports, preserve line numbers
+        let compressed = compress::compress_for_reading(&content, ext);
 
-    if truncated {
-        output.push_str(&format!(
-            "\n... truncated ({} more lines). Use start_line/end_line to read specific ranges.",
-            selected.len() - MAX_LINES
-        ));
+        // Count how many lines were stripped
+        let stripped_count = compressed[start_line.saturating_sub(1)..end_line]
+            .iter()
+            .filter(|l| l.is_none())
+            .count();
+        let visible_count = (end_line - start_line + 1) - stripped_count;
+
+        output.push_str(&format!("[{path_str}: {total_lines} lines"));
+        if start_line != 1 || end_line != total_lines {
+            output.push_str(&format!(", showing L{start_line}-{end_line}"));
+        }
+        if stripped_count > 0 {
+            output.push_str(&format!(", {stripped_count} comment/import lines stripped"));
+        }
+        output.push_str("]\n");
+
+        let mut lines_shown = 0;
+        for i in (start_line - 1)..end_line {
+            if lines_shown >= MAX_LINES {
+                let remaining = end_line - i;
+                output.push_str(&format!(
+                    "\n... truncated ({remaining} more lines). Use start_line/end_line to read specific ranges."
+                ));
+                break;
+            }
+
+            if let Some(Some(line)) = compressed.get(i) {
+                output.push_str(&format!("{:>4}│{line}\n", i + 1));
+                lines_shown += 1;
+            }
+            // None lines are simply skipped — line numbers stay correct
+        }
+    } else {
+        // Non-code files: output raw with line numbers
+        let lines: Vec<&str> = content.lines().collect();
+        let selected = &lines[start_line.saturating_sub(1)..end_line];
+        let truncated = selected.len() > MAX_LINES;
+        let display_lines = if truncated {
+            &selected[..MAX_LINES]
+        } else {
+            selected
+        };
+
+        output.push_str(&format!("[{path_str}: {total_lines} lines"));
+        if start_line != 1 || end_line != total_lines {
+            output.push_str(&format!(", showing L{start_line}-{end_line}"));
+        }
+        output.push_str("]\n");
+
+        for (i, line) in display_lines.iter().enumerate() {
+            let line_num = start_line + i;
+            output.push_str(&format!("{line_num:>4}│{line}\n"));
+        }
+
+        if truncated {
+            output.push_str(&format!(
+                "\n... truncated ({} more lines). Use start_line/end_line to read specific ranges.",
+                selected.len() - MAX_LINES
+            ));
+        }
     }
 
     Ok(ToolResult::ok(output))

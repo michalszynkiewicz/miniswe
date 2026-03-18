@@ -38,6 +38,8 @@ fn build_system_prompt() -> String {
          4.Verify:run tests/typecheck after edits\n\
          5.Step by step:follow scratchpad plan,one step at a time\n\
          6.If unsure:explore with search/read_symbol;repo map shows structure\n\
+         7.File headers:every file must start with a brief comment describing its purpose\n\
+         8.Keep files<200 lines;split into focused modules when growing\n\
          \n\
          [TOOLS]\n\
          read_symbol(name,follow_deps?)→function/class/type source\n\
@@ -244,6 +246,7 @@ pub fn assemble(
     user_message: &str,
     conversation_history: &[Message],
     plan_only: bool,
+    mcp_summary: Option<&str>,
 ) -> AssembledContext {
     let budget = config.model.context_window;
     let output_budget = config.model.max_output_tokens;
@@ -287,6 +290,13 @@ pub fn assemble(
     if let Some(repo_map) = load_repo_map(config, &keywords) {
         system_context.push_str("\n[REPO MAP]\n");
         system_context.push_str(&repo_map);
+    }
+
+    // 7. MCP server summaries (one line each — lazy loading)
+    if let Some(mcp) = mcp_summary {
+        system_context.push_str("\n[MCP SERVERS]\n");
+        system_context.push_str(mcp);
+        system_context.push_str("\nUse mcp_use(server,tool,arguments) to call MCP tools.\n");
     }
 
     if plan_only {

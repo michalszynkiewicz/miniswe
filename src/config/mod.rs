@@ -60,8 +60,10 @@ pub struct ContextConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HardwareConfig {
-    /// Available VRAM in GB
+    /// Total VRAM in GB
     pub vram_gb: f32,
+    /// VRAM to reserve for OS/display (subtracted from vram_gb for model budget)
+    pub vram_reserve_gb: f32,
     /// RAM budget for KV cache overflow
     pub ram_budget_gb: f32,
 }
@@ -98,7 +100,7 @@ impl Default for ModelConfig {
             provider: "llama-cpp".into(),
             endpoint: "http://localhost:8080".into(),
             model: "devstral-small-2".into(),
-            context_window: 65536,
+            context_window: 50000,
             temperature: 0.15,
             max_output_tokens: 16384,
         }
@@ -121,6 +123,7 @@ impl Default for HardwareConfig {
     fn default() -> Self {
         Self {
             vram_gb: 24.0,
+            vram_reserve_gb: 3.0,
             ram_budget_gb: 80.0,
         }
     }

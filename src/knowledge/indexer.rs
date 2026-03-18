@@ -9,6 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 use ignore::WalkBuilder;
 
+use super::ts_extract;
 use super::{ProjectIndex, Symbol};
 
 /// Known source file extensions.
@@ -62,7 +63,24 @@ pub fn index_project(root: &Path) -> Result<ProjectIndex> {
             if SOURCE_EXTENSIONS.contains(&ext) {
                 file_count += 1;
                 if let Ok(content) = std::fs::read_to_string(path) {
-                    let symbols = extract_symbols(&rel_str, &content, ext);
+                    // Try tree-sitter first, fall back to regex
+                    let symbols = if let Some(ts_result) =
+                        ts_extract::extract(&rel_str, &content, ext)
+                    {
+                        // Store references for graph building
+                        for sym_ref in &ts_result.references {
+                            index
+                                .references
+                                .entry(rel_str.clone())
+                                .or_default()
+                                .push(sym_ref.name.clone());
+                        }
+                        ts_result.symbols
+                    } else {
+                        // Regex fallback
+                        extract_symbols(&rel_str, &content, ext)
+                    };
+
                     for sym in &symbols {
                         index
                             .symbols

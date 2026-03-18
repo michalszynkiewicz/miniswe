@@ -14,6 +14,7 @@ pub mod graph;
 pub mod indexer;
 pub mod profile;
 pub mod repo_map;
+pub mod ts_extract;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -46,6 +47,9 @@ pub struct ProjectIndex {
     pub summaries: HashMap<String, String>,
     /// File tree as a flat list of paths
     pub file_tree: Vec<String>,
+    /// Per-file references: file → list of symbol names referenced in that file
+    #[serde(default)]
+    pub references: HashMap<String, Vec<String>>,
     /// Total files indexed
     pub total_files: usize,
     /// Total symbols extracted
@@ -110,6 +114,7 @@ impl ProjectIndex {
             symbols,
             summaries,
             file_tree,
+            references: HashMap::new(), // not persisted — rebuilt on each index
             total_files,
             total_symbols,
         })
