@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::context;
 use crate::context::compress;
 use crate::llm::{ChatRequest, LlmClient, Message};
+use crate::mcp::{McpConfig, McpRegistry};
 use crate::tools;
 use crate::tui;
 
@@ -26,7 +27,7 @@ const MASK_AFTER_RESULTS: usize = 6;
 /// Run the agent for a single message.
 pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
     let client = LlmClient::new(config.model.clone());
-    let tool_defs = tools::tool_definitions();
+    let mut tool_defs = tools::tool_definitions();
 
     tui::print_header(if plan_only {
         "Plan Mode (read-only)"
@@ -34,15 +35,50 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
         "minime"
     });
 
+    // Initialize MCP servers
+    let mcp_config = McpConfig::load(&config.project_root)?;
+    let mut mcp_registry = if mcp_config.has_servers() {
+        let cache_dir = config.minime_path("mcp");
+        match McpRegistry::connect(&mcp_config, &cache_dir) {
+            Ok(registry) => {
+                if registry.has_servers() {
+                    tui::print_status(&format!(
+                        "MCP: {} servers, {} tools",
+                        registry.servers.len(),
+                        registry.tool_count()
+                    ));
+                    // Add mcp_use tool definition
+                    tool_defs.push(tools::definitions::mcp_tool_definition());
+                }
+                Some(registry)
+            }
+            Err(e) => {
+                tui::print_status(&format!("MCP: failed to connect ({e})"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mcp_summary = mcp_registry
+        .as_ref()
+        .and_then(|r| r.context_summary());
+
     let mut conversation_history: Vec<Message> = Vec::new();
     let mut round = 0;
 
     // Track tool results for observation masking
-    // Each entry: (tool_name, args, full_content, message_index_in_messages)
     let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
 
     // Initial context assembly
-    let assembled = context::assemble(&config, message, &conversation_history, plan_only);
+    let assembled = context::assemble(
+        &config,
+        message,
+        &conversation_history,
+        plan_only,
+        mcp_summary.as_deref(),
+    );
     tui::print_status(&format!(
         "Context: ~{} tokens assembled",
         assembled.token_estimate
@@ -142,9 +178,23 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
                 continue;
             }
 
-            let result = match tools::execute_tool(&tc.function.name, &args, &config).await {
-                Ok(r) => r,
-                Err(e) => crate::tools::ToolResult::err(format!("Tool error: {e}")),
+            // Handle MCP tool calls
+            let result = if tc.function.name == "mcp_use" {
+                let server = args["server"].as_str().unwrap_or("");
+                let tool = args["tool"].as_str().unwrap_or("");
+                let tool_args = args.get("arguments").cloned().unwrap_or_default();
+                match &mut mcp_registry {
+                    Some(registry) => match registry.call_tool(server, tool, tool_args) {
+                        Ok(content) => crate::tools::ToolResult::ok(content),
+                        Err(e) => crate::tools::ToolResult::err(format!("MCP error: {e}")),
+                    },
+                    None => crate::tools::ToolResult::err("No MCP servers connected".into()),
+                }
+            } else {
+                match tools::execute_tool(&tc.function.name, &args, &config).await {
+                    Ok(r) => r,
+                    Err(e) => crate::tools::ToolResult::err(format!("Tool error: {e}")),
+                }
             };
 
             let first_line = result.content.lines().next().unwrap_or("(empty)");
@@ -244,6 +294,11 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
             } else {
                 format!("{lib}/{topic}")
             }
+        }
+        "mcp_use" => {
+            let server = args["server"].as_str().unwrap_or("?");
+            let tool = args["tool"].as_str().unwrap_or("?");
+            format!("{server}/{tool}")
         }
         _ => format!("{args}"),
     }

@@ -8,6 +8,7 @@ mod config;
 mod context;
 mod knowledge;
 mod llm;
+mod mcp;
 mod tools;
 mod tui;
 

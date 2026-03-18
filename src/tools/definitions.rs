@@ -242,3 +242,32 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
     ]
 }
+
+/// Return the mcp_use tool definition (only added when MCP servers are configured).
+pub fn mcp_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".into(),
+        function: FunctionDefinition {
+            name: "mcp_use".into(),
+            description: "Call a tool on an MCP server. Use the [MCP:name] entries in context to see available servers and tools.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "description": "MCP server name (from [MCP:name] in context)"
+                    },
+                    "tool": {
+                        "type": "string",
+                        "description": "Tool name on that server"
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "Arguments to pass to the tool"
+                    }
+                },
+                "required": ["server", "tool"]
+            }),
+        },
+    }
+}

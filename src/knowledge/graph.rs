@@ -63,47 +63,70 @@ impl DependencyGraph {
         // Build edges from cross-file references
         let mut edges: HashMap<String, Vec<String>> = HashMap::new();
 
-        for (file, _summary) in &index.summaries {
-            // Get symbols defined in this file
-            let file_symbols: Vec<&Symbol> = index
-                .symbols
-                .values()
-                .flatten()
-                .filter(|s| s.file == *file)
-                .collect();
+        // Prefer tree-sitter references (precise) when available
+        if !index.references.is_empty() {
+            // Tree-sitter path: use actual references extracted from AST
+            for (ref_file, ref_names) in &index.references {
+                for ref_name in ref_names {
+                    // Find which file(s) define this symbol
+                    if let Some(def_files) = symbol_to_files.get(ref_name.as_str()) {
+                        for &def_file in def_files {
+                            if def_file != ref_file.as_str() {
+                                edges
+                                    .entry(ref_file.clone())
+                                    .or_default()
+                                    .push(def_file.to_string());
 
-            // For each symbol defined in this file, check if its name
-            // appears as a dependency or reference in other files' symbols
-            for (other_file, _) in &index.summaries {
-                if other_file == file {
-                    continue;
+                                if let (Some(&from), Some(&to)) = (
+                                    node_map.get(ref_file.as_str()),
+                                    node_map.get(def_file),
+                                ) {
+                                    graph.add_edge(from, to, ());
+                                }
+                            }
+                        }
+                    }
                 }
-
-                let other_symbols: Vec<&Symbol> = index
+            }
+        } else {
+            // Regex fallback: use signature-substring matching (heuristic)
+            for (file, _summary) in &index.summaries {
+                let file_symbols: Vec<&Symbol> = index
                     .symbols
                     .values()
                     .flatten()
-                    .filter(|s| s.file == *other_file)
+                    .filter(|s| s.file == *file)
                     .collect();
 
-                // Check if any symbol in other_file references a symbol defined in this file
-                // We do this by checking if symbol names from this file appear in
-                // the signatures of symbols in other files
-                for my_sym in &file_symbols {
-                    for other_sym in &other_symbols {
-                        if other_sym.signature.contains(&my_sym.name) && my_sym.name.len() > 2 {
-                            // other_file depends on file (uses its symbol)
-                            edges
-                                .entry(other_file.clone())
-                                .or_default()
-                                .push(file.clone());
+                for (other_file, _) in &index.summaries {
+                    if other_file == file {
+                        continue;
+                    }
 
-                            if let (Some(&from), Some(&to)) =
-                                (node_map.get(other_file.as_str()), node_map.get(file.as_str()))
+                    let other_symbols: Vec<&Symbol> = index
+                        .symbols
+                        .values()
+                        .flatten()
+                        .filter(|s| s.file == *other_file)
+                        .collect();
+
+                    for my_sym in &file_symbols {
+                        for other_sym in &other_symbols {
+                            if other_sym.signature.contains(&my_sym.name) && my_sym.name.len() > 2
                             {
-                                graph.add_edge(from, to, ());
+                                edges
+                                    .entry(other_file.clone())
+                                    .or_default()
+                                    .push(file.clone());
+
+                                if let (Some(&from), Some(&to)) = (
+                                    node_map.get(other_file.as_str()),
+                                    node_map.get(file.as_str()),
+                                ) {
+                                    graph.add_edge(from, to, ());
+                                }
+                                break;
                             }
-                            break; // One edge per file pair is enough
                         }
                     }
                 }

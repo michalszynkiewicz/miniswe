@@ -4,7 +4,6 @@
 //! - read_file, read_symbol, search, edit, shell, task_update, diagnostics
 //! - web_search, web_fetch, docs_lookup
 
-mod definitions;
 mod edit;
 mod read_file;
 mod search;
@@ -13,6 +12,7 @@ mod task_update;
 mod web;
 mod write_file;
 
+pub mod definitions;
 pub use definitions::tool_definitions;
 
 use anyhow::{Result, bail};
