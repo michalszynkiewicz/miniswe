@@ -13,6 +13,10 @@ pub struct Cli {
     #[arg(long, short = 'c')]
     pub r#continue: bool,
 
+    /// Non-interactive mode: auto-approve all permissions, no prompts
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

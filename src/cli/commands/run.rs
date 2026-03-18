@@ -23,9 +23,13 @@ use crate::tui;
 const MASK_AFTER_RESULTS: usize = 6;
 
 /// Run the agent for a single message.
-pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
+pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()> {
     let client = LlmClient::new(config.model.clone());
-    let perms = PermissionManager::new(&config);
+    let perms = if headless {
+        PermissionManager::headless(&config)
+    } else {
+        PermissionManager::new(&config)
+    };
     let mut tool_defs = tools::tool_definitions();
 
     tui::print_header(if plan_only {
@@ -127,6 +131,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
         if tool_result_log.len() > MASK_AFTER_RESULTS {
             mask_old_tool_results(&mut messages, &tool_result_log);
         }
+
+        // Sanitize message roles before sending (strict chat template compat)
+        context::sanitize_messages(&mut messages);
 
         // Call LLM with streaming
         let request = ChatRequest {

@@ -21,9 +21,13 @@ use crate::tui;
 const MASK_AFTER_RESULTS: usize = 6;
 
 /// Run the interactive REPL.
-pub async fn run(config: Config) -> Result<()> {
+pub async fn run(config: Config, headless: bool) -> Result<()> {
     let client = LlmClient::new(config.model.clone());
-    let perms = PermissionManager::new(&config);
+    let perms = if headless {
+        PermissionManager::headless(&config)
+    } else {
+        PermissionManager::new(&config)
+    };
     let mut tool_defs = tools::tool_definitions();
 
     tui::print_header("Interactive Mode");
@@ -151,6 +155,9 @@ pub async fn run(config: Config) -> Result<()> {
             if tool_result_log.len() > MASK_AFTER_RESULTS {
                 mask_old_tool_results(&mut messages, &tool_result_log);
             }
+
+            // Sanitize message roles before sending (strict chat template compat)
+            context::sanitize_messages(&mut messages);
 
             let request = ChatRequest {
                 messages: messages.clone(),

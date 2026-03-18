@@ -37,18 +37,19 @@ async fn main() -> Result<()> {
         }
         Some(Command::Plan { message }) => {
             let config = Config::load()?;
-            cli::commands::run::run(config, &message, true).await?;
+            cli::commands::run::run(config, &message, true, cli.yes).await?;
         }
         Some(Command::Docs { subcommand }) => {
             cli::commands::docs::run(subcommand).await?;
         }
         None => {
-            // Interactive mode or single message
             let config = Config::load()?;
             if let Some(message) = cli.message {
-                cli::commands::run::run(config, &message, false).await?;
+                // Single-shot mode
+                cli::commands::run::run(config, &message, false, cli.yes).await?;
             } else {
-                cli::commands::repl::run(config).await?;
+                // Interactive REPL
+                cli::commands::repl::run(config, cli.yes).await?;
             }
         }
     }

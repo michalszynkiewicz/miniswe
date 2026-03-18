@@ -52,6 +52,14 @@ pub enum Action {
 
 impl PermissionManager {
     pub fn new(config: &Config) -> Self {
+        Self::with_auto_approve(config, false)
+    }
+
+    pub fn headless(config: &Config) -> Self {
+        Self::with_auto_approve(config, true)
+    }
+
+    fn with_auto_approve(config: &Config, auto_approve: bool) -> Self {
         let project_root = config
             .project_root
             .canonicalize()
@@ -94,7 +102,7 @@ impl PermissionManager {
             approved_mcp: Mutex::new(HashSet::new()),
             web_approved: Mutex::new(false),
             shell_allowlist,
-            auto_approve: false,
+            auto_approve,
         }
     }
 
