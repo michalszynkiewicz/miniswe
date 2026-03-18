@@ -1,10 +1,12 @@
 //! Terminal UI for miniswe.
 //!
 //! Provides a simple streaming output display for the agent loop.
-//! Phase 1: Basic terminal output with colors.
+//! Phase 1: Basic terminal output with colors + spinner.
 //! Phase 2 (future): Full ratatui TUI with panels.
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Print a styled header.
 pub fn print_header(text: &str) {
@@ -68,6 +70,55 @@ pub fn read_input(prompt: &str) -> Option<String> {
         Ok(0) => None, // EOF
         Ok(_) => Some(input.trim().to_string()),
         Err(_) => None,
+    }
+}
+
+/// A spinner that shows activity while waiting for the LLM.
+/// Call `start()` before the LLM request, `stop()` when tokens start flowing.
+pub struct Spinner {
+    running: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    /// Start the spinner with a label.
+    pub fn start(label: &str) -> Self {
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = running.clone();
+        let label = label.to_string();
+
+        let handle = std::thread::spawn(move || {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut i = 0;
+            while running_clone.load(Ordering::Relaxed) {
+                eprint!("\r\x1b[2m{} {}\x1b[0m", frames[i % frames.len()], label);
+                io::stderr().flush().ok();
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                i += 1;
+            }
+            // Clear the spinner line
+            eprint!("\r\x1b[2K");
+            io::stderr().flush().ok();
+        });
+
+        Self {
+            running,
+            handle: Some(handle),
+        }
+    }
+
+    /// Stop the spinner.
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 

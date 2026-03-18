@@ -8,6 +8,9 @@
 //! 5. Apply observation masking (compress old tool results)
 //! 6. Feed results back and repeat
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::Result;
 
 use crate::config::Config;
@@ -31,6 +34,11 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         PermissionManager::new(&config)
     };
     let mut tool_defs = tools::tool_definitions();
+
+    // Clear stale scratchpad/plan from previous sessions
+    // (only persist with --continue, which isn't implemented yet)
+    let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+    let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
 
     tui::print_header(if plan_only {
         "Plan Mode (read-only)"
@@ -79,6 +87,17 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     // Track tool results for observation masking
     let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
 
+    // Ctrl+C cancellation flag
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_for_handler = cancelled.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::signal::ctrl_c().await.ok();
+            cancelled_for_handler.store(true, Ordering::Relaxed);
+            eprintln!("\n\x1b[33m(interrupted — finishing current step)\x1b[0m");
+        }
+    });
+
     // Initial context assembly
     let assembled = context::assemble(
         &config,
@@ -112,8 +131,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 _ => {
                     // Tell the LLM to wrap up
                     messages.push(Message::user(
-                        "[SYSTEM: The user has asked you to stop. \
-                         Wrap up immediately and summarize what you've done so far.]"
+                        "[Stop now. Summarize what you've done.]"
                     ));
                 }
             }
@@ -122,8 +140,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         // Warn the LLM when approaching the hard limit
         if round == max_rounds.saturating_sub(5) {
             messages.push(Message::user(
-                "[SYSTEM: You are approaching the tool call limit. \
-                 Wrap up your current task and summarize what you've done.]"
+                "[Approaching tool limit. Wrap up and summarize.]"
             ));
         }
 
@@ -144,16 +161,33 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
         tui::print_separator();
 
+        // Reset cancel flag for this round
+        cancelled.store(false, Ordering::Relaxed);
+
+        let mut spinner = tui::Spinner::start("thinking...");
+        let mut first_token = true;
+
         let response = match client
             .chat_stream(&request, |token| {
+                if first_token {
+                    spinner.stop();
+                    first_token = false;
+                }
                 tui::print_token(token);
-            })
+            }, &cancelled)
             .await
         {
-            Ok(r) => r,
+            Ok(r) => {
+                spinner.stop();
+                r
+            }
             Err(e) => {
-                // Strip HTML from error messages (common with HTTP errors)
+                spinner.stop();
                 let err_str = e.to_string();
+                if err_str.contains("Interrupted") {
+                    tui::print_status("Generation interrupted.");
+                    break;
+                }
                 let clean = if err_str.contains('<') {
                     err_str.split('<').next().unwrap_or(&err_str).trim().to_string()
                 } else {

@@ -1041,6 +1041,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "crossterm",
  "futures",
  "ignore",
  "notify",

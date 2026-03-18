@@ -7,10 +7,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use super::client::{McpClient, McpToolDef};
+use super::client::McpClient;
 use super::config::McpConfig;
 
 /// Cached info about an MCP server and its tools.

@@ -1,5 +1,7 @@
 //! miniswe — A lightweight CLI coding agent for local LLMs
 
+#![allow(dead_code)] // Many functions are kept for future use or API completeness
+
 mod cli;
 mod config;
 mod context;

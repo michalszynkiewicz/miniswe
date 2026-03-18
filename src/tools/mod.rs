@@ -21,7 +21,6 @@ pub use permissions::PermissionManager;
 use anyhow::{Result, bail};
 use permissions::Action;
 use serde_json::Value;
-use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::knowledge::ProjectIndex;
