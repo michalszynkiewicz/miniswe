@@ -1,4 +1,4 @@
-# minime — A Context-Frugal CLI Coding Agent
+# miniswe — A Lightweight CLI Coding Agent for Local LLMs
 
 *Designed for 64K context windows on consumer hardware. Optimized for Devstral Small 2 (24B) on RTX 3090 + 128GB RAM.*
 
@@ -30,7 +30,7 @@ Existing tools (Claude Code, OpenCode, gptme, Aider) were designed for 128K–20
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                       minime CLI                              │
+│                       miniswe CLI                              │
 │                                                              │
 │  ┌───────────┐  ┌───────────┐  ┌──────────────────────────┐  │
 │  │  Planner  │  │  Executor │  │   Knowledge Engine        │  │
@@ -53,7 +53,7 @@ Existing tools (Claude Code, OpenCode, gptme, Aider) were designed for 128K–20
 
 ### Core Components
 
-**A. Context Assembler** — The brain of minime. Every turn, it builds a fresh context from:
+**A. Context Assembler** — The brain of miniswe. Every turn, it builds a fresh context from:
 1. System prompt (slim, ~2K tokens)
 2. Project profile (auto-generated, ~500–800 tokens)
 3. User guide (optional, ~500 tokens)
@@ -72,7 +72,7 @@ Existing tools (Claude Code, OpenCode, gptme, Aider) were designed for 128K–20
 - Lessons store (accumulated tips from past sessions)
 
 **C. Planner / Executor** — Two-mode operation:
-- **Plan mode**: Read-only. Explores the codebase, asks clarifying questions, produces a task plan written to `.minime/plan.md`. Gets the full 64K budget for exploration since there's no edit overhead.
+- **Plan mode**: Read-only. Explores the codebase, asks clarifying questions, produces a task plan written to `.miniswe/plan.md`. Gets the full 64K budget for exploration since there's no edit overhead.
 - **Act mode**: Executes against the plan. Each step gets its own focused context assembled from the plan, scratchpad, and relevant code snippets.
 
 ---
@@ -81,9 +81,9 @@ Existing tools (Claude Code, OpenCode, gptme, Aider) were designed for 128K–20
 
 This is where we invest the most. With a 24B model, **quality of context matters even more than quantity** — the model has less capacity for reasoning over noisy input than frontier models.
 
-### 3.1 Project Profile (`.minime/profile.md`)
+### 3.1 Project Profile (`.miniswe/profile.md`)
 
-Auto-generated on `minime init`. A compressed, high-signal overview that gives the model a mental map of the project before it reads any code:
+Auto-generated on `miniswe init`. A compressed, high-signal overview that gives the model a mental map of the project before it reads any code:
 
 ```markdown
 # Project Profile (auto-generated — edit to refine)
@@ -192,7 +192,7 @@ src/utils/crypto.ts: (name only)
 Pre-indexed, retrievable code snippets for on-demand loading. This is the mechanism for getting actual code into context without reading entire files:
 
 ```
-.minime/
+.miniswe/
   index/
     symbols.json      # { symbol: { file, line, kind, signature, deps } }
     graph.json         # adjacency list + PageRank scores
@@ -218,7 +218,7 @@ Pre-indexed, retrievable code snippets for on-demand loading. This is the mechan
 
 **Why no embeddings:** Aider proved that ripgrep + AST beats embeddings in practice — Anthropic made the same discovery and switched Claude Code from Voyage embeddings to grep-based search. Running an embedding model alongside a 24B model on consumer hardware is impractical, and graph-based retrieval is deterministic and instant.
 
-### 3.4 Task Scratchpad (`.minime/scratchpad.md`)
+### 3.4 Task Scratchpad (`.miniswe/scratchpad.md`)
 
 Inspired by Manus's todo.md self-prompting pattern. This file is **rewritten by the model at the end of every turn** and injected at the **tail of context** (exploiting recency bias — the strongest attention region):
 
@@ -249,7 +249,7 @@ Fix session expiry bug: tokens not being invalidated after password change
 
 **Why this works so well for smaller models**: Instead of keeping full conversation history (which would be noisy and expensive to process), we compress all decisions and discoveries into structured state. The model reads the scratchpad and knows exactly where it is, what it learned, and what to do next — even after aggressive context trimming. The structured format also helps smaller models parse the state reliably.
 
-### 3.5 Lessons Store (`.minime/lessons.md`)
+### 3.5 Lessons Store (`.miniswe/lessons.md`)
 
 Inspired by gptme's lessons system. Accumulated tips from past sessions, loaded on-demand when relevant:
 
@@ -384,7 +384,7 @@ web_fetch(url: str, selector?: str)
 docs_lookup(library: str, topic?: str)
   → Search local llms.txt cache for library documentation
   → Returns relevant section only, keyword-matched (~500–2K tokens)
-  → Populated by `minimedocs add` command — instant, no network
+  → Populated by `miniswe docs add` command — instant, no network
 ```
 
 ### 5.2 Tool Schema Compression
@@ -412,7 +412,7 @@ Tools available:
 ## 6. The System Prompt (~2,000 tokens)
 
 ```markdown
-You are minime, a coding agent operating in a terminal. You work on the
+You are miniswe, a coding agent operating in a terminal. You work on the
 project described in the Profile below.
 
 ## How You Work
@@ -475,9 +475,9 @@ When the task is complete, summarize what you changed.
 ## 7. Workflow: A Complete Session
 
 ```
-$ minime"fix the bug where sessions aren't invalidated after password change"
+$ miniswe "fix the bug where sessions aren't invalidated after password change"
 
-┌─ minime ────────────────────────────────────────────────────────┐
+┌─ miniswe ────────────────────────────────────────────────────────┐
 │                                                                │
 │ Phase 1: PLAN                                                  │
 │ Context: system(2K) + profile(0.8K) + repo_map(5K) + msg(0.3K)│
@@ -491,7 +491,7 @@ $ minime"fix the bug where sessions aren't invalidated after password change"
 │   → read_symbol("validateSession") → 280 tokens               │
 │   → search("invalidate session") → no matches                 │
 │                                                                │
-│ Model writes plan to .minime/plan.md:                           │
+│ Model writes plan to .miniswe/plan.md:                           │
 │   1. ✓ Explore session + password code                         │
 │   2. Add invalidateUserSessions() to session.ts                │
 │   3. Call it from changePassword in user.ts                    │
@@ -554,68 +554,68 @@ $ minime"fix the bug where sessions aren't invalidated after password change"
 
 ```bash
 # Initialize project knowledge base
-minime init
+miniswe init
   → Detects language/framework from config files
   → Runs tree-sitter parse, builds symbol index + dependency graph
-  → Generates .minime/profile.md (review and edit this!)
-  → Imports existing CLAUDE.md / AGENTS.md into .minime/guide.md
-  → Creates .minime/ directory structure
+  → Generates .miniswe/profile.md (review and edit this!)
+  → Imports existing CLAUDE.md / AGENTS.md into .miniswe/guide.md
+  → Creates .miniswe/ directory structure
   → Reports: "Indexed 347 files, 2,891 symbols, 4,312 cross-references"
 
 # Rebuild index (after major refactors or branch switches)
-minimereindex [--full]
+miniswe reindex [--full]
   → Incremental by default (only changed files since last index)
   → --full forces complete re-parse and graph rebuild
 
-# Show what minime knows about your project
-minimeinfo
+# Show what miniswe knows about your project
+miniswe info
   → Displays: profile summary, top-20 symbols by PageRank,
     index stats, context budget breakdown, model config
 
 # Edit project-specific guidance
-minimeguide
-  → Opens .minime/guide.md in $EDITOR
+miniswe guide
+  → Opens .miniswe/guide.md in $EDITOR
   → On save: lints for token count, warns if over 500 tokens
   → Tip: "Keep this under 500 tokens. If it's longer, move
-    details into .minime/lessons.md for on-demand loading."
+    details into .miniswe/lessons.md for on-demand loading."
 
 # Preview what context a task would assemble
-minimecontext "fix the auth bug"
+miniswe context "fix the auth bug"
   → Shows exactly what would be sent to the LLM for this prompt
   → Token breakdown by component (profile, map, snippets, etc.)
   → Lists which symbols would be retrieved and why
   → Invaluable for debugging poor model behavior
 
 # Add a lesson from the current session
-minimelearn "always run db:generate after schema changes"
-  → Appends to .minime/lessons.md under auto-detected category
+miniswe learn "always run db:generate after schema changes"
+  → Appends to .miniswe/lessons.md under auto-detected category
   → Will be loaded in future sessions when keywords match
 
 # Show current model + hardware config
-minimeconfig
+miniswe config
   → Model: Devstral-Small-2-24B (Q4_K_M)
   → Context: 65536 tokens (KV cache: Q8_0)
   → VRAM: 14.2GB weights + 8.1GB KV = 22.3GB / 24GB
   → Generation speed: ~33 t/s
 
 # Run in plan-only mode (exploration, no edits)
-minimeplan "how should I refactor the auth module?"
-  → Explores codebase, produces .minime/plan.md
+miniswe plan "how should I refactor the auth module?"
+  → Explores codebase, produces .miniswe/plan.md
   → No file modifications allowed
   → Useful for understanding before committing to changes
 
 # Continue from last session
-minime--continue
+miniswe --continue
   → Loads last session's scratchpad and plan
   → Resumes from where you left off
 ```
 
 ---
 
-## 9. `.minime/` Directory Structure
+## 9. `.miniswe/` Directory Structure
 
 ```
-.minime/
+.miniswe/
 ├── profile.md            # Auto-generated project profile (~500-800 tokens)
 ├── guide.md              # User's custom instructions (keep < 500 tokens)
 ├── plan.md               # Current active plan (written by planner)
@@ -718,7 +718,7 @@ Research shows small models attend to fewer instructions reliably — the instru
 ### LLM Interface
 
 ```toml
-# .minime/config.toml
+# .miniswe/config.toml
 [model]
 provider = "llama-cpp"          # or "ollama", "vllm", "openai-compatible"
 endpoint = "http://localhost:8080"
@@ -740,7 +740,7 @@ history_turns = 5               # Raw turns to keep
 ### Recommended llama.cpp Server Config
 
 ```bash
-# Start the server (run this before minime)
+# Start the server (run this before miniswe)
 llama-server \
   --model Devstral-Small-2-24B-UD-Q4_K_XL.gguf \
   --ctx-size 65536 \
@@ -757,7 +757,7 @@ llama-server \
 
 ## 12. Comparison: Context Efficiency
 
-| Metric | Claude Code | OpenCode | gptme | Aider | **minime** |
+| Metric | Claude Code | OpenCode | gptme | Aider | **miniswe** |
 |--------|-------------|----------|-------|-------|-----------|
 | Target context | 200K | 128K+ | Flexible | 8K–128K | **64K** |
 | System prompt | ~8K | ~4K | ~3K | ~2K | **~2K** |
@@ -919,15 +919,15 @@ A coding agent needs web access for: looking up API docs, checking error message
 
 Before hitting the network, check local sources. These are free, instant, and don't consume context tokens until the model actually needs them.
 
-**llms.txt files**: The emerging standard for LLM-friendly documentation. Many libraries now ship a `llms.txt` or `llms-full.txt` at their doc root. minime downloads and caches these on `minime init`:
+**llms.txt files**: The emerging standard for LLM-friendly documentation. Many libraries now ship a `llms.txt` or `llms-full.txt` at their doc root. miniswe downloads and caches these on `miniswe init`:
 
 ```bash
-minimedocs add https://docs.astro.build/llms.txt
-minimedocs add https://orm.drizzle.team/llms.txt
-# Cached to .minime/docs/astro.llms.txt, .minime/docs/drizzle.llms.txt
+miniswe docs add https://docs.astro.build/llms.txt
+miniswe docs add https://orm.drizzle.team/llms.txt
+# Cached to .miniswe/docs/astro.llms.txt, .miniswe/docs/drizzle.llms.txt
 ```
 
-**Package-derived docs**: On `minime init`, scan `package.json` / `Cargo.toml` / `go.mod` for dependencies. For known libraries, auto-fetch their `llms.txt` or condensed API references.
+**Package-derived docs**: On `miniswe init`, scan `package.json` / `Cargo.toml` / `go.mod` for dependencies. For known libraries, auto-fetch their `llms.txt` or condensed API references.
 
 **Local man/help pages**: For CLI tools used in build scripts (`pnpm`, `docker`, `git`), the model can shell out to `--help` instead of searching the web.
 
@@ -983,7 +983,7 @@ web_fetch(url: str, selectors?: str) → cleaned page content
 
 ### 14.5 Tool Definitions
 
-Three new tools added to minime's tool set (total now: 10):
+Three new tools added to miniswe's tool set (total now: 10):
 
 ```
 Tools:
@@ -996,7 +996,7 @@ Tools:
 
 ### 14.6 Smart Web Access Patterns
 
-The model doesn't just blindly search — minime's system prompt guides efficient web use:
+The model doesn't just blindly search — miniswe's system prompt guides efficient web use:
 
 ```
 ## Web Access Rules
@@ -1011,15 +1011,15 @@ The model doesn't just blindly search — minime's system prompt guides efficien
 
 ```bash
 # Add documentation sources
-minimedocs add <url>              # Fetch and cache llms.txt or page
-minimedocs add --package <name>   # Auto-find docs for a dependency
-minimedocs list                   # Show cached documentation
-minimedocs refresh                # Re-fetch all cached docs
+miniswe docs add <url>              # Fetch and cache llms.txt or page
+miniswe docs add --package <name>   # Auto-find docs for a dependency
+miniswe docs list                   # Show cached documentation
+miniswe docs refresh                # Re-fetch all cached docs
 
 # Example workflow:
-minimedocs add https://trpc.io/llms.txt
-minimedocs add https://www.prisma.io/docs/llms-full.txt
-minimedocs add --package next     # Auto-detects Next.js, fetches docs
+miniswe docs add https://trpc.io/llms.txt
+miniswe docs add https://www.prisma.io/docs/llms-full.txt
+miniswe docs add --package next     # Auto-detects Next.js, fetches docs
 
 # Now the model can use docs_lookup("prisma", "deleteMany") 
 # without any web request
@@ -1027,10 +1027,10 @@ minimedocs add --package next     # Auto-detects Next.js, fetches docs
 
 ### 14.8 SearXNG Self-Hosted Alternative
 
-For fully offline/private setups, minime supports SearXNG as a search backend:
+For fully offline/private setups, miniswe supports SearXNG as a search backend:
 
 ```toml
-# .minime/config.toml
+# .miniswe/config.toml
 [web]
 search_backend = "searxng"        # or "duckduckgo" (default)
 searxng_url = "http://localhost:8080"
@@ -1044,10 +1044,10 @@ SearXNG aggregates results from multiple engines (Google, Bing, DuckDuckGo, etc.
 ## 15. Future Extensions
 
 ### Phase 2: Multi-Session Coordination
-When working on large features, run 2–3 minime sessions in git worktrees:
+When working on large features, run 2–3 miniswe sessions in git worktrees:
 ```bash
 git worktree add ../project-auth -b feature/auth-refactor
-cd ../project-auth && minime"refactor the auth module"
+cd ../project-auth && miniswe "refactor the auth module"
 ```
 Each session is fully isolated with its own scratchpad and plan.
 
@@ -1060,7 +1060,7 @@ Beyond diagnostics, use LSP for:
 ### Phase 4: Learning Loop
 After each session, offer to extract lessons:
 ```
-minimelearn --from-session
+miniswe learn --from-session
   → "I noticed you always run db:generate after schema changes.
      Save this as a lesson? [y/n]"
 ```

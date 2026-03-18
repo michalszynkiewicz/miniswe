@@ -164,7 +164,9 @@ impl LlmClient {
         let mut indices: Vec<usize> = current_tool_call_parts.keys().copied().collect();
         indices.sort();
         for idx in indices {
-            let (id, name, arguments) = current_tool_call_parts.remove(&idx).unwrap();
+            let Some((id, name, arguments)) = current_tool_call_parts.remove(&idx) else {
+                continue;
+            };
             tool_calls.push(ToolCall {
                 id,
                 r#type: "function".into(),

@@ -1,10 +1,10 @@
 # Project Profile (auto-generated — edit to refine)
 
 ## Identity
-- Name: minime
+- Name: miniswe
 - Language: Rust (100%)
 - Package manager: cargo
-- Description: A context-frugal CLI coding agent for 64K context windows on consumer hardware
+- Description: A lightweight CLI coding agent for local LLMs
 - Commands: Build: `cargo build` | Test: `cargo test` | Lint: `cargo clippy`
 
 ## Entry Points

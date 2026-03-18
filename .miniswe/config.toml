@@ -1,9 +1,9 @@
 [model]
 provider = "llama-cpp"
-endpoint = "http://localhost:8080"
+endpoint = "http://localhost:8464"
 model = "devstral-small-2"
 context_window = 50000
-temperature = 0.15000000596046448
+temperature = 0.15
 max_output_tokens = 16384
 
 [context]

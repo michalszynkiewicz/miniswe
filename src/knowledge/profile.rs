@@ -1,7 +1,7 @@
 //! Project profile auto-generation.
 //!
 //! Scans the project for config files (Cargo.toml, package.json, etc.)
-//! and generates `.minime/profile.md` — a compressed overview of the project.
+//! and generates `.miniswe/profile.md` — a compressed overview of the project.
 
 use std::path::Path;
 

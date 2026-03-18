@@ -22,7 +22,7 @@ pub async fn search(args: &Value, _config: &Config) -> Result<ToolResult> {
     let url = format!("https://html.duckduckgo.com/html/?q={encoded_query}");
 
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; minime/0.1)")
+        .user_agent("Mozilla/5.0 (compatible; miniswe/0.1)")
         .build()?;
 
     match client.get(&url).send().await {
@@ -66,7 +66,7 @@ pub async fn fetch(args: &Value, config: &Config) -> Result<ToolResult> {
     };
 
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; minime/0.1)")
+        .user_agent("Mozilla/5.0 (compatible; miniswe/0.1)")
         .build()?;
 
     match client.get(&fetch_url).send().await {
@@ -102,11 +102,11 @@ pub async fn docs_lookup(args: &Value, config: &Config) -> Result<ToolResult> {
         ));
     }
 
-    let docs_dir = config.minime_path("docs");
+    let docs_dir = config.miniswe_path("docs");
 
     if !docs_dir.exists() {
         return Ok(ToolResult::ok(format!(
-            "No local docs cached. Run `minime docs add <url>` to add documentation."
+            "No local docs cached. Run `miniswe docs add <url>` to add documentation."
         )));
     }
 
@@ -245,7 +245,7 @@ fn extract_relevant_sections(content: &str, keyword: &str) -> String {
 
 /// List cached documentation files.
 fn list_cached_docs(config: &Config) -> String {
-    let docs_dir = config.minime_path("docs");
+    let docs_dir = config.miniswe_path("docs");
     if !docs_dir.exists() {
         return "(none)".into();
     }

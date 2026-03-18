@@ -16,10 +16,8 @@ use crate::context::compress;
 use crate::llm::{ChatRequest, LlmClient, Message};
 use crate::mcp::{McpConfig, McpRegistry};
 use crate::tools;
+use crate::tools::permissions::{Action, PermissionManager};
 use crate::tui;
-
-/// Maximum number of tool-call rounds before stopping.
-const MAX_ROUNDS: usize = 25;
 
 /// After this many tool results in the messages, start masking old ones.
 const MASK_AFTER_RESULTS: usize = 6;
@@ -27,18 +25,19 @@ const MASK_AFTER_RESULTS: usize = 6;
 /// Run the agent for a single message.
 pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
     let client = LlmClient::new(config.model.clone());
+    let perms = PermissionManager::new(&config);
     let mut tool_defs = tools::tool_definitions();
 
     tui::print_header(if plan_only {
         "Plan Mode (read-only)"
     } else {
-        "minime"
+        "miniswe"
     });
 
     // Initialize MCP servers
     let mcp_config = McpConfig::load(&config.project_root)?;
     let mut mcp_registry = if mcp_config.has_servers() {
-        let cache_dir = config.minime_path("mcp");
+        let cache_dir = config.miniswe_path("mcp");
         match McpRegistry::connect(&mcp_config, &cache_dir) {
             Ok(registry) => {
                 if registry.has_servers() {
@@ -65,8 +64,13 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
         .as_ref()
         .and_then(|r| r.context_summary());
 
+    let max_rounds = config.context.max_rounds;
+    let pause_at = config.context.pause_after_rounds;
+
     let mut conversation_history: Vec<Message> = Vec::new();
     let mut round = 0;
+    let mut had_error = false;
+    let mut user_continued = false;
 
     // Track tool results for observation masking
     let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
@@ -88,9 +92,35 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
 
     loop {
         round += 1;
-        if round > MAX_ROUNDS {
+        if round > max_rounds {
             tui::print_error("Maximum tool rounds reached. Stopping.");
             break;
+        }
+
+        // Ask user if they want to continue after pause_after_rounds
+        if round == pause_at && !user_continued {
+            tui::print_status(&format!("{pause_at} tool rounds used."));
+            let response = tui::read_input("Continue? [y]es / [n]o:");
+            match response.as_deref() {
+                Some("y") | Some("yes") | Some("") => {
+                    user_continued = true;
+                }
+                _ => {
+                    // Tell the LLM to wrap up
+                    messages.push(Message::user(
+                        "[SYSTEM: The user has asked you to stop. \
+                         Wrap up immediately and summarize what you've done so far.]"
+                    ));
+                }
+            }
+        }
+
+        // Warn the LLM when approaching the hard limit
+        if round == max_rounds.saturating_sub(5) {
+            messages.push(Message::user(
+                "[SYSTEM: You are approaching the tool call limit. \
+                 Wrap up your current task and summarize what you've done.]"
+            ));
         }
 
         // Apply observation masking: replace old tool results with summaries
@@ -115,7 +145,19 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
         {
             Ok(r) => r,
             Err(e) => {
-                tui::print_error(&format!("LLM error: {e}"));
+                // Strip HTML from error messages (common with HTTP errors)
+                let err_str = e.to_string();
+                let clean = if err_str.contains('<') {
+                    err_str.split('<').next().unwrap_or(&err_str).trim().to_string()
+                } else {
+                    err_str
+                };
+                tui::print_error(&format!("LLM error: {clean}"));
+                tui::print_status(&format!(
+                    "Check that your LLM server is running at {}",
+                    config.model.endpoint
+                ));
+                had_error = true;
                 break;
             }
         };
@@ -156,8 +198,19 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
         messages.push(assistant_msg.clone());
 
         for tc in &tool_calls {
-            let args: serde_json::Value =
-                serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+            let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
+                Ok(v) => v,
+                Err(e) => {
+                    let result_msg = Message::tool_result(
+                        &tc.id,
+                        &format!("Invalid JSON in tool arguments: {e}\nRaw: {}", tc.function.arguments),
+                    );
+                    messages.push(result_msg.clone());
+                    conversation_history.push(result_msg);
+                    tui::print_tool_result(&tc.function.name, false, "invalid JSON args");
+                    continue;
+                }
+            };
 
             let args_summary = summarize_args(&tc.function.name, &args);
             tui::print_tool_call(&tc.function.name, &args_summary);
@@ -183,15 +236,18 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
                 let server = args["server"].as_str().unwrap_or("");
                 let tool = args["tool"].as_str().unwrap_or("");
                 let tool_args = args.get("arguments").cloned().unwrap_or_default();
-                match &mut mcp_registry {
-                    Some(registry) => match registry.call_tool(server, tool, tool_args) {
-                        Ok(content) => crate::tools::ToolResult::ok(content),
-                        Err(e) => crate::tools::ToolResult::err(format!("MCP error: {e}")),
+                match perms.check(&Action::McpUse(server.into(), tool.into())) {
+                    Err(e) => crate::tools::ToolResult::err(e),
+                    Ok(()) => match &mut mcp_registry {
+                        Some(registry) => match registry.call_tool(server, tool, tool_args) {
+                            Ok(content) => crate::tools::ToolResult::ok(content),
+                            Err(e) => crate::tools::ToolResult::err(format!("MCP error: {e}")),
+                        },
+                        None => crate::tools::ToolResult::err("No MCP servers connected".into()),
                     },
-                    None => crate::tools::ToolResult::err("No MCP servers connected".into()),
                 }
             } else {
-                match tools::execute_tool(&tc.function.name, &args, &config).await {
+                match tools::execute_tool(&tc.function.name, &args, &config, &perms).await {
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("Tool error: {e}")),
                 }
@@ -214,7 +270,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool) -> Result<()> {
     }
 
     tui::print_separator();
-    tui::print_complete("Done");
+    if !had_error {
+        tui::print_complete("Done");
+    }
 
     Ok(())
 }

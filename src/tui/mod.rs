@@ -1,4 +1,4 @@
-//! Terminal UI for minime.
+//! Terminal UI for miniswe.
 //!
 //! Provides a simple streaming output display for the agent loop.
 //! Phase 1: Basic terminal output with colors.
@@ -8,7 +8,7 @@ use std::io::{self, Write};
 
 /// Print a styled header.
 pub fn print_header(text: &str) {
-    eprintln!("\x1b[1;36m┌─ minime ─────────────────────────────────────────┐\x1b[0m");
+    eprintln!("\x1b[1;36m┌─ miniswe ─────────────────────────────────────────┐\x1b[0m");
     eprintln!("\x1b[1;36m│\x1b[0m {:<49}\x1b[1;36m│\x1b[0m", text);
     eprintln!("\x1b[1;36m└─────────────────────────────────────────────────────┘\x1b[0m");
 }

@@ -60,9 +60,9 @@ pub struct ProjectIndex {
 }
 
 impl ProjectIndex {
-    /// Save the index to `.minime/index/`.
-    pub fn save(&self, minime_dir: &Path) -> anyhow::Result<()> {
-        let index_dir = minime_dir.join("index");
+    /// Save the index to `.miniswe/index/`.
+    pub fn save(&self, miniswe_dir: &Path) -> anyhow::Result<()> {
+        let index_dir = miniswe_dir.join("index");
         std::fs::create_dir_all(&index_dir)?;
 
         std::fs::write(
@@ -85,9 +85,9 @@ impl ProjectIndex {
         Ok(())
     }
 
-    /// Load the index from `.minime/index/`.
-    pub fn load(minime_dir: &Path) -> anyhow::Result<Self> {
-        let index_dir = minime_dir.join("index");
+    /// Load the index from `.miniswe/index/`.
+    pub fn load(miniswe_dir: &Path) -> anyhow::Result<Self> {
+        let index_dir = miniswe_dir.join("index");
 
         let symbols: HashMap<String, Vec<Symbol>> = load_json(&index_dir, "symbols.json")?;
         let summaries: HashMap<String, String> = load_json(&index_dir, "summaries.json")?;

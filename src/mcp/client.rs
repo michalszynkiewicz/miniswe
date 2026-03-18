@@ -7,8 +7,12 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+
+/// Default timeout for MCP requests in seconds.
+const REQUEST_TIMEOUT_SECS: u64 = 30;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -86,7 +90,7 @@ impl McpClient {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {
-                    "name": "minime",
+                    "name": "miniswe",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             })),
@@ -138,9 +142,10 @@ impl McpClient {
         }
     }
 
-    /// Send a JSON-RPC request and wait for the response.
+    /// Send a JSON-RPC request and wait for the response, with timeout.
     fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
         let id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let timeout = Duration::from_secs(REQUEST_TIMEOUT_SECS);
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0",
@@ -161,17 +166,27 @@ impl McpClient {
         stdin.write_all(request_json.as_bytes())?;
         stdin.flush()?;
 
-        // Read response from stdout
+        // Read response from stdout with timeout
         let stdout = self
             .child
             .stdout
             .as_mut()
             .context("MCP server stdout not available")?;
         let mut reader = BufReader::new(stdout);
+        let deadline = Instant::now() + timeout;
 
         // Read lines until we get a JSON-RPC response with our id
         // (skip notifications which have no id)
         loop {
+            if Instant::now() > deadline {
+                bail!(
+                    "MCP server '{}' timed out after {}s waiting for response to '{}'",
+                    self.server_name,
+                    REQUEST_TIMEOUT_SECS,
+                    method
+                );
+            }
+
             let mut line = String::new();
             let bytes_read = reader.read_line(&mut line)?;
             if bytes_read == 0 {

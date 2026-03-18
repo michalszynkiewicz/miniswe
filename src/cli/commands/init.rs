@@ -1,4 +1,4 @@
-//! `minime init` — Initialize the project knowledge base.
+//! `miniswe init` — Initialize the project knowledge base.
 
 use std::fs;
 
@@ -14,31 +14,31 @@ use crate::tui;
 pub async fn run() -> Result<()> {
     let root = std::env::current_dir()?;
 
-    tui::print_header("Initializing minime");
+    tui::print_header("Initializing miniswe");
 
     // Check if already initialized
-    let minime_dir = root.join(".minime");
-    if minime_dir.exists() {
+    let miniswe_dir = root.join(".miniswe");
+    if miniswe_dir.exists() {
         tui::print_status("Project already initialized. Re-indexing...");
     }
 
     // Create directory structure
-    tui::print_status("Creating .minime/ directory structure...");
-    fs::create_dir_all(minime_dir.join("index"))?;
-    fs::create_dir_all(minime_dir.join("snippets"))?;
-    fs::create_dir_all(minime_dir.join("sessions"))?;
-    fs::create_dir_all(minime_dir.join("docs"))?;
+    tui::print_status("Creating .miniswe/ directory structure...");
+    fs::create_dir_all(miniswe_dir.join("index"))?;
+    fs::create_dir_all(miniswe_dir.join("snippets"))?;
+    fs::create_dir_all(miniswe_dir.join("sessions"))?;
+    fs::create_dir_all(miniswe_dir.join("docs"))?;
 
     // Detect project and generate profile
     tui::print_status("Detecting project configuration...");
     let info = profile::detect_project(&root)?;
     let profile_content = profile::generate_profile(&info);
-    let profile_path = minime_dir.join("profile.md");
+    let profile_path = miniswe_dir.join("profile.md");
     fs::write(&profile_path, &profile_content)?;
     tui::print_status(&format!("  Generated profile: {}", info.name));
 
     // Create default config if it doesn't exist
-    let config_path = minime_dir.join("config.toml");
+    let config_path = miniswe_dir.join("config.toml");
     if !config_path.exists() {
         let config = Config::default();
         let config_content = toml::to_string_pretty(&config)?;
@@ -47,7 +47,7 @@ pub async fn run() -> Result<()> {
     }
 
     // Create guide.md if it doesn't exist
-    let guide_path = minime_dir.join("guide.md");
+    let guide_path = miniswe_dir.join("guide.md");
     if !guide_path.exists() {
         fs::write(
             &guide_path,
@@ -59,13 +59,13 @@ pub async fn run() -> Result<()> {
     }
 
     // Create lessons.md if it doesn't exist
-    let lessons_path = minime_dir.join("lessons.md");
+    let lessons_path = miniswe_dir.join("lessons.md");
     if !lessons_path.exists() {
         fs::write(
             &lessons_path,
             "# Lessons\n\n\
              <!-- Accumulated tips from past sessions -->\n\
-             <!-- Use `minime learn \"tip\"` to add entries -->\n",
+             <!-- Use `miniswe learn \"tip\"` to add entries -->\n",
         )?;
         tui::print_status("  Created lessons.md");
     }
@@ -82,7 +82,7 @@ pub async fn run() -> Result<()> {
     }
 
     // Load previous index for incremental reindexing
-    let previous = crate::knowledge::ProjectIndex::load(&minime_dir).ok();
+    let previous = crate::knowledge::ProjectIndex::load(&miniswe_dir).ok();
 
     // Run indexer (incremental if previous index exists)
     tui::print_status("Indexing project files...");
@@ -94,16 +94,16 @@ pub async fn run() -> Result<()> {
     let dep_graph = DependencyGraph::build(&index);
     let edge_count: usize = dep_graph.edges.values().map(|v| v.len()).sum();
 
-    index.save(&minime_dir)?;
-    dep_graph.save(&minime_dir)?;
+    index.save(&miniswe_dir)?;
+    dep_graph.save(&miniswe_dir)?;
 
     tui::print_complete(&format!(
         "Indexed {} files, {} symbols, {} cross-references",
         index.total_files, index.total_symbols, edge_count
     ));
 
-    // Create .gitignore for .minime/
-    let gitignore_path = minime_dir.join(".gitignore");
+    // Create .gitignore for .miniswe/
+    let gitignore_path = miniswe_dir.join(".gitignore");
     if !gitignore_path.exists() {
         fs::write(
             &gitignore_path,

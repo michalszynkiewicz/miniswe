@@ -1,4 +1,4 @@
-//! `minime config` — Show/edit configuration.
+//! `miniswe config` — Show/edit configuration.
 
 use anyhow::Result;
 
@@ -36,12 +36,12 @@ pub async fn run() -> Result<()> {
 
     if !config.is_initialized() {
         eprintln!();
-        tui::print_status("Config file: (using defaults — run `minime init` to create)");
+        tui::print_status("Config file: (using defaults — run `miniswe init` to create)");
     } else {
         eprintln!();
         tui::print_status(&format!(
             "Config file: {}",
-            config.minime_path("config.toml").display()
+            config.miniswe_path("config.toml").display()
         ));
     }
 
