@@ -81,9 +81,12 @@ pub async fn run() -> Result<()> {
         ));
     }
 
-    // Run indexer
+    // Load previous index for incremental reindexing
+    let previous = crate::knowledge::ProjectIndex::load(&minime_dir).ok();
+
+    // Run indexer (incremental if previous index exists)
     tui::print_status("Indexing project files...");
-    let mut index = indexer::index_project(&root)?;
+    let mut index = indexer::index_project(&root, previous.as_ref())?;
 
     // Populate cross-references
     tui::print_status("Building dependency graph...");

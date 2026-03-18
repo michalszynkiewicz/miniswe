@@ -215,6 +215,7 @@ pub fn extract(file: &str, content: &str, ext: &str) -> Option<ExtractionResult>
                 line,
                 kind: map_syntax_type(&syntax_type),
                 signature: sig_line,
+                end_line: 0, // filled by compute_end_lines after extraction
                 deps: Vec::new(),
             });
         } else {

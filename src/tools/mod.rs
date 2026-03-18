@@ -6,6 +6,7 @@
 
 mod edit;
 mod read_file;
+mod read_symbol;
 mod search;
 mod shell;
 mod task_update;
@@ -53,17 +54,7 @@ pub async fn execute_tool(
 ) -> Result<ToolResult> {
     match name {
         "read_file" => read_file::execute(args, config).await,
-        "read_symbol" => {
-            // For now, read_symbol falls back to search + read_file
-            // Full tree-sitter symbol lookup comes with the knowledge engine
-            let symbol_name = args["name"].as_str().unwrap_or("");
-            let search_args = serde_json::json!({
-                "query": symbol_name,
-                "scope": "symbols",
-                "max_results": 5
-            });
-            search::execute(&search_args, config).await
-        }
+        "read_symbol" => read_symbol::execute(args, config).await,
         "search" => search::execute(args, config).await,
         "edit" => edit::execute(args, config).await,
         "write_file" => write_file::execute(args, config).await,
