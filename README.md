@@ -2,7 +2,7 @@
 
 A lightweight CLI coding agent for local LLMs.
 
-Optimized for quantized small LLMs (Devstral Small 2 Q4_K_M, Qwen 2.5 Coder, etc.) running locally via llama.cpp, Ollama, or vLLM. Works with any OpenAI-compatible API.
+Optimized for quantized small LLMs (Devstral Small 2 Q4_K_XL, Qwen 2.5 Coder, etc.) running locally via llama.cpp, Ollama, or vLLM. Works with any OpenAI-compatible API.
 
 ## Quick Start
 
@@ -10,7 +10,7 @@ Optimized for quantized small LLMs (Devstral Small 2 Q4_K_M, Qwen 2.5 Coder, etc
 # Build (default: Rust, Python, JS, TS, Go tree-sitter grammars)
 cargo build --release
 
-# Start the LLM server (see start-devstral-small-2.sh)
+# Start the LLM server
 ./start-devstral-small-2.sh
 
 # In another terminal: initialize in your project
@@ -38,12 +38,12 @@ miniswe operates on one principle: **assemble exactly the right context for each
 
 - **Context Assembler** — Per-turn context building within a strict token budget. Compressed system prompt, profile, repo map, scratchpad, history with observation masking.
 - **Knowledge Engine** — Tree-sitter AST parsing (19 languages), PageRank-based dependency graph, doc-header extraction for file summaries, incremental re-indexing after edits.
-- **Compression Pipeline** — Deterministic compression: structured context format, import elision, history-as-diffs, observation masking.
-- **Tool System** — 12 built-in tools + unlimited MCP tools via lazy-loading bridge. Path jailing, shell approval, per-query web access control.
+- **Compression Pipeline** — Deterministic compression: structured context format, stdlib import elision, history-as-diffs, observation masking.
+- **Tool System** — 11 built-in tools + unlimited MCP tools via lazy-loading bridge. Path jailing, shell approval, per-query web access control.
 - **LLM Interface** — OpenAI-compatible API client with streaming, tool call parsing, and Ctrl+C interruption.
 - **MCP Support** — Standard `.mcp.json` config (Claude Code compatible). Lazy-loading: only one-line summaries in context (~10 tokens/server), full schemas resolved at execution time.
 
-### Token Budget (50K window, Devstral Small 2 Q4_K_M on RTX 3090)
+### Token Budget (50K window, Devstral Small 2 Q4_K_XL on RTX 3090)
 
 | Component | Tokens | % |
 |-----------|--------|---|
@@ -83,22 +83,36 @@ miniswe operates on one principle: **assemble exactly the right context for each
 
 ## Tools
 
-### Built-in (12 tools)
+### Built-in (11 tools)
 
 | Tool | Purpose |
 |------|---------|
-| `read_file` | Read file contents with line numbers (comments preserved, imports elided) |
+| `read_file` | Read file contents with line numbers (comments preserved, stdlib imports elided) |
 | `read_symbol` | Look up a function/class/type by name via index coordinates |
 | `search` | ripgrep-based code search |
-| `edit` | Search-and-replace editing (best for large files) |
-| `write_file` | Whole-file rewrite (preferred for files <200 lines) |
+| `write_file` | Create or rewrite files (primary editing tool — writes complete file content) |
 | `shell` | Execute shell commands (30s default timeout, permission required) |
 | `task_update` | Update the task scratchpad (agent's memory) |
 | `diagnostics` | Get compiler/linter errors |
-| `web_search` | DuckDuckGo web search (shows query, asks permission) |
+| `web_search` | Web search via Serper or GitHub (shows query, asks permission) |
 | `web_fetch` | Fetch URL as clean markdown via Jina Reader (shows URL, asks permission) |
 | `docs_lookup` | Search local documentation cache (no network, always allowed) |
 | `mcp_use` | Call any tool on a connected MCP server |
+
+### Web Search
+
+Web search uses Serper (Google results) when an API key is available, falling back to GitHub repository search (no key needed, uses `gh` token if available for higher rate limits).
+
+```bash
+# Option 1: Serper key file (recommended — free 2,500 queries/month at serper.dev)
+mkdir -p ~/.miniswe
+echo "your-serper-key" > ~/.miniswe/serper.key
+
+# Option 2: environment variable
+export SERPER_API_KEY="your-key"
+
+# Option 3: no key — falls back to GitHub repo search (10-30 req/min)
+```
 
 ### MCP Tools (unlimited, via `.mcp.json`)
 
@@ -128,10 +142,12 @@ All file access is jailed to the project root. Destructive actions require user 
 | Absolute paths or `../` traversal | Blocked |
 | Shell commands (cargo, git, ls, etc.) | Auto-approved (allowlist) |
 | Shell commands (other) | Prompted per command |
-| Web search | Prompted (shows query) |
-| Web fetch | Prompted (shows URL and proxy) |
+| Web search | Prompted (shows query being sent) |
+| Web fetch | Prompted (shows URL and proxy info) |
 | MCP tool calls | Prompted per server |
 | `-y` flag | Auto-approves everything |
+
+See [docs/safe-headless-execution.md](docs/safe-headless-execution.md) for running safely in CI/Docker.
 
 ## Tree-sitter Language Support
 
@@ -180,9 +196,12 @@ vram_reserve_gb = 3             # reserved for OS/display (usable: 21GB)
 ram_budget_gb = 80
 
 [web]
-search_backend = "duckduckgo"   # or "searxng"
+search_backend = "serper"       # or "github", "searxng"
+search_api_key = ""             # or use ~/.miniswe/serper.key
 fetch_backend = "jina"          # or "local"
 ```
+
+A config for RTX 4050 laptops (6GB VRAM) is included at [4050-config.toml](4050-config.toml).
 
 ## LLM Server Setup
 
