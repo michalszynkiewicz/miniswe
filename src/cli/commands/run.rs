@@ -8,6 +8,7 @@
 //! 5. Apply observation masking (compress old tool results)
 //! 6. Feed results back and repeat
 
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -164,25 +165,31 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         // Reset cancel flag for this round
         cancelled.store(false, Ordering::Relaxed);
 
-        let mut spinner = tui::Spinner::start("thinking...");
-        let mut first_token = true;
+        eprint!("\x1b[2m⠋ thinking...\x1b[0m");
+        std::io::stderr().flush().ok();
+        let thinking = Arc::new(AtomicBool::new(true));
 
         let response = match client
             .chat_stream(&request, |token| {
-                if first_token {
-                    spinner.stop();
-                    first_token = false;
+                if thinking.load(Ordering::Relaxed) {
+                    thinking.store(false, Ordering::Relaxed);
+                    eprint!("\r\x1b[2K");
+                    std::io::stderr().flush().ok();
                 }
                 tui::print_token(token);
             }, &cancelled)
             .await
         {
             Ok(r) => {
-                spinner.stop();
+                if thinking.load(Ordering::Relaxed) {
+                    eprint!("\r\x1b[2K");
+                    std::io::stderr().flush().ok();
+                }
                 r
             }
             Err(e) => {
-                spinner.stop();
+                eprint!("\r\x1b[2K");
+                std::io::stderr().flush().ok();
                 let err_str = e.to_string();
                 if err_str.contains("Interrupted") {
                     tui::print_status("Generation interrupted.");

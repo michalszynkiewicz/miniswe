@@ -77,36 +77,15 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 }),
             },
         },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "edit".into(),
-                description: "Replace old text with new text in a file. Best for surgical changes to large files. For small files (<200 lines), prefer write_file.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path relative to project root"
-                        },
-                        "old": {
-                            "type": "string",
-                            "description": "Exact text to find and replace"
-                        },
-                        "new": {
-                            "type": "string",
-                            "description": "Replacement text"
-                        }
-                    },
-                    "required": ["path", "old", "new"]
-                }),
-            },
-        },
+        // NOTE: `edit` tool is intentionally hidden from the tool list.
+        // Quantized small models use it obsessively with single-line changes
+        // instead of write_file. The tool still works if called (handled in
+        // tools/mod.rs), but the model won't see it and will use write_file.
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "write_file".into(),
-                description: "Write complete file contents. More reliable than edit for small files (<200 lines). Preferred for creating new files or rewriting existing ones.".into(),
+                description: "Write complete file contents. Use this for: new files, multiple changes to a file, or any file under 200 lines. More reliable than edit.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -181,7 +160,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "web_search".into(),
-                description: "Search the web using DuckDuckGo. Returns title+URL+snippet for top results.".into(),
+                description: "Search the web. Returns title+URL+snippet for top results.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
