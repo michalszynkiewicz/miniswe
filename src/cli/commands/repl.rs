@@ -1,5 +1,6 @@
 //! Interactive REPL mode.
 
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -90,18 +91,20 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         let _ = std::fs::create_dir_all(parent);
     }
     let history = Box::new(
-        FileBackedHistory::with_file(1000, history_file)
+        FileBackedHistory::with_file(200, history_file)
             .expect("Failed to create history file"),
     );
     let mut editor = Reedline::create()
         .with_history(history)
-        .use_bracketed_paste(true);
+        .use_bracketed_paste(true)
+        .with_quick_completions(false)
+        .with_partial_completions(false);
+
+    let mut conversation_history: Vec<Message> = Vec::new();
     let prompt = DefaultPrompt::new(
         DefaultPromptSegment::Basic("you".to_string()),
         DefaultPromptSegment::Empty,
     );
-
-    let mut conversation_history: Vec<Message> = Vec::new();
 
     loop {
         let input = match editor.read_line(&prompt) {
@@ -112,8 +115,8 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                 }
                 trimmed
             }
-            Ok(Signal::CtrlC) => continue,  // Ctrl+C: cancel current line
-            Ok(Signal::CtrlD) => break,     // Ctrl+D: exit
+            Ok(Signal::CtrlC) => continue,
+            Ok(Signal::CtrlD) => break,
             Err(_) => break,
         };
 
@@ -240,25 +243,32 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
             // Reset cancel flag for this round
             cancelled.store(false, Ordering::Relaxed);
 
-            let mut spinner = tui::Spinner::start("thinking...");
-            let mut first_token = true;
+            // Show spinner while waiting for LLM (use atomic flag, no thread)
+            let thinking = Arc::new(AtomicBool::new(true));
+            eprint!("\x1b[2m⠋ thinking...\x1b[0m");
+            io::stderr().flush().ok();
 
             let response = match client
                 .chat_stream(&request, |token| {
-                    if first_token {
-                        spinner.stop();
-                        first_token = false;
+                    if thinking.load(Ordering::Relaxed) {
+                        thinking.store(false, Ordering::Relaxed);
+                        eprint!("\r\x1b[2K"); // clear spinner
+                        io::stderr().flush().ok();
                     }
                     tui::print_token(token);
                 }, &cancelled)
                 .await
             {
                 Ok(r) => {
-                    spinner.stop();
+                    if thinking.load(Ordering::Relaxed) {
+                        eprint!("\r\x1b[2K");
+                        io::stderr().flush().ok();
+                    }
                     r
                 }
                 Err(e) => {
-                    spinner.stop();
+                    eprint!("\r\x1b[2K");
+                    io::stderr().flush().ok();
                     let err_str = e.to_string();
                     if err_str.contains("Interrupted") {
                         tui::print_status("Generation interrupted.");
@@ -343,10 +353,11 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
             }
         }
 
-        // Keep conversation history bounded
+        // Keep conversation history bounded (use drain instead of repeated remove(0))
         let max_history = config.context.history_turns * 6;
-        while conversation_history.len() > max_history {
-            conversation_history.remove(0);
+        if conversation_history.len() > max_history {
+            let drain_count = conversation_history.len() - max_history;
+            conversation_history.drain(..drain_count);
         }
 
         tui::print_separator();

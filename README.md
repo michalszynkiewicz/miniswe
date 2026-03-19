@@ -10,10 +10,10 @@ Optimized for quantized small LLMs (Devstral Small 2 Q4_K_M, Qwen 2.5 Coder, etc
 # Build (default: Rust, Python, JS, TS, Go tree-sitter grammars)
 cargo build --release
 
-# Build with all 19 languages
-cargo build --release --features all-languages
+# Start the LLM server (see start-devstral-small-2.sh)
+./start-devstral-small-2.sh
 
-# Initialize in your project
+# In another terminal: initialize in your project
 cd /path/to/your/project
 miniswe init
 
@@ -22,6 +22,9 @@ miniswe
 
 # Run with a single message
 miniswe "fix the bug in auth.rs"
+
+# Headless mode (auto-approve all permissions, for CI/scripts)
+miniswe -y "add error handling to main.rs"
 
 # Plan mode (read-only exploration)
 miniswe plan "how should I refactor the auth module?"
@@ -34,10 +37,10 @@ miniswe operates on one principle: **assemble exactly the right context for each
 ### Core Components
 
 - **Context Assembler** — Per-turn context building within a strict token budget. Compressed system prompt, profile, repo map, scratchpad, history with observation masking.
-- **Knowledge Engine** — Tree-sitter AST parsing (19 languages), PageRank-based dependency graph, doc-header extraction for file summaries.
-- **Compression Pipeline** — 5-layer deterministic compression: code format stripping, structured context format, import elision, history-as-diffs, observation masking. ~1.6x effective context multiplier.
-- **Tool System** — 12 built-in tools + unlimited MCP tools via lazy-loading bridge.
-- **LLM Interface** — OpenAI-compatible API client with streaming and tool call parsing.
+- **Knowledge Engine** — Tree-sitter AST parsing (19 languages), PageRank-based dependency graph, doc-header extraction for file summaries, incremental re-indexing after edits.
+- **Compression Pipeline** — Deterministic compression: structured context format, import elision, history-as-diffs, observation masking.
+- **Tool System** — 12 built-in tools + unlimited MCP tools via lazy-loading bridge. Path jailing, shell approval, per-query web access control.
+- **LLM Interface** — OpenAI-compatible API client with streaming, tool call parsing, and Ctrl+C interruption.
 - **MCP Support** — Standard `.mcp.json` config (Claude Code compatible). Lazy-loading: only one-line summaries in context (~10 tokens/server), full schemas resolved at execution time.
 
 ### Token Budget (50K window, Devstral Small 2 Q4_K_M on RTX 3090)
@@ -49,7 +52,6 @@ miniswe operates on one principle: **assemble exactly the right context for each
 | Repo map (PageRank-ranked) | 5,000 | 10% |
 | MCP summaries | ~50 | 0.1% |
 | Scratchpad | 1,500 | 3% |
-| Retrieved snippets | 12,000 | 24% |
 | Conversation history (compressed) | 6,000 | 12% |
 | **Available for output** | **~24,000** | **48%** |
 
@@ -57,8 +59,9 @@ miniswe operates on one principle: **assemble exactly the right context for each
 
 | Command | Description |
 |---------|-------------|
-| `miniswe` | Interactive REPL mode |
+| `miniswe` | Interactive REPL mode (Ctrl+R history search) |
 | `miniswe "message"` | Single-shot agent execution |
+| `miniswe -y "message"` | Headless mode (auto-approve all permissions) |
 | `miniswe init` | Initialize project (index, profile, graph) |
 | `miniswe info` | Show project info and index stats |
 | `miniswe config` | Show current configuration |
@@ -66,23 +69,35 @@ miniswe operates on one principle: **assemble exactly the right context for each
 | `miniswe docs add <url>` | Cache documentation for offline use |
 | `miniswe docs list` | List cached docs |
 
+### REPL Commands
+
+| Command | Description |
+|---------|-------------|
+| `/new` | Clear history + scratchpad + plan (fresh start) |
+| `/clear` | Clear conversation history only |
+| `/help` | Show available commands |
+| `quit` | Exit |
+| `Ctrl+C` | Interrupt current LLM generation |
+| `Ctrl+R` | Search input history |
+| `Ctrl+D` | Exit |
+
 ## Tools
 
 ### Built-in (12 tools)
 
 | Tool | Purpose |
 |------|---------|
-| `read_file` | Read file contents with line numbers |
-| `read_symbol` | Look up a specific function/class/type by name |
+| `read_file` | Read file contents with line numbers (comments preserved, imports elided) |
+| `read_symbol` | Look up a function/class/type by name via index coordinates |
 | `search` | ripgrep-based code search |
 | `edit` | Search-and-replace editing (best for large files) |
-| `write_file` | Whole-file rewrite (preferred for files <200 lines, more reliable for quantized models) |
-| `shell` | Execute shell commands |
+| `write_file` | Whole-file rewrite (preferred for files <200 lines) |
+| `shell` | Execute shell commands (30s default timeout, permission required) |
 | `task_update` | Update the task scratchpad (agent's memory) |
 | `diagnostics` | Get compiler/linter errors |
-| `web_search` | DuckDuckGo web search |
-| `web_fetch` | Fetch URL as clean markdown (via Jina Reader) |
-| `docs_lookup` | Search local documentation cache |
+| `web_search` | DuckDuckGo web search (shows query, asks permission) |
+| `web_fetch` | Fetch URL as clean markdown via Jina Reader (shows URL, asks permission) |
+| `docs_lookup` | Search local documentation cache (no network, always allowed) |
 | `mcp_use` | Call any tool on a connected MCP server |
 
 ### MCP Tools (unlimited, via `.mcp.json`)
@@ -96,16 +111,27 @@ miniswe supports the standard `.mcp.json` configuration (same format as Claude C
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "env": { "GITHUB_TOKEN": "ghp_..." }
-    },
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"]
     }
   }
 }
 ```
 
-**Lazy-loading approach:** On startup, miniswe connects to MCP servers, fetches tool schemas, and caches them to `.miniswe/mcp/`. Only a one-line summary per server goes into the LLM context (~10 tokens each). Full schemas are resolved on the Rust side at execution time — zero context waste.
+On startup, miniswe connects to MCP servers, fetches tool schemas, and caches them. Only a one-line summary per server goes into LLM context (~10 tokens each). Full schemas are resolved at execution time.
+
+## Permission System
+
+All file access is jailed to the project root. Destructive actions require user approval:
+
+| Action | Permission |
+|--------|-----------|
+| Read/write files in project | Always allowed (path-jailed) |
+| Absolute paths or `../` traversal | Blocked |
+| Shell commands (cargo, git, ls, etc.) | Auto-approved (allowlist) |
+| Shell commands (other) | Prompted per command |
+| Web search | Prompted (shows query) |
+| Web fetch | Prompted (shows URL and proxy) |
+| MCP tool calls | Prompted per server |
+| `-y` flag | Auto-approves everything |
 
 ## Tree-sitter Language Support
 
@@ -133,9 +159,9 @@ cargo build --release --no-default-features
 ```toml
 [model]
 provider = "llama-cpp"          # or "ollama", "vllm", "openai-compatible"
-endpoint = "http://localhost:8080"
+endpoint = "http://localhost:8464"
 model = "devstral-small-2"
-context_window = 50000          # conservative for RTX 3090 + display
+context_window = 50000
 temperature = 0.15
 max_output_tokens = 16384
 
@@ -145,6 +171,8 @@ snippet_budget = 12000
 history_turns = 5
 history_budget = 6000
 scratchpad_budget = 1500
+max_rounds = 100                # hard limit on tool call rounds
+pause_after_rounds = 50         # ask user to confirm continuation
 
 [hardware]
 vram_gb = 24
@@ -156,73 +184,63 @@ search_backend = "duckduckgo"   # or "searxng"
 fetch_backend = "jina"          # or "local"
 ```
 
-## Project Directory Structure
-
-```
-.miniswe/
-├── config.toml           # Model, context, and web settings
-├── profile.md            # Auto-generated project overview
-├── guide.md              # Your custom instructions (<500 tokens)
-├── lessons.md            # Accumulated tips from past sessions
-├── scratchpad.md         # Current task state (auto-managed)
-├── plan.md               # Active plan (auto-managed)
-├── index/
-│   ├── symbols.json      # Extracted symbol index (tree-sitter)
-│   ├── graph.json        # Dependency graph + PageRank scores
-│   ├── summaries.json    # Doc-header file summaries
-│   └── file_tree.txt     # Project file listing
-├── mcp/                  # Cached MCP server schemas
-├── snippets/             # Pre-chunked code (future)
-├── sessions/             # Session logs (future)
-└── docs/                 # Cached documentation (llms.txt)
-
-.mcp.json                 # MCP server configuration (Claude Code format)
-```
-
-**Git-committed:** `profile.md`, `guide.md`, `lessons.md`
-**Git-ignored:** Everything else (index, mcp, snippets, sessions, scratchpad, plan)
-
 ## LLM Server Setup
 
-### llama.cpp (recommended for RTX 3090)
+### llama.cpp (recommended)
+
+Use the included start script:
+
+```bash
+# Download the model (first time)
+mkdir -p models
+hf download unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF \
+  --include 'Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL.gguf' \
+  --local-dir models/
+
+# Start the server
+./start-devstral-small-2.sh
+```
+
+Or manually:
 
 ```bash
 llama-server \
-  --model Devstral-Small-2-24B-UD-Q4_K_M.gguf \
+  --model Devstral-Small-2-24B-UD-Q4_K_XL.gguf \
   --ctx-size 50000 \
-  --cache-type-k q8_0 \
-  --cache-type-v q8_0 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
   --n-gpu-layers 99 \
-  --flash-attn \
+  --flash-attn on \
   --threads 8 \
-  --port 8080
+  --port 8464 --metrics
 ```
 
 ### Ollama
 
 ```bash
+export OLLAMA_CONTEXT_LENGTH=50000
+export OLLAMA_KV_CACHE_TYPE=q8_0
+export OLLAMA_FLASH_ATTENTION=1
 ollama serve
+
 # In .miniswe/config.toml:
-# [model]
 # provider = "ollama"
 # endpoint = "http://localhost:11434"
-# model = "devstral"
+```
+
+## Debugging
+
+```bash
+# Show role sequence, token usage, and KV cache stats before each LLM call
+MINISWE_DEBUG=1 miniswe
 ```
 
 ## Development
 
 ```bash
-# Build
-cargo build
-
-# Run tests
-cargo test
-
-# Run with tracing
-RUST_LOG=debug cargo run -- init
-
-# Check lints
-cargo clippy
+cargo build                     # debug build
+cargo test                      # run tests
+cargo clippy                    # lint
+RUST_LOG=debug cargo run -- init  # with tracing
 ```
 
 ## Design Document

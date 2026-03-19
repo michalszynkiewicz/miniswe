@@ -1,0 +1,42 @@
+# miniswe config for RTX 4050 laptop (6GB VRAM)
+# Model: Qwen 2.5 Coder 7B Q4_K_M (~4.5GB) + Q8 KV cache (~0.5GB) = ~5GB
+#
+# Download:
+#   hf download Qwen/Qwen2.5-Coder-7B-Instruct-GGUF \
+#     --include "qwen2.5-coder-7b-instruct-q4_k_m.gguf" \
+#     --local-dir models/
+#
+# Start:
+#   llama-server \
+#     --model models/qwen2.5-coder-7b-instruct-q4_k_m.gguf \
+#     --ctx-size 16000 \
+#     --cache-type-k q8_0 --cache-type-v q8_0 \
+#     --n-gpu-layers 99 \
+#     --flash-attn on \
+#     --port 8464
+
+[model]
+provider = "llama-cpp"
+endpoint = "http://localhost:8464"
+model = "qwen2.5-coder-7b"
+context_window = 16000
+temperature = 0.15
+max_output_tokens = 4096
+
+[context]
+repo_map_budget = 2000
+snippet_budget = 4000
+history_turns = 3
+history_budget = 2000
+scratchpad_budget = 1000
+max_rounds = 100
+pause_after_rounds = 50
+
+[hardware]
+vram_gb = 6
+vram_reserve_gb = 1
+ram_budget_gb = 16
+
+[web]
+search_backend = "serper"
+fetch_backend = "jina"

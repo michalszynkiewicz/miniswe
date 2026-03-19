@@ -236,7 +236,7 @@ impl PermissionManager {
         let response = prompt_user(&format!(
             "Allow web search?\n\
              \x1b[2m  query: \"{query}\"\n\
-             \x1b[2m  sends to: DuckDuckGo\x1b[0m\n\
+             \x1b[2m  sends to: web search API\x1b[0m\n\
              \x1b[1;33m  [y]es / [n]o / [a]llow all web this session: \x1b[0m"
         ));
 

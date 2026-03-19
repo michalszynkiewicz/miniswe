@@ -76,8 +76,10 @@ pub struct HardwareConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
-    /// Search backend: "duckduckgo" or "searxng"
+    /// Search backend: "serper" (default), "searxng"
     pub search_backend: String,
+    /// API key for search provider (Serper: free at serper.dev)
+    pub search_api_key: Option<String>,
     /// SearXNG URL (if search_backend = "searxng")
     pub searxng_url: Option<String>,
     /// Fetch backend: "jina" or "local"
@@ -138,7 +140,8 @@ impl Default for HardwareConfig {
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
-            search_backend: "duckduckgo".into(),
+            search_backend: "serper".into(),
+            search_api_key: None,
             searxng_url: None,
             fetch_backend: "jina".into(),
         }

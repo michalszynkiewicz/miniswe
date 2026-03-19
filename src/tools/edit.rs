@@ -90,6 +90,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let context_start = edit_start.saturating_sub(3);
     let context_end = (edit_start + new_lines.len() + 3).min(edited_lines.len());
 
+    let total_lines = edited_lines.len();
     let mut output = format!("✓ Edited {path_str} (1 replacement)\n");
     for i in context_start..context_end {
         let marker = if i >= edit_start && i < edit_start + new_lines.len() {
@@ -98,6 +99,13 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
             " "
         };
         output.push_str(&format!("{marker}{:>4}│{}\n", i + 1, edited_lines[i]));
+    }
+
+    // Nudge model to use write_file for small files with multiple changes
+    if total_lines < 200 {
+        output.push_str(&format!(
+            "\nNote: {path_str} is {total_lines} lines. For multiple changes, use write_file to rewrite the whole file in one call.\n"
+        ));
     }
 
     Ok(ToolResult::ok(output))
