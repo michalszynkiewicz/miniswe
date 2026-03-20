@@ -70,6 +70,10 @@ pub struct App {
     pub token_buffer: String,
     /// Tool results for Ctrl+O detail viewer (tool_name → full content)
     pub tool_results: Vec<(String, String)>,
+    /// Permission prompt waiting for user input (shown above input bar)
+    pub pending_permission: Option<String>,
+    /// User's response to the permission prompt
+    pub permission_response: Option<String>,
 }
 
 impl App {
@@ -89,6 +93,8 @@ impl App {
             is_thinking: false,
             token_buffer: String::new(),
             tool_results: Vec::new(),
+            pending_permission: None,
+            permission_response: None,
         }
     }
 

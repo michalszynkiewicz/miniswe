@@ -112,7 +112,8 @@ impl PermissionManager {
         // Reject absolute paths
         if path_str.starts_with('/') || path_str.starts_with('\\') {
             return Err(format!(
-                "Absolute paths not allowed: {path_str}. Use paths relative to the project root."
+                "Absolute paths not allowed: {path_str}. Use paths relative to the project root: {}",
+                self.project_root.display()
             ));
         }
 
@@ -140,7 +141,8 @@ impl PermissionManager {
                     .map_err(|e| format!("Cannot resolve path: {e}"))?;
                 if !canonical_parent.starts_with(&self.project_root) {
                     return Err(format!(
-                        "Path escapes project root: {path_str}"
+                        "Path escapes project root: {path_str}. Project root is: {}",
+                        self.project_root.display()
                     ));
                 }
                 return Ok(joined);
@@ -160,7 +162,95 @@ impl PermissionManager {
         Ok(canonical)
     }
 
-    /// Check if an action is allowed. Prompts the user if needed.
+    /// Check if an action needs a user prompt. Returns:
+    /// - `Ok(None)` — allowed, no prompt needed
+    /// - `Ok(Some(prompt))` — needs user approval, here's the prompt text
+    /// - `Err(reason)` — blocked (blocklist), no prompt will help
+    pub fn check_needs_prompt(&self, action: &Action) -> Result<Option<String>, String> {
+        if self.auto_approve {
+            return Ok(None);
+        }
+        match action {
+            Action::ReadFile(_) | Action::WriteFile(_) => Ok(None),
+            Action::Shell(cmd) => self.check_shell_needs_prompt(cmd),
+            Action::WebSearch(query) => self.check_web_needs_prompt(
+                &format!("Allow web search?\n  query: \"{query}\"\n  [y]es / [n]o / [a]llow all web: ")
+            ),
+            Action::WebFetch(url) => self.check_web_needs_prompt(
+                &format!("Allow web fetch?\n  url: {url}\n  [y]es / [n]o / [a]llow all web: ")
+            ),
+            Action::McpUse(server, tool) => self.check_mcp_needs_prompt(server, tool),
+        }
+    }
+
+    /// Record user's approval for an action after prompting.
+    pub fn approve(&self, action: &Action, always: bool) {
+        match action {
+            Action::Shell(cmd) => {
+                if always {
+                    self.approved_shell.lock().unwrap().insert(cmd.trim().to_string());
+                }
+            }
+            Action::WebSearch(_) | Action::WebFetch(_) => {
+                if always {
+                    *self.web_approved.lock().unwrap() = true;
+                }
+            }
+            Action::McpUse(server, _) => {
+                if always {
+                    self.approved_mcp.lock().unwrap().insert(server.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_shell_needs_prompt(&self, cmd: &str) -> Result<Option<String>, String> {
+        let cmd_trimmed = cmd.trim();
+        for blocked in BLOCKED_COMMANDS {
+            if cmd_trimmed.contains(blocked) {
+                return Err(format!("Blocked dangerous command: {cmd_trimmed}"));
+            }
+        }
+        for prefix in &self.shell_allowlist {
+            if cmd_trimmed.starts_with(prefix) {
+                return Ok(None);
+            }
+        }
+        {
+            let approved = self.approved_shell.lock().unwrap();
+            if approved.contains(cmd_trimmed) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(format!(
+            "Allow shell command?\n  $ {cmd_trimmed}\n  [y]es / [n]o / [a]lways for this command: "
+        )))
+    }
+
+    fn check_web_needs_prompt(&self, prompt: &str) -> Result<Option<String>, String> {
+        {
+            let approved = self.web_approved.lock().unwrap();
+            if *approved {
+                return Ok(None);
+            }
+        }
+        Ok(Some(prompt.to_string()))
+    }
+
+    fn check_mcp_needs_prompt(&self, server: &str, tool: &str) -> Result<Option<String>, String> {
+        {
+            let approved = self.approved_mcp.lock().unwrap();
+            if approved.contains(server) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(format!(
+            "Allow MCP '{server}' tool '{tool}'?\n  [y]es / [n]o / [a]lways for this server: "
+        )))
+    }
+
+    /// Check if an action is allowed. Prompts the user if needed (non-TUI mode).
     /// Returns Ok(()) if approved, Err(reason) if denied.
     pub fn check(&self, action: &Action) -> Result<(), String> {
         if self.auto_approve {

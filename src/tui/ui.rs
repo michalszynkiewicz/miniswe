@@ -18,21 +18,37 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-/// Normal mode: output pane + input line.
+/// Normal mode: output pane + input line + optional permission prompt.
 fn draw_normal(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
-    // Split: output takes most space, input gets 3 lines at bottom
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(5),    // output
-            Constraint::Length(3), // input
-        ])
-        .split(area);
+    if app.pending_permission.is_some() {
+        // Three-way split: output, permission prompt, input
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(5),    // output
+                Constraint::Length(4), // permission prompt
+                Constraint::Length(3), // input (y/n/a)
+            ])
+            .split(area);
 
-    draw_output(frame, app, chunks[0]);
-    draw_input(frame, app, chunks[1]);
+        draw_output(frame, app, chunks[0]);
+        draw_permission(frame, app, chunks[1]);
+        draw_permission_input(frame, app, chunks[2]);
+    } else {
+        // Normal two-way split: output + input
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(5),    // output
+                Constraint::Length(3), // input
+            ])
+            .split(area);
+
+        draw_output(frame, app, chunks[0]);
+        draw_input(frame, app, chunks[1]);
+    }
 }
 
 /// Draw the scrollable output pane.
@@ -155,6 +171,44 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         if cursor_x < area.x + area.width - 1 {
             frame.set_cursor_position((cursor_x, cursor_y));
         }
+    }
+}
+
+/// Draw the permission prompt bar.
+fn draw_permission(frame: &mut Frame, app: &App, area: Rect) {
+    let text = app.pending_permission.as_deref().unwrap_or("");
+    // Show the prompt text (e.g. "Allow shell command?\n  $ rm src/tests.rs")
+    let lines: Vec<Line> = text.lines()
+        .take(3)
+        .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::Yellow))))
+        .collect();
+
+    let widget = Paragraph::new(lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title(" Permission Required ")
+            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+
+    frame.render_widget(widget, area);
+}
+
+/// Draw the permission response input.
+fn draw_permission_input(frame: &mut Frame, app: &App, area: Rect) {
+    let input_text = format!("  {}", app.input);
+    let widget = Paragraph::new(input_text)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" [y]es / [n]o / [a]lways "))
+        .style(Style::default().fg(Color::White));
+
+    frame.render_widget(widget, area);
+
+    // Show cursor
+    let cursor_x = area.x + 1 + "  ".len() as u16 + app.cursor as u16;
+    let cursor_y = area.y + 1;
+    if cursor_x < area.x + area.width - 1 {
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 

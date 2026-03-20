@@ -1,8 +1,9 @@
 //! Configuration management for miniswe.
 //!
-//! Loads from `.miniswe/config.toml` in the project root, with defaults
-//! for all values. Supports provider configuration for llama.cpp, Ollama, vLLM,
-//! or any OpenAI-compatible endpoint.
+//! Single config file at `~/.miniswe/config.toml` for all settings (model,
+//! hardware, API keys). Project root is always the current working directory.
+//! Per-project data (index, scratchpad, profile) lives in `.miniswe/` in the
+//! project directory — created by `miniswe init`.
 
 use std::path::PathBuf;
 
@@ -17,9 +18,23 @@ pub struct Config {
     pub context: ContextConfig,
     pub hardware: HardwareConfig,
     pub web: WebConfig,
+    pub logging: LogConfig,
     /// Resolved project root directory (not serialized).
     #[serde(skip)]
     pub project_root: PathBuf,
+}
+
+/// Logging configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogConfig {
+    /// Log verbosity: "info", "debug", "trace"
+    /// - info: tool calls and outcomes (one-liner per action)
+    /// - debug: full interactions — LLM messages, tool args/results, file changes
+    /// - trace: everything + context assembly stats, token counts, masking decisions
+    pub level: String,
+    /// Whether to write session logs to .miniswe/logs/
+    pub enabled: bool,
 }
 
 /// LLM provider and model settings.
@@ -95,7 +110,17 @@ impl Default for Config {
             context: ContextConfig::default(),
             hardware: HardwareConfig::default(),
             web: WebConfig::default(),
+            logging: LogConfig::default(),
             project_root: PathBuf::from("."),
+        }
+    }
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: "debug".into(),
+            enabled: true,
         }
     }
 }
@@ -149,44 +174,62 @@ impl Default for WebConfig {
 }
 
 impl Config {
-    /// Find the project root by looking for `.miniswe/` directory,
-    /// walking up from the current directory.
-    pub fn find_project_root() -> Option<PathBuf> {
-        let mut dir = std::env::current_dir().ok()?;
-        loop {
-            if dir.join(".miniswe").is_dir() {
-                return Some(dir);
-            }
-            if !dir.pop() {
-                return None;
-            }
-        }
+    /// Path to the global config directory (`~/.miniswe/`).
+    pub fn global_dir() -> Option<PathBuf> {
+        dirs::home_dir().map(|h| h.join(".miniswe"))
     }
 
-    /// Load config from `.miniswe/config.toml` in the project root.
-    /// Falls back to defaults if the file doesn't exist.
+    /// Load config with layered resolution:
+    /// 1. Built-in defaults
+    /// 2. `~/.miniswe/config.toml` — global settings (API keys, model, hardware)
+    /// 3. `.miniswe/config.toml` in cwd — per-project overrides (optional)
+    ///
+    /// Project root is always the current working directory.
     pub fn load() -> Result<Self> {
-        let project_root = Self::find_project_root()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let project_root = std::env::current_dir()
+            .context("Failed to determine current directory")?;
 
-        let config_path = project_root.join(".miniswe").join("config.toml");
-
-        let mut config = if config_path.exists() {
-            let contents = std::fs::read_to_string(&config_path)
-                .with_context(|| format!("Failed to read config from {}", config_path.display()))?;
+        // Layer 1: global config (~/.miniswe/config.toml), or defaults
+        let mut config = if let Some(global_path) = Self::global_dir()
+            .map(|d| d.join("config.toml"))
+            .filter(|p| p.exists())
+        {
+            let contents = std::fs::read_to_string(&global_path)
+                .with_context(|| format!("Failed to read {}", global_path.display()))?;
             toml::from_str(&contents)
-                .with_context(|| format!("Failed to parse config from {}", config_path.display()))?
+                .with_context(|| format!("Failed to parse {}", global_path.display()))?
         } else {
             Config::default()
         };
+
+        // Layer 2: project config (.miniswe/config.toml), if present
+        let project_config_path = project_root.join(".miniswe").join("config.toml");
+        if project_config_path.exists() {
+            let contents = std::fs::read_to_string(&project_config_path)
+                .with_context(|| format!("Failed to read {}", project_config_path.display()))?;
+            let project: Config = toml::from_str(&contents)
+                .with_context(|| format!("Failed to parse {}", project_config_path.display()))?;
+
+            // Project values override global. Inherit secrets from global
+            // if not set in project (serde fills Options with None by default).
+            let global_web = config.web.clone();
+            config = project;
+            if config.web.search_api_key.is_none() {
+                config.web.search_api_key = global_web.search_api_key;
+            }
+            if config.web.searxng_url.is_none() {
+                config.web.searxng_url = global_web.searxng_url;
+            }
+        }
 
         config.project_root = project_root;
         Ok(config)
     }
 
-    /// Save configuration to `.miniswe/config.toml`.
+    /// Save configuration to `~/.miniswe/config.toml`.
     pub fn save(&self) -> Result<()> {
-        let config_dir = self.project_root.join(".miniswe");
+        let config_dir = Self::global_dir()
+            .context("Cannot determine home directory")?;
         std::fs::create_dir_all(&config_dir)?;
         let config_path = config_dir.join("config.toml");
         let contents = toml::to_string_pretty(self)?;
@@ -194,17 +237,17 @@ impl Config {
         Ok(())
     }
 
-    /// Path to the `.miniswe/` directory.
+    /// Path to the `.miniswe/` data directory in the project.
     pub fn miniswe_dir(&self) -> PathBuf {
         self.project_root.join(".miniswe")
     }
 
-    /// Path to a specific file within `.miniswe/`.
+    /// Path to a specific file within the project's `.miniswe/`.
     pub fn miniswe_path(&self, relative: &str) -> PathBuf {
         self.miniswe_dir().join(relative)
     }
 
-    /// Check if this project has been initialized.
+    /// Check if this project has been initialized (`miniswe init` was run).
     pub fn is_initialized(&self) -> bool {
         self.miniswe_dir().is_dir()
     }
