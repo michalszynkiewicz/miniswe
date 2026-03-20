@@ -42,9 +42,29 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let count = content.matches(old).count();
 
     if count == 0 {
-        return Ok(ToolResult::err(format!(
-            "old_content not found in {path_str}. Make sure the text matches exactly (including whitespace)."
-        )));
+        // Show what the file actually contains near where the match might be,
+        // so the model can fix its edit without a separate read_file call.
+        let file_lines: Vec<&str> = content.lines().collect();
+        let mut err_msg = format!(
+            "old_content not found in {path_str}. Make sure the text matches exactly (including whitespace).\n"
+        );
+        let first_old_line = old.lines().next().unwrap_or("").trim();
+        if !first_old_line.is_empty() {
+            for (i, line) in file_lines.iter().enumerate() {
+                if line.contains(first_old_line) {
+                    let ctx_start = i.saturating_sub(5);
+                    let ctx_end = (i + 6).min(file_lines.len());
+                    err_msg.push_str(&format!("[near match at L{}]\n", i + 1));
+                    for j in ctx_start..ctx_end {
+                        let marker = if j == i { ">" } else { " " };
+                        err_msg.push_str(&format!("{marker}{:>4}│{}\n", j + 1, file_lines[j]));
+                    }
+                    break;
+                }
+            }
+        }
+        err_msg.push_str(&format!("[{path_str}: {} lines total]\n", file_lines.len()));
+        return Ok(ToolResult::err(err_msg));
     }
 
     if count > 1 {
@@ -86,12 +106,17 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         }
     }
 
-    // Show 3 lines of context around the edit
-    let context_start = edit_start.saturating_sub(3);
-    let context_end = (edit_start + new_lines.len() + 3).min(edited_lines.len());
+    // Show ±10 lines of context around the edit so the model has enough
+    // surrounding code to attempt follow-up edits without re-reading.
+    let context_start = edit_start.saturating_sub(10);
+    let context_end = (edit_start + new_lines.len() + 10).min(edited_lines.len());
 
     let total_lines = edited_lines.len();
-    let mut output = format!("✓ Edited {path_str} (1 replacement)\n");
+    let mut output = format!(
+        "✓ Edited {path_str} (1 replacement, showing L{}-{})\n",
+        context_start + 1,
+        context_end
+    );
     for i in context_start..context_end {
         let marker = if i >= edit_start && i < edit_start + new_lines.len() {
             "+"

@@ -66,6 +66,16 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         ));
     }
 
+    // Include the tail of the written file so the model can verify correctness
+    // and make follow-up edits without a separate read_file call.
+    let lines: Vec<&str> = content.lines().collect();
+    let tail_start = lines.len().saturating_sub(30);
+    output.push_str("[tail]\n");
+    for (i, line) in lines[tail_start..].iter().enumerate() {
+        let line_num = tail_start + i + 1;
+        output.push_str(&format!("{line_num:>4}│{line}\n"));
+    }
+
     Ok(ToolResult::ok(output))
 }
 

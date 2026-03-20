@@ -374,6 +374,49 @@ async fn shell_runs_in_project_root() {
     assert!(result.content.contains("found"));
 }
 
+// ── shell output truncation ─────────────────────────────────────────
+
+#[tokio::test]
+async fn shell_truncates_very_long_lines() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // Generate a single line with 200K characters (no newlines)
+    // Use printf with brace expansion — avoids pipes which can cause issues with shell tool's try_wait
+    let args = json!({"command": "printf 'x%.0s' $(seq 1 200000)"});
+    let result = tools::execute_tool("shell", &args, &config, &perms(&config))
+        .await
+        .unwrap();
+
+    assert!(result.success, "command should succeed: {}", result.content);
+    // Output should be capped, not 200K+ chars
+    assert!(
+        result.content.len() < 50_000,
+        "Shell output should be truncated for very long lines, got {} bytes",
+        result.content.len()
+    );
+}
+
+#[tokio::test]
+async fn shell_truncates_many_lines() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // Generate 500 lines of output
+    let args = json!({"command": "seq 1 500"});
+    let result = tools::execute_tool("shell", &args, &config, &perms(&config))
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(
+        result.content.contains("showing last 100"),
+        "Should indicate truncation: {}",
+        result.content.lines().next().unwrap_or("")
+    );
+    // Should keep the LAST 100 lines (tail priority), so "500" should be visible
+    assert!(result.content.contains("500"), "Should contain the last line (500)");
+    // "1" (first line) might or might not be visible depending on exact truncation
+}
+
 // ── task_update ─────────────────────────────────────────────────────
 
 #[tokio::test]
