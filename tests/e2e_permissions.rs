@@ -30,6 +30,12 @@ async fn path_jail_blocks_absolute_path() {
         "should block absolute path: {}",
         result.content
     );
+    // Error message should include the project root so the model knows where to look
+    assert!(
+        result.content.contains("relative to the project root:"),
+        "should mention project root in error: {}",
+        result.content
+    );
 }
 
 #[tokio::test]
@@ -255,4 +261,38 @@ fn headless_auto_approves_web() {
 
     let result = perms.check(&Action::WebFetch("https://example.com".into()));
     assert!(result.is_ok());
+}
+
+// ── Project root is always cwd ──────────────────────────────────────
+
+#[test]
+fn project_root_is_cwd() {
+    use miniswe::config::Config;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let project = tmp.path().join("myproject");
+    fs::create_dir_all(&project).unwrap();
+
+    // is_initialized checks for .miniswe/ directory
+    let mut config = Config::default();
+    config.project_root = project.clone();
+    assert!(!config.is_initialized(), "no .miniswe/ dir yet");
+
+    // Create .miniswe/ — now initialized
+    fs::create_dir_all(project.join(".miniswe")).unwrap();
+    assert!(config.is_initialized(), "should be initialized with .miniswe/ dir");
+}
+
+#[test]
+fn global_config_dir_is_in_home() {
+    use miniswe::config::Config;
+
+    let global = Config::global_dir();
+    assert!(global.is_some(), "should resolve home dir");
+    let path = global.unwrap();
+    assert!(
+        path.ends_with(".miniswe"),
+        "global dir should be ~/.miniswe, got {}",
+        path.display()
+    );
 }

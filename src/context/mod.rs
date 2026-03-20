@@ -13,6 +13,45 @@
 pub mod compress;
 
 use crate::config::Config;
+
+/// Embedded user guide — baked into the binary, injected into context when
+/// the user asks meta-questions about the tool.
+const USAGE_GUIDE: &str = include_str!("../../docs/usage.md");
+
+/// Detect whether the user's message is asking about how the tool itself works.
+/// Triggers on questions about sessions, configuration, tools, shortcuts, etc.
+fn is_meta_question(message: &str) -> bool {
+    let lower = message.to_lowercase();
+
+    // Must look like a question (not a task)
+    let is_question = lower.contains("how do")
+        || lower.contains("how can")
+        || lower.contains("how to")
+        || lower.contains("what is")
+        || lower.contains("what are")
+        || lower.contains("where is")
+        || lower.contains("where do")
+        || lower.contains("can i")
+        || lower.contains("can you")
+        || lower.contains("tell me about")
+        || lower.contains("explain")
+        || lower.ends_with('?');
+
+    if !is_question {
+        return false;
+    }
+
+    // Must reference the tool or its features
+    let tool_terms = [
+        "miniswe", "session", "continue", "previous", "scratchpad",
+        "config", "configure", "setting", "keyboard", "shortcut",
+        "permission", "tool", "command", "repl", "plan mode",
+        "index", "repo map", "log", "logging", "guide",
+        "init", "web search", "headless", ".miniswe",
+    ];
+
+    tool_terms.iter().any(|term| lower.contains(term))
+}
 use crate::knowledge::graph::DependencyGraph;
 use crate::knowledge::repo_map;
 use crate::knowledge::ProjectIndex;
@@ -349,6 +388,13 @@ pub fn assemble(
     // 1. System prompt (compressed)
     let mut system_context = build_system_prompt();
 
+    // 1b. Project root — tells the model where it is and that all file
+    // paths in tool calls are relative to this directory.
+    system_context.push_str(&format!(
+        "[PROJECT ROOT]{}\nAll file paths are relative to this directory. Use relative paths only.\n",
+        config.project_root.display()
+    ));
+
     // 2. Project profile (compressed to structured format)
     if let Some(profile) = load_profile(config) {
         system_context.push_str("\n");
@@ -404,6 +450,13 @@ pub fn assemble(
     if let Some(scratchpad) = load_scratchpad(config) {
         system_context.push_str("\n[SCRATCHPAD]\n");
         system_context.push_str(&scratchpad);
+    }
+
+    // 8. Self-documentation: inject the usage guide when the user is asking
+    // about how the tool works, how to continue sessions, etc.
+    if is_meta_question(user_message) {
+        system_context.push_str("\n[USAGE GUIDE]\n");
+        system_context.push_str(USAGE_GUIDE);
     }
 
     if plan_only {

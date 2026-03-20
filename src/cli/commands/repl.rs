@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::context;
 use crate::context::compress;
 use crate::llm::{ChatRequest, LlmClient, Message};
+use crate::logging::SessionLog;
 use crate::mcp::{McpConfig, McpRegistry};
 use crate::tools;
 use crate::tools::permissions::{Action, PermissionManager};
@@ -23,11 +24,21 @@ use crate::tui::app::{App, AppMode, LineStyle};
 use crate::tui::event::{self, AppEvent};
 use crate::tui::ui;
 
-/// After this many tool results, start masking old ones.
-const MASK_AFTER_RESULTS: usize = 6;
+/// Per-tool-type masking thresholds: how many recent full results to keep.
+fn mask_keep_count(tool_name: &str) -> usize {
+    match tool_name {
+        "read_file" | "read_symbol" => 3,
+        "write_file" | "edit" => 2,
+        "shell" | "diagnostics" => 2,
+        "search" | "web_search" | "web_fetch" | "docs_lookup" => 1,
+        _ => 2,
+    }
+}
 
 /// Run the interactive REPL with TUI.
 pub async fn run(config: Config, headless: bool) -> Result<()> {
+    let log = SessionLog::new(&config);
+
     let client = LlmClient::new(config.model.clone());
     let perms = if headless {
         PermissionManager::headless(&config)
@@ -208,6 +219,8 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                 let mcp_ref = &mut mcp_registry;
                                 let conv_ref = &mut conversation_history;
 
+                                log.user_message(&input);
+
                                 // Run agent loop inline (not spawned — needs mutable refs)
                                 run_agent_loop(
                                     &mut app,
@@ -222,6 +235,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                     &mut messages,
                                     conv_ref,
                                     max_rounds,
+                                    &log,
                                 ).await;
 
                                 app.is_thinking = false;
@@ -302,7 +316,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
 /// This runs inline in the main loop, processing events between rounds.
 async fn run_agent_loop(
     app: &mut App,
-    _rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+    rx: &mut mpsc::UnboundedReceiver<AppEvent>,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     client: &LlmClient,
     tool_defs: &[crate::llm::ToolDefinition],
@@ -313,6 +327,7 @@ async fn run_agent_loop(
     messages: &mut Vec<Message>,
     conversation_history: &mut Vec<Message>,
     max_rounds: usize,
+    log: &SessionLog,
 ) {
     let mut round = 0;
     let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
@@ -327,15 +342,14 @@ async fn run_agent_loop(
         }
 
         round += 1;
+        log.round_start(round);
         if round > max_rounds {
             app.push_output("Maximum tool rounds reached.", LineStyle::Error);
             break;
         }
 
-        // Observation masking
-        if tool_result_log.len() > MASK_AFTER_RESULTS {
-            mask_old_tool_results(messages, &tool_result_log);
-        }
+        // Observation masking (per-type thresholds)
+        mask_old_tool_results(messages, &tool_result_log);
 
         // Sanitize messages
         context::sanitize_messages(messages);
@@ -375,6 +389,7 @@ async fn run_agent_loop(
                         } else {
                             err_str
                         };
+                        log.llm_error(&clean);
                         app.push_output(&format!("LLM error: {clean}"), LineStyle::Error);
                     }
                     break;
@@ -395,6 +410,9 @@ async fn run_agent_loop(
         // Flush any remaining tokens
         app.flush_tokens();
 
+        if let Some(content) = &assistant_msg.content {
+            log.llm_response(content);
+        }
         conversation_history.push(assistant_msg.clone());
 
         let tool_calls = match &assistant_msg.tool_calls {
@@ -438,13 +456,14 @@ async fn run_agent_loop(
             }
             let repeat_count = recent_calls.iter().filter(|c| *c == &call_key).count();
             if repeat_count >= 3 {
+                log.loop_detected(&tc.function.name, &args_summary, repeat_count);
                 app.push_output(
                     &format!("  ✗ Loop detected: {}({}) called {} times — stopping", tc.function.name, args_summary, repeat_count),
                     LineStyle::Error,
                 );
                 let result_msg = Message::tool_result(
                     &tc.id,
-                    "ERROR: You are in a loop, calling the same tool repeatedly. Stop and summarize what you've accomplished so far.",
+                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times with no edits in between. Try a different approach, or explain what's blocking you.",
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
@@ -452,6 +471,7 @@ async fn run_agent_loop(
                 continue;
             }
 
+            log.tool_call_detail(&tc.function.name, &args);
             app.push_output(
                 &format!("  → {}({})", tc.function.name, args_summary),
                 LineStyle::ToolCall,
@@ -460,20 +480,84 @@ async fn run_agent_loop(
             // Re-render to show tool call
             let _ = terminal.draw(|frame| ui::draw(frame, app));
 
-            // Execute tool
+            // Determine if this tool call needs a permission prompt
+            let perm_action = match tc.function.name.as_str() {
+                "shell" => Some(Action::Shell(args["command"].as_str().unwrap_or("").into())),
+                "web_search" => Some(Action::WebSearch(args["query"].as_str().unwrap_or("").into())),
+                "web_fetch" => Some(Action::WebFetch(args["url"].as_str().unwrap_or("").into())),
+                "mcp_use" => Some(Action::McpUse(
+                    args["server"].as_str().unwrap_or("").into(),
+                    args["tool"].as_str().unwrap_or("").into(),
+                )),
+                _ => None,
+            };
+
+            // Check permission via TUI prompt (not raw stderr)
+            let mut perm_denied = false;
+            if let Some(ref action) = perm_action {
+                match perms.check_needs_prompt(action) {
+                    Err(e) => {
+                        // Blocklisted — skip this tool call
+                        let result_msg = Message::tool_result(&tc.id, &e);
+                        messages.push(result_msg.clone());
+                        conversation_history.push(result_msg);
+                        app.push_output(&format!("  ✗ {}: {e}", tc.function.name), LineStyle::ToolErr);
+                        continue;
+                    }
+                    Ok(Some(prompt)) => {
+                        // Needs user approval — show prompt in TUI
+                        app.pending_permission = Some(prompt);
+                        app.input.clear();
+                        app.cursor = 0;
+                        let _ = terminal.draw(|frame| ui::draw(frame, app));
+
+                        // Wait for user input (y/n/a)
+                        let response = wait_for_permission_input(app, rx, terminal).await;
+                        app.pending_permission = None;
+
+                        match response.as_str() {
+                            "y" | "yes" => {
+                                perms.approve(action, false);
+                            }
+                            "a" | "always" => {
+                                perms.approve(action, true);
+                            }
+                            _ => {
+                                perm_denied = true;
+                            }
+                        }
+
+                        let _ = terminal.draw(|frame| ui::draw(frame, app));
+                    }
+                    Ok(None) => {} // No prompt needed
+                }
+            }
+
+            if perm_denied {
+                let result_msg = Message::tool_result(
+                    &tc.id,
+                    &format!("{} denied by user", tc.function.name),
+                );
+                messages.push(result_msg.clone());
+                conversation_history.push(result_msg);
+                app.push_output(
+                    &format!("  ✗ {}: denied", tc.function.name),
+                    LineStyle::ToolErr,
+                );
+                continue;
+            }
+
+            // Execute tool (permissions already checked above for shell/web/mcp)
             let result = if tc.function.name == "mcp_use" {
                 let server = args["server"].as_str().unwrap_or("");
                 let tool = args["tool"].as_str().unwrap_or("");
                 let tool_args = args.get("arguments").cloned().unwrap_or_default();
-                match perms.check(&Action::McpUse(server.into(), tool.into())) {
-                    Err(e) => crate::tools::ToolResult::err(e),
-                    Ok(()) => match mcp_registry {
-                        Some(registry) => match registry.call_tool(server, tool, tool_args) {
-                            Ok(content) => crate::tools::ToolResult::ok(content),
-                            Err(e) => crate::tools::ToolResult::err(format!("MCP error: {e}")),
-                        },
-                        None => crate::tools::ToolResult::err("No MCP servers connected".into()),
+                match mcp_registry {
+                    Some(registry) => match registry.call_tool(server, tool, tool_args) {
+                        Ok(content) => crate::tools::ToolResult::ok(content),
+                        Err(e) => crate::tools::ToolResult::err(format!("MCP error: {e}")),
                     },
+                    None => crate::tools::ToolResult::err("No MCP servers connected".into()),
                 }
             } else {
                 match tools::execute_tool(&tc.function.name, &args, config, perms).await {
@@ -483,10 +567,19 @@ async fn run_agent_loop(
             };
 
             let first_line = result.content.lines().next().unwrap_or("(empty)");
+            log.tool_call(&tc.function.name, &args_summary, result.success, first_line);
+            log.tool_result_detail(&tc.function.name, result.success, &result.content);
             let style = if result.success { LineStyle::ToolOk } else { LineStyle::ToolErr };
             let icon = if result.success { "✓" } else { "✗" };
             app.push_output(&format!("  {icon} {}: {first_line}", tc.function.name), style);
             app.store_tool_result(&tc.function.name, &result.content);
+
+            // Successful edit/write = code changed, reset loop detector
+            if result.success
+                && (tc.function.name == "edit" || tc.function.name == "write_file")
+            {
+                recent_calls.clear();
+            }
 
             tool_result_log.push((
                 tc.function.name.clone(),
@@ -504,30 +597,51 @@ async fn run_agent_loop(
     }
 }
 
-/// Replace old tool results with compressed summaries.
+/// Replace old tool results with compressed summaries using per-type thresholds.
 fn mask_old_tool_results(
     messages: &mut Vec<Message>,
     tool_result_log: &[(String, serde_json::Value, String)],
 ) {
-    let mask_count = tool_result_log.len().saturating_sub(MASK_AFTER_RESULTS);
-    if mask_count == 0 {
+    if tool_result_log.is_empty() {
         return;
     }
 
-    let old_results: Vec<String> = tool_result_log[..mask_count]
+    let mut type_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    let mut should_mask: Vec<bool> = vec![false; tool_result_log.len()];
+
+    for i in (0..tool_result_log.len()).rev() {
+        let tool_name = tool_result_log[i].0.as_str();
+        let count = type_counts.entry(tool_name).or_insert(0);
+        *count += 1;
+        if *count > mask_keep_count(tool_name) {
+            should_mask[i] = true;
+        }
+    }
+
+    if !should_mask.iter().any(|m| *m) {
+        return;
+    }
+
+    let summaries: Vec<Option<String>> = tool_result_log
         .iter()
-        .map(|(name, args, content)| compress::summarize_tool_result(name, args, content))
+        .enumerate()
+        .map(|(i, (name, args, content))| {
+            if should_mask[i] {
+                Some(compress::summarize_tool_result(name, args, content))
+            } else {
+                None
+            }
+        })
         .collect();
 
-    let mut tool_msg_count = 0;
+    let mut tool_msg_idx = 0;
     for msg in messages.iter_mut() {
         if msg.role == "tool" {
-            if tool_msg_count < mask_count {
-                if let Some(summary) = old_results.get(tool_msg_count) {
-                    msg.content = Some(summary.clone());
-                }
+            if let Some(Some(summary)) = summaries.get(tool_msg_idx) {
+                msg.content = Some(summary.clone());
             }
-            tool_msg_count += 1;
+            tool_msg_idx += 1;
         }
     }
 }
@@ -574,5 +688,45 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
             format!("{server}/{tool}")
         }
         _ => format!("{args}"),
+    }
+}
+
+/// Wait for the user to respond to a permission prompt in the TUI.
+/// Blocks until Enter is pressed, returns the trimmed input (e.g., "y", "n", "a").
+async fn wait_for_permission_input(
+    app: &mut App,
+    rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> String {
+    loop {
+        let _ = terminal.draw(|frame| ui::draw(frame, app));
+
+        let evt = match rx.recv().await {
+            Some(e) => e,
+            None => return "n".into(),
+        };
+
+        match evt {
+            AppEvent::Key(key) => {
+                match key.code {
+                    KeyCode::Enter => {
+                        let response = app.input.trim().to_lowercase();
+                        app.input.clear();
+                        app.cursor = 0;
+                        return response;
+                    }
+                    KeyCode::Char(c) => app.insert_char(c),
+                    KeyCode::Backspace => app.delete_char(),
+                    KeyCode::Esc => {
+                        app.input.clear();
+                        app.cursor = 0;
+                        return "n".into();
+                    }
+                    _ => {}
+                }
+            }
+            AppEvent::Tick => {} // re-render
+            _ => {}
+        }
     }
 }

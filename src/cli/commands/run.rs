@@ -18,6 +18,7 @@ use crate::config::Config;
 use crate::context;
 use crate::context::compress;
 use crate::llm::{ChatRequest, LlmClient, Message};
+use crate::logging::SessionLog;
 use crate::mcp::{McpConfig, McpRegistry};
 use crate::tools;
 use crate::tools::permissions::{Action, PermissionManager};
@@ -38,6 +39,9 @@ fn mask_keep_count(tool_name: &str) -> usize {
 
 /// Run the agent for a single message.
 pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()> {
+    let log = SessionLog::new(&config);
+    log.user_message(message);
+
     let client = LlmClient::new(config.model.clone());
     let perms = if headless {
         PermissionManager::headless(&config)
@@ -47,7 +51,6 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let mut tool_defs = tools::tool_definitions();
 
     // Clear stale scratchpad/plan from previous sessions
-    // (only persist with --continue, which isn't implemented yet)
     let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
     let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
 
@@ -120,6 +123,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         plan_only,
         mcp_summary.as_deref(),
     );
+    log.context_assembled(assembled.token_estimate, assembled.messages.len());
     tui::print_status(&format!(
         "Context: ~{} tokens assembled",
         assembled.token_estimate
@@ -129,6 +133,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
     loop {
         round += 1;
+        log.round_start(round);
         if round > max_rounds {
             tui::print_error("Maximum tool rounds reached. Stopping.");
             break;
@@ -160,7 +165,12 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
         // Apply observation masking: replace old tool results with summaries
         // (per-type thresholds — keeps reads longer than writes/searches)
+        let pre_mask = tool_result_log.len();
         mask_old_tool_results(&mut messages, &tool_result_log);
+        log.masking_applied(
+            messages.iter().filter(|m| m.role == "tool" && m.content.as_ref().is_some_and(|c| c.starts_with('['))).count(),
+            pre_mask,
+        );
 
         // Sanitize message roles before sending (strict chat template compat)
         context::sanitize_messages(&mut messages);
@@ -212,6 +222,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 } else {
                     err_str
                 };
+                log.llm_error(&clean);
                 tui::print_error(&format!("LLM error: {clean}"));
                 tui::print_status(&format!(
                     "Check that your LLM server is running at {}",
@@ -238,7 +249,10 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             println!();
         }
 
-        // Add assistant message to history
+        // Log and add assistant message to history
+        if let Some(content) = &assistant_msg.content {
+            log.llm_response(content);
+        }
         conversation_history.push(assistant_msg.clone());
 
         // Check for tool calls
@@ -282,19 +296,21 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             }
             let repeat_count = recent_calls.iter().filter(|c| *c == &call_key).count();
             if repeat_count >= 3 {
+                log.loop_detected(&tc.function.name, &args_summary, repeat_count);
                 tui::print_error(&format!(
                     "Loop detected: {}({}) called {} times — stopping",
                     tc.function.name, args_summary, repeat_count
                 ));
                 let result_msg = Message::tool_result(
                     &tc.id,
-                    "ERROR: You are in a loop, calling the same tool repeatedly. Stop and summarize what you've accomplished so far.",
+                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times with no edits in between. Try a different approach, or explain what's blocking you.",
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
                 continue;
             }
 
+            log.tool_call_detail(&tc.function.name, &args);
             tui::print_tool_call(&tc.function.name, &args_summary);
 
             // Block edit tools in plan-only mode
@@ -336,7 +352,17 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             };
 
             let first_line = result.content.lines().next().unwrap_or("(empty)");
+            log.tool_call(&tc.function.name, &args_summary, result.success, first_line);
+            log.tool_result_detail(&tc.function.name, result.success, &result.content);
             tui::print_tool_result(&tc.function.name, result.success, first_line);
+
+            // A successful edit/write means code changed — the next shell/test
+            // call is on different code, so it's not a loop. Reset the tracker.
+            if result.success
+                && (tc.function.name == "edit" || tc.function.name == "write_file")
+            {
+                recent_calls.clear();
+            }
 
             // Log for future observation masking
             tool_result_log.push((
@@ -350,6 +376,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             conversation_history.push(result_msg);
         }
     }
+
+    log.session_end(round, had_error);
 
     tui::print_separator();
     if !had_error {

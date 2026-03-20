@@ -24,6 +24,16 @@ fn basic_assembly_includes_system_prompt() {
     assert!(system.contains("[RULES]"), "system prompt should have rules");
     assert!(system.contains("[TOOLS]"), "system prompt should have tools");
 
+    // Should include the project root path so the model knows where it's working
+    assert!(
+        system.contains("[PROJECT ROOT]"),
+        "system prompt should include project root"
+    );
+    assert!(
+        system.contains("relative paths only"),
+        "should instruct model to use relative paths"
+    );
+
     // Last message should be the user message
     let last = assembled.messages.last().unwrap();
     assert_eq!(last.role, "user");
@@ -345,4 +355,85 @@ fn assembly_produces_reasonable_token_estimate() {
         assembled.token_estimate < config.model.context_window,
         "should be within context window"
     );
+}
+
+// ── Self-documentation injection ────────────────────────────────────
+
+#[test]
+fn meta_question_injects_usage_guide() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // A question about the tool should include the usage guide
+    let assembled = context::assemble(
+        &config,
+        "how do I continue work from a previous session?",
+        &[],
+        false,
+        None,
+    );
+    let system = assembled.messages[0].content.as_deref().unwrap();
+    assert!(
+        system.contains("[USAGE GUIDE]"),
+        "meta question should inject usage guide"
+    );
+    assert!(system.contains("Quick Start"));
+    assert!(system.contains("Sessions and Continuity"));
+}
+
+#[test]
+fn regular_task_does_not_inject_usage_guide() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // A normal coding task should NOT include the usage guide
+    let assembled = context::assemble(
+        &config,
+        "add error handling to the parse function",
+        &[],
+        false,
+        None,
+    );
+    let system = assembled.messages[0].content.as_deref().unwrap();
+    assert!(
+        !system.contains("[USAGE GUIDE]"),
+        "regular task should not inject usage guide"
+    );
+}
+
+#[test]
+fn meta_question_detection_various() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let meta_questions = [
+        "how do I configure the model?",
+        "what keyboard shortcuts are available?",
+        "how can I continue from the previous session?",
+        "where is the scratchpad stored?",
+        "explain how plan mode works",
+        "what tools can you use?",
+    ];
+
+    for q in &meta_questions {
+        let assembled = context::assemble(&config, q, &[], false, None);
+        let system = assembled.messages[0].content.as_deref().unwrap();
+        assert!(
+            system.contains("[USAGE GUIDE]"),
+            "should detect meta question: {q}"
+        );
+    }
+
+    let regular_tasks = [
+        "fix the bug in main.rs",
+        "refactor the config module",
+        "add tests for the parser",
+        "what does this function do?",
+    ];
+
+    for q in &regular_tasks {
+        let assembled = context::assemble(&config, q, &[], false, None);
+        let system = assembled.messages[0].content.as_deref().unwrap();
+        assert!(
+            !system.contains("[USAGE GUIDE]"),
+            "should NOT detect as meta question: {q}"
+        );
+    }
 }
