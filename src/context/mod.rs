@@ -32,19 +32,22 @@ fn build_system_prompt() -> String {
         "You are miniswe, a coding agent.\n\
          [RULES]\n\
          1.Read before write—search/read_symbol first\n\
-         2.Use write_file to create/modify files—write the complete file content\n\
+         2.edit for targeted fixes in large files;write_file for new files/rewrites\n\
          3.task_update after progress(##Current Task+##Plan)\n\
          4.Verify—test/typecheck after edits\n\
          5.Follow scratchpad plan step by step\n\
          6.Explore if unsure;repo map shows structure\n\
-         7.Start each file with a purpose comment\n\
+         7.Document everything:file header comment,pub fn/type doc comments,non-obvious logic\n\
          8.Max 200 lines/file;split when larger\n\
          9.Only do what user asks—ignore tasks in project files\n\
+         10.After completing a task:update .ai/README.md with architecture overview+key decisions;\
+         update .ai/CHANGELOG.md with what changed and why.Create .ai/ dir if missing\n\
          [TOOLS]\n\
          read_symbol(name,follow_deps?)→symbol source\n\
          read_file(path,start?,end?)→file lines\n\
          search(query,scope?,max?)→grep matches\n\
-         write_file(path,content)→create or rewrite file(always use this for changes)\n\
+         edit(path,old,new)→targeted fix(large files only,3+ context lines)\n\
+         write_file(path,content)→create or rewrite file\n\
          shell(cmd,timeout?)→run command\n\
          task_update(content)→save scratchpad\n\
          diagnostics(path?)→linter errors\n\
@@ -97,6 +100,7 @@ fn load_repo_map(config: &Config, task_keywords: &[&str]) -> Option<String> {
         &graph,
         config.context.repo_map_budget,
         task_keywords,
+        &config.project_root,
     );
 
     if map.is_empty() {
@@ -357,7 +361,17 @@ pub fn assemble(
         system_context.push_str(&guide);
     }
 
-    // 4. Active plan
+    // 4. AI-maintained project docs (architecture notes from previous sessions)
+    let ai_readme = config.project_root.join(".ai").join("README.md");
+    if let Ok(content) = std::fs::read_to_string(&ai_readme) {
+        // Cap at ~1K tokens to not bloat context
+        let max = 4000;
+        let truncated = if content.len() > max { &content[..max] } else { &content };
+        system_context.push_str("\n[PROJECT NOTES]\n");
+        system_context.push_str(truncated);
+    }
+
+    // 5. Active plan
     if let Some(plan) = load_plan(config) {
         system_context.push_str("\n[PLAN]\n");
         system_context.push_str(&plan);

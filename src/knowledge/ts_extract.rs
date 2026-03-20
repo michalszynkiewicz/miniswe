@@ -213,10 +213,11 @@ pub fn extract(file: &str, content: &str, ext: &str) -> Option<ExtractionResult>
                 name: name.clone(),
                 file: file.into(),
                 line,
-                kind: map_syntax_type(&syntax_type),
+                kind: map_syntax_type(&syntax_type, ext),
                 signature: sig_line,
-                end_line: 0, // filled by compute_end_lines after extraction
+                end_line: 0,
                 deps: Vec::new(),
+                parent_impl: None,
             });
         } else {
             // It's a reference
@@ -225,6 +226,12 @@ pub fn extract(file: &str, content: &str, ext: &str) -> Option<ExtractionResult>
                 file: file.into(),
             });
         }
+    }
+
+    // Second pass for Rust: extract impl blocks and assign parent_impl to methods
+    #[cfg(feature = "lang-rust")]
+    if ext == "rs" {
+        enrich_rust_impl_blocks(file, content, &mut result);
     }
 
     Some(result)
@@ -321,11 +328,146 @@ pub fn enabled_languages() -> Vec<&'static str> {
     langs
 }
 
+/// Enrich Rust symbols with impl block information.
+///
+/// Scans source for `impl` lines, determines their brace ranges,
+/// and sets `parent_impl` on methods that fall within those ranges.
+/// Also adds impl blocks as standalone symbols.
+#[cfg(feature = "lang-rust")]
+fn enrich_rust_impl_blocks(file: &str, content: &str, result: &mut ExtractionResult) {
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Find impl blocks: line number + header signature + brace range
+    let mut impl_blocks: Vec<(usize, usize, String)> = Vec::new(); // (start_line, end_line, header)
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("impl") {
+            continue;
+        }
+        // Must be an impl block, not just a word starting with "impl"
+        let after_impl = &trimmed[4..];
+        if after_impl.is_empty() || (!after_impl.starts_with(' ') && !after_impl.starts_with('<')) {
+            continue;
+        }
+
+        // Extract the header (everything up to the opening brace)
+        let header = trimmed.trim_end_matches('{').trim().to_string();
+
+        // Find the closing brace by tracking depth
+        let mut depth = 0;
+        let mut end = i;
+        for j in i..lines.len() {
+            for ch in lines[j].chars() {
+                if ch == '{' { depth += 1; }
+                if ch == '}' { depth -= 1; }
+            }
+            if depth <= 0 && j > i {
+                end = j;
+                break;
+            }
+        }
+        if end == i {
+            end = lines.len().saturating_sub(1);
+        }
+
+        impl_blocks.push((i + 1, end + 1, header)); // 1-indexed
+    }
+
+    // Add impl blocks as symbols
+    for (start, end, header) in &impl_blocks {
+        // Extract the type name from the impl header
+        // "impl<T> Trait for Type<T>" → "Type"
+        // "impl Type" → "Type"
+        let name = extract_impl_type_name(header);
+
+        result.symbols.push(super::Symbol {
+            name: format!("impl {name}"),
+            file: file.into(),
+            line: *start,
+            end_line: *end,
+            kind: "impl".into(),
+            signature: header.clone(),
+            deps: Vec::new(),
+            parent_impl: None,
+        });
+    }
+
+    // Assign parent_impl to methods that fall within impl block ranges
+    for sym in result.symbols.iter_mut() {
+        if sym.file != file || sym.parent_impl.is_some() {
+            continue;
+        }
+        if sym.kind != "function" {
+            continue;
+        }
+        for (start, end, header) in &impl_blocks {
+            if sym.line > *start && sym.line < *end {
+                sym.parent_impl = Some(header.clone());
+                break;
+            }
+        }
+    }
+}
+
+/// Extract the primary type name from an impl header.
+/// "impl<T: Clone> Service<Request> for Router<T>" → "Router"
+/// "impl Router" → "Router"
+/// "impl<T> Router<T>" → "Router"
+#[cfg(feature = "lang-rust")]
+fn extract_impl_type_name(header: &str) -> String {
+    // If "for " exists, the type is after "for"
+    let type_part = if let Some(pos) = header.find(" for ") {
+        &header[pos + 5..]
+    } else {
+        // No "for" — type is after "impl" (and optional generics)
+        let after_impl = header.trim_start_matches("impl").trim();
+        // Skip generic params: "impl<T: Clone> Router<T>" → "Router<T>"
+        if after_impl.starts_with('<') {
+            // Find matching >
+            let mut depth = 0;
+            let mut end = 0;
+            for (i, ch) in after_impl.chars().enumerate() {
+                if ch == '<' { depth += 1; }
+                if ch == '>' { depth -= 1; }
+                if depth == 0 {
+                    end = i + 1;
+                    break;
+                }
+            }
+            after_impl[end..].trim()
+        } else {
+            after_impl
+        }
+    };
+
+    // Take just the name (before any <)
+    type_part
+        .split('<')
+        .next()
+        .unwrap_or(type_part)
+        .split_whitespace()
+        .next()
+        .unwrap_or("Unknown")
+        .to_string()
+}
+
 /// Map tree-sitter syntax type names to our normalized kind names.
-fn map_syntax_type(syntax_type: &str) -> String {
+///
+/// Tree-sitter's tags system uses language-agnostic types (e.g., "class" for
+/// any type definition). We normalize these to language-specific kinds so the
+/// LLM sees consistent terminology (e.g., "struct" for Rust, "class" for Python).
+fn map_syntax_type(syntax_type: &str, ext: &str) -> String {
     match syntax_type {
         "function" | "method" | "function.method" => "function".into(),
-        "class" => "class".into(),
+        "class" => {
+            // Rust/Go structs are reported as "class" by tree-sitter tags
+            match ext {
+                "rs" => "struct".into(),
+                "go" => "struct".into(),
+                _ => "class".into(),
+            }
+        }
         "module" => "module".into(),
         "struct" => "struct".into(),
         "enum" => "enum".into(),

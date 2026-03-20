@@ -10,6 +10,7 @@
 //! - Tier 2+: Omitted (not included)
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use super::graph::DependencyGraph;
 use super::{ProjectIndex, Symbol};
@@ -20,11 +21,15 @@ use super::{ProjectIndex, Symbol};
 ///
 /// `task_keywords` personalizes the ranking — files matching these keywords
 /// get boosted in the PageRank scores.
+///
+/// If `project_root` is provided, files that no longer exist on disk are
+/// skipped to avoid sending stale paths to the LLM.
 pub fn render(
     index: &ProjectIndex,
     graph: &DependencyGraph,
     token_budget: usize,
     task_keywords: &[&str],
+    project_root: &Path,
 ) -> String {
     if index.symbols.is_empty() {
         return String::new();
@@ -68,18 +73,17 @@ pub fn render(
     let tier1_count = find_tier1_cutoff(&ranked_files, &file_symbols, token_budget);
 
     for (i, (file, _score)) in ranked_files.iter().enumerate() {
+        // Skip files that no longer exist on disk
+        if !project_root.join(file).exists() {
+            continue;
+        }
+
         let symbols = match file_symbols.get(file) {
             Some(s) => s,
             None => continue,
         };
 
-        // Filter out impl blocks for cleaner output
-        let display_symbols: Vec<&&Symbol> = symbols
-            .iter()
-            .filter(|s| s.kind != "impl")
-            .collect();
-
-        if display_symbols.is_empty() {
+        if symbols.is_empty() {
             continue;
         }
 
@@ -101,23 +105,56 @@ pub fn render(
         used_tokens += header_tokens;
 
         if is_tier1 {
-            // Tier 1: full signatures
-            for sym in &display_symbols {
-                let line = format!("│ {}\n", sym.signature);
-                let line_tokens = estimate_tokens(&line);
-                if used_tokens + line_tokens > token_budget {
-                    output.push_str("│ ...\n");
-                    used_tokens += 2;
-                    break;
+            // Tier 1: full signatures, grouped by impl block
+            let mut printed_impls: Vec<String> = Vec::new();
+
+            for sym in symbols {
+                // Skip standalone impl symbols — they'll be printed as headers
+                if sym.kind == "impl" {
+                    continue;
                 }
-                output.push_str(&line);
-                used_tokens += line_tokens;
+
+                // If method has a parent_impl, print the impl header first
+                if let Some(ref impl_header) = sym.parent_impl {
+                    if !printed_impls.contains(impl_header) {
+                        let impl_line = format!("│ {impl_header}\n");
+                        let impl_tokens = estimate_tokens(&impl_line);
+                        if used_tokens + impl_tokens > token_budget {
+                            output.push_str("│ ...\n");
+                            used_tokens += 2;
+                            break;
+                        }
+                        output.push_str(&impl_line);
+                        used_tokens += impl_tokens;
+                        printed_impls.push(impl_header.clone());
+                    }
+                    // Indent method under its impl
+                    let line = format!("│   {}\n", sym.signature);
+                    let line_tokens = estimate_tokens(&line);
+                    if used_tokens + line_tokens > token_budget {
+                        break;
+                    }
+                    output.push_str(&line);
+                    used_tokens += line_tokens;
+                } else {
+                    // Standalone symbol (struct, enum, function outside impl)
+                    let line = format!("│ {}\n", sym.signature);
+                    let line_tokens = estimate_tokens(&line);
+                    if used_tokens + line_tokens > token_budget {
+                        output.push_str("│ ...\n");
+                        used_tokens += 2;
+                        break;
+                    }
+                    output.push_str(&line);
+                    used_tokens += line_tokens;
+                }
             }
         } else {
-            // Tier 0: names only, comma-separated
-            let names: Vec<&str> = display_symbols
+            // Tier 0: names only, including impl headers
+            let names: Vec<String> = symbols
                 .iter()
-                .map(|s| s.name.as_str())
+                .filter(|s| s.kind != "impl")
+                .map(|s| s.name.clone())
                 .collect();
             let names_line = format!("│ {}\n", names.join(", "));
             let names_tokens = estimate_tokens(&names_line);

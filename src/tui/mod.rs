@@ -1,12 +1,16 @@
 //! Terminal UI for miniswe.
 //!
-//! Provides a simple streaming output display for the agent loop.
-//! Phase 1: Basic terminal output with colors + spinner.
-//! Phase 2 (future): Full ratatui TUI with panels.
+//! Two modes:
+//! - Non-interactive (run.rs): uses print_* functions with ANSI codes
+//! - Interactive (repl.rs): uses ratatui TUI with split panes
+
+pub mod app;
+pub mod event;
+pub mod ui;
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+
+// === Non-interactive output functions (used by run.rs and headless mode) ===
 
 /// Print a styled header.
 pub fn print_header(text: &str) {
@@ -60,65 +64,19 @@ pub fn print_separator() {
     eprintln!("\x1b[2m──────────────────────────────────────────────────\x1b[0m");
 }
 
-/// Read a line of input from the user.
+/// Read a line of input from the user (for permission prompts).
 pub fn read_input(prompt: &str) -> Option<String> {
+    // Ensure terminal is in cooked mode for line input
+    let _ = crossterm::terminal::disable_raw_mode();
+
     eprint!("\x1b[1;35m{prompt}\x1b[0m ");
     io::stderr().flush().ok();
 
     let mut input = String::new();
     match io::stdin().read_line(&mut input) {
-        Ok(0) => None, // EOF
+        Ok(0) => None,
         Ok(_) => Some(input.trim().to_string()),
         Err(_) => None,
-    }
-}
-
-/// A spinner that shows activity while waiting for the LLM.
-/// Call `start()` before the LLM request, `stop()` when tokens start flowing.
-pub struct Spinner {
-    running: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Spinner {
-    /// Start the spinner with a label.
-    pub fn start(label: &str) -> Self {
-        let running = Arc::new(AtomicBool::new(true));
-        let running_clone = running.clone();
-        let label = label.to_string();
-
-        let handle = std::thread::spawn(move || {
-            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let mut i = 0;
-            while running_clone.load(Ordering::Relaxed) {
-                eprint!("\r\x1b[2m{} {}\x1b[0m", frames[i % frames.len()], label);
-                io::stderr().flush().ok();
-                std::thread::sleep(std::time::Duration::from_millis(80));
-                i += 1;
-            }
-            // Clear the spinner line
-            eprint!("\r\x1b[2K");
-            io::stderr().flush().ok();
-        });
-
-        Self {
-            running,
-            handle: Some(handle),
-        }
-    }
-
-    /// Stop the spinner.
-    pub fn stop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for Spinner {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 

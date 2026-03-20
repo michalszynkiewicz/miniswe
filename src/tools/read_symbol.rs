@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use crate::config::Config;
 use crate::context::compress;
 use crate::knowledge::ProjectIndex;
+use crate::knowledge::indexer;
 use super::ToolResult;
 
 /// Maximum lines to return per symbol.
@@ -31,7 +32,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 
     // Load the index
     let miniswe_dir = config.miniswe_dir();
-    let index = match ProjectIndex::load(&miniswe_dir) {
+    let mut index = match ProjectIndex::load(&miniswe_dir) {
         Ok(idx) => idx,
         Err(_) => {
             return Ok(ToolResult::err(
@@ -48,10 +49,63 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         )));
     }
 
+    // Verify symbol coordinates are still valid by checking that the symbol's
+    // name or signature still appears at the expected line in the file on disk.
+    // If not, the index is stale — reindex the file before returning.
+    let stale_files: Vec<String> = symbols
+        .iter()
+        .map(|s| s.file.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .filter(|file| {
+            let abs = config.project_root.join(file);
+            let content = match fs::read_to_string(&abs) {
+                Ok(c) => c,
+                Err(_) => return true, // file gone — stale
+            };
+            let lines: Vec<&str> = content.lines().collect();
+            // Check every symbol in this file: does the expected line still
+            // contain the symbol name?
+            symbols.iter().filter(|s| &s.file == file).any(|s| {
+                let idx = s.line.saturating_sub(1);
+                match lines.get(idx) {
+                    Some(line) => !line.contains(&s.name),
+                    None => true, // line out of bounds — stale
+                }
+            })
+        })
+        .collect();
+
+    if !stale_files.is_empty() {
+        for file in &stale_files {
+            let abs = config.project_root.join(file);
+            indexer::reindex_file(file, &abs, &mut index, &miniswe_dir);
+        }
+        // Re-lookup after reindex
+        let symbols = index.lookup(name);
+        if symbols.is_empty() {
+            return Ok(ToolResult::err(format!(
+                "Symbol '{name}' was removed from the file. Try search(\"{name}\") instead."
+            )));
+        }
+        return render_symbols(name, &symbols, follow_deps, &index, config);
+    }
+
+    let symbols = index.lookup(name);
+    render_symbols(name, &symbols, follow_deps, &index, config)
+}
+
+fn render_symbols(
+    name: &str,
+    symbols: &[&crate::knowledge::Symbol],
+    follow_deps: bool,
+    index: &ProjectIndex,
+    config: &Config,
+) -> Result<ToolResult> {
     let mut output = String::new();
     let mut symbols_shown = 0;
 
-    for sym in &symbols {
+    for sym in symbols {
         if symbols_shown >= MAX_SYMBOLS {
             output.push_str(&format!(
                 "\n... and {} more definitions. Use search for full results.\n",
@@ -77,7 +131,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     // Follow dependencies if requested
     if follow_deps && symbols_shown < MAX_SYMBOLS {
         let mut dep_names: Vec<&str> = Vec::new();
-        for sym in &symbols {
+        for sym in symbols {
             for dep in &sym.deps {
                 if dep != name && !dep_names.contains(&dep.as_str()) {
                     dep_names.push(dep.as_str());

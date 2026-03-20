@@ -12,6 +12,8 @@ snippet_budget = 12000
 history_turns = 5
 history_budget = 6000
 scratchpad_budget = 1500
+max_rounds = 100
+pause_after_rounds = 50
 
 [hardware]
 vram_gb = 24.0
@@ -19,5 +21,5 @@ vram_reserve_gb = 3.0
 ram_budget_gb = 80.0
 
 [web]
-search_backend = "duckduckgo"
+search_backend = "serper"
 fetch_backend = "jina"

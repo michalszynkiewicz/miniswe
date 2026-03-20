@@ -85,6 +85,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let mut had_error = false;
     let mut user_continued = false;
 
+    // Track tool calls for loop detection
+    let mut recent_calls: Vec<String> = Vec::new();
+
     // Track tool results for observation masking
     let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
 
@@ -261,6 +264,28 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             };
 
             let args_summary = summarize_args(&tc.function.name, &args);
+
+            // Detect tool call loops
+            let call_key = format!("{}:{}", tc.function.name, args_summary);
+            recent_calls.push(call_key.clone());
+            if recent_calls.len() > 6 {
+                recent_calls.remove(0);
+            }
+            let repeat_count = recent_calls.iter().filter(|c| *c == &call_key).count();
+            if repeat_count >= 3 {
+                tui::print_error(&format!(
+                    "Loop detected: {}({}) called {} times — stopping",
+                    tc.function.name, args_summary, repeat_count
+                ));
+                let result_msg = Message::tool_result(
+                    &tc.id,
+                    "ERROR: You are in a loop, calling the same tool repeatedly. Stop and summarize what you've accomplished so far.",
+                );
+                messages.push(result_msg.clone());
+                conversation_history.push(result_msg);
+                continue;
+            }
+
             tui::print_tool_call(&tc.function.name, &args_summary);
 
             // Block edit tools in plan-only mode

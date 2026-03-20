@@ -36,6 +36,10 @@ pub struct Symbol {
     pub signature: String,
     /// Symbols this depends on
     pub deps: Vec<String>,
+    /// For methods inside impl blocks: the impl header signature
+    /// e.g., "impl<T: Clone> Service<Request> for Router<T>"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_impl: Option<String>,
 }
 
 /// The project index — all extracted knowledge.
