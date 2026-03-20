@@ -216,6 +216,117 @@ fn after_nested() {
     assert_eq!(after.line, 11);
 }
 
+// ── count_braces edge cases ─────────────────────────────────────────
+
+#[test]
+fn end_line_with_raw_string() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // Raw string with inner quotes: r#"has "quotes" and }"# — the inner "
+    // should NOT end the string, but naive " detection exits string mode early.
+    let source = r##"fn with_raw_string() {
+    let s = r#"has "quotes" and }"#;
+    println!("{s}");
+}
+
+fn after_raw() {
+    println!("ok");
+}
+"##;
+    fs::write(helpers::project_path(&config, "raw.rs"), source).unwrap();
+
+    let index = indexer::index_project(&config.project_root, None).unwrap();
+
+    let sym = &index.lookup("with_raw_string")[0];
+    assert_eq!(sym.line, 1);
+    assert_eq!(
+        sym.end_line, 4,
+        "with_raw_string() should end at line 4, got {}",
+        sym.end_line
+    );
+}
+
+#[test]
+fn end_line_with_block_comment() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // Block comment with unbalanced brace: /* } */
+    let source = "\
+fn with_block_comment() {
+    /* } */
+    let x = 1;
+}
+
+fn after_comment() {
+    println!(\"ok\");
+}
+";
+    fs::write(helpers::project_path(&config, "block.rs"), source).unwrap();
+
+    let index = indexer::index_project(&config.project_root, None).unwrap();
+
+    let sym = &index.lookup("with_block_comment")[0];
+    assert_eq!(sym.line, 1);
+    assert_eq!(
+        sym.end_line, 4,
+        "with_block_comment() should end at line 4, got {}",
+        sym.end_line
+    );
+}
+
+#[test]
+fn end_line_with_escaped_backslash_before_quote() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // String ending with escaped backslash: "\\" followed by closing brace
+    // The \\\\ in the Rust literal becomes \\ on disk, so the file contains: "\\"}
+    // The " after \\ is the real end of the string (not escaped).
+    let source = "fn with_escaped_backslash() {\n    if true { let s = \"\\\\\"; }\n    println!(\"ok\");\n}\n\nfn after_escaped() {\n    println!(\"ok\");\n}\n";
+    fs::write(helpers::project_path(&config, "escaped.rs"), source).unwrap();
+
+    let index = indexer::index_project(&config.project_root, None).unwrap();
+
+    let sym = &index.lookup("with_escaped_backslash")[0];
+    assert_eq!(sym.line, 1);
+    assert_eq!(
+        sym.end_line, 4,
+        "with_escaped_backslash() should end at line 4, got {}",
+        sym.end_line
+    );
+}
+
+#[test]
+fn end_line_with_closure() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // Closures create nested braces that must not truncate the outer function
+    let source = "\
+fn with_closure() {
+    let items = vec![1, 2, 3];
+    let doubled: Vec<i32> = items.iter().map(|x| {
+        x * 2
+    }).collect();
+    println!(\"{doubled:?}\");
+}
+
+fn after_closure() {
+    println!(\"ok\");
+}
+";
+    fs::write(helpers::project_path(&config, "closure.rs"), source).unwrap();
+
+    let index = indexer::index_project(&config.project_root, None).unwrap();
+
+    let sym = &index.lookup("with_closure")[0];
+    assert_eq!(sym.line, 1);
+    assert_eq!(
+        sym.end_line, 7,
+        "with_closure() should end at line 7, got {} — \
+         closures must not truncate the outer function",
+        sym.end_line
+    );
+}
+
 // ── read_symbol returns correct source ──────────────────────────────
 
 #[tokio::test]

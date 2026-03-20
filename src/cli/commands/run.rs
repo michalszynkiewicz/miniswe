@@ -23,8 +23,18 @@ use crate::tools;
 use crate::tools::permissions::{Action, PermissionManager};
 use crate::tui;
 
-/// After this many tool results in the messages, start masking old ones.
-const MASK_AFTER_RESULTS: usize = 6;
+/// Per-tool-type masking thresholds: how many recent full results to keep.
+/// read_file/read_symbol are the most valuable to keep (model needs file content
+/// for follow-up edits). write_file/edit confirmations lose value quickly.
+fn mask_keep_count(tool_name: &str) -> usize {
+    match tool_name {
+        "read_file" | "read_symbol" => 3,
+        "write_file" | "edit" => 2,
+        "shell" | "diagnostics" => 2,
+        "search" | "web_search" | "web_fetch" | "docs_lookup" => 1,
+        _ => 2,
+    }
+}
 
 /// Run the agent for a single message.
 pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()> {
@@ -149,9 +159,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         }
 
         // Apply observation masking: replace old tool results with summaries
-        if tool_result_log.len() > MASK_AFTER_RESULTS {
-            mask_old_tool_results(&mut messages, &tool_result_log);
-        }
+        // (per-type thresholds — keeps reads longer than writes/searches)
+        mask_old_tool_results(&mut messages, &tool_result_log);
 
         // Sanitize message roles before sending (strict chat template compat)
         context::sanitize_messages(&mut messages);
@@ -350,35 +359,59 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     Ok(())
 }
 
-/// Replace old tool results in the message list with compressed summaries.
+/// Replace old tool results with compressed summaries using per-type thresholds.
 ///
-/// Keeps the most recent MASK_AFTER_RESULTS tool results in full,
-/// replaces older ones with one-line summaries.
+/// For each tool type, keeps the N most recent results in full (where N
+/// depends on the tool type — reads are kept longer than writes/searches).
+/// Older results are replaced with one-line summaries.
 fn mask_old_tool_results(
     messages: &mut Vec<Message>,
     tool_result_log: &[(String, serde_json::Value, String)],
 ) {
-    let mask_count = tool_result_log.len().saturating_sub(MASK_AFTER_RESULTS);
-    if mask_count == 0 {
+    if tool_result_log.is_empty() {
         return;
     }
 
-    // Build summaries for old results
-    let old_results: Vec<String> = tool_result_log[..mask_count]
+    // Walk backwards to count per-type and decide which to mask
+    let mut type_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    let mut should_mask: Vec<bool> = vec![false; tool_result_log.len()];
+
+    for i in (0..tool_result_log.len()).rev() {
+        let tool_name = tool_result_log[i].0.as_str();
+        let count = type_counts.entry(tool_name).or_insert(0);
+        *count += 1;
+        if *count > mask_keep_count(tool_name) {
+            should_mask[i] = true;
+        }
+    }
+
+    // Check if anything needs masking at all
+    if !should_mask.iter().any(|m| *m) {
+        return;
+    }
+
+    // Build summaries for masked results
+    let summaries: Vec<Option<String>> = tool_result_log
         .iter()
-        .map(|(name, args, content)| compress::summarize_tool_result(name, args, content))
+        .enumerate()
+        .map(|(i, (name, args, content))| {
+            if should_mask[i] {
+                Some(compress::summarize_tool_result(name, args, content))
+            } else {
+                None
+            }
+        })
         .collect();
 
-    // Find tool result messages and replace old ones with summaries
-    let mut tool_msg_count = 0;
+    // Apply to messages
+    let mut tool_msg_idx = 0;
     for msg in messages.iter_mut() {
         if msg.role == "tool" {
-            if tool_msg_count < mask_count {
-                if let Some(summary) = old_results.get(tool_msg_count) {
-                    msg.content = Some(summary.clone());
-                }
+            if let Some(Some(summary)) = summaries.get(tool_msg_idx) {
+                msg.content = Some(summary.clone());
             }
-            tool_msg_count += 1;
+            tool_msg_idx += 1;
         }
     }
 }

@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use serde_json::Value;
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,12 @@ use super::ToolResult;
 
 /// Maximum output lines (tail-priority for error visibility).
 const MAX_OUTPUT_LINES: usize = 100;
+
+/// Maximum characters per output line before truncation.
+const MAX_LINE_CHARS: usize = 1000;
+
+/// Maximum total bytes to read from stdout+stderr combined.
+const MAX_OUTPUT_BYTES: usize = 512 * 1024; // 512KB
 
 /// Default timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -40,6 +47,28 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         Err(e) => return Ok(ToolResult::err(format!("Failed to execute command: {e}"))),
     };
 
+    // Drain stdout and stderr in background threads to prevent pipe deadlock.
+    // If the child writes more than the OS pipe buffer (~64KB) and nobody reads,
+    // the child blocks and try_wait() never sees it exit → false timeout.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(out) = stdout {
+            let _ = out.take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(err) = stderr {
+            let _ = err.take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut buf);
+        }
+        buf
+    });
+
     // Poll for completion with timeout
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
@@ -66,13 +95,14 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         }
     }
 
-    // Process has exited — collect output
-    let output = child.wait_with_output()
-        .map_err(|e| anyhow::anyhow!("Failed to read command output: {e}"))?;
+    let exit_code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
 
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Collect output from drain threads
+    let stdout_bytes = stdout_handle.join().unwrap_or_default();
+    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
 
     let mut combined = String::new();
     if !stdout.is_empty() {
@@ -86,7 +116,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         combined.push_str(&stderr);
     }
 
-    // Tail-truncate for error visibility
+    // Tail-truncate for error visibility, and cap long lines
     let lines: Vec<&str> = combined.lines().collect();
     let truncated = lines.len() > MAX_OUTPUT_LINES;
     let display_lines = if truncated {
@@ -104,7 +134,19 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         ));
     }
     result.push_str("]\n");
-    result.push_str(&display_lines.join("\n"));
+
+    // Join display lines, truncating any that exceed MAX_LINE_CHARS
+    for (i, line) in display_lines.iter().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
+        if line.len() > MAX_LINE_CHARS {
+            result.push_str(&line[..MAX_LINE_CHARS]);
+            result.push_str("...(truncated)");
+        } else {
+            result.push_str(line);
+        }
+    }
 
     if exit_code == 0 {
         Ok(ToolResult::ok(result))

@@ -211,42 +211,66 @@ pub fn reindex_file(
 }
 
 /// Count net braces (`{` minus `}`) on a line, skipping braces inside string
-/// literals and comments. Returns the net depth change for the line.
+/// literals, character literals, and comments.
+///
+/// Handles: `"strings"`, `'c'` char literals, `//` line comments,
+/// `/* block comments */`, escaped quotes (`\"`), and escaped backslashes (`\\`).
 fn count_braces_outside_strings(line: &str) -> i32 {
-    let mut depth = 0;
-    let mut in_string = false;
-    let mut string_char = '"';
-    let mut prev = '\0';
-    let mut in_line_comment = false;
+    let chars: Vec<char> = line.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    let mut depth: i32 = 0;
 
-    for ch in line.chars() {
-        if in_line_comment {
+    while i < len {
+        let ch = chars[i];
+
+        // Line comment: // — skip rest of line
+        if ch == '/' && i + 1 < len && chars[i + 1] == '/' {
             break;
         }
 
-        if in_string {
-            if ch == string_char && prev != '\\' {
-                in_string = false;
+        // Block comment: /* ... */ — skip until */
+        if ch == '/' && i + 1 < len && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < len {
+                if chars[i] == '*' && chars[i + 1] == '/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
             }
-            prev = ch;
             continue;
         }
 
-        // Detect start of line comment
-        if ch == '/' && prev == '/' {
-            // Undo the `{` or `}` we might have counted for the first `/`
-            // (but `/` isn't a brace, so nothing to undo)
-            in_line_comment = true;
-            prev = ch;
+        // String literal: "..." — skip until unescaped "
+        if ch == '"' {
+            i += 1;
+            while i < len {
+                if chars[i] == '\\' {
+                    i += 2; // skip escaped char
+                    continue;
+                }
+                if chars[i] == '"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
             continue;
         }
 
-        // Detect start of string literal
-        if ch == '"' || ch == '\'' {
-            // Check for raw strings: r#"..."# or r"..." — treat the rest as string
-            in_string = true;
-            string_char = ch;
-            prev = ch;
+        // Character literal: '.' or '\.' — skip
+        if ch == '\'' {
+            if i + 2 < len && chars[i + 1] == '\\' && i + 3 < len && chars[i + 3] == '\'' {
+                i += 4; // '\x'
+                continue;
+            }
+            if i + 2 < len && chars[i + 2] == '\'' {
+                i += 3; // 'x'
+                continue;
+            }
+            // Not a char literal (e.g., lifetime 'a) — skip the quote
+            i += 1;
             continue;
         }
 
@@ -256,7 +280,7 @@ fn count_braces_outside_strings(line: &str) -> i32 {
             depth -= 1;
         }
 
-        prev = ch;
+        i += 1;
     }
 
     depth
