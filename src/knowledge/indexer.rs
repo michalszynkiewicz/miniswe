@@ -210,6 +210,58 @@ pub fn reindex_file(
     let _ = index.save(miniswe_dir);
 }
 
+/// Count net braces (`{` minus `}`) on a line, skipping braces inside string
+/// literals and comments. Returns the net depth change for the line.
+fn count_braces_outside_strings(line: &str) -> i32 {
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut string_char = '"';
+    let mut prev = '\0';
+    let mut in_line_comment = false;
+
+    for ch in line.chars() {
+        if in_line_comment {
+            break;
+        }
+
+        if in_string {
+            if ch == string_char && prev != '\\' {
+                in_string = false;
+            }
+            prev = ch;
+            continue;
+        }
+
+        // Detect start of line comment
+        if ch == '/' && prev == '/' {
+            // Undo the `{` or `}` we might have counted for the first `/`
+            // (but `/` isn't a brace, so nothing to undo)
+            in_line_comment = true;
+            prev = ch;
+            continue;
+        }
+
+        // Detect start of string literal
+        if ch == '"' || ch == '\'' {
+            // Check for raw strings: r#"..."# or r"..." — treat the rest as string
+            in_string = true;
+            string_char = ch;
+            prev = ch;
+            continue;
+        }
+
+        if ch == '{' {
+            depth += 1;
+        } else if ch == '}' {
+            depth -= 1;
+        }
+
+        prev = ch;
+    }
+
+    depth
+}
+
 /// Compute end_line for each symbol by scanning for matching braces/dedent.
 ///
 /// Heuristic: from the symbol's start line, track brace depth. When it
@@ -242,13 +294,8 @@ fn compute_end_lines(symbols: &mut Vec<Symbol>, content: &str) {
         if start_line.contains('{') || lines.get(start + 1).is_some_and(|l| l.trim() == "{") {
             let mut depth = 0;
             for j in start..upper_bound.min(total) {
-                for ch in lines[j].chars() {
-                    if ch == '{' {
-                        depth += 1;
-                    } else if ch == '}' {
-                        depth -= 1;
-                    }
-                }
+                let brace_delta = count_braces_outside_strings(lines[j]);
+                depth += brace_delta;
                 if depth <= 0 && j > start {
                     symbols[i].end_line = j + 1;
                     break;
@@ -314,6 +361,7 @@ fn extract_rust_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
                     end_line: 0,
                     deps: Vec::new(),
+                    parent_impl: None,
                 });
             }
         }
@@ -331,6 +379,7 @@ fn extract_rust_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
                     end_line: 0,
                     deps: Vec::new(),
+                    parent_impl: None,
                 });
             }
         }
@@ -345,6 +394,7 @@ fn extract_rust_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
                     end_line: 0,
                     deps: Vec::new(),
+                    parent_impl: None,
                 });
             }
         }
@@ -359,6 +409,7 @@ fn extract_rust_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
                     end_line: 0,
                     deps: Vec::new(),
+                    parent_impl: None,
                 });
             }
         }
@@ -373,6 +424,7 @@ fn extract_rust_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
                     end_line: 0,
                     deps: Vec::new(),
+                    parent_impl: None,
                 });
             }
         }
@@ -398,6 +450,7 @@ fn extract_python_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) 
                     signature: trimmed.trim_end_matches(':').to_string(),
                     end_line: 0,
                     deps: Vec::new(),
+                    parent_impl: None,
                 });
             }
         } else if trimmed.starts_with("class ") {
@@ -410,6 +463,7 @@ fn extract_python_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) 
                     signature: trimmed.trim_end_matches(':').to_string(),
                     end_line: 0,
                     deps: Vec::new(),
+                    parent_impl: None,
                 });
             }
         }
@@ -432,6 +486,7 @@ fn extract_js_ts_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
                     end_line: 0,
                     deps: Vec::new(),
+                    parent_impl: None,
                 });
             }
         }
@@ -446,6 +501,7 @@ fn extract_js_ts_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
                     end_line: 0,
                     deps: Vec::new(),
+                    parent_impl: None,
                 });
             }
         }
@@ -460,6 +516,7 @@ fn extract_js_ts_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
                     end_line: 0,
                     deps: Vec::new(),
+                    parent_impl: None,
                 });
             }
         }
@@ -474,6 +531,7 @@ fn extract_js_ts_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     signature: trimmed.to_string(),
                     end_line: 0,
                     deps: Vec::new(),
+                    parent_impl: None,
                 });
             }
         }
@@ -505,6 +563,7 @@ fn extract_go_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
                     end_line: 0,
                     deps: Vec::new(),
+                    parent_impl: None,
                 });
             }
         } else if trimmed.starts_with("type ") {
@@ -524,6 +583,7 @@ fn extract_go_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     signature: trimmed.trim_end_matches('{').trim().to_string(),
                     end_line: 0,
                     deps: Vec::new(),
+                    parent_impl: None,
                 });
             }
         }

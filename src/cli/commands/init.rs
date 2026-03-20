@@ -58,15 +58,27 @@ pub async fn run() -> Result<()> {
         tui::print_status("  Created guide.md (edit this with project-specific tips)");
     }
 
-    // Create lessons.md if it doesn't exist
+    // Create lessons.md if it doesn't exist, seeded with language-specific tips
     let lessons_path = miniswe_dir.join("lessons.md");
     if !lessons_path.exists() {
-        fs::write(
-            &lessons_path,
-            "# Lessons\n\n\
-             <!-- Accumulated tips from past sessions -->\n\
-             <!-- Use `miniswe learn \"tip\"` to add entries -->\n",
-        )?;
+        let mut lessons = String::from("# Lessons\n\n");
+
+        // Seed Rust lessons if Cargo.toml exists
+        if root.join("Cargo.toml").exists() {
+            lessons.push_str(
+                "## Rust\n\
+                 - Return Result<T, E> in library code, never unwrap\n\
+                 - Prefer impl Trait over dyn Trait in function arguments\n\
+                 - Use thiserror for library error types, anyhow for applications\n\
+                 - When borrow checker rejects code: try Clone, Arc, or restructure ownership before adding lifetimes\n\
+                 - Read compiler errors carefully — they usually contain the fix\n\
+                 - Keep files under 200 lines; split into modules early\n\
+                 - For async traits: use async-trait crate or return Pin<Box<dyn Future>>\n\
+                 - When writing trait impls: read the trait definition first to understand required methods\n\n",
+            );
+        }
+
+        fs::write(&lessons_path, &lessons)?;
         tui::print_status("  Created lessons.md");
     }
 

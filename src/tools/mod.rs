@@ -73,9 +73,10 @@ pub async fn execute_tool(
             if let Err(e) = perms.resolve_and_check_path(path) {
                 return Ok(ToolResult::err(e));
             }
-            let result = edit::execute(args, config).await?;
+            let mut result = edit::execute(args, config).await?;
             if result.success {
                 reindex_changed_file(path, config);
+                auto_cargo_check(path, config, &mut result);
             }
             Ok(result)
         }
@@ -84,9 +85,10 @@ pub async fn execute_tool(
             if let Err(e) = perms.resolve_and_check_path(path) {
                 return Ok(ToolResult::err(e));
             }
-            let result = write_file::execute(args, config).await?;
+            let mut result = write_file::execute(args, config).await?;
             if result.success {
                 reindex_changed_file(path, config);
+                auto_cargo_check(path, config, &mut result);
             }
             Ok(result)
         }
@@ -136,4 +138,50 @@ fn reindex_changed_file(rel_path: &str, config: &Config) {
     };
 
     indexer::reindex_file(rel_path, &abs_path, &mut index, &miniswe_dir);
+}
+
+/// Auto-run `cargo check` after editing a .rs file. Appends output to the tool result.
+fn auto_cargo_check(path: &str, config: &Config, result: &mut ToolResult) {
+    if !path.ends_with(".rs") {
+        return;
+    }
+    // Only if this is a Rust project (Cargo.toml exists)
+    if !config.project_root.join("Cargo.toml").exists() {
+        return;
+    }
+
+    let output = std::process::Command::new("cargo")
+        .args(["check", "--message-format=short"])
+        .current_dir(&config.project_root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    match output {
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            // Extract just the error/warning lines, cap at 30 lines
+            let relevant: Vec<&str> = stderr
+                .lines()
+                .filter(|l| {
+                    l.contains("error") || l.contains("warning") || l.starts_with("  ")
+                })
+                .take(30)
+                .collect();
+
+            if o.status.success() {
+                result.content.push_str("\n[cargo check] OK");
+            } else if relevant.is_empty() {
+                result.content.push_str("\n[cargo check] failed (no details captured)");
+                result.success = false;
+            } else {
+                result.content.push_str("\n[cargo check]\n");
+                result.content.push_str(&relevant.join("\n"));
+                result.success = false;
+            }
+        }
+        Err(_) => {
+            // cargo not available or timed out — silently skip
+        }
+    }
 }

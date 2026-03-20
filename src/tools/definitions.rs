@@ -77,10 +77,31 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 }),
             },
         },
-        // NOTE: `edit` tool is intentionally hidden from the tool list.
-        // Quantized small models use it obsessively with single-line changes
-        // instead of write_file. The tool still works if called (handled in
-        // tools/mod.rs), but the model won't see it and will use write_file.
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "edit".into(),
+                description: "Replace a section in a file. `old` must match exactly and uniquely. Include 3+ surrounding lines for a unique match. ONLY for targeted fixes in large files (>100 lines). For new files or full rewrites, use write_file.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path relative to project root"
+                        },
+                        "old": {
+                            "type": "string",
+                            "description": "Exact text to find (include 3+ lines of context for unique match)"
+                        },
+                        "new": {
+                            "type": "string",
+                            "description": "Replacement text"
+                        }
+                    },
+                    "required": ["path", "old", "new"]
+                }),
+            },
+        },
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
