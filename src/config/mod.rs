@@ -28,6 +28,7 @@ pub struct Config {
     pub hardware: HardwareConfig,
     pub web: WebConfig,
     pub logging: LogConfig,
+    pub lsp: LspConfig,
     /// Resolved project root directory (not serialized).
     #[serde(skip)]
     pub project_root: PathBuf,
@@ -206,6 +207,25 @@ pub struct WebConfig {
     pub fetch_backend: String,
 }
 
+/// LSP integration configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspConfig {
+    /// Enable LSP integration (rust-analyzer for Rust projects).
+    pub enabled: bool,
+    /// Timeout in milliseconds for diagnostic responses after file changes.
+    pub diagnostic_timeout_ms: u64,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            diagnostic_timeout_ms: 2000,
+        }
+    }
+}
+
 // --- Defaults ---
 
 impl Default for Config {
@@ -218,6 +238,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             web: WebConfig::default(),
             logging: LogConfig::default(),
+            lsp: LspConfig::default(),
             project_root: PathBuf::from("."),
         }
     }

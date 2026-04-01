@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # bench-task-B — Benchmark: "Add --max-rounds CLI flag"
 #
-# Task requires wiring a CLI arg through config → agent loops (4 files).
-# Tests cross-module navigation where repo_map and profile should help.
+# Validates by building, running the binary, running tests, and
+# doing a live smoke test with the LLM to confirm the flag works.
+# On failure, feeds errors back to miniswe for a retry.
 #
-# Validation checks:
-#   1. Does it compile? (cargo check)
-#   2. Does cli/mod.rs have a max_rounds arg?
-#   3. Is it referenced in run.rs?
-#   4. Is it referenced in repl.rs?
+# Validation:
+#   1. cargo check — does it compile?
+#   2. cargo build — can we get a binary?
+#   3. binary --help — does it show the rounds flag?
+#   4. binary <flag> 5 --help — does the flag parse?
+#   5. cargo test — do the model's own tests pass?
+#   6. live smoke test — run with rounds=1, verify log shows 1 round
 #
 # Usage:
-#   ./scripts/bench-task-B-max-rounds-flag.sh [--runs 3] [--timeout 300]
+#   ./scripts/bench-task-B-max-rounds-flag.sh [--runs 3] [--timeout 600]
 
 set -euo pipefail
 
@@ -19,63 +22,191 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/bench-common.sh"
 
 TASK_NAME="task_B_max_rounds_flag"
-TASK="Add a --max-rounds CLI flag (clap arg, short form: -r, type: Option<u32>) to miniswe that overrides context.max_rounds from config.toml when provided. Steps: 1) Add the arg to Cli struct in src/cli/mod.rs. 2) In src/main.rs or wherever config is passed to commands, apply the override if the flag is Some. 3) Make sure both run.rs and repl.rs use the overridden value. The flag should appear in --help output."
+TASK="Add a CLI flag that lets the user limit the maximum number of agent rounds per session. It should override whatever the config file says. Make sure it works for both single-shot and interactive modes. Write a test that verifies the flag actually limits the number of rounds."
 
 # ── Validation ──────────────────────────────────────────────────────────
 
-validate_result() {
-    local run_dir="$1"
-    local work_dir="$2"
-    local checks=0
-    local passed=0
-    local details=""
+# Detect the flag name the model chose (might be --max-rounds, --rounds, etc.)
+detect_flag_name() {
+    local help_output="$1"
+    # Look for common patterns in help output
+    local flag
+    flag=$(echo "${help_output}" | grep -oE -- '--[a-z-]*round[a-z-]*' | head -1 || true)
+    echo "${flag}"
+}
 
-    # Check 1: Does it compile?
-    ((checks++))
-    if (cd "${work_dir}" && cargo check 2>"${run_dir}/cargo_check.txt"); then
-        ((passed++))
+validate_result() {
+    local attempt_dir="$1"
+    local work_dir="$2"
+    local errors=""
+    local passed=0
+    local checks=0
+    local details=""
+    local binary="${work_dir}/target/debug/miniswe"
+    local flag_name=""
+
+    # Check 1: cargo check
+    (( ++checks ))
+    local check_output
+    if check_output=$(cd "${work_dir}" && cargo check 2>&1); then
+        (( ++passed ))
         details="${details}compile:PASS "
     else
         details="${details}compile:FAIL "
+        local err_lines
+        err_lines=$(echo "${check_output}" | grep -E '^error' | head -20)
+        errors="${errors}
+COMPILE ERROR:
+${err_lines}"
     fi
+    echo "${check_output}" > "${attempt_dir}/cargo_check.txt"
 
-    # Check 2: cli/mod.rs has max_rounds arg
-    ((checks++))
-    if grep -q 'max.rounds\|max_rounds' "${work_dir}/src/cli/mod.rs" 2>/dev/null; then
-        ((passed++))
-        details="${details}cli_arg:PASS "
+    # Check 2: cargo build (only if check passed)
+    (( ++checks ))
+    if [ "$passed" -ge 1 ]; then
+        local build_output
+        if build_output=$(cd "${work_dir}" && cargo build 2>&1); then
+            (( ++passed ))
+            details="${details}build:PASS "
+        else
+            details="${details}build:FAIL "
+            errors="${errors}
+BUILD ERROR:
+$(echo "${build_output}" | grep -E '^error' | head -10)"
+        fi
+        echo "${build_output}" > "${attempt_dir}/cargo_build.txt"
     else
-        details="${details}cli_arg:FAIL "
+        details="${details}build:SKIP "
+        errors="${errors}
+BUILD: skipped (compile failed)"
     fi
 
-    # Check 3: Referenced in run.rs
-    ((checks++))
-    if grep -q 'max.rounds\|max_rounds' "${work_dir}/src/cli/commands/run.rs" 2>/dev/null; then
-        ((passed++))
-        details="${details}run.rs:PASS "
+    # Check 3: --help shows some kind of rounds flag
+    (( ++checks ))
+    if [ -f "${binary}" ]; then
+        local help_output
+        help_output=$("${binary}" --help 2>&1 || true)
+        echo "${help_output}" > "${attempt_dir}/help_output.txt"
+
+        flag_name=$(detect_flag_name "${help_output}")
+        if [ -n "${flag_name}" ]; then
+            (( ++passed ))
+            details="${details}help:PASS(${flag_name}) "
+        else
+            details="${details}help:FAIL "
+            errors="${errors}
+--help output does not contain a flag related to 'rounds'. Full output:
+${help_output}"
+        fi
     else
-        details="${details}run.rs:FAIL "
+        details="${details}help:SKIP "
+        errors="${errors}
+HELP: skipped (no binary)"
     fi
 
-    # Check 4: Referenced in repl.rs
-    ((checks++))
-    if grep -q 'max.rounds\|max_rounds' "${work_dir}/src/cli/commands/repl.rs" 2>/dev/null; then
-        ((passed++))
-        details="${details}repl.rs:PASS "
+    # Check 4: flag parses without error
+    (( ++checks ))
+    if [ -f "${binary}" ] && [ -n "${flag_name}" ]; then
+        local flag_output
+        local flag_exit=0
+        flag_output=$("${binary}" ${flag_name} 5 --help 2>&1) || flag_exit=$?
+        echo "${flag_output}" > "${attempt_dir}/flag_test.txt"
+        echo "exit_code=${flag_exit}" >> "${attempt_dir}/flag_test.txt"
+
+        if [ "$flag_exit" -eq 0 ]; then
+            (( ++passed ))
+            details="${details}parse:PASS "
+        else
+            details="${details}parse:FAIL "
+            errors="${errors}
+'miniswe ${flag_name} 5 --help' exited with code ${flag_exit}. Output:
+$(echo "${flag_output}" | head -10)"
+        fi
     else
-        details="${details}repl.rs:FAIL "
+        details="${details}parse:SKIP "
     fi
 
-    # Overall verdict
+    # Check 5: cargo test
+    (( ++checks ))
+    if [ "$passed" -ge 2 ]; then
+        local test_output
+        local test_exit=0
+        test_output=$(cd "${work_dir}" && cargo test 2>&1) || test_exit=$?
+        echo "${test_output}" > "${attempt_dir}/cargo_test.txt"
+
+        if [ "$test_exit" -eq 0 ]; then
+            (( ++passed ))
+            details="${details}test:PASS "
+        else
+            details="${details}test:FAIL "
+            local failures
+            failures=$(echo "${test_output}" | grep -A5 'FAILED\|panicked\|test result:' | head -20)
+            errors="${errors}
+TESTS FAILED (exit ${test_exit}):
+${failures}"
+        fi
+    else
+        details="${details}test:SKIP "
+        errors="${errors}
+TESTS: skipped (build failed)"
+    fi
+
+    # Check 6: live smoke test — run with rounds=1, verify only 1 round in log
+    (( ++checks ))
+    if [ -f "${binary}" ] && [ -n "${flag_name}" ] && [ "$passed" -ge 4 ]; then
+        # Clean logs
+        rm -f "${work_dir}/.miniswe/logs/"*.log
+        mkdir -p "${work_dir}/.miniswe/logs"
+
+        local smoke_exit=0
+        cd "${work_dir}"
+        timeout 120 "${binary}" ${flag_name} 1 --yes "Say hello" \
+            > "${attempt_dir}/smoke_stdout.txt" \
+            2> "${attempt_dir}/smoke_stderr.txt" \
+            || smoke_exit=$?
+        cd - > /dev/null
+
+        # Check how many rounds the log shows
+        local smoke_log
+        smoke_log=$(ls "${work_dir}/.miniswe/logs/"*.log 2>/dev/null | tail -1 || true)
+        local round_count=0
+        if [ -n "${smoke_log}" ] && [ -f "${smoke_log}" ]; then
+            cp "${smoke_log}" "${attempt_dir}/smoke_session.log"
+            round_count=$(grep -c '\[round ' "${smoke_log}" || true)
+            round_count=${round_count:-0}
+        fi
+
+        echo "smoke_exit=${smoke_exit} round_count=${round_count}" > "${attempt_dir}/smoke_result.txt"
+
+        if [ "${round_count}" -ge 1 ] && [ "${round_count}" -le 2 ]; then
+            (( ++passed ))
+            details="${details}smoke:PASS(${round_count}r) "
+        elif [ "${round_count}" -eq 0 ]; then
+            details="${details}smoke:FAIL(0r) "
+            errors="${errors}
+SMOKE TEST: ran 'miniswe ${flag_name} 1 --yes \"Say hello\"' but log shows 0 rounds. The flag may not be wired to the agent loop. Exit code: ${smoke_exit}"
+        else
+            details="${details}smoke:FAIL(${round_count}r) "
+            errors="${errors}
+SMOKE TEST: ran 'miniswe ${flag_name} 1 --yes \"Say hello\"' — expected 1 round but got ${round_count}. The flag is not limiting rounds correctly."
+        fi
+    else
+        details="${details}smoke:SKIP "
+        errors="${errors}
+SMOKE TEST: skipped (earlier checks failed)"
+    fi
+
+    # Verdict
     local verdict="FAIL"
     if [ "${passed}" -eq "${checks}" ]; then
         verdict="PASS"
-    elif [ "${passed}" -ge 2 ]; then
+    elif [ "${passed}" -ge 4 ]; then
         verdict="PARTIAL"
     fi
 
-    echo "${verdict}" > "${run_dir}/validation.txt"
-    echo "${passed}/${checks} ${details}" > "${run_dir}/validation_details.txt"
+    echo "${verdict}" > "${attempt_dir}/validation.txt"
+    echo "${passed}/${checks} ${details}" > "${attempt_dir}/validation_details.txt"
+    echo "${errors}" > "${attempt_dir}/validation_errors.txt"
     echo "    validation: ${verdict} (${passed}/${checks}) ${details}"
 }
 

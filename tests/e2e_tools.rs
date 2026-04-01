@@ -26,7 +26,7 @@ async fn read_file_returns_content_with_line_numbers() {
     fs::write(helpers::project_path(&config, "test.txt"), content).unwrap();
 
     let args = json!({"path": "test.txt"});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -50,7 +50,7 @@ async fn read_file_with_line_range() {
     fs::write(helpers::project_path(&config, "range.txt"), &content).unwrap();
 
     let args = json!({"path": "range.txt", "start_line": 3, "end_line": 5});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -70,7 +70,7 @@ async fn read_file_compresses_rust_stdlib_imports() {
     fs::write(helpers::project_path(&config, "test.rs"), content).unwrap();
 
     let args = json!({"path": "test.rs"});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -93,7 +93,7 @@ async fn read_file_not_found() {
     let (_tmp, config) = helpers::create_test_project();
 
     let args = json!({"path": "nonexistent.txt"});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -110,7 +110,7 @@ async fn read_file_rejects_large_file() {
     fs::write(helpers::project_path(&config, "huge.txt"), &large).unwrap();
 
     let args = json!({"path": "huge.txt"});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -128,7 +128,7 @@ async fn write_file_creates_new_file() {
         "path": "new_file.txt",
         "content": "hello world\nsecond line\n"
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -148,7 +148,7 @@ async fn write_file_creates_parent_dirs() {
         "path": "deeply/nested/dir/file.txt",
         "content": "nested content"
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -168,7 +168,7 @@ async fn write_file_overwrites_existing() {
         "path": "existing.txt",
         "content": "new content"
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -192,7 +192,7 @@ async fn edit_performs_replacement() {
         "old": "    let x = 1;",
         "new": "    let x = 42;"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config))
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -216,7 +216,7 @@ async fn edit_rejects_ambiguous_match() {
         "old": "foo",
         "new": "qux"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config))
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -240,7 +240,7 @@ async fn edit_file_not_found() {
         "old": "foo",
         "new": "bar"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config))
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -259,7 +259,7 @@ async fn edit_old_not_found_in_file() {
         "old": "nonexistent text",
         "new": "replacement"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config))
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -287,7 +287,7 @@ async fn search_finds_matches() {
     .unwrap();
 
     let args = json!({"query": "hello world"});
-    let result = tools::execute_tool("search", &args, &config, &perms(&config))
+    let result = tools::execute_tool("search", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -308,7 +308,7 @@ async fn search_no_matches() {
     fs::write(helpers::project_path(&config, "src/main.rs"), "fn main() {}\n").unwrap();
 
     let args = json!({"query": "ZZZZUNIQUENOMATCH"});
-    let result = tools::execute_tool("search", &args, &config, &perms(&config))
+    let result = tools::execute_tool("search", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -323,7 +323,7 @@ async fn shell_runs_command_and_captures_output() {
     let (_tmp, config) = helpers::create_test_project();
 
     let args = json!({"command": "echo hello"});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config))
+    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -337,7 +337,7 @@ async fn shell_captures_exit_code() {
     let (_tmp, config) = helpers::create_test_project();
 
     let args = json!({"command": "exit 42"});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config))
+    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -350,7 +350,7 @@ async fn shell_timeout() {
     let (_tmp, config) = helpers::create_test_project();
 
     let args = json!({"command": "sleep 60", "timeout": 1});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config))
+    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -366,7 +366,7 @@ async fn shell_runs_in_project_root() {
     fs::write(helpers::project_path(&config, "marker.txt"), "found").unwrap();
 
     let args = json!({"command": "cat marker.txt"});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config))
+    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -383,7 +383,7 @@ async fn shell_truncates_very_long_lines() {
     // Generate a single line with 200K characters (no newlines)
     // Use printf with brace expansion — avoids pipes which can cause issues with shell tool's try_wait
     let args = json!({"command": "printf 'x%.0s' $(seq 1 200000)"});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config))
+    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -402,7 +402,7 @@ async fn shell_truncates_many_lines() {
 
     // Generate 500 lines of output
     let args = json!({"command": "seq 1 500"});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config))
+    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -425,7 +425,7 @@ async fn task_update_creates_scratchpad() {
 
     let scratchpad = "## Current Task\nImplement feature X\n\n## Plan\n1. Step one\n2. Step two\n";
     let args = json!({"content": scratchpad});
-    let result = tools::execute_tool("task_update", &args, &config, &perms(&config))
+    let result = tools::execute_tool("task_update", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -443,7 +443,7 @@ async fn task_update_rejects_missing_sections() {
 
     // Missing ## Plan section
     let args = json!({"content": "## Current Task\nDo something\n"});
-    let result = tools::execute_tool("task_update", &args, &config, &perms(&config))
+    let result = tools::execute_tool("task_update", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -452,7 +452,7 @@ async fn task_update_rejects_missing_sections() {
 
     // Missing ## Current Task section
     let args = json!({"content": "## Plan\n1. Step\n"});
-    let result = tools::execute_tool("task_update", &args, &config, &perms(&config))
+    let result = tools::execute_tool("task_update", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -466,7 +466,7 @@ async fn task_update_rejects_missing_sections() {
 async fn unknown_tool_returns_error() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let result = tools::execute_tool("nonexistent_tool", &json!({}), &config, &perms(&config)).await;
+    let result = tools::execute_tool("nonexistent_tool", &json!({}), &config, &perms(&config), None).await;
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -480,7 +480,7 @@ async fn read_file_missing_path() {
     let (_tmp, config) = helpers::create_test_project();
 
     let args = json!({});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -493,7 +493,7 @@ async fn write_file_missing_content() {
     let (_tmp, config) = helpers::create_test_project();
 
     let args = json!({"path": "file.txt"});
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -506,7 +506,7 @@ async fn shell_missing_command() {
     let (_tmp, config) = helpers::create_test_project();
 
     let args = json!({});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config))
+    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 

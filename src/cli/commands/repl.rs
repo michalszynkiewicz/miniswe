@@ -17,6 +17,7 @@ use crate::context;
 use crate::context::compress;
 use crate::llm::{ChatRequest, Message, ModelRouter};
 use crate::logging::SessionLog;
+use crate::lsp::LspClient;
 use crate::mcp::{McpConfig, McpRegistry};
 use crate::tools;
 use crate::tools::permissions::{Action, PermissionManager};
@@ -30,7 +31,8 @@ fn mask_keep_count(tool_name: &str) -> usize {
         "read_file" | "read_symbol" => 3,
         "write_file" | "edit" => 2,
         "shell" | "diagnostics" => 2,
-        "search" | "web_search" | "web_fetch" | "docs_lookup" => 1,
+        "search" | "web_search" | "web_fetch" | "docs_lookup"
+        | "goto_definition" | "find_references" => 1,
         _ => 2,
     }
 }
@@ -46,6 +48,19 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         PermissionManager::new(&config)
     };
     let mut tool_defs = tools::tool_definitions();
+
+    // Spawn LSP client (non-blocking)
+    let lsp_client: Option<Arc<LspClient>> = if config.lsp.enabled {
+        match LspClient::spawn(config.project_root.clone()).await {
+            Ok(client) => Some(Arc::new(client)),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    if lsp_client.is_some() {
+        tool_defs.extend(tools::definitions::lsp_tool_definitions());
+    }
 
     // Clear stale scratchpad/plan
     let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
@@ -241,6 +256,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                     conv_ref,
                                     max_rounds,
                                     &log,
+                                    &lsp_client,
                                 ).await;
 
                                 app.is_thinking = false;
@@ -333,6 +349,7 @@ async fn run_agent_loop(
     conversation_history: &mut Vec<Message>,
     max_rounds: usize,
     log: &SessionLog,
+    lsp: &Option<Arc<LspClient>>,
 ) {
     let mut round = 0;
     let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
@@ -565,7 +582,7 @@ async fn run_agent_loop(
                     None => crate::tools::ToolResult::err("No MCP servers connected".into()),
                 }
             } else {
-                match tools::execute_tool(&tc.function.name, &args, config, perms).await {
+                match tools::execute_tool(&tc.function.name, &args, config, perms, lsp.as_deref()).await {
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("Tool error: {e}")),
                 }

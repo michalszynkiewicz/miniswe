@@ -1,4 +1,6 @@
 //! Shared test helpers for E2E tests.
+//! Not every test file uses every helper, so suppress per-crate dead_code warnings.
+#![allow(unused)]
 
 use std::fs;
 use std::path::PathBuf;

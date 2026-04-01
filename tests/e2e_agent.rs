@@ -217,7 +217,7 @@ async fn single_tool_call_flow_reads_file() {
 
     // Execute the tool
     let args: serde_json::Value = serde_json::from_str(&tc[0].function.arguments).unwrap();
-    let result = tools::execute_tool(&tc[0].function.name, &args, &config, &p)
+    let result = tools::execute_tool(&tc[0].function.name, &args, &config, &p, None)
         .await
         .unwrap();
 
@@ -261,7 +261,7 @@ async fn write_file_flow_creates_file_on_disk() {
         .unwrap();
 
     let args: serde_json::Value = serde_json::from_str(&tc[0].function.arguments).unwrap();
-    let result = tools::execute_tool(&tc[0].function.name, &args, &config, &p)
+    let result = tools::execute_tool(&tc[0].function.name, &args, &config, &p, None)
         .await
         .unwrap();
 
