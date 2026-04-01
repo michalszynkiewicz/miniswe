@@ -11,8 +11,9 @@
 
 # Pinned SHA — provider system was introduced here.
 # SHA of the code the model works on (the task target).
-# The benchmark binary (with LSP, providers, etc.) is built from HEAD.
-BASELINE_SHA="e152ca85416f2c8a3ec027c8dfce8dbc42211af6"
+# Includes LSP + providers + warning fixes. The --max-rounds task doesn't
+# exist here. The benchmark binary is built from HEAD.
+BASELINE_SHA="94e2fd5"
 
 # ── Defaults ────────────────────────────────────────────────────────────
 
