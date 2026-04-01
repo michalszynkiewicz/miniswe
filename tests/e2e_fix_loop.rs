@@ -36,7 +36,7 @@ async fn edit_shows_10_lines_context() {
         "old": "line 15",
         "new": "EDITED LINE 15"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config))
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -64,7 +64,7 @@ async fn edit_not_found_shows_near_match() {
         "old": "let x = 42;\n    println!(\"wrong\");",
         "new": "let x = 99;"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config))
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -98,7 +98,7 @@ async fn edit_not_found_no_near_match() {
         "old": "completely different text that does not appear",
         "new": "replacement"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config))
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -123,7 +123,7 @@ async fn write_file_includes_tail() {
         "path": "tail_test.txt",
         "content": content
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -147,7 +147,7 @@ async fn write_file_short_file_shows_all_in_tail() {
         "path": "short.txt",
         "content": "line 1\nline 2\nline 3\n"
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -181,7 +181,7 @@ async fn auto_check_includes_source_context_on_error() {
         "path": "src/main.rs",
         "content": "fn main() {\n    let x: u32 = \"hello\";\n    println!(\"{x}\");\n}\n"
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -219,7 +219,7 @@ async fn auto_check_ok_on_valid_code() {
         "path": "src/main.rs",
         "content": "fn main() {\n    println!(\"hello\");\n}\n"
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -243,8 +243,6 @@ async fn auto_check_ok_on_valid_code() {
 fn masking_keeps_reads_longer_than_writes() {
     // Simulate the masking logic: with 8 tool results of mixed types,
     // reads should be kept longer than writes.
-    use miniswe::context::compress;
-
     // Build a simulated tool_result_log
     let log: Vec<(String, serde_json::Value, String)> = vec![
         ("read_file".into(), json!({"path": "a.rs"}), "content of a.rs...".into()),

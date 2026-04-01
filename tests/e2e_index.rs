@@ -351,7 +351,7 @@ pub fn farewell(name: &str) -> String {
 
     // Use read_symbol tool
     let args = json!({"name": "greet"});
-    let result = tools::execute_tool("read_symbol", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_symbol", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -376,7 +376,7 @@ async fn read_symbol_not_found() {
     let (_tmp, config) = helpers::create_test_project();
 
     let args = json!({"name": "nonexistent_symbol"});
-    let result = tools::execute_tool("read_symbol", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_symbol", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -417,7 +417,7 @@ pub fn target() {
     // Phase 3: read_symbol should detect that the file is stale and re-extract,
     // returning the correct content from the updated file.
     let args = json!({"name": "target"});
-    let result = tools::execute_tool("read_symbol", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_symbol", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -546,7 +546,7 @@ async fn reindex_after_write_file_updates_symbols() {
         "path": "src/lib.rs",
         "content": "pub fn replacement() {\n    println!(\"new\");\n}\n"
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
     assert!(result.success);

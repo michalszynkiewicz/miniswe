@@ -243,6 +243,62 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Return LSP tool definitions (only added when LSP is available).
+pub fn lsp_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "goto_definition".into(),
+                description: "Jump to the definition of a symbol at a given file location. Returns the definition's file, line, and surrounding source code.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path relative to project root"
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "Line number (1-indexed)"
+                        },
+                        "column": {
+                            "type": "integer",
+                            "description": "Column number (1-indexed)"
+                        }
+                    },
+                    "required": ["path", "line", "column"]
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "find_references".into(),
+                description: "Find all references to the symbol at a given file location. Returns a list of file:line locations with the referencing code.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path relative to project root"
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "Line number (1-indexed)"
+                        },
+                        "column": {
+                            "type": "integer",
+                            "description": "Column number (1-indexed)"
+                        }
+                    },
+                    "required": ["path", "line", "column"]
+                }),
+            },
+        },
+    ]
+}
+
 /// Return the mcp_use tool definition (only added when MCP servers are configured).
 pub fn mcp_tool_definition() -> ToolDefinition {
     ToolDefinition {

@@ -20,7 +20,7 @@ async fn path_jail_blocks_absolute_path() {
     let (_tmp, config) = helpers::create_test_project();
 
     let args = json!({"path": "/etc/passwd"});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -43,7 +43,7 @@ async fn path_jail_blocks_traversal() {
     let (_tmp, config) = helpers::create_test_project();
 
     let args = json!({"path": "../../etc/passwd"});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -62,7 +62,7 @@ async fn path_jail_allows_relative_path() {
     fs::write(helpers::project_path(&config, "safe.txt"), "ok").unwrap();
 
     let args = json!({"path": "safe.txt"});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -74,7 +74,7 @@ async fn path_jail_blocks_write_absolute() {
     let (_tmp, config) = helpers::create_test_project();
 
     let args = json!({"path": "/tmp/evil.txt", "content": "pwned"});
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -91,7 +91,7 @@ async fn path_jail_blocks_edit_traversal() {
         "old": "root",
         "new": "hacked"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config))
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -111,7 +111,7 @@ async fn path_jail_allows_subdirectory() {
     fs::write(helpers::project_path(&config, "src/deep/file.txt"), "nested").unwrap();
 
     let args = json!({"path": "src/deep/file.txt"});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -231,7 +231,7 @@ async fn file_size_limit_blocks_huge_file() {
     fs::write(helpers::project_path(&config, "huge.bin"), &large).unwrap();
 
     let args = json!({"path": "huge.bin"});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config))
+    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 

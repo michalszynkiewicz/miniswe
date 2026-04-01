@@ -19,6 +19,7 @@ use crate::context;
 use crate::context::compress;
 use crate::llm::{ChatRequest, Message, ModelRouter};
 use crate::logging::SessionLog;
+use crate::lsp::LspClient;
 use crate::mcp::{McpConfig, McpRegistry};
 use crate::tools;
 use crate::tools::permissions::{Action, PermissionManager};
@@ -32,7 +33,8 @@ fn mask_keep_count(tool_name: &str) -> usize {
         "read_file" | "read_symbol" => 3,
         "write_file" | "edit" => 2,
         "shell" | "diagnostics" => 2,
-        "search" | "web_search" | "web_fetch" | "docs_lookup" => 1,
+        "search" | "web_search" | "web_fetch" | "docs_lookup"
+        | "goto_definition" | "find_references" => 1,
         _ => 2,
     }
 }
@@ -72,6 +74,27 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
     // Select model role: plan mode uses the plan model, normal mode uses default
     let model_role = if plan_only { ModelRole::Plan } else { ModelRole::Default };
+
+    // Spawn LSP client (non-blocking — initializes in background)
+    let lsp_client: Option<Arc<LspClient>> = if config.lsp.enabled {
+        match LspClient::spawn(config.project_root.clone()).await {
+            Ok(client) => {
+                tui::print_status("LSP: rust-analyzer starting...");
+                Some(Arc::new(client))
+            }
+            Err(e) => {
+                tui::print_status(&format!("LSP: not available ({e})"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Add LSP tool definitions if available
+    if lsp_client.is_some() {
+        tool_defs.extend(tools::definitions::lsp_tool_definitions());
+    }
 
     // Initialize MCP servers
     let mcp_config = McpConfig::load(&config.project_root)?;
@@ -358,7 +381,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     },
                 }
             } else {
-                match tools::execute_tool(&tc.function.name, &args, &config, &perms).await {
+                match tools::execute_tool(&tc.function.name, &args, &config, &perms, lsp_client.as_deref()).await {
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("Tool error: {e}")),
                 }
@@ -391,6 +414,13 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     }
 
     log.session_end(round, had_error);
+
+    // Shut down LSP
+    if let Some(lsp) = lsp_client {
+        if let Ok(lsp) = Arc::try_unwrap(lsp) {
+            lsp.shutdown().await;
+        }
+    }
 
     tui::print_separator();
     if !had_error {

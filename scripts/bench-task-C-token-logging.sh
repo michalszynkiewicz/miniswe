@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # bench-task-C — Benchmark: "Add per-round token usage logging"
 #
-# Task requires understanding SSE streaming, logging system, and agent loop
-# data flow across 4+ modules. Hardest task — most likely to differentiate
-# providers.
+# Validates by building, then checking the binary's behavior would include
+# token logging (we can't easily trigger a real LLM call, so we verify the
+# code structurally after confirming it compiles and builds).
 #
-# Validation checks:
-#   1. Does it compile? (cargo check)
-#   2. Does logging.rs have a token/usage logging method?
-#   3. Does llm/mod.rs parse usage/token fields from API response?
-#   4. Is the new logging called from run.rs or repl.rs?
+# Validation:
+#   1. cargo check — does it compile?
+#   2. cargo build — can we get a binary?
+#   3. logging.rs has a token/usage method
+#   4. llm/mod.rs or llm/types.rs parses usage fields
+#   5. Agent loop (run.rs or repl.rs) calls the new logging
 #
 # Usage:
-#   ./scripts/bench-task-C-token-logging.sh [--runs 3] [--timeout 300]
+#   ./scripts/bench-task-C-token-logging.sh [--runs 3] [--timeout 600]
 
 set -euo pipefail
 
@@ -25,47 +26,75 @@ TASK="Add per-round token usage logging. After each LLM API call, log the number
 # ── Validation ──────────────────────────────────────────────────────────
 
 validate_result() {
-    local run_dir="$1"
+    local attempt_dir="$1"
     local work_dir="$2"
-    local checks=0
+    local errors=""
     local passed=0
+    local checks=0
     local details=""
 
-    # Check 1: Does it compile?
-    ((checks++))
-    if (cd "${work_dir}" && cargo check 2>"${run_dir}/cargo_check.txt"); then
-        ((passed++))
+    # Check 1: cargo check
+    (( ++checks ))
+    local check_output
+    if check_output=$(cd "${work_dir}" && cargo check 2>&1); then
+        (( ++passed ))
         details="${details}compile:PASS "
     else
         details="${details}compile:FAIL "
+        local err_lines
+        err_lines=$(echo "${check_output}" | grep -E '^error' | head -20)
+        errors="${errors}
+COMPILE ERROR:
+${err_lines}"
+    fi
+    echo "${check_output}" > "${attempt_dir}/cargo_check.txt"
+
+    # Check 2: cargo build
+    (( ++checks ))
+    if [ "$passed" -ge 1 ]; then
+        local build_output
+        if build_output=$(cd "${work_dir}" && cargo build 2>&1); then
+            (( ++passed ))
+            details="${details}build:PASS "
+        else
+            details="${details}build:FAIL "
+            errors="${errors}
+BUILD ERROR:
+$(echo "${build_output}" | grep -E '^error' | head -10)"
+        fi
+        echo "${build_output}" > "${attempt_dir}/cargo_build.txt"
+    else
+        details="${details}build:SKIP "
+        errors="${errors}
+BUILD: skipped (compile failed)"
     fi
 
-    # Check 2: logging.rs has token/usage logging method
-    ((checks++))
-    if grep -qE 'fn\s+(token_usage|log_tokens|tokens_used|usage)' "${work_dir}/src/logging.rs" 2>/dev/null; then
-        ((passed++))
+    # Check 3: logging.rs has token/usage method
+    (( ++checks ))
+    if grep -qE 'fn\s+(token_usage|log_tokens|tokens_used|usage_log)' "${work_dir}/src/logging.rs" 2>/dev/null ||
+       grep -qE '\[tokens\]' "${work_dir}/src/logging.rs" 2>/dev/null; then
+        (( ++passed ))
         details="${details}log_method:PASS "
-    elif grep -qE '\[tokens\]|token.*usage|prompt_tokens' "${work_dir}/src/logging.rs" 2>/dev/null; then
-        ((passed++))
-        details="${details}log_method:PASS(pattern) "
     else
         details="${details}log_method:FAIL "
+        errors="${errors}
+MISSING: src/logging.rs needs a method for logging token usage (e.g. fn token_usage(...) that writes a [tokens] log line)."
     fi
 
-    # Check 3: llm/mod.rs parses usage from API response
-    ((checks++))
-    if grep -qE 'usage|prompt_tokens|completion_tokens' "${work_dir}/src/llm/mod.rs" 2>/dev/null; then
-        ((passed++))
+    # Check 4: llm parses usage from response
+    (( ++checks ))
+    if grep -qE 'usage|prompt_tokens|completion_tokens' "${work_dir}/src/llm/mod.rs" 2>/dev/null ||
+       grep -qE 'usage|prompt_tokens|completion_tokens' "${work_dir}/src/llm/types.rs" 2>/dev/null; then
+        (( ++passed ))
         details="${details}llm_parse:PASS "
-    elif grep -qE 'usage|prompt_tokens|completion_tokens' "${work_dir}/src/llm/types.rs" 2>/dev/null; then
-        ((passed++))
-        details="${details}llm_parse:PASS(types) "
     else
         details="${details}llm_parse:FAIL "
+        errors="${errors}
+MISSING: src/llm/mod.rs or src/llm/types.rs needs to parse the 'usage' field from the OpenAI API response (prompt_tokens, completion_tokens, total_tokens)."
     fi
 
-    # Check 4: Agent loop calls the new logging
-    ((checks++))
+    # Check 5: Agent loop calls the logging
+    (( ++checks ))
     local found_in_loop=false
     if grep -qE 'token_usage|log_tokens|tokens_used|\.usage' "${work_dir}/src/cli/commands/run.rs" 2>/dev/null; then
         found_in_loop=true
@@ -74,22 +103,25 @@ validate_result() {
         found_in_loop=true
     fi
     if $found_in_loop; then
-        ((passed++))
+        (( ++passed ))
         details="${details}loop_call:PASS "
     else
         details="${details}loop_call:FAIL "
+        errors="${errors}
+MISSING: The agent loop in src/cli/commands/run.rs or repl.rs needs to call the token usage logging after each LLM call."
     fi
 
-    # Overall verdict
+    # Verdict
     local verdict="FAIL"
     if [ "${passed}" -eq "${checks}" ]; then
         verdict="PASS"
-    elif [ "${passed}" -ge 2 ]; then
+    elif [ "${passed}" -ge 3 ]; then
         verdict="PARTIAL"
     fi
 
-    echo "${verdict}" > "${run_dir}/validation.txt"
-    echo "${passed}/${checks} ${details}" > "${run_dir}/validation_details.txt"
+    echo "${verdict}" > "${attempt_dir}/validation.txt"
+    echo "${passed}/${checks} ${details}" > "${attempt_dir}/validation_details.txt"
+    echo "${errors}" > "${attempt_dir}/validation_errors.txt"
     echo "    validation: ${verdict} (${passed}/${checks}) ${details}"
 }
 
