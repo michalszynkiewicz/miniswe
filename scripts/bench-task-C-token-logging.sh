@@ -36,7 +36,7 @@ validate_result() {
     # Check 1: cargo check
     (( ++checks ))
     local check_output
-    if check_output=$(cd "${work_dir}" && cargo check 2>&1); then
+    if check_output=$(cd "${work_dir}" && RUSTFLAGS="-A warnings" cargo check 2>&1); then
         (( ++passed ))
         details="${details}compile:PASS "
     else
@@ -53,7 +53,7 @@ ${err_lines}"
     (( ++checks ))
     if [ "$passed" -ge 1 ]; then
         local build_output
-        if build_output=$(cd "${work_dir}" && cargo build 2>&1); then
+        if build_output=$(cd "${work_dir}" && RUSTFLAGS="-A warnings" cargo build 2>&1); then
             (( ++passed ))
             details="${details}build:PASS "
         else
