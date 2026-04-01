@@ -14,10 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 
-use crate::config::Config;
+use crate::config::{Config, ModelRole};
 use crate::context;
 use crate::context::compress;
-use crate::llm::{ChatRequest, LlmClient, Message};
+use crate::llm::{ChatRequest, Message, ModelRouter};
 use crate::logging::SessionLog;
 use crate::mcp::{McpConfig, McpRegistry};
 use crate::tools;
@@ -42,7 +42,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let log = SessionLog::new(&config);
     log.user_message(message);
 
-    let client = LlmClient::new(config.model.clone());
+    let router = ModelRouter::new(&config);
     let perms = if headless {
         PermissionManager::headless(&config)
     } else {
@@ -59,6 +59,19 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     } else {
         "miniswe"
     });
+
+    // Show model info
+    for line in router.startup_summary() {
+        tui::print_status(&line);
+    }
+    if !router.is_multi_model() {
+        tui::print_status(
+            "Tip: configure [models] in config.toml with llama-swap for multi-model routing (plan/code/fast)"
+        );
+    }
+
+    // Select model role: plan mode uses the plan model, normal mode uses default
+    let model_role = if plan_only { ModelRole::Plan } else { ModelRole::Default };
 
     // Initialize MCP servers
     let mcp_config = McpConfig::load(&config.project_root)?;
@@ -191,8 +204,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         std::io::stderr().flush().ok();
         let thinking = Arc::new(AtomicBool::new(true));
 
-        let response = match client
-            .chat_stream(&request, |token| {
+        let response = match router
+            .chat_stream(model_role, &request, |token| {
                 if thinking.load(Ordering::Relaxed) {
                     thinking.store(false, Ordering::Relaxed);
                     eprint!("\r\x1b[2K");

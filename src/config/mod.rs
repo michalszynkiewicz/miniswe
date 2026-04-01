@@ -5,6 +5,7 @@
 //! Per-project data (index, scratchpad, profile) lives in `.miniswe/` in the
 //! project directory — created by `miniswe init`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -15,6 +16,14 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     pub model: ModelConfig,
+    /// Named model slots for multi-model routing.
+    /// If present, these override `model` for the corresponding roles.
+    /// Requires an OpenAI-compatible proxy like llama-swap to handle
+    /// on-demand model loading behind a single endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models: Option<HashMap<String, ModelConfig>>,
+    /// Which model slot to use for each role.
+    pub routing: RoutingConfig,
     pub context: ContextConfig,
     pub hardware: HardwareConfig,
     pub web: WebConfig,
@@ -22,6 +31,39 @@ pub struct Config {
     /// Resolved project root directory (not serialized).
     #[serde(skip)]
     pub project_root: PathBuf,
+}
+
+/// Which named model slot to use for each role.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingConfig {
+    /// Model for general use / coding (default fallback).
+    pub default: String,
+    /// Model for planning and complex reasoning.
+    pub plan: String,
+    /// Model for fast/lightweight tasks (summaries, scratchpad).
+    pub fast: String,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            default: "default".into(),
+            plan: "default".into(),
+            fast: "default".into(),
+        }
+    }
+}
+
+/// Which model to use for a given operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRole {
+    /// General / coding tasks.
+    Default,
+    /// Planning, complex reasoning, architecture.
+    Plan,
+    /// Fast lightweight tasks (summaries, scratchpad).
+    Fast,
 }
 
 /// Logging configuration.
@@ -107,6 +149,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             model: ModelConfig::default(),
+            models: None,
+            routing: RoutingConfig::default(),
             context: ContextConfig::default(),
             hardware: HardwareConfig::default(),
             web: WebConfig::default(),
@@ -250,5 +294,26 @@ impl Config {
     /// Check if this project has been initialized (`miniswe init` was run).
     pub fn is_initialized(&self) -> bool {
         self.miniswe_dir().is_dir()
+    }
+
+    /// Get the model config for a given role.
+    /// Returns the named model from `[models]` if configured, otherwise falls
+    /// back to the single `[model]` config.
+    pub fn model_for_role(&self, role: ModelRole) -> &ModelConfig {
+        let slot_name = match role {
+            ModelRole::Default => &self.routing.default,
+            ModelRole::Plan => &self.routing.plan,
+            ModelRole::Fast => &self.routing.fast,
+        };
+
+        self.models
+            .as_ref()
+            .and_then(|m| m.get(slot_name))
+            .unwrap_or(&self.model)
+    }
+
+    /// Whether multiple distinct models are configured.
+    pub fn is_multi_model(&self) -> bool {
+        self.models.as_ref().is_some_and(|m| m.len() > 1)
     }
 }

@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-MODEL="${MINISWE_MODEL:-models/Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL.gguf}"
+MODEL="${MINISWE_MODEL:-$HOME/models/devstral-small-2/Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL.gguf}"
 PORT="${MINISWE_PORT:-8464}"
 CTX_SIZE="${MINISWE_CTX_SIZE:-50000}"
 THREADS="${MINISWE_THREADS:-8}"
