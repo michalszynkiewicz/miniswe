@@ -11,16 +11,18 @@
 //! 8. Current user message
 
 pub mod compress;
+pub mod providers;
 
 use crate::config::Config;
+use providers::ProviderInput;
 
 /// Embedded user guide — baked into the binary, injected into context when
 /// the user asks meta-questions about the tool.
-const USAGE_GUIDE: &str = include_str!("../../docs/usage.md");
+pub(crate) const USAGE_GUIDE: &str = include_str!("../../docs/usage.md");
 
 /// Detect whether the user's message is asking about how the tool itself works.
 /// Triggers on questions about sessions, configuration, tools, shortcuts, etc.
-fn is_meta_question(message: &str) -> bool {
+pub(crate) fn is_meta_question(message: &str) -> bool {
     let lower = message.to_lowercase();
 
     // Must look like a question (not a task)
@@ -52,11 +54,7 @@ fn is_meta_question(message: &str) -> bool {
 
     tool_terms.iter().any(|term| lower.contains(term))
 }
-use crate::knowledge::graph::DependencyGraph;
-use crate::knowledge::repo_map;
-use crate::knowledge::ProjectIndex;
 use crate::llm::Message;
-use std::fs;
 
 /// The assembled context ready to send to the LLM.
 pub struct AssembledContext {
@@ -98,95 +96,6 @@ fn build_system_prompt() -> String {
     )
 }
 
-/// Load and compress the project profile.
-fn load_profile(config: &Config) -> Option<String> {
-    let path = config.miniswe_path("profile.md");
-    let content = fs::read_to_string(path).ok()?;
-    Some(compress::compress_profile(&content))
-}
-
-/// Load the user guide from `.miniswe/guide.md`.
-fn load_guide(config: &Config) -> Option<String> {
-    let path = config.miniswe_path("guide.md");
-    let content = fs::read_to_string(path).ok()?;
-    // Skip if it's just the template
-    if content.contains("<!-- Add project-specific instructions") && content.lines().count() <= 5 {
-        return None;
-    }
-    Some(content)
-}
-
-/// Load the scratchpad from `.miniswe/scratchpad.md`.
-fn load_scratchpad(config: &Config) -> Option<String> {
-    let path = config.miniswe_path("scratchpad.md");
-    fs::read_to_string(path).ok()
-}
-
-/// Load the plan from `.miniswe/plan.md`.
-fn load_plan(config: &Config) -> Option<String> {
-    let path = config.miniswe_path("plan.md");
-    fs::read_to_string(path).ok()
-}
-
-/// Load the repo map slice, personalized for the current task.
-fn load_repo_map(config: &Config, task_keywords: &[&str]) -> Option<String> {
-    let miniswe_dir = config.miniswe_dir();
-    let index = ProjectIndex::load(&miniswe_dir).ok()?;
-    let graph = DependencyGraph::load(&miniswe_dir).ok()?;
-
-    let map = repo_map::render(
-        &index,
-        &graph,
-        config.context.repo_map_budget,
-        task_keywords,
-        &config.project_root,
-    );
-
-    if map.is_empty() {
-        None
-    } else {
-        Some(map)
-    }
-}
-
-/// Load relevant lessons from `.miniswe/lessons.md` based on keywords.
-fn load_relevant_lessons(config: &Config, keywords: &[&str]) -> Option<String> {
-    let path = config.miniswe_path("lessons.md");
-    let content = fs::read_to_string(path).ok()?;
-
-    // Skip if it's just the template
-    if content.contains("<!-- Accumulated tips") && content.lines().count() <= 5 {
-        return None;
-    }
-
-    if keywords.is_empty() {
-        return Some(content);
-    }
-
-    // Extract sections that match any keyword
-    let mut relevant = String::new();
-    let mut in_section = false;
-
-    for line in content.lines() {
-        if line.starts_with("## ") {
-            let heading_lower = line.to_lowercase();
-            in_section = keywords
-                .iter()
-                .any(|kw| kw.len() >= 3 && heading_lower.contains(&kw.to_lowercase()));
-        }
-
-        if in_section {
-            relevant.push_str(line);
-            relevant.push('\n');
-        }
-    }
-
-    if relevant.is_empty() {
-        None
-    } else {
-        Some(relevant)
-    }
-}
 
 /// Rough token estimate: ~4 characters per token for English/code.
 pub fn estimate_tokens(text: &str) -> usize {
@@ -385,84 +294,42 @@ pub fn assemble(
     let mut messages = Vec::new();
     let mut used_tokens = 0;
 
-    // 1. System prompt (compressed)
+    // 1. System prompt (always present)
     let mut system_context = build_system_prompt();
 
-    // 1b. Project root — tells the model where it is and that all file
-    // paths in tool calls are relative to this directory.
+    // 1b. Project root (always present)
     system_context.push_str(&format!(
         "[PROJECT ROOT]{}\nAll file paths are relative to this directory. Use relative paths only.\n",
         config.project_root.display()
     ));
 
-    // 2. Project profile (compressed to structured format)
-    if let Some(profile) = load_profile(config) {
-        system_context.push_str("\n");
-        system_context.push_str(&profile);
-    }
-
-    // 3. User guide
-    if let Some(guide) = load_guide(config) {
-        system_context.push_str("\n[GUIDE]\n");
-        system_context.push_str(&guide);
-    }
-
-    // 4. AI-maintained project docs (architecture notes from previous sessions)
-    let ai_readme = config.project_root.join(".ai").join("README.md");
-    if let Ok(content) = std::fs::read_to_string(&ai_readme) {
-        // Cap at ~1K tokens to not bloat context
-        let max = 4000;
-        let truncated = if content.len() > max { &content[..max] } else { &content };
-        system_context.push_str("\n[PROJECT NOTES]\n");
-        system_context.push_str(truncated);
-    }
-
-    // 5. Active plan
-    if let Some(plan) = load_plan(config) {
-        system_context.push_str("\n[PLAN]\n");
-        system_context.push_str(&plan);
-    }
-
-    // 5. Relevant lessons (keyword-matched)
+    // 2. Run enabled context providers
     let keywords: Vec<&str> = user_message
         .split_whitespace()
         .filter(|w| w.len() >= 3)
         .collect();
-    if let Some(lessons) = load_relevant_lessons(config, &keywords) {
-        system_context.push_str("\n[LESSONS]\n");
-        system_context.push_str(&lessons);
-    }
 
-    // 6. Repo map (task-personalized, budget-controlled)
-    if let Some(repo_map) = load_repo_map(config, &keywords) {
-        system_context.push_str("\n[REPO MAP]\n");
-        system_context.push_str(&repo_map);
-    }
+    let input = ProviderInput {
+        config,
+        user_message,
+        keywords,
+        plan_only,
+        mcp_summary,
+    };
 
-    // 7. MCP server summaries (one line each — lazy loading)
-    if let Some(mcp) = mcp_summary {
-        system_context.push_str("\n[MCP SERVERS]\n");
-        system_context.push_str(mcp);
-        system_context.push_str("\nmcp_use(server,tool,args)→call MCP tool\n");
-    }
-
-    // 7. Scratchpad (folded into system message to avoid role alternation issues)
-    if let Some(scratchpad) = load_scratchpad(config) {
-        system_context.push_str("\n[SCRATCHPAD]\n");
-        system_context.push_str(&scratchpad);
-    }
-
-    // 8. Self-documentation: inject the usage guide when the user is asking
-    // about how the tool works, how to continue sessions, etc.
-    if is_meta_question(user_message) {
-        system_context.push_str("\n[USAGE GUIDE]\n");
-        system_context.push_str(USAGE_GUIDE);
-    }
-
-    if plan_only {
-        system_context.push_str(
-            "\n[MODE:PLAN]Read-only.No edits/shell.Write plan via task_update.\n",
-        );
+    let all_providers = providers::default_providers();
+    for provider in &all_providers {
+        if !config.context.providers.is_enabled(provider.name()) {
+            continue;
+        }
+        if let Some(block) = provider.provide(&input) {
+            system_context.push('\n');
+            if !block.header.is_empty() {
+                system_context.push_str(block.header);
+                system_context.push('\n');
+            }
+            system_context.push_str(&block.content);
+        }
     }
 
     messages.push(Message::system(&system_context));

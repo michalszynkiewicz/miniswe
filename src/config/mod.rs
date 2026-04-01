@@ -115,6 +115,69 @@ pub struct ContextConfig {
     pub max_rounds: usize,
     /// Ask user to confirm continuation after this many rounds
     pub pause_after_rounds: usize,
+    /// Toggle individual context providers on/off.
+    pub providers: ProvidersConfig,
+}
+
+/// Which context providers are enabled.
+///
+/// Each field corresponds to a `ContextProvider::name()`. Set to `false` in
+/// config.toml to disable that provider:
+///
+/// ```toml
+/// [context.providers]
+/// lessons = false
+/// repo_map = false
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProvidersConfig {
+    pub profile: bool,
+    pub guide: bool,
+    pub project_notes: bool,
+    pub plan: bool,
+    pub lessons: bool,
+    pub repo_map: bool,
+    pub mcp: bool,
+    pub scratchpad: bool,
+    pub usage_guide: bool,
+    pub plan_mode: bool,
+}
+
+impl Default for ProvidersConfig {
+    fn default() -> Self {
+        Self {
+            profile: true,
+            guide: true,
+            project_notes: true,
+            plan: true,
+            lessons: true,
+            repo_map: true,
+            mcp: true,
+            scratchpad: true,
+            usage_guide: true,
+            plan_mode: true,
+        }
+    }
+}
+
+impl ProvidersConfig {
+    /// Check if a provider is enabled by name.
+    pub fn is_enabled(&self, name: &str) -> bool {
+        match name {
+            "profile" => self.profile,
+            "guide" => self.guide,
+            "project_notes" => self.project_notes,
+            "plan" => self.plan,
+            "lessons" => self.lessons,
+            "repo_map" => self.repo_map,
+            "mcp" => self.mcp,
+            "scratchpad" => self.scratchpad,
+            "usage_guide" => self.usage_guide,
+            "plan_mode" => self.plan_mode,
+            _ => true, // unknown providers default to enabled
+        }
+    }
 }
 
 /// Hardware configuration hints.
@@ -192,6 +255,7 @@ impl Default for ContextConfig {
             scratchpad_budget: 1500,
             max_rounds: 100,
             pause_after_rounds: 50,
+            providers: ProvidersConfig::default(),
         }
     }
 }
