@@ -4,7 +4,9 @@
 //! Handles streaming responses and tool call parsing.
 
 mod types;
+pub mod router;
 
+pub use router::ModelRouter;
 pub use types::*;
 
 use std::sync::Arc;

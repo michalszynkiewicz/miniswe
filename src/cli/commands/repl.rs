@@ -12,10 +12,10 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use crate::config::Config;
+use crate::config::{Config, ModelRole};
 use crate::context;
 use crate::context::compress;
-use crate::llm::{ChatRequest, LlmClient, Message};
+use crate::llm::{ChatRequest, Message, ModelRouter};
 use crate::logging::SessionLog;
 use crate::mcp::{McpConfig, McpRegistry};
 use crate::tools;
@@ -39,7 +39,7 @@ fn mask_keep_count(tool_name: &str) -> usize {
 pub async fn run(config: Config, headless: bool) -> Result<()> {
     let log = SessionLog::new(&config);
 
-    let client = LlmClient::new(config.model.clone());
+    let router = ModelRouter::new(&config);
     let perms = if headless {
         PermissionManager::headless(&config)
     } else {
@@ -82,10 +82,15 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
     app.load_history(&history_file);
 
     // Welcome message
-    app.push_output(&format!(
-        "miniswe — Model: {} @ {}",
-        config.model.model, config.model.endpoint
-    ), LineStyle::Status);
+    for line in router.startup_summary() {
+        app.push_output(&format!("miniswe — {line}"), LineStyle::Status);
+    }
+    if !router.is_multi_model() {
+        app.push_output(
+            "Tip: configure [models] in config.toml with llama-swap for multi-model routing",
+            LineStyle::Status,
+        );
+    }
     if let Some(ref mcp) = mcp_registry {
         if mcp.has_servers() {
             app.push_output(
@@ -226,7 +231,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                     &mut app,
                                     &mut rx,
                                     &mut terminal,
-                                    &client,
+                                    &router,
                                     &tool_defs,
                                     &config,
                                     perms_ref,
@@ -318,7 +323,7 @@ async fn run_agent_loop(
     app: &mut App,
     rx: &mut mpsc::UnboundedReceiver<AppEvent>,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    client: &LlmClient,
+    router: &ModelRouter,
     tool_defs: &[crate::llm::ToolDefinition],
     config: &Config,
     perms: &PermissionManager,
@@ -370,7 +375,7 @@ async fn run_agent_loop(
         // Call LLM with streaming — render on each token
         let response = {
             let mut token_count = 0u32;
-            match client.chat_stream(&request, |token| {
+            match router.chat_stream(ModelRole::Default, &request, |token| {
                 app.push_token(token);
                 // Re-render every few tokens (not every token — too expensive)
                 token_count += 1;
