@@ -1,0 +1,61 @@
+# Dockerfile.benchmark — Build miniswe at pinned SHA and run provider benchmarks.
+#
+# Build:
+#   docker build -f scripts/Dockerfile.benchmark -t miniswe-bench .
+#
+# Run task B (--max-rounds flag):
+#   docker run --network=host -v ./benchmark_results:/results miniswe-bench B
+#
+# Run task C (token logging):
+#   docker run --network=host -v ./benchmark_results:/results miniswe-bench C
+#
+# Run both:
+#   docker run --network=host -v ./benchmark_results:/results miniswe-bench all
+#
+# Extra options forwarded to benchmark script:
+#   docker run --network=host -v ./benchmark_results:/results miniswe-bench B --runs 3
+
+FROM rust:1.87-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+RUN cargo build --release
+
+# ── Runtime ─────────────────────────────────────────────────────────────
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /bench
+
+# Binary
+COPY --from=builder /build/target/release/miniswe /usr/local/bin/miniswe
+
+# Full repo (for git archive at pinned SHA)
+COPY . /repo
+
+# .miniswe index data (not in git, generated on host)
+COPY .miniswe/index /repo/.miniswe/index
+COPY .miniswe/profile.md /repo/.miniswe/profile.md
+COPY .miniswe/lessons.md /repo/.miniswe/lessons.md
+
+# Benchmark scripts
+COPY scripts/bench-common.sh scripts/bench-task-B-max-rounds-flag.sh \
+     scripts/bench-task-C-token-logging.sh /bench/scripts/
+RUN chmod +x /bench/scripts/*.sh
+
+VOLUME /results
+
+# Entrypoint picks which task(s) to run
+COPY scripts/docker-entrypoint.sh /bench/docker-entrypoint.sh
+RUN chmod +x /bench/docker-entrypoint.sh
+
+ENTRYPOINT ["/bench/docker-entrypoint.sh"]
+CMD ["all"]
