@@ -347,7 +347,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 consecutive_loops += 1;
                 let result_msg = Message::tool_result(
                     &tc.id,
-                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times. Try a completely different approach.",
+                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times. Try a completely different approach. Remember: you have tools like get_repo_map(), search(), read_file(), write_file(), diagnostics() available.",
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
