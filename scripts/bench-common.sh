@@ -26,7 +26,11 @@ MAX_ROUNDS=50
 MAX_ATTEMPTS=3
 RUNS_PER_VARIANT=1
 TEMPERATURE=0.0
+STRATEGY="full"  # "full" = test every provider, "bisect" = coarse triage then drill down
 PROVIDERS=(profile guide project_notes lessons repo_map scratchpad lsp)
+# Provider groups for bisect strategy
+PROVIDERS_CORE=(repo_map lsp profile)
+PROVIDERS_EXTRAS=(guide project_notes lessons scratchpad)
 
 # ── Arg parsing ─────────────────────────────────────────────────────────
 
@@ -42,6 +46,7 @@ parse_common_args() {
             --max-attempts)  MAX_ATTEMPTS="$2";      shift 2 ;;
             --runs)          RUNS_PER_VARIANT="$2";  shift 2 ;;
             --temperature)   TEMPERATURE="$2";       shift 2 ;;
+            --strategy)      STRATEGY="$2";          shift 2 ;;
             *)
                 echo "Unknown option: $1" >&2
                 exit 1
@@ -54,7 +59,12 @@ parse_common_args() {
 
 write_config() {
     local out="$1"
-    local disabled="${2:-}"
+    local disabled="${2:-}"  # comma-separated list of disabled providers
+
+    # Helper: check if a provider is in the disabled list
+    _is_disabled() {
+        echo ",${disabled}," | grep -q ",${1},"
+    }
 
     cat > "$out" <<TOML
 [model]
@@ -75,16 +85,16 @@ max_rounds = ${MAX_ROUNDS}
 pause_after_rounds = ${MAX_ROUNDS}
 
 [context.providers]
-profile = $([ "$disabled" = "profile" ] && echo "false" || echo "true")
-guide = $([ "$disabled" = "guide" ] && echo "false" || echo "true")
-project_notes = $([ "$disabled" = "project_notes" ] && echo "false" || echo "true")
-plan = $([ "$disabled" = "plan" ] && echo "false" || echo "true")
-lessons = $([ "$disabled" = "lessons" ] && echo "false" || echo "true")
-repo_map = $([ "$disabled" = "repo_map" ] && echo "false" || echo "true")
-mcp = $([ "$disabled" = "mcp" ] && echo "false" || echo "true")
-scratchpad = $([ "$disabled" = "scratchpad" ] && echo "false" || echo "true")
-usage_guide = $([ "$disabled" = "usage_guide" ] && echo "false" || echo "true")
-plan_mode = $([ "$disabled" = "plan_mode" ] && echo "false" || echo "true")
+profile = $(_is_disabled profile && echo "false" || echo "true")
+guide = $(_is_disabled guide && echo "false" || echo "true")
+project_notes = $(_is_disabled project_notes && echo "false" || echo "true")
+plan = $(_is_disabled plan && echo "false" || echo "true")
+lessons = $(_is_disabled lessons && echo "false" || echo "true")
+repo_map = $(_is_disabled repo_map && echo "false" || echo "true")
+mcp = $(_is_disabled mcp && echo "false" || echo "true")
+scratchpad = $(_is_disabled scratchpad && echo "false" || echo "true")
+usage_guide = $(_is_disabled usage_guide && echo "false" || echo "true")
+plan_mode = $(_is_disabled plan_mode && echo "false" || echo "true")
 
 [hardware]
 vram_gb = 24.0
@@ -96,7 +106,7 @@ search_backend = "serper"
 fetch_backend = "jina"
 
 [lsp]
-enabled = $([ "$disabled" = "lsp" ] && echo "false" || echo "true")
+enabled = $(_is_disabled lsp && echo "false" || echo "true")
 diagnostic_timeout_ms = 2000
 
 [logging]
@@ -453,9 +463,43 @@ print_summary() {
     echo "Logs: ${RESULTS_DIR}/"
 }
 
+# ── Score extraction ────────────────────────────────────────────────────
+
+# Get a composite score for a variant: rounds + (attempts * 20) + (errors * 2).
+# Higher = worse. Used by bisect to compare variants.
+get_variant_score() {
+    local variant_dir="$1"
+    [ -f "${variant_dir}/avg_metrics.txt" ] || { echo "9999"; return; }
+    eval "$(cat "${variant_dir}/avg_metrics.txt")"
+    local score=$(( ${avg_rounds:-50} + ${avg_attempts:-3} * 20 + ${avg_tool_errors:-0} * 2 ))
+    # Penalize non-passing validation
+    local pass_count=0 total=0
+    IFS=',' read -ra vlist <<< "${validations:-}"
+    for v in "${vlist[@]}"; do
+        [ -z "$v" ] && continue
+        (( ++total ))
+        [ "$v" = "PASS" ] && (( ++pass_count ))
+    done
+    if [ "$total" -gt 0 ] && [ "$pass_count" -lt "$total" ]; then
+        score=$((score + (total - pass_count) * 30))
+    fi
+    echo "$score"
+}
+
 # ── Orchestrator ────────────────────────────────────────────────────────
 
-run_benchmark() {
+# Run a single variant and compute its average metrics.
+# Args: variant_name disabled_csv
+run_variant() {
+    local variant_name="$1"
+    local disabled="$2"
+    for run in $(seq 1 "${RUNS_PER_VARIANT}"); do
+        run_miniswe "${variant_name}" "${disabled}" "${run}" "${TASK}"
+    done
+    average_metrics "${RESULTS_DIR}/${variant_name}"
+}
+
+run_benchmark_init() {
     parse_common_args "$@"
 
     local timestamp
@@ -469,6 +513,7 @@ run_benchmark() {
 
     echo "=== miniswe provider benchmark: ${TASK_NAME} ==="
     echo "SHA:          ${SHA}"
+    echo "Strategy:     ${STRATEGY}"
     echo "Task:         ${TASK:0:80}..."
     echo "Endpoint:     ${LLM_ENDPOINT}"
     echo "Results:      ${RESULTS_DIR}"
@@ -481,6 +526,7 @@ run_benchmark() {
     cat > "${RESULTS_DIR}/metadata.txt" <<EOF
 task_name=${TASK_NAME}
 sha=${SHA}
+strategy=${STRATEGY}
 timestamp=${timestamp}
 task=${TASK}
 endpoint=${LLM_ENDPOINT}
@@ -499,23 +545,106 @@ EOF
         echo "OK"
     fi
     echo ""
+}
 
-    # Baseline
-    for run in $(seq 1 "${RUNS_PER_VARIANT}"); do
-        run_miniswe "00_baseline" "" "${run}" "${TASK}"
-    done
-    average_metrics "${RESULTS_DIR}/00_baseline"
+# Full ablation: test every provider individually.
+run_benchmark_full() {
+    run_benchmark_init "$@"
 
-    # Ablation
+    run_variant "00_baseline" ""
+
     local i=1
     for provider in "${PROVIDERS[@]}"; do
-        variant_name=$(printf "%02d_no_%s" "$i" "$provider")
-        for run in $(seq 1 "${RUNS_PER_VARIANT}"); do
-            run_miniswe "${variant_name}" "${provider}" "${run}" "${TASK}"
-        done
-        average_metrics "${RESULTS_DIR}/${variant_name}"
+        run_variant "$(printf "%02d_no_%s" "$i" "$provider")" "${provider}"
         (( ++i ))
     done
 
     print_summary "${TASK_NAME}"
+}
+
+# Bisect: coarse triage, then drill into impactful group.
+run_benchmark_bisect() {
+    run_benchmark_init "$@"
+
+    # ── Phase 1: Coarse triage (3 runs) ──────────────────────────────
+    echo "═══ PHASE 1: Coarse triage ═══"
+    echo ""
+
+    run_variant "00_baseline" ""
+    local baseline_score
+    baseline_score=$(get_variant_score "${RESULTS_DIR}/00_baseline")
+
+    # All providers off
+    local all_disabled
+    all_disabled=$(IFS=,; echo "${PROVIDERS[*]}")
+    run_variant "01_all_off" "${all_disabled}"
+    local all_off_score
+    all_off_score=$(get_variant_score "${RESULTS_DIR}/01_all_off")
+
+    # Core off (repo_map, lsp, profile)
+    local core_disabled
+    core_disabled=$(IFS=,; echo "${PROVIDERS_CORE[*]}")
+    run_variant "02_core_off" "${core_disabled}"
+    local core_off_score
+    core_off_score=$(get_variant_score "${RESULTS_DIR}/02_core_off")
+
+    echo ""
+    echo "── Phase 1 scores (lower = better) ──"
+    echo "  baseline:  ${baseline_score}"
+    echo "  all_off:   ${all_off_score}"
+    echo "  core_off:  ${core_off_score}"
+    echo ""
+
+    # Decide whether to continue
+    local delta=$((all_off_score - baseline_score))
+    if [ "$delta" -lt 5 ] && [ "$delta" -gt -5 ]; then
+        echo "No significant impact from any providers (delta=${delta}). Stopping."
+        print_summary "${TASK_NAME}"
+        return
+    fi
+
+    # ── Phase 2: Drill into impactful group ──────────────────────────
+    echo "═══ PHASE 2: Drill down ═══"
+    echo ""
+
+    local core_delta=$((core_off_score - baseline_score))
+    local extras_delta=$((all_off_score - core_off_score))
+
+    echo "  Core providers impact:   ${core_delta}"
+    echo "  Extras providers impact: ${extras_delta}"
+    echo ""
+
+    # Test individual providers in the group with bigger impact
+    local i=10
+    if [ "$core_delta" -ge "$extras_delta" ] || [ "$core_delta" -ge 5 ]; then
+        echo "Drilling into CORE providers: ${PROVIDERS_CORE[*]}"
+        echo ""
+        for provider in "${PROVIDERS_CORE[@]}"; do
+            run_variant "$(printf "%02d_no_%s" "$i" "$provider")" "${provider}"
+            (( ++i ))
+        done
+    fi
+
+    if [ "$extras_delta" -ge "$core_delta" ] || [ "$extras_delta" -ge 5 ]; then
+        echo "Drilling into EXTRAS providers: ${PROVIDERS_EXTRAS[*]}"
+        echo ""
+        for provider in "${PROVIDERS_EXTRAS[@]}"; do
+            run_variant "$(printf "%02d_no_%s" "$i" "$provider")" "${provider}"
+            (( ++i ))
+        done
+    fi
+
+    print_summary "${TASK_NAME}"
+}
+
+# Main entry point. Caller must define: TASK, TASK_NAME, validate_result()
+run_benchmark() {
+    case "${STRATEGY:-full}" in
+        full)   run_benchmark_full "$@" ;;
+        bisect) run_benchmark_bisect "$@" ;;
+        *)
+            echo "Unknown strategy: ${STRATEGY}. Use 'full' or 'bisect'." >&2
+            exit 1
+            ;;
+    esac
 }
