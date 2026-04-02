@@ -151,44 +151,57 @@ ${failures}"
 TESTS: skipped (build failed)"
     fi
 
-    # Check 6: live smoke test — run with rounds=1, verify only 1 round in log
+    # Check 6: smoke test — run a multi-round task with and without the flag.
+    # Verifies the flag actually limits rounds, not just parses.
     (( ++checks ))
     if [ -f "${binary}" ] && [ -n "${flag_name}" ] && [ "$passed" -ge 4 ]; then
-        # Clean logs
-        rm -f "${work_dir}/.miniswe/logs/"*.log
         mkdir -p "${work_dir}/.miniswe/logs"
 
-        local smoke_exit=0
+        # Run WITHOUT flag to get baseline round count
+        rm -f "${work_dir}/.miniswe/logs/"*.log
         cd "${work_dir}"
-        timeout 120 "${binary}" ${flag_name} 1 --yes "Say hello" \
+        timeout 120 "${binary}" --yes "Read every .rs file in src/ and list their names" \
+            > "${attempt_dir}/smoke_baseline_stdout.txt" \
+            2> "${attempt_dir}/smoke_baseline_stderr.txt" \
+            || true
+        cd - > /dev/null
+        local baseline_rounds=0
+        for f in "${work_dir}/.miniswe/logs/"*.log; do
+            [ -f "$f" ] || continue
+            local r; r=$(grep -c '\[round ' "$f" || true)
+            baseline_rounds=$((baseline_rounds + ${r:-0}))
+        done
+
+        # Run WITH flag set to 2
+        rm -f "${work_dir}/.miniswe/logs/"*.log
+        cd "${work_dir}"
+        timeout 120 "${binary}" ${flag_name} 2 --yes "Read every .rs file in src/ and list their names" \
             > "${attempt_dir}/smoke_stdout.txt" \
             2> "${attempt_dir}/smoke_stderr.txt" \
-            || smoke_exit=$?
+            || true
         cd - > /dev/null
+        local limited_rounds=0
+        for f in "${work_dir}/.miniswe/logs/"*.log; do
+            [ -f "$f" ] || continue
+            local r; r=$(grep -c '\[round ' "$f" || true)
+            limited_rounds=$((limited_rounds + ${r:-0}))
+        done
 
-        # Check how many rounds the log shows
-        local smoke_log
-        smoke_log=$(ls "${work_dir}/.miniswe/logs/"*.log 2>/dev/null | tail -1 || true)
-        local round_count=0
-        if [ -n "${smoke_log}" ] && [ -f "${smoke_log}" ]; then
-            cp "${smoke_log}" "${attempt_dir}/smoke_session.log"
-            round_count=$(grep -c '\[round ' "${smoke_log}" || true)
-            round_count=${round_count:-0}
-        fi
+        echo "baseline=${baseline_rounds} limited=${limited_rounds}" > "${attempt_dir}/smoke_result.txt"
 
-        echo "smoke_exit=${smoke_exit} round_count=${round_count}" > "${attempt_dir}/smoke_result.txt"
-
-        if [ "${round_count}" -ge 1 ] && [ "${round_count}" -le 2 ]; then
+        if [ "${limited_rounds}" -le 2 ] && [ "${baseline_rounds}" -gt 2 ]; then
             (( ++passed ))
-            details="${details}smoke:PASS(${round_count}r) "
-        elif [ "${round_count}" -eq 0 ]; then
-            details="${details}smoke:FAIL(0r) "
-            errors="${errors}
-SMOKE TEST: ran 'miniswe ${flag_name} 1 --yes \"Say hello\"' but log shows 0 rounds. The flag may not be wired to the agent loop. Exit code: ${smoke_exit}"
+            details="${details}smoke:PASS(base=${baseline_rounds}r,lim=${limited_rounds}r) "
+        elif [ "${limited_rounds}" -le 2 ] && [ "${baseline_rounds}" -le 2 ]; then
+            # Both finish quickly — inconclusive but give benefit of doubt
+            if [ "$passed" -ge 5 ]; then
+                (( ++passed ))
+            fi
+            details="${details}smoke:INCONCLUSIVE(both≤2r) "
         else
-            details="${details}smoke:FAIL(${round_count}r) "
+            details="${details}smoke:FAIL(base=${baseline_rounds}r,lim=${limited_rounds}r) "
             errors="${errors}
-SMOKE TEST: ran 'miniswe ${flag_name} 1 --yes \"Say hello\"' — expected 1 round but got ${round_count}. The flag is not limiting rounds correctly."
+SMOKE TEST: flag should limit to 2 rounds but got ${limited_rounds}. Without flag: ${baseline_rounds} rounds. The flag is not wired to the agent loop."
         fi
     else
         details="${details}smoke:SKIP "

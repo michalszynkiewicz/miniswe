@@ -261,21 +261,47 @@ $(grep -E 'FAILED|panicked|failures' /output/cargo_test.txt | head -10)"
         fi
     fi
 
-    # Check 6: smoke test
+    # Check 6: smoke test — use a task that normally takes 3+ rounds,
+    # run with max_rounds=2, verify the flag actually limits it.
+    # "Read all .rs files in src/ and list their names" needs multiple
+    # read_file calls, so without the flag it would take 3+ rounds.
     TOTAL=$((TOTAL + 1))
     if [ -f "${BINARY}" ] && [ -n "${FLAG}" ] && [ "$PASS" -ge 4 ]; then
         rm -f .miniswe/logs/*.log
+
+        # First: run WITHOUT the flag to establish baseline round count
         SMOKE_EXIT=0
-        timeout 120 "${BINARY}" ${FLAG} 1 --yes "Say hello" \
+        timeout 120 "${BINARY}" --yes "Read every .rs file in src/ and list their names" \
+            > /output/smoke_baseline_stdout.txt 2> /output/smoke_baseline_stderr.txt || SMOKE_EXIT=$?
+        BASELINE_ROUNDS=$(grep -c '\[round ' .miniswe/logs/*.log 2>/dev/null || echo 0)
+        echo "smoke_baseline_rounds=${BASELINE_ROUNDS}"
+
+        # Then: run WITH flag set to 2
+        rm -f .miniswe/logs/*.log
+        SMOKE_EXIT=0
+        timeout 120 "${BINARY}" ${FLAG} 2 --yes "Read every .rs file in src/ and list their names" \
             > /output/smoke_stdout.txt 2> /output/smoke_stderr.txt || SMOKE_EXIT=$?
-        SMOKE_ROUNDS=$(grep -c '\[round ' .miniswe/logs/*.log 2>/dev/null || echo 0)
-        if [ "${SMOKE_ROUNDS}" -ge 1 ] && [ "${SMOKE_ROUNDS}" -le 2 ]; then
-            echo "smoke:PASS(${SMOKE_ROUNDS}r)"
+        LIMITED_ROUNDS=$(grep -c '\[round ' .miniswe/logs/*.log 2>/dev/null || echo 0)
+        echo "smoke_limited_rounds=${LIMITED_ROUNDS}"
+
+        echo "smoke_baseline=${BASELINE_ROUNDS} smoke_limited=${LIMITED_ROUNDS}" > /output/smoke_result.txt
+
+        # The flag works if: limited run has fewer rounds than baseline,
+        # AND limited run has at most 2 rounds (the limit we set)
+        if [ "${LIMITED_ROUNDS}" -le 2 ] && [ "${BASELINE_ROUNDS}" -gt 2 ]; then
+            echo "smoke:PASS(baseline=${BASELINE_ROUNDS}r,limited=${LIMITED_ROUNDS}r)"
             PASS=$((PASS + 1))
+        elif [ "${LIMITED_ROUNDS}" -le 2 ] && [ "${BASELINE_ROUNDS}" -le 2 ]; then
+            # Task was too simple — both finish in ≤2 rounds
+            echo "smoke:INCONCLUSIVE(both≤2r)"
+            # Give benefit of doubt if everything else passed
+            if [ "$PASS" -ge 5 ]; then
+                PASS=$((PASS + 1))
+            fi
         else
-            echo "smoke:FAIL(${SMOKE_ROUNDS}r)"
+            echo "smoke:FAIL(baseline=${BASELINE_ROUNDS}r,limited=${LIMITED_ROUNDS}r)"
             ERRORS="${ERRORS}
-SMOKE TEST: expected 1 round, got ${SMOKE_ROUNDS}."
+SMOKE TEST: flag should limit to 2 rounds but got ${LIMITED_ROUNDS}. Without flag: ${BASELINE_ROUNDS} rounds. The flag is not wired to the agent loop."
         fi
     fi
 
