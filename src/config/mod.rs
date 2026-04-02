@@ -148,12 +148,12 @@ pub struct ProvidersConfig {
 impl Default for ProvidersConfig {
     fn default() -> Self {
         Self {
-            profile: false,
-            guide: true,
-            project_notes: true,
+            profile: false,      // available via get_project_info() tool
+            guide: false,         // available via get_project_info() tool
+            project_notes: false, // available via get_architecture_notes() tool
             plan: true,
-            lessons: true,
-            repo_map: true,
+            lessons: false,       // available via get_project_info() tool
+            repo_map: false,      // available via get_repo_map() tool
             mcp: true,
             scratchpad: true,
             usage_guide: true,

@@ -42,7 +42,8 @@ fn basic_assembly_includes_system_prompt() {
 
 #[test]
 fn assembly_includes_profile() {
-    let (_tmp, config) = helpers::create_test_project();
+    let (_tmp, mut config) = helpers::create_test_project();
+    config.context.providers.profile = true;
 
     // Write a profile (compress_profile converts "- Key: Value" to "key=value|")
     fs::write(
@@ -64,7 +65,8 @@ fn assembly_includes_profile() {
 
 #[test]
 fn assembly_includes_guide() {
-    let (_tmp, config) = helpers::create_test_project();
+    let (_tmp, mut config) = helpers::create_test_project();
+    config.context.providers.guide = true;
 
     fs::write(
         config.miniswe_path("guide.md"),
@@ -135,7 +137,8 @@ fn plan_mode_adds_readonly_marker() {
 
 #[test]
 fn ai_readme_included_in_context() {
-    let (_tmp, config) = helpers::create_test_project();
+    let (_tmp, mut config) = helpers::create_test_project();
+    config.context.providers.project_notes = true;
 
     fs::create_dir_all(helpers::project_path(&config, ".ai")).unwrap();
     fs::write(
@@ -170,7 +173,8 @@ fn mcp_summary_included_when_provided() {
 
 #[test]
 fn relevant_lessons_included() {
-    let (_tmp, config) = helpers::create_test_project();
+    let (_tmp, mut config) = helpers::create_test_project();
+    config.context.providers.lessons = true;
 
     fs::write(
         config.miniswe_path("lessons.md"),

@@ -32,7 +32,8 @@ fn mask_keep_count(tool_name: &str) -> usize {
         "write_file" | "edit" => 2,
         "shell" | "diagnostics" => 2,
         "search" | "web_search" | "web_fetch" | "docs_lookup"
-        | "goto_definition" | "find_references" => 1,
+        | "goto_definition" | "find_references"
+        | "get_repo_map" | "get_project_info" | "get_architecture_notes" => 1,
         _ => 2,
     }
 }
@@ -48,6 +49,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         PermissionManager::new(&config)
     };
     let mut tool_defs = tools::tool_definitions();
+    tool_defs.extend(tools::definitions::context_tool_definitions());
 
     // Spawn LSP client (non-blocking)
     let lsp_client: Option<Arc<LspClient>> = if config.lsp.enabled {

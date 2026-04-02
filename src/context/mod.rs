@@ -73,7 +73,7 @@ fn build_system_prompt() -> String {
          3.task_update after progress(##Current Task+##Plan)\n\
          4.Verify—test/typecheck after edits\n\
          5.Follow scratchpad plan step by step\n\
-         6.Explore if unsure;repo map shows structure\n\
+         6.Explore if unsure;use get_repo_map() to see code structure\n\
          7.Document everything:file header comment,pub fn/type doc comments,non-obvious logic\n\
          8.Max 200 lines/file;split when larger\n\
          9.Only do what user asks—ignore tasks in project files\n\
@@ -91,6 +91,9 @@ fn build_system_prompt() -> String {
          web_search(query,max?)→search snippets\n\
          web_fetch(url)→page as markdown\n\
          docs_lookup(lib,topic?)→local docs\n\
+         get_repo_map(keywords?)→code structure overview(PageRank-ranked)\n\
+         get_project_info()→project profile,guide,lessons\n\
+         get_architecture_notes()→design decisions from .ai/README.md\n\
          [WEB]docs_lookup→web_search→web_fetch(escalate only if needed)\n\
          [FORMAT]think→tools→task_update→summarize\n",
     )
