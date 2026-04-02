@@ -537,7 +537,7 @@ fn mask_old_tool_results(
                     msg.content = Some(summary.clone());
                 } else {
                     // Archive pointer
-                    msg.content = Some("[archived — see .miniswe/tool_history.md]".into());
+                    msg.content = Some("[archived — use read_file(\".miniswe/tool_history.md\") to recall]".into());
                 }
             }
             tool_msg_idx += 1;

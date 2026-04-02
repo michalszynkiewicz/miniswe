@@ -679,7 +679,7 @@ fn mask_old_tool_results(
                 if from_end < keep_count {
                     msg.content = Some(summary.clone());
                 } else {
-                    msg.content = Some("[archived — see .miniswe/tool_history.md]".into());
+                    msg.content = Some("[archived — use read_file(\".miniswe/tool_history.md\") to recall]".into());
                 }
             }
             tool_msg_idx += 1;
