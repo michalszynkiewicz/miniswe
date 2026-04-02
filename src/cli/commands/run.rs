@@ -40,7 +40,6 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let mut tool_defs = tools::tool_definitions();
     // Context tools — pull-based access to repo map, profile, architecture notes
     tool_defs.extend(tools::definitions::context_tool_definitions());
-    tool_defs.push(tools::definitions::history_tool_definition());
 
     // Clear stale scratchpad/plan from previous sessions
     let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));

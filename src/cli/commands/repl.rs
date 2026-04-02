@@ -38,7 +38,6 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
     };
     let mut tool_defs = tools::tool_definitions();
     tool_defs.extend(tools::definitions::context_tool_definitions());
-    tool_defs.push(tools::definitions::history_tool_definition());
 
     // Spawn LSP client (non-blocking)
     let lsp_client: Option<Arc<LspClient>> = if config.lsp.enabled {
