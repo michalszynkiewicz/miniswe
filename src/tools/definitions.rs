@@ -299,6 +299,50 @@ pub fn lsp_tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Context tools — pull-based access to project knowledge.
+pub fn context_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "get_repo_map".into(),
+                description: "Get the project's code structure overview — files ranked by importance with function/type signatures. Use this when you need to understand the codebase layout before making changes. Optionally filter by keywords to focus on relevant areas.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "keywords": {
+                            "type": "string",
+                            "description": "Space-separated keywords to focus the map on (e.g. 'config cli run'). Optional — omit for full overview."
+                        }
+                    }
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "get_project_info".into(),
+                description: "Get project metadata: language, build system, entry points, coding guidelines, and accumulated tips. Useful at the start of a task to understand the project.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "get_architecture_notes".into(),
+                description: "Get architecture overview and key decisions from previous sessions (.ai/README.md). Useful when you need to understand design decisions or overall system structure.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+        },
+    ]
+}
+
 /// Return the mcp_use tool definition (only added when MCP servers are configured).
 pub fn mcp_tool_definition() -> ToolDefinition {
     ToolDefinition {

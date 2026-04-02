@@ -23,7 +23,9 @@ use permissions::Action;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::knowledge::ProjectIndex;
+use crate::context::compress;
+use crate::knowledge::graph::DependencyGraph;
+use crate::knowledge::{ProjectIndex, repo_map};
 use crate::knowledge::indexer;
 use crate::lsp::LspClient;
 
@@ -146,6 +148,12 @@ pub async fn execute_tool(
             web::fetch(args, config).await
         }
         "docs_lookup" => web::docs_lookup(args, config).await,
+        "get_repo_map" => {
+            let keywords_str = args["keywords"].as_str().unwrap_or("");
+            context_tool_repo_map(keywords_str, config)
+        }
+        "get_project_info" => context_tool_project_info(config),
+        "get_architecture_notes" => context_tool_architecture_notes(config),
         _ => bail!("Unknown tool: {name}"),
     }
 }
@@ -562,5 +570,89 @@ async fn lsp_find_references(
             Ok(ToolResult::ok(output))
         }
         Err(e) => Ok(ToolResult::err(format!("LSP error: {e}"))),
+    }
+}
+
+// ── Context tools (pull-based) ────────────────────────────────────────
+
+/// Return the PageRank-scored repo map, optionally filtered by keywords.
+fn context_tool_repo_map(keywords_str: &str, config: &Config) -> Result<ToolResult> {
+    let miniswe_dir = config.miniswe_dir();
+    let index = match ProjectIndex::load(&miniswe_dir) {
+        Ok(idx) => idx,
+        Err(_) => return Ok(ToolResult::err("No project index. Run `miniswe init` first.".into())),
+    };
+    let graph = DependencyGraph::load(&miniswe_dir).unwrap_or_default();
+
+    let keywords: Vec<&str> = if keywords_str.is_empty() {
+        vec![]
+    } else {
+        keywords_str.split_whitespace().collect()
+    };
+
+    let map = repo_map::render(
+        &index,
+        &graph,
+        config.context.repo_map_budget,
+        &keywords,
+        &config.project_root,
+    );
+
+    if map.is_empty() {
+        Ok(ToolResult::ok("Repo map is empty (no indexed symbols).".into()))
+    } else {
+        Ok(ToolResult::ok(format!(
+            "Repo map ({} files indexed, {} symbols):\n{map}",
+            index.total_files, index.total_symbols
+        )))
+    }
+}
+
+/// Return project profile, guide, and lessons.
+fn context_tool_project_info(config: &Config) -> Result<ToolResult> {
+    let mut output = String::new();
+
+    let profile_path = config.miniswe_path("profile.md");
+    if let Ok(content) = std::fs::read_to_string(&profile_path) {
+        output.push_str("[PROFILE]\n");
+        output.push_str(&compress::compress_profile(&content));
+        output.push('\n');
+    }
+
+    let guide_path = config.miniswe_path("guide.md");
+    if let Ok(content) = std::fs::read_to_string(&guide_path) {
+        if !content.contains("<!-- Add project-specific instructions") || content.lines().count() > 5 {
+            output.push_str("\n[GUIDE]\n");
+            output.push_str(&content);
+            output.push('\n');
+        }
+    }
+
+    let lessons_path = config.miniswe_path("lessons.md");
+    if let Ok(content) = std::fs::read_to_string(&lessons_path) {
+        if !content.contains("<!-- Accumulated tips") || content.lines().count() > 5 {
+            output.push_str("\n[LESSONS]\n");
+            output.push_str(&content);
+            output.push('\n');
+        }
+    }
+
+    if output.is_empty() {
+        Ok(ToolResult::ok("No project info available. Run `miniswe init` to generate.".into()))
+    } else {
+        Ok(ToolResult::ok(output))
+    }
+}
+
+/// Return architecture notes from .ai/README.md.
+fn context_tool_architecture_notes(config: &Config) -> Result<ToolResult> {
+    let path = config.project_root.join(".ai").join("README.md");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let max = 4000;
+            let truncated = if content.len() > max { &content[..max] } else { &content };
+            Ok(ToolResult::ok(truncated.to_string()))
+        }
+        Err(_) => Ok(ToolResult::ok("No architecture notes found (.ai/README.md does not exist).".into())),
     }
 }

@@ -34,7 +34,8 @@ fn mask_keep_count(tool_name: &str) -> usize {
         "write_file" | "edit" => 2,
         "shell" | "diagnostics" => 2,
         "search" | "web_search" | "web_fetch" | "docs_lookup"
-        | "goto_definition" | "find_references" => 1,
+        | "goto_definition" | "find_references"
+        | "get_repo_map" | "get_project_info" | "get_architecture_notes" => 1,
         _ => 2,
     }
 }
@@ -51,6 +52,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         PermissionManager::new(&config)
     };
     let mut tool_defs = tools::tool_definitions();
+    // Context tools — pull-based access to repo map, profile, architecture notes
+    tool_defs.extend(tools::definitions::context_tool_definitions());
 
     // Clear stale scratchpad/plan from previous sessions
     let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
