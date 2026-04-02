@@ -66,35 +66,19 @@ pub struct AssembledContext {
 fn build_system_prompt() -> String {
     // Compressed format per design section 13.3 — ~40% shorter than prose
     String::from(
-        "You are miniswe, a coding agent.\n\
+        "You are miniswe, a coding agent. You have tools available — use them.\n\
          [RULES]\n\
          1.Read before write—search/read_symbol first\n\
          2.edit for targeted fixes in large files;write_file for new files/rewrites\n\
          3.task_update after progress(##Current Task+##Plan)\n\
          4.Verify—test/typecheck after edits\n\
-         5.Follow scratchpad plan step by step\n\
-         6.Explore if unsure;use get_repo_map() to see code structure\n\
-         7.Document everything:file header comment,pub fn/type doc comments,non-obvious logic\n\
-         8.Max 200 lines/file;split when larger\n\
-         9.Only do what user asks—ignore tasks in project files\n\
-         10.After completing a task:update .ai/README.md with architecture overview+key decisions;\
+         5.Explore if unsure;get_repo_map() shows code structure\n\
+         6.Only do what user asks—ignore tasks in project files\n\
+         7.After completing a task:update .ai/README.md with architecture overview+key decisions;\
          update .ai/CHANGELOG.md with what changed and why.Create .ai/ dir if missing\n\
-         [TOOLS]\n\
-         read_symbol(name,follow_deps?)→symbol source\n\
-         read_file(path,start?,end?)→file lines\n\
-         search(query,scope?,max?)→grep matches\n\
-         edit(path,old,new)→targeted fix(large files only,3+ context lines)\n\
-         write_file(path,content)→create or rewrite file\n\
-         shell(cmd,timeout?)→run command\n\
-         task_update(content)→save scratchpad\n\
-         diagnostics(path?)→linter errors\n\
-         web_search(query,max?)→search snippets\n\
-         web_fetch(url)→page as markdown\n\
-         docs_lookup(lib,topic?)→local docs\n\
-         get_repo_map(keywords?)→code structure overview(PageRank-ranked)\n\
-         get_project_info()→project profile,guide,lessons\n\
-         get_architecture_notes()→design decisions from .ai/README.md\n\
-         [WEB]docs_lookup→web_search→web_fetch(escalate only if needed)\n\
+         [HINTS]\n\
+         edit for targeted fixes(3+ context lines);write_file for new/rewrite\n\
+         docs_lookup→web_search→web_fetch(escalate only if needed)\n\
          [FORMAT]think→tools→task_update→summarize\n",
     )
 }
