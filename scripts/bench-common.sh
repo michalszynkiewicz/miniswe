@@ -81,7 +81,7 @@ history_turns = 5
 history_budget = 6000
 scratchpad_budget = 1500
 max_rounds = ${MAX_ROUNDS}
-pause_after_rounds = ${MAX_ROUNDS}
+pause_after_rounds = 99999
 
 [context.providers]
 profile = $(_is_disabled profile && echo "false" || echo "true")
