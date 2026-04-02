@@ -336,12 +336,14 @@ SCRIPT
     local final_line
     final_line=$(grep "=== FINAL:" "${variant_dir}/container.log" 2>/dev/null || echo "FINAL: ?/? after ? attempt(s)")
 
-    # Count total rounds across all attempts
+    # Count total rounds across all attempt logs
     local rounds=0
-    if ls "${variant_dir}"/*.log 1>/dev/null 2>&1; then
-        rounds=$(grep -c '\[round ' "${variant_dir}"/*.log 2>/dev/null || true)
-        rounds=${rounds:-0}
-    fi
+    for logfile in "${variant_dir}"/*.log; do
+        [ -f "${logfile}" ] || continue
+        local r
+        r=$(grep -c '\[round ' "${logfile}" 2>/dev/null || true)
+        rounds=$((rounds + ${r:-0}))
+    done
 
     # Count attempts
     local attempts
@@ -372,11 +374,16 @@ printf "%-20s %8s %4s %8s %s\n" "Variant" "Rounds" "Att" "Time" "Result"
 echo "-----------------------------------------------------------------"
 for d in "${RESULTS_DIR}"/*/; do
     name=$(basename "$d")
-    rounds=$(grep -c '\[round ' "$d"/*.log 2>/dev/null || echo "?")
+    local_rounds=0
+    for logfile in "$d"/*.log; do
+        [ -f "${logfile}" ] || continue
+        local_r=$(grep -c '\[round ' "${logfile}" 2>/dev/null || true)
+        local_rounds=$((local_rounds + ${local_r:-0}))
+    done
     wall=$(cat "$d/wall_s.txt" 2>/dev/null || echo "?")
     attempts=$(grep -c "=== ATTEMPT .* remaining" "$d/container.log" 2>/dev/null || echo "?")
     result=$(grep "=== FINAL:" "$d/container.log" 2>/dev/null | grep -oE "[0-9]+/[0-9]+" || echo "?/?")
-    printf "%-20s %8s %4s %7ss  %s\n" "$name" "$rounds" "$attempts" "$wall" "$result"
+    printf "%-20s %8s %4s %7ss  %s\n" "$name" "$local_rounds" "$attempts" "$wall" "$result"
 done
 echo "================================================================="
 echo ""
