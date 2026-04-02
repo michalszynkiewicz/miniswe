@@ -133,6 +133,9 @@ prepare_workdir() {
 
     git -C "${REPO_DIR}" archive "${SHA}" | tar -x -C "${WORK_DIR}"
 
+    # Clear cached builds from previous attempts
+    rm -rf "${WORK_DIR}/target"
+
     # Initialize miniswe fresh for this SHA's code
     rm -rf "${WORK_DIR}/.miniswe"
     cd "${WORK_DIR}"
