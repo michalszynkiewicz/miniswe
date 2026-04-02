@@ -11,9 +11,9 @@
 
 # Pinned SHA — provider system was introduced here.
 # SHA of the code the model works on (the task target).
-# Includes LSP + providers + warning fixes. The --max-rounds task doesn't
-# exist here. The benchmark binary is built from HEAD.
-BASELINE_SHA="94e2fd5"
+# Smaller codebase (pre-LSP) — devstral can handle it. Test warnings
+# suppressed via RUSTFLAGS in validation scripts.
+BASELINE_SHA="e152ca85416f2c8a3ec027c8dfce8dbc42211af6"
 
 # ── Defaults ────────────────────────────────────────────────────────────
 
