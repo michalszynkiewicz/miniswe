@@ -9,11 +9,10 @@
 #     → writes validation.txt (PASS/PARTIAL/FAIL)
 #     → writes validation_errors.txt (human-readable failures for retry)
 
-# Pinned SHA — provider system was introduced here.
 # SHA of the code the model works on (the task target).
-# Smaller codebase (pre-LSP) — devstral can handle it. Test warnings
-# suppressed via RUSTFLAGS in validation scripts.
-BASELINE_SHA="e152ca85416f2c8a3ec027c8dfce8dbc42211af6"
+# Pre-LSP codebase with warning fixes and UTF-8 truncation fix.
+# Branch: bench-baseline
+BASELINE_SHA="cc34d2626faf32c1b6dd1b8b33af693fb936b098"
 
 # ── Defaults ────────────────────────────────────────────────────────────
 
