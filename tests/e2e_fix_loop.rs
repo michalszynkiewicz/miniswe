@@ -240,94 +240,90 @@ async fn auto_check_ok_on_valid_code() {
 // but we can verify the behavior through the public mask_keep_count concept.
 
 #[test]
-fn masking_keeps_reads_longer_than_writes() {
-    // Simulate the masking logic: with 8 tool results of mixed types,
-    // reads should be kept longer than writes.
-    // Build a simulated tool_result_log
+fn token_budget_masking_keeps_newest() {
+    // Token-budget masking: walk backwards, keep newest until budget exceeded.
+    // Budget = 100 tokens (~400 chars). Each "big" entry is ~200 chars (50 tokens).
+    use miniswe::context::estimate_tokens;
+
+    let big = "x".repeat(200); // ~50 tokens
+    let small = "y".repeat(40); // ~10 tokens
+
     let log: Vec<(String, serde_json::Value, String)> = vec![
-        ("read_file".into(), json!({"path": "a.rs"}), "content of a.rs...".into()),
-        ("write_file".into(), json!({"path": "b.rs"}), "✓ Wrote b.rs".into()),
-        ("shell".into(), json!({"command": "ls"}), "[shell: exit 0]\nfile1".into()),
-        ("read_file".into(), json!({"path": "c.rs"}), "content of c.rs...".into()),
-        ("write_file".into(), json!({"path": "d.rs"}), "✓ Wrote d.rs".into()),
-        ("search".into(), json!({"query": "foo"}), "matches...".into()),
-        ("read_file".into(), json!({"path": "e.rs"}), "content of e.rs...".into()),
-        ("read_file".into(), json!({"path": "f.rs"}), "content of f.rs...".into()),
+        ("read_file".into(), json!({"path": "a.rs"}), big.clone()),    // oldest
+        ("read_file".into(), json!({"path": "b.rs"}), big.clone()),
+        ("write_file".into(), json!({"path": "c.rs"}), small.clone()),
+        ("read_file".into(), json!({"path": "d.rs"}), big.clone()),    // newest
     ];
 
-    // Apply the per-type masking logic (reimplemented here for testing)
-    fn mask_keep_count(tool_name: &str) -> usize {
-        match tool_name {
-            "read_file" | "read_symbol" => 3,
-            "write_file" | "edit" => 2,
-            "shell" | "diagnostics" => 2,
-            "search" | "web_search" | "web_fetch" | "docs_lookup" => 1,
-            _ => 2,
-        }
-    }
-
-    let mut type_counts: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
+    // Budget of 100 tokens: newest two (big=50 + small=10 = 60) fit,
+    // third from end (big=50, total 110) exceeds budget → masked
+    let budget = 100;
+    let mut used = 0;
     let mut should_mask: Vec<bool> = vec![false; log.len()];
-
     for i in (0..log.len()).rev() {
-        let tool_name = log[i].0.as_str();
-        let count = type_counts.entry(tool_name).or_insert(0);
-        *count += 1;
-        if *count > mask_keep_count(tool_name) {
+        used += estimate_tokens(&log[i].2);
+        if used > budget {
             should_mask[i] = true;
         }
     }
 
-    // First read_file (index 0): 4th oldest of 4 reads → MASKED (keep 3)
-    assert!(should_mask[0], "oldest read_file should be masked");
-
-    // write_file at index 1: 2nd oldest of 2 writes → kept
-    assert!(!should_mask[1], "2nd write_file should be kept (threshold 2)");
-
-    // shell at index 2: 1st of 1 shell → kept
-    assert!(!should_mask[2], "only shell should be kept");
-
-    // read_file at index 3: 3rd oldest of 4 reads → kept (threshold 3)
-    assert!(!should_mask[3], "3rd most recent read should be kept");
-
-    // search at index 5: 1st of 1 search → kept (threshold 1)
-    assert!(!should_mask[5], "only search should be kept");
-
-    // Last 2 reads (indices 6,7): most recent → kept
-    assert!(!should_mask[6], "2nd most recent read should be kept");
-    assert!(!should_mask[7], "most recent read should be kept");
+    assert!(should_mask[0], "oldest should be masked (over budget)");
+    assert!(should_mask[1], "second oldest should be masked (over budget)");
+    assert!(!should_mask[2], "write_file fits in budget");
+    assert!(!should_mask[3], "newest read fits in budget");
 }
 
 #[test]
-fn masking_nothing_when_under_thresholds() {
-    // With only a few tool results, nothing should be masked
+fn token_budget_masking_nothing_when_under_budget() {
+    use miniswe::context::estimate_tokens;
+
+    let small = "content".to_string(); // ~2 tokens
+
     let log: Vec<(String, serde_json::Value, String)> = vec![
-        ("read_file".into(), json!({"path": "a.rs"}), "content...".into()),
-        ("write_file".into(), json!({"path": "b.rs"}), "✓ Wrote".into()),
-        ("read_file".into(), json!({"path": "c.rs"}), "content...".into()),
+        ("read_file".into(), json!({"path": "a.rs"}), small.clone()),
+        ("write_file".into(), json!({"path": "b.rs"}), small.clone()),
+        ("read_file".into(), json!({"path": "c.rs"}), small.clone()),
     ];
 
-    fn mask_keep_count(tool_name: &str) -> usize {
-        match tool_name {
-            "read_file" | "read_symbol" => 3,
-            _ => 2,
-        }
-    }
-
-    let mut type_counts: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
+    // Budget of 1000 tokens: total is ~6 tokens, well under budget
+    let budget = 1000;
+    let mut used = 0;
     let mut should_mask: Vec<bool> = vec![false; log.len()];
-
     for i in (0..log.len()).rev() {
-        let tool_name = log[i].0.as_str();
-        let count = type_counts.entry(tool_name).or_insert(0);
-        *count += 1;
-        if *count > mask_keep_count(tool_name) {
+        used += estimate_tokens(&log[i].2);
+        if used > budget {
             should_mask[i] = true;
         }
     }
 
-    // 2 reads (under threshold of 3) + 1 write (under threshold of 2) → nothing masked
-    assert!(!should_mask.iter().any(|m| *m), "nothing should be masked");
+    assert!(!should_mask.iter().any(|m| *m), "nothing should be masked under budget");
+}
+
+#[test]
+fn rich_summary_includes_function_signatures() {
+    use miniswe::context::compress::summarize_tool_result;
+
+    let content = r#"[src/cli/mod.rs: 59 lines]
+   1│pub mod commands;
+   2│
+   3│use clap::{Parser, Subcommand};
+   4│
+   5│pub struct Cli {
+   6│    pub message: Option<String>,
+   7│}
+   8│
+   9│pub fn run_cli(args: &[String]) -> Result<()> {
+  10│    todo!()
+  11│}
+"#;
+
+    let summary = summarize_tool_result(
+        "read_file",
+        &json!({"path": "src/cli/mod.rs"}),
+        content,
+    );
+
+    assert!(summary.contains("src/cli/mod.rs"), "should have path");
+    assert!(summary.contains("pub struct Cli"), "should have struct signature");
+    assert!(summary.contains("pub fn run_cli"), "should have function signature");
 }
