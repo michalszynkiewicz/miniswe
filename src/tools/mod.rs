@@ -154,6 +154,13 @@ pub async fn execute_tool(
         }
         "get_project_info" => context_tool_project_info(config),
         "get_architecture_notes" => context_tool_architecture_notes(config),
+        "get_tool_history" => {
+            let path = config.project_root.join(".miniswe").join("tool_history.md");
+            match std::fs::read_to_string(&path) {
+                Ok(content) if !content.is_empty() => Ok(ToolResult::ok(content)),
+                _ => Ok(ToolResult::ok("No archived tool history.".into())),
+            }
+        }
         _ => bail!("Unknown tool: {name}"),
     }
 }
