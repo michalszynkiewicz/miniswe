@@ -343,6 +343,21 @@ pub fn context_tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Context tools — access to archived tool history.
+pub fn history_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".into(),
+        function: FunctionDefinition {
+            name: "get_tool_history".into(),
+            description: "Retrieve archived summaries of previous tool calls (file reads, edits, searches) from earlier in this session. Use when you see '[archived]' markers in tool results and need to recall what you previously read or did.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+    }
+}
+
 /// Return the mcp_use tool definition (only added when MCP servers are configured).
 pub fn mcp_tool_definition() -> ToolDefinition {
     ToolDefinition {
