@@ -213,6 +213,11 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.replace('\n', "\\n")
     } else {
-        format!("{}...({}B total)", s[..max].replace('\n', "\\n"), s.len())
+        // Find nearest char boundary at or before max
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...({}B total)", s[..end].replace('\n', "\\n"), s.len())
     }
 }
