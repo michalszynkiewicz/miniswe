@@ -133,13 +133,11 @@ prepare_workdir() {
 
     git -C "${REPO_DIR}" archive "${SHA}" | tar -x -C "${WORK_DIR}"
 
+    # Initialize miniswe fresh for this SHA's code
     rm -rf "${WORK_DIR}/.miniswe"
-    mkdir -p "${WORK_DIR}/.miniswe"
-    for item in index profile.md guide.md lessons.md; do
-        if [ -e "${REPO_DIR}/.miniswe/${item}" ]; then
-            cp -r "${REPO_DIR}/.miniswe/${item}" "${WORK_DIR}/.miniswe/"
-        fi
-    done
+    cd "${WORK_DIR}"
+    "${MINISWE}" init 2>/dev/null || true
+    cd - > /dev/null
     mkdir -p "${WORK_DIR}/.miniswe/logs"
 
     cd "${WORK_DIR}"
