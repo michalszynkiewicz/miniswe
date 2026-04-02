@@ -11,7 +11,7 @@
 #
 # The run-benchmark-docker.sh script handles per-variant containers.
 
-FROM rust:1.87-bookworm
+FROM rust:1.89-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev git curl ca-certificates maven \
