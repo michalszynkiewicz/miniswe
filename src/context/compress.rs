@@ -396,14 +396,46 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
         "read_file" => {
             let path = args["path"].as_str().unwrap_or("?");
             let line_count = content.lines().count();
-            // Extract symbol names from content if it looks like code
-            let symbols = extract_symbol_names_from_content(content);
-            if symbols.is_empty() {
+            // Extract function/struct signatures for a useful summary
+            let mut sigs = Vec::new();
+            for line in content.lines() {
+                let trimmed = line.trim();
+                // Capture function/method signatures
+                if (trimmed.starts_with("pub fn ")
+                    || trimmed.starts_with("pub async fn ")
+                    || trimmed.starts_with("fn ")
+                    || trimmed.starts_with("async fn "))
+                    && trimmed.contains('(')
+                {
+                    let sig = trimmed.split('{').next().unwrap_or(trimmed).trim();
+                    if sig.len() < 80 {
+                        sigs.push(sig.to_string());
+                    }
+                }
+                // Capture struct/enum/trait definitions
+                if (trimmed.starts_with("pub struct ")
+                    || trimmed.starts_with("pub enum ")
+                    || trimmed.starts_with("pub trait ")
+                    || trimmed.starts_with("struct ")
+                    || trimmed.starts_with("enum ")
+                    || trimmed.starts_with("trait "))
+                    && !trimmed.contains(';')
+                {
+                    let def = trimmed.split('{').next().unwrap_or(trimmed).trim();
+                    if def.len() < 80 {
+                        sigs.push(def.to_string());
+                    }
+                }
+                if sigs.len() >= 10 {
+                    break;
+                }
+            }
+            if sigs.is_empty() {
                 format!("[read:{path}→{line_count}L]")
             } else {
                 format!(
-                    "[read:{path}→{line_count}L,exports:{}]",
-                    symbols.join(",")
+                    "[read:{path}→{line_count}L]\n{}",
+                    sigs.join("\n")
                 )
             }
         }
