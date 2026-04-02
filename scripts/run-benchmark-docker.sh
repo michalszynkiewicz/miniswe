@@ -140,6 +140,7 @@ set -euo pipefail
 SHA="$1"
 TASK="$2"
 TIMEOUT="$3"
+MAX_ATTEMPTS=3
 
 # Fresh checkout
 cd /work
@@ -155,79 +156,144 @@ mkdir -p .miniswe/logs
 # Init git for diff tracking
 git init -q && git add -A && git commit -q -m "baseline" 2>/dev/null
 
-# Run miniswe
-echo "=== MINISWE START ==="
-timeout "${TIMEOUT}" miniswe --yes "${TASK}" > /output/stdout.txt 2> /output/stderr.txt || true
-echo "=== MINISWE END ==="
+START_TIME=$(date +%s)
+DEADLINE=$((START_TIME + TIMEOUT))
+ATTEMPT=0
+CURRENT_TASK="${TASK}"
 
-# Copy logs
-cp .miniswe/logs/*.log /output/ 2>/dev/null || true
+while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
+    ATTEMPT=$((ATTEMPT + 1))
+    NOW=$(date +%s)
+    REMAINING=$((DEADLINE - NOW))
+    if [ "$REMAINING" -le 30 ]; then
+        echo "=== ATTEMPT ${ATTEMPT}: SKIPPED (${REMAINING}s left) ==="
+        break
+    fi
 
-# Capture changes
-git diff --name-only > /output/changed_files.txt 2>/dev/null || true
-git ls-files --others --exclude-standard >> /output/changed_files.txt 2>/dev/null || true
-git diff > /output/diff.patch 2>/dev/null || true
+    echo "=== ATTEMPT ${ATTEMPT}/${MAX_ATTEMPTS} (${REMAINING}s remaining) ==="
 
-# === Validation ===
-echo "=== VALIDATION ==="
+    # Clear logs from previous attempt
+    rm -f .miniswe/logs/*.log
 
-# Check 1: cargo check
-if RUSTFLAGS="-A warnings" cargo check 2> /output/cargo_check.txt; then
-    echo "compile:PASS"
-else
-    echo "compile:FAIL"
-    cat /output/cargo_check.txt | grep "^error" | head -20 > /output/compile_errors.txt
-fi
+    # Run miniswe (keep modified code from previous attempts)
+    timeout "${REMAINING}" miniswe --yes "${CURRENT_TASK}" \
+        > /output/stdout_attempt${ATTEMPT}.txt \
+        2> /output/stderr_attempt${ATTEMPT}.txt \
+        || true
 
-# Check 2: cargo build
-if RUSTFLAGS="-A warnings" cargo build 2> /output/cargo_build.txt; then
-    echo "build:PASS"
-else
-    echo "build:FAIL"
-fi
+    # Copy logs
+    cp .miniswe/logs/*.log /output/ 2>/dev/null || true
 
-# Check 3: --help shows rounds flag
-BINARY="./target/debug/miniswe"
-if [ -f "${BINARY}" ]; then
-    "${BINARY}" --help > /output/help_output.txt 2>&1 || true
-    if grep -qiE -- '--[a-z-]*round[a-z-]*' /output/help_output.txt; then
-        FLAG=$(grep -oE -- '--[a-z-]*round[a-z-]*' /output/help_output.txt | head -1)
-        echo "help:PASS(${FLAG})"
+    # Capture changes
+    git diff --name-only > /output/changed_files.txt 2>/dev/null || true
+    git ls-files --others --exclude-standard >> /output/changed_files.txt 2>/dev/null || true
+    git diff > /output/diff.patch 2>/dev/null || true
 
-        # Check 4: flag parses
+    # === Validate ===
+    PASS=0
+    TOTAL=0
+    ERRORS=""
+
+    # Check 1: cargo check
+    TOTAL=$((TOTAL + 1))
+    if RUSTFLAGS="-A warnings" cargo check 2> /output/cargo_check.txt; then
+        echo "compile:PASS"
+        PASS=$((PASS + 1))
+    else
+        echo "compile:FAIL"
+        ERRORS="${ERRORS}
+COMPILE ERROR:
+$(grep '^error' /output/cargo_check.txt | head -20)"
+    fi
+
+    # Check 2: cargo build
+    TOTAL=$((TOTAL + 1))
+    BINARY="./target/debug/miniswe"
+    if [ "$PASS" -ge 1 ]; then
+        if RUSTFLAGS="-A warnings" cargo build 2> /output/cargo_build.txt; then
+            echo "build:PASS"
+            PASS=$((PASS + 1))
+        else
+            echo "build:FAIL"
+        fi
+    else
+        echo "build:SKIP"
+    fi
+
+    # Check 3: --help shows rounds flag
+    TOTAL=$((TOTAL + 1))
+    FLAG=""
+    if [ -f "${BINARY}" ]; then
+        "${BINARY}" --help > /output/help_output.txt 2>&1 || true
+        if grep -qiE -- '--[a-z-]*round[a-z-]*' /output/help_output.txt; then
+            FLAG=$(grep -oE -- '--[a-z-]*round[a-z-]*' /output/help_output.txt | head -1)
+            echo "help:PASS(${FLAG})"
+            PASS=$((PASS + 1))
+        else
+            echo "help:FAIL"
+            ERRORS="${ERRORS}
+--help does not show a rounds flag."
+        fi
+    fi
+
+    # Check 4: flag parses
+    TOTAL=$((TOTAL + 1))
+    if [ -f "${BINARY}" ] && [ -n "${FLAG}" ]; then
         if "${BINARY}" ${FLAG} 5 --help > /dev/null 2>&1; then
             echo "parse:PASS"
+            PASS=$((PASS + 1))
         else
             echo "parse:FAIL"
         fi
+    fi
 
-        # Check 5: cargo test
+    # Check 5: cargo test
+    TOTAL=$((TOTAL + 1))
+    if [ "$PASS" -ge 2 ]; then
         if RUSTFLAGS="-A warnings" cargo test 2> /output/cargo_test.txt; then
             echo "test:PASS"
+            PASS=$((PASS + 1))
         else
             echo "test:FAIL"
+            ERRORS="${ERRORS}
+TESTS FAILED:
+$(grep -E 'FAILED|panicked|failures' /output/cargo_test.txt | head -10)"
         fi
-
-        # Check 6: smoke test
-        rm -f .miniswe/logs/*.log
-        if timeout 120 "${BINARY}" ${FLAG} 1 --yes "Say hello" > /output/smoke_stdout.txt 2> /output/smoke_stderr.txt; then
-            ROUNDS=$(grep -c '\[round ' .miniswe/logs/*.log 2>/dev/null || echo 0)
-            if [ "${ROUNDS}" -ge 1 ] && [ "${ROUNDS}" -le 2 ]; then
-                echo "smoke:PASS(${ROUNDS}r)"
-            else
-                echo "smoke:FAIL(${ROUNDS}r)"
-            fi
-        else
-            echo "smoke:FAIL(exit)"
-        fi
-    else
-        echo "help:FAIL"
     fi
-else
-    echo "build:NOBINARY"
-fi
 
-echo "=== VALIDATION END ==="
+    # Check 6: smoke test
+    TOTAL=$((TOTAL + 1))
+    if [ -f "${BINARY}" ] && [ -n "${FLAG}" ] && [ "$PASS" -ge 4 ]; then
+        rm -f .miniswe/logs/*.log
+        SMOKE_EXIT=0
+        timeout 120 "${BINARY}" ${FLAG} 1 --yes "Say hello" \
+            > /output/smoke_stdout.txt 2> /output/smoke_stderr.txt || SMOKE_EXIT=$?
+        SMOKE_ROUNDS=$(grep -c '\[round ' .miniswe/logs/*.log 2>/dev/null || echo 0)
+        if [ "${SMOKE_ROUNDS}" -ge 1 ] && [ "${SMOKE_ROUNDS}" -le 2 ]; then
+            echo "smoke:PASS(${SMOKE_ROUNDS}r)"
+            PASS=$((PASS + 1))
+        else
+            echo "smoke:FAIL(${SMOKE_ROUNDS}r)"
+            ERRORS="${ERRORS}
+SMOKE TEST: expected 1 round, got ${SMOKE_ROUNDS}."
+        fi
+    fi
+
+    echo "=== ATTEMPT ${ATTEMPT} RESULT: ${PASS}/${TOTAL} ==="
+
+    # All passed?
+    if [ "$PASS" -eq "$TOTAL" ]; then
+        echo "=== PASSED on attempt ${ATTEMPT} ==="
+        break
+    fi
+
+    # Compose retry message
+    CURRENT_TASK="Your previous changes have these problems:
+${ERRORS}
+Please fix the issues. The modified files are still on disk."
+done
+
+echo "=== FINAL: ${PASS}/${TOTAL} after ${ATTEMPT} attempt(s) ==="
 SCRIPT
 )
 
@@ -262,34 +328,29 @@ SCRIPT
 
     rm -f "${tmp_script}"
 
-    # Parse validation results
-    local validation_output
-    validation_output=$(sed -n '/=== VALIDATION ===/,/=== VALIDATION END ===/p' "${variant_dir}/container.log")
-    echo "${validation_output}" > "${variant_dir}/validation_raw.txt"
-
-    local pass=0 total=0
-    for check in compile build help parse test smoke; do
-        if echo "${validation_output}" | grep -q "${check}:PASS"; then
-            (( ++pass ))
-        fi
-        if echo "${validation_output}" | grep -qE "${check}:(PASS|FAIL)"; then
-            (( ++total ))
-        fi
-    done
-
+    # Parse results
     local wall_s
     wall_s=$(cat "${variant_dir}/wall_s.txt")
 
-    # Count rounds from log
+    # Extract final result line
+    local final_line
+    final_line=$(grep "=== FINAL:" "${variant_dir}/container.log" 2>/dev/null || echo "FINAL: ?/? after ? attempt(s)")
+
+    # Count total rounds across all attempts
     local rounds=0
     if ls "${variant_dir}"/*.log 1>/dev/null 2>&1; then
         rounds=$(grep -c '\[round ' "${variant_dir}"/*.log 2>/dev/null || true)
         rounds=${rounds:-0}
     fi
 
+    # Count attempts
+    local attempts
+    attempts=$(grep -c "=== ATTEMPT .* remaining" "${variant_dir}/container.log" 2>/dev/null || echo "0")
+
     echo ""
-    echo "    Result: ${pass}/${total} passed, ${rounds} rounds, ${wall_s}s"
-    echo "    ${validation_output}" | grep -E "(PASS|FAIL)" | sed 's/^/    /'
+    echo "    ${final_line}"
+    echo "    rounds=${rounds} attempts=${attempts} wall=${wall_s}s"
+    grep -E "(compile|build|help|parse|test|smoke):(PASS|FAIL)" "${variant_dir}/container.log" | tail -6 | sed 's/^/    /'
     echo ""
 }
 
@@ -307,14 +368,15 @@ echo ""
 echo "================================================================="
 echo "  RESULTS"
 echo "================================================================="
-printf "%-20s %8s %8s\n" "Variant" "Rounds" "Time"
+printf "%-20s %8s %4s %8s %s\n" "Variant" "Rounds" "Att" "Time" "Result"
 echo "-----------------------------------------------------------------"
 for d in "${RESULTS_DIR}"/*/; do
     name=$(basename "$d")
     rounds=$(grep -c '\[round ' "$d"/*.log 2>/dev/null || echo "?")
     wall=$(cat "$d/wall_s.txt" 2>/dev/null || echo "?")
-    validation=$(sed -n '/=== VALIDATION ===/,/=== VALIDATION END ===/p' "$d/container.log" 2>/dev/null | grep -cE "PASS" || echo "?")
-    printf "%-20s %8s %7ss  %s/6\n" "$name" "$rounds" "$wall" "$validation"
+    attempts=$(grep -c "=== ATTEMPT .* remaining" "$d/container.log" 2>/dev/null || echo "?")
+    result=$(grep "=== FINAL:" "$d/container.log" 2>/dev/null | grep -oE "[0-9]+/[0-9]+" || echo "?/?")
+    printf "%-20s %8s %4s %7ss  %s\n" "$name" "$rounds" "$attempts" "$wall" "$result"
 done
 echo "================================================================="
 echo ""
