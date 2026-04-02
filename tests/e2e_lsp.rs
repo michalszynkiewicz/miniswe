@@ -244,6 +244,20 @@ fn detect_go_project() {
 }
 
 #[test]
+fn detect_java_maven_project() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    fs::write(tmp.path().join("pom.xml"), "<project/>").unwrap();
+    assert_eq!(LspServer::detect(tmp.path()), Some(LspServer::Jdtls));
+}
+
+#[test]
+fn detect_java_gradle_project() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    fs::write(tmp.path().join("build.gradle"), "").unwrap();
+    assert_eq!(LspServer::detect(tmp.path()), Some(LspServer::Jdtls));
+}
+
+#[test]
 fn detect_no_project() {
     let tmp = tempfile::TempDir::new().unwrap();
     assert_eq!(LspServer::detect(tmp.path()), None);

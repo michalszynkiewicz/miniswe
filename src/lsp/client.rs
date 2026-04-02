@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,11 +42,7 @@ impl LspClient {
         let binary_path = server.ensure_binary().await
             .with_context(|| format!("failed to get {} binary", server.name()))?;
 
-        let mut cmd = Command::new(&binary_path);
-        for arg in server.stdio_args() {
-            cmd.arg(arg);
-        }
-
+        let mut cmd = server.build_command(&binary_path, &project_root);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -335,6 +331,8 @@ fn language_id(path: &Path) -> &'static str {
         Some("tsx") => "typescriptreact",
         Some("js") => "javascript",
         Some("go") => "go",
+        Some("java") => "java",
+        Some("kt") | Some("kts") => "kotlin",
         _ => "plaintext",
     }
 }

@@ -16,6 +16,7 @@ pub enum LspServer {
     Pyright,
     Gopls,
     Clangd,
+    Jdtls,
 }
 
 impl LspServer {
@@ -34,6 +35,11 @@ impl LspServer {
             Some(Self::Pyright)
         } else if project_root.join("go.mod").exists() {
             Some(Self::Gopls)
+        } else if project_root.join("pom.xml").exists()
+            || project_root.join("build.gradle").exists()
+            || project_root.join("build.gradle.kts").exists()
+        {
+            Some(Self::Jdtls)
         } else if project_root.join("CMakeLists.txt").exists()
             || project_root.join("compile_commands.json").exists()
             || project_root.join("Makefile").exists()
@@ -57,6 +63,7 @@ impl LspServer {
             Self::Pyright => "pyright",
             Self::Gopls => "gopls",
             Self::Clangd => "clangd",
+            Self::Jdtls => "jdtls",
         }
     }
 
@@ -68,6 +75,7 @@ impl LspServer {
             Self::Pyright => "pyright-langserver",
             Self::Gopls => "gopls",
             Self::Clangd => "clangd",
+            Self::Jdtls => "jdtls",
         }
     }
 
@@ -79,6 +87,7 @@ impl LspServer {
             Self::Pyright => vec!["--stdio"],
             Self::Gopls => vec!["serve"],
             Self::Clangd => vec![],
+            Self::Jdtls => vec![],  // args built in build_command()
         }
     }
 
@@ -106,6 +115,7 @@ impl LspServer {
             Self::TypeScriptLanguageServer => npm_install(&cache_dir, "typescript-language-server", "typescript-language-server"),
             Self::Pyright => npm_install(&cache_dir, "pyright", "pyright-langserver"),
             Self::Gopls => go_install(&cache_dir),
+            Self::Jdtls => download_jdtls(&cache_dir).await,
         }
     }
 
@@ -114,7 +124,34 @@ impl LspServer {
             Self::TypeScriptLanguageServer | Self::Pyright => {
                 cache_dir.join("node_modules/.bin").join(self.binary_name())
             }
+            Self::Jdtls => {
+                // jdtls is a directory with a launcher jar inside
+                cache_dir.join("jdtls").join("bin").join("jdtls")
+            }
             _ => cache_dir.join(self.binary_name()),
+        }
+    }
+
+    /// Build the Command to spawn this LSP server.
+    /// For most servers: binary + stdio_args.
+    /// For jdtls: java with special launcher args.
+    pub fn build_command(&self, binary_path: &Path, project_root: &Path) -> Command {
+        match self {
+            Self::Jdtls => {
+                // jdtls ships a launcher script at bin/jdtls
+                let mut cmd = Command::new(binary_path);
+                // -data is the workspace data dir (per-project)
+                let data_dir = project_root.join(".miniswe").join("jdtls-data");
+                cmd.arg("-data").arg(&data_dir);
+                cmd
+            }
+            _ => {
+                let mut cmd = Command::new(binary_path);
+                for arg in self.stdio_args() {
+                    cmd.arg(arg);
+                }
+                cmd
+            }
         }
     }
 }
@@ -363,4 +400,119 @@ fn go_install(cache_dir: &Path) -> Result<PathBuf> {
 
     eprintln!("[lsp] gopls installed to {}", dest.display());
     Ok(dest)
+}
+
+/// Download Eclipse JDT Language Server.
+/// jdtls ships as a tar.gz with a `bin/jdtls` launcher script.
+async fn download_jdtls(cache_dir: &Path) -> Result<PathBuf> {
+    if find_in_path("java").is_none() {
+        anyhow::bail!("jdtls: Java not found — install a JDK to use Java LSP");
+    }
+
+    let platform = if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "mac"
+    } else {
+        anyhow::bail!("jdtls: unsupported platform");
+    };
+
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        anyhow::bail!("jdtls: unsupported architecture");
+    };
+
+    // Find latest milestone from Eclipse download site
+    let api_url = "https://api.github.com/repos/eclipse-jdtls/eclipse.jdt.ls/releases/latest";
+    let client = reqwest::Client::new();
+    let release: serde_json::Value = client.get(api_url)
+        .header("User-Agent", "miniswe")
+        .send().await?
+        .json().await?;
+
+    let assets = release["assets"].as_array()
+        .context("no assets in jdtls release")?;
+
+    // Look for the platform-specific tar.gz
+    let search = format!("{platform}-{arch}");
+    let asset = assets.iter()
+        .find(|a| {
+            a["name"].as_str()
+                .is_some_and(|n| n.contains(&search) && n.ends_with(".tar.gz"))
+        })
+        .or_else(|| {
+            // Fall back to generic tar.gz
+            assets.iter().find(|a| {
+                a["name"].as_str()
+                    .is_some_and(|n| n.ends_with(".tar.gz") && !n.contains("source"))
+            })
+        })
+        .context("no matching jdtls asset")?;
+
+    let download_url = asset["browser_download_url"].as_str()
+        .context("no download URL")?;
+
+    eprintln!("[lsp] downloading jdtls...");
+    let response = reqwest::get(download_url).await?;
+    let tar_gz_bytes = response.bytes().await?;
+
+    // Extract tar.gz
+    let jdtls_dir = cache_dir.join("jdtls");
+    std::fs::create_dir_all(&jdtls_dir)?;
+
+    let decoder = flate2::read::GzDecoder::new(&tar_gz_bytes[..]);
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(&jdtls_dir)
+        .context("extract jdtls tar.gz")?;
+
+    // The bin/jdtls launcher script needs to be executable
+    let launcher = jdtls_dir.join("bin").join("jdtls");
+    if launcher.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+        }
+        eprintln!("[lsp] jdtls installed to {}", launcher.display());
+        Ok(launcher)
+    } else {
+        // Some versions have the launcher jar directly — create a wrapper script
+        let plugins_dir = jdtls_dir.join("plugins");
+        let launcher_jar = std::fs::read_dir(&plugins_dir)?
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_name().to_string_lossy().starts_with("org.eclipse.equinox.launcher_")
+                    && e.file_name().to_string_lossy().ends_with(".jar")
+            })
+            .context("no equinox launcher jar found in jdtls")?;
+
+        let config_dir = if cfg!(target_os = "linux") {
+            jdtls_dir.join("config_linux")
+        } else {
+            jdtls_dir.join("config_mac")
+        };
+
+        // Create a launcher script
+        let script = format!(
+            "#!/bin/sh\nexec java \\\n  -Declipse.application=org.eclipse.jdt.ls.core.id1 \\\n  -Dosgi.bundles.defaultStartLevel=4 \\\n  -Declipse.product=org.eclipse.jdt.ls.core.product \\\n  -Dosgi.checkConfiguration=true \\\n  -Dosgi.sharedConfiguration.area={config} \\\n  -Dosgi.sharedConfiguration.area.readOnly=true \\\n  -Dosgi.configuration.cascaded=true \\\n  -noverify \\\n  --add-modules=ALL-SYSTEM \\\n  --add-opens java.base/java.util=ALL-UNNAMED \\\n  --add-opens java.base/java.lang=ALL-UNNAMED \\\n  -jar {jar} \\\n  \"$@\"\n",
+            config = config_dir.display(),
+            jar = launcher_jar.path().display(),
+        );
+
+        let bin_dir = jdtls_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir)?;
+        let script_path = bin_dir.join("jdtls");
+        std::fs::write(&script_path, script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+        }
+
+        eprintln!("[lsp] jdtls installed to {}", script_path.display());
+        Ok(script_path)
+    }
 }

@@ -167,8 +167,8 @@ fn reindex_changed_file(rel_path: &str, config: &Config) {
 /// context around errors to the tool result. Runs in a blocking thread to
 /// avoid stalling the async runtime.
 async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: Option<&LspClient>) {
-    // Try LSP diagnostics first — ~200ms vs 2-5s for cargo check
-    if path.ends_with(".rs") {
+    // Try LSP diagnostics first — ~200ms vs 2-5s for compiler check
+    {
         if let Some(lsp) = lsp {
             if lsp.is_ready() && !lsp.has_crashed() {
                 let abs_path = config.project_root.join(path);
@@ -180,9 +180,9 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
                             .filter(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
                             .collect();
                         if errors.is_empty() {
-                            result.content.push_str("\n[rust-analyzer] OK");
+                            result.content.push_str("\n[lsp] OK");
                         } else {
-                            result.content.push_str("\n[rust-analyzer]\n");
+                            result.content.push_str("\n[lsp]\n");
                             for diag in &errors {
                                 let line = diag.range.start.line + 1;
                                 let col = diag.range.start.character + 1;
@@ -219,6 +219,10 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
         ("go", vec!["vet", "./..."])
     } else if path.ends_with(".py") {
         ("python3", vec!["-m", "py_compile", path])
+    } else if path.ends_with(".java") && config.project_root.join("pom.xml").exists() {
+        ("mvn", vec!["compile", "-q"])
+    } else if path.ends_with(".java") && config.project_root.join("build.gradle").exists() {
+        ("gradle", vec!["compileJava", "-q"])
     } else {
         return; // no checker for this language
     };
@@ -248,6 +252,8 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
         "go vet"
     } else if path.ends_with(".py") {
         "py_compile"
+    } else if path.ends_with(".java") {
+        "mvn compile"
     } else {
         "check"
     };
