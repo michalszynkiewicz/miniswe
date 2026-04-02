@@ -148,7 +148,7 @@ pub struct ProvidersConfig {
 impl Default for ProvidersConfig {
     fn default() -> Self {
         Self {
-            profile: true,
+            profile: false,
             guide: true,
             project_notes: true,
             plan: true,
