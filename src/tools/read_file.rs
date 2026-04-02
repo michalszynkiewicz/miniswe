@@ -13,7 +13,7 @@ use crate::context::compress;
 use super::ToolResult;
 
 /// Maximum lines to return before truncation.
-const MAX_LINES: usize = 200;
+const MAX_LINES: usize = 500;
 
 /// File extensions that get compression applied.
 const COMPRESSIBLE: &[&str] = &[

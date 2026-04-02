@@ -25,20 +25,6 @@ use crate::tools;
 use crate::tools::permissions::{Action, PermissionManager};
 use crate::tui;
 
-/// Per-tool-type masking thresholds: how many recent full results to keep.
-/// read_file/read_symbol are the most valuable to keep (model needs file content
-/// for follow-up edits). write_file/edit confirmations lose value quickly.
-fn mask_keep_count(tool_name: &str) -> usize {
-    match tool_name {
-        "read_file" | "read_symbol" => 6,
-        "write_file" | "edit" => 2,
-        "shell" | "diagnostics" => 2,
-        "search" | "web_search" | "web_fetch" | "docs_lookup"
-        | "goto_definition" | "find_references"
-        | "get_repo_map" | "get_project_info" | "get_architecture_notes" => 1,
-        _ => 2,
-    }
-}
 
 /// Run the agent for a single message.
 pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()> {
@@ -207,9 +193,10 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         }
 
         // Apply observation masking: replace old tool results with summaries
-        // (per-type thresholds — keeps reads longer than writes/searches)
+        // Budget = half the context window for tool results
+        let tool_result_budget = config.model.context_window / 2;
         let pre_mask = tool_result_log.len();
-        mask_old_tool_results(&mut messages, &tool_result_log);
+        mask_old_tool_results(&mut messages, &tool_result_log, tool_result_budget, &config.project_root);
         log.masking_applied(
             messages.iter().filter(|m| m.role == "tool" && m.content.as_ref().is_some_and(|c| c.starts_with('['))).count(),
             pre_mask,
@@ -451,29 +438,44 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 /// For each tool type, keeps the N most recent results in full (where N
 /// depends on the tool type — reads are kept longer than writes/searches).
 /// Older results are replaced with one-line summaries.
+/// Token-budget-aware observation masking with tiered storage.
+///
+/// Three tiers:
+/// 1. **Full results** — newest, within budget. Model sees complete tool output.
+/// 2. **Inline summaries** — older, kept as compact summaries in context (up to
+///    SUMMARY_KEEP_COUNT). Model sees signatures/key info.
+/// 3. **Archived** — oldest summaries written to `.miniswe/tool_history.md`.
+///    A one-liner in context tells the model the archive exists.
+///
+/// This prevents the re-read loop: even when full results are masked,
+/// the model retains enough info (signatures, struct definitions) to
+/// know what it already read without re-reading.
+const SUMMARY_KEEP_COUNT: usize = 20;
+
 fn mask_old_tool_results(
     messages: &mut Vec<Message>,
     tool_result_log: &[(String, serde_json::Value, String)],
+    tool_result_token_budget: usize,
+    project_root: &std::path::Path,
 ) {
     if tool_result_log.is_empty() {
         return;
     }
 
-    // Walk backwards to count per-type and decide which to mask
-    let mut type_counts: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
+    // Walk backwards (newest first), accumulate tokens
+    let mut used_tokens = 0;
     let mut should_mask: Vec<bool> = vec![false; tool_result_log.len()];
 
     for i in (0..tool_result_log.len()).rev() {
-        let tool_name = tool_result_log[i].0.as_str();
-        let count = type_counts.entry(tool_name).or_insert(0);
-        *count += 1;
-        if *count > mask_keep_count(tool_name) {
+        let content = &tool_result_log[i].2;
+        let tokens = context::estimate_tokens(content);
+        used_tokens += tokens;
+
+        if used_tokens > tool_result_token_budget {
             should_mask[i] = true;
         }
     }
 
-    // Check if anything needs masking at all
     if !should_mask.iter().any(|m| *m) {
         return;
     }
@@ -491,12 +493,52 @@ fn mask_old_tool_results(
         })
         .collect();
 
-    // Apply to messages
+    // Count how many summaries we have
+    let summary_count = summaries.iter().filter(|s| s.is_some()).count();
+
+    // Archive old summaries to file if there are too many
+    if summary_count > SUMMARY_KEEP_COUNT {
+        let archive_path = project_root.join(".miniswe").join("tool_history.md");
+        let mut archive = String::new();
+        // Read existing archive
+        if let Ok(existing) = std::fs::read_to_string(&archive_path) {
+            archive = existing;
+        }
+        // Append oldest summaries (those beyond SUMMARY_KEEP_COUNT)
+        let mut archived_count = 0;
+        let excess = summary_count - SUMMARY_KEEP_COUNT;
+        for summary in &summaries {
+            if let Some(s) = summary {
+                if archived_count < excess {
+                    archive.push_str(s);
+                    archive.push('\n');
+                    archived_count += 1;
+                }
+            }
+        }
+        let _ = std::fs::write(&archive_path, &archive);
+    }
+
+    // Apply to messages: keep SUMMARY_KEEP_COUNT most recent summaries inline,
+    // replace older ones with a compact archive pointer
     let mut tool_msg_idx = 0;
+    let total_summaries = summaries.iter().filter(|s| s.is_some()).count();
+
     for msg in messages.iter_mut() {
         if msg.role == "tool" {
             if let Some(Some(summary)) = summaries.get(tool_msg_idx) {
-                msg.content = Some(summary.clone());
+                let summary_pos_from_start = summaries[..=tool_msg_idx]
+                    .iter()
+                    .filter(|s| s.is_some())
+                    .count();
+                let from_end = total_summaries - summary_pos_from_start;
+                if from_end < SUMMARY_KEEP_COUNT {
+                    // Keep inline
+                    msg.content = Some(summary.clone());
+                } else {
+                    // Archive pointer
+                    msg.content = Some("[archived — see .miniswe/tool_history.md]".into());
+                }
             }
             tool_msg_idx += 1;
         }

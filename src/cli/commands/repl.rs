@@ -25,18 +25,6 @@ use crate::tui::app::{App, AppMode, LineStyle};
 use crate::tui::event::{self, AppEvent};
 use crate::tui::ui;
 
-/// Per-tool-type masking thresholds: how many recent full results to keep.
-fn mask_keep_count(tool_name: &str) -> usize {
-    match tool_name {
-        "read_file" | "read_symbol" => 6,
-        "write_file" | "edit" => 2,
-        "shell" | "diagnostics" => 2,
-        "search" | "web_search" | "web_fetch" | "docs_lookup"
-        | "goto_definition" | "find_references"
-        | "get_repo_map" | "get_project_info" | "get_architecture_notes" => 1,
-        _ => 2,
-    }
-}
 
 /// Run the interactive REPL with TUI.
 pub async fn run(config: Config, headless: bool) -> Result<()> {
@@ -372,8 +360,9 @@ async fn run_agent_loop(
             break;
         }
 
-        // Observation masking (per-type thresholds)
-        mask_old_tool_results(messages, &tool_result_log);
+        // Observation masking — budget = half the context window
+        let tool_result_budget = config.model.context_window / 2;
+        mask_old_tool_results(messages, &tool_result_log, tool_result_budget, &config.project_root);
 
         // Sanitize messages
         context::sanitize_messages(messages);
@@ -621,24 +610,25 @@ async fn run_agent_loop(
     }
 }
 
-/// Replace old tool results with compressed summaries using per-type thresholds.
+/// Token-budget-aware observation masking (same logic as run.rs).
 fn mask_old_tool_results(
     messages: &mut Vec<Message>,
     tool_result_log: &[(String, serde_json::Value, String)],
+    tool_result_token_budget: usize,
+    project_root: &std::path::Path,
 ) {
+    // Delegate to the shared implementation pattern
     if tool_result_log.is_empty() {
         return;
     }
 
-    let mut type_counts: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
+    let mut used_tokens = 0;
     let mut should_mask: Vec<bool> = vec![false; tool_result_log.len()];
 
     for i in (0..tool_result_log.len()).rev() {
-        let tool_name = tool_result_log[i].0.as_str();
-        let count = type_counts.entry(tool_name).or_insert(0);
-        *count += 1;
-        if *count > mask_keep_count(tool_name) {
+        let tokens = context::estimate_tokens(&tool_result_log[i].2);
+        used_tokens += tokens;
+        if used_tokens > tool_result_token_budget {
             should_mask[i] = true;
         }
     }
@@ -659,11 +649,38 @@ fn mask_old_tool_results(
         })
         .collect();
 
+    let summary_count = summaries.iter().filter(|s| s.is_some()).count();
+    let keep_count = 20;
+
+    if summary_count > keep_count {
+        let archive_path = project_root.join(".miniswe").join("tool_history.md");
+        let mut archive = std::fs::read_to_string(&archive_path).unwrap_or_default();
+        let excess = summary_count - keep_count;
+        let mut archived = 0;
+        for s in &summaries {
+            if let Some(s) = s {
+                if archived < excess {
+                    archive.push_str(s);
+                    archive.push('\n');
+                    archived += 1;
+                }
+            }
+        }
+        let _ = std::fs::write(&archive_path, &archive);
+    }
+
+    let total_summaries = summaries.iter().filter(|s| s.is_some()).count();
     let mut tool_msg_idx = 0;
     for msg in messages.iter_mut() {
         if msg.role == "tool" {
             if let Some(Some(summary)) = summaries.get(tool_msg_idx) {
-                msg.content = Some(summary.clone());
+                let pos = summaries[..=tool_msg_idx].iter().filter(|s| s.is_some()).count();
+                let from_end = total_summaries - pos;
+                if from_end < keep_count {
+                    msg.content = Some(summary.clone());
+                } else {
+                    msg.content = Some("[archived — see .miniswe/tool_history.md]".into());
+                }
             }
             tool_msg_idx += 1;
         }

@@ -22,7 +22,7 @@ fn basic_assembly_includes_system_prompt() {
     let system = assembled.messages[0].content.as_deref().unwrap();
     assert!(system.contains("miniswe"), "system prompt should mention miniswe");
     assert!(system.contains("[RULES]"), "system prompt should have rules");
-    assert!(system.contains("[TOOLS]"), "system prompt should have tools");
+    assert!(system.contains("[HINTS]"), "system prompt should have hints");
 
     // Should include the project root path so the model knows where it's working
     assert!(
