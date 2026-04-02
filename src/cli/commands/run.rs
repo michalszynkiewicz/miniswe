@@ -136,6 +136,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
     // Track tool calls for loop detection
     let mut recent_calls: Vec<String> = Vec::new();
+    let mut consecutive_loops = 0u32;
 
     // Track tool results for observation masking
     let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
@@ -168,6 +169,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let mut messages = assembled.messages;
 
     loop {
+        if had_error {
+            break;
+        }
         round += 1;
         log.round_start(round);
         if round > max_rounds {
@@ -337,13 +341,22 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     "Loop detected: {}({}) called {} times — stopping",
                     tc.function.name, args_summary, repeat_count
                 ));
+                consecutive_loops += 1;
                 let result_msg = Message::tool_result(
                     &tc.id,
-                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times with no edits in between. Try a different approach, or explain what's blocking you.",
+                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times. Try a completely different approach.",
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
+                if consecutive_loops >= 3 {
+                    tui::print_error("Too many consecutive loops — ending session");
+                    had_error = true;
+                    // Break inner tool loop; outer round loop checks had_error
+                    break;
+                }
                 continue;
+            } else {
+                consecutive_loops = 0;
             }
 
             log.tool_call_detail(&tc.function.name, &args);
