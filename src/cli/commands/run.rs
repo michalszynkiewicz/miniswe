@@ -30,7 +30,7 @@ use crate::tui;
 /// for follow-up edits). write_file/edit confirmations lose value quickly.
 fn mask_keep_count(tool_name: &str) -> usize {
     match tool_name {
-        "read_file" | "read_symbol" => 3,
+        "read_file" | "read_symbol" => 6,
         "write_file" | "edit" => 2,
         "shell" | "diagnostics" => 2,
         "search" | "web_search" | "web_fetch" | "docs_lookup"
