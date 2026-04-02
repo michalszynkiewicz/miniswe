@@ -399,7 +399,13 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
             // Extract function/struct signatures for a useful summary
             let mut sigs = Vec::new();
             for line in content.lines() {
-                let trimmed = line.trim();
+                // Strip line-number prefixes like "   5│" or "+  10│"
+                let stripped = if let Some(pos) = line.find('│') {
+                    &line[pos + '│'.len_utf8()..]
+                } else {
+                    line
+                };
+                let trimmed = stripped.trim();
                 // Capture function/method signatures
                 if (trimmed.starts_with("pub fn ")
                     || trimmed.starts_with("pub async fn ")
