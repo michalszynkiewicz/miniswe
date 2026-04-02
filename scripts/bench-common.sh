@@ -497,8 +497,6 @@ run_variant() {
 }
 
 run_benchmark_init() {
-    parse_common_args "$@"
-
     local timestamp
     timestamp=$(date +%Y%m%d_%H%M%S)
     RESULTS_DIR="${RESULTS_DIR:-${REPO_DIR}/benchmark_results/${TASK_NAME}_${timestamp}}"
@@ -546,7 +544,7 @@ EOF
 
 # Full ablation: test every provider individually.
 run_benchmark_full() {
-    run_benchmark_init "$@"
+    run_benchmark_init
 
     run_variant "00_baseline" ""
 
@@ -561,7 +559,7 @@ run_benchmark_full() {
 
 # Bisect: coarse triage, then drill into impactful group.
 run_benchmark_bisect() {
-    run_benchmark_init "$@"
+    run_benchmark_init
 
     # ── Phase 1: Coarse triage (3 runs) ──────────────────────────────
     echo "═══ PHASE 1: Coarse triage ═══"
@@ -636,9 +634,11 @@ run_benchmark_bisect() {
 
 # Main entry point. Caller must define: TASK, TASK_NAME, validate_result()
 run_benchmark() {
+    # Parse args first so STRATEGY is set before dispatch
+    parse_common_args "$@"
     case "${STRATEGY:-full}" in
-        full)   run_benchmark_full "$@" ;;
-        bisect) run_benchmark_bisect "$@" ;;
+        full)   run_benchmark_full ;;
+        bisect) run_benchmark_bisect ;;
         *)
             echo "Unknown strategy: ${STRATEGY}. Use 'full' or 'bisect'." >&2
             exit 1
