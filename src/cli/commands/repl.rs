@@ -37,7 +37,19 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         PermissionManager::new(&config)
     };
     let mut tool_defs = tools::tool_definitions();
-    tool_defs.extend(tools::definitions::context_tool_definitions());
+    // Filter tools based on config
+    {
+        let mut disabled = Vec::new();
+        if !config.tools.context_tools {
+            disabled.extend_from_slice(&["get_repo_map", "get_project_info", "get_architecture_notes"]);
+        }
+        if !config.tools.transform { disabled.push("transform"); }
+        if !config.tools.web_tools { disabled.extend_from_slice(&["web_search", "web_fetch", "docs_lookup"]); }
+        tool_defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
+    }
+    if config.tools.context_tools {
+        tool_defs.extend(tools::definitions::context_tool_definitions());
+    }
 
     // Spawn LSP client (non-blocking)
     let lsp_client: Option<Arc<LspClient>> = if config.lsp.enabled {
@@ -49,7 +61,9 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         None
     };
     if lsp_client.is_some() {
-        tool_defs.extend(tools::definitions::lsp_tool_definitions());
+        if config.tools.lsp_tools {
+            tool_defs.extend(tools::definitions::lsp_tool_definitions());
+        }
     }
 
     // Clear stale scratchpad/plan

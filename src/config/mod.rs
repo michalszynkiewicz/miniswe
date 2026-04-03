@@ -29,6 +29,7 @@ pub struct Config {
     pub web: WebConfig,
     pub logging: LogConfig,
     pub lsp: LspConfig,
+    pub tools: ToolsConfig,
     /// Resolved project root directory (not serialized).
     #[serde(skip)]
     pub project_root: PathBuf,
@@ -217,6 +218,31 @@ pub struct LspConfig {
     pub diagnostic_timeout_ms: u64,
 }
 
+/// Toggle which tool groups are available to the LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    /// Context tools: get_repo_map, get_project_info, get_architecture_notes
+    pub context_tools: bool,
+    /// LSP tools: goto_definition, find_references
+    pub lsp_tools: bool,
+    /// Transform tool: LLM-powered multi-site code transformation
+    pub transform: bool,
+    /// Web tools: web_search, web_fetch, docs_lookup
+    pub web_tools: bool,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            context_tools: true,
+            lsp_tools: true,
+            transform: true,
+            web_tools: true,
+        }
+    }
+}
+
 impl Default for LspConfig {
     fn default() -> Self {
         Self {
@@ -239,6 +265,7 @@ impl Default for Config {
             web: WebConfig::default(),
             logging: LogConfig::default(),
             lsp: LspConfig::default(),
+            tools: ToolsConfig::default(),
             project_root: PathBuf::from("."),
         }
     }
