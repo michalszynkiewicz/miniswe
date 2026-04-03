@@ -189,10 +189,12 @@ TESTS: skipped (build failed)"
 
         echo "baseline=${baseline_rounds} limited=${limited_rounds}" > "${attempt_dir}/smoke_result.txt"
 
-        if [ "${limited_rounds}" -le 2 ] && [ "${baseline_rounds}" -gt 2 ]; then
+        # Note: round N+1 gets logged before break check, so --max-rounds 2
+        # logs 3 [round entries. Accept limited <= limit+1.
+        if [ "${limited_rounds}" -le 3 ] && [ "${baseline_rounds}" -gt 3 ]; then
             (( ++passed ))
             details="${details}smoke:PASS(base=${baseline_rounds}r,lim=${limited_rounds}r) "
-        elif [ "${limited_rounds}" -le 2 ] && [ "${baseline_rounds}" -le 2 ]; then
+        elif [ "${limited_rounds}" -le 3 ] && [ "${baseline_rounds}" -le 3 ]; then
             # Both finish quickly — inconclusive but give benefit of doubt
             if [ "$passed" -ge 5 ]; then
                 (( ++passed ))
