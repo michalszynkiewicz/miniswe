@@ -586,30 +586,45 @@ async fn llm_summarize_tool_results(
         }
     };
 
-    let text = response.choices.first()?.message.content.as_deref()?;
+    let text = match response.choices.first().and_then(|c| c.message.content.as_deref()) {
+        Some(t) => t,
+        None => {
+            eprintln!("[masking] LLM summarizer returned empty response");
+            return None;
+        }
+    };
 
-    // Parse numbered lines
+    eprintln!("[masking] LLM summarizer responded ({} chars)", text.len());
+
+    // Parse lines — strip numbering, skip blanks
     let summaries: Vec<String> = text
         .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            // Strip leading number + period/parenthesis
-            let content = trimmed
+        .map(|line| {
+            line.trim()
                 .trim_start_matches(|c: char| c.is_ascii_digit())
-                .trim_start_matches(['.', ')', ':', ' ']);
-            if content.is_empty() {
-                None
-            } else {
-                Some(content.trim().to_string())
-            }
+                .trim_start_matches(['.', ')', ':', ' '])
+                .trim()
+                .to_string()
         })
+        .filter(|s| !s.is_empty())
         .collect();
 
-    // Must match the number of results
-    if summaries.len() == results.len() {
+    let expected = results.len();
+    if summaries.len() == expected {
         Some(summaries)
+    } else if summaries.len() > expected {
+        // LLM was verbose — take first N
+        eprintln!("[masking] summarizer returned {} lines, expected {}, taking first {}", summaries.len(), expected, expected);
+        Some(summaries.into_iter().take(expected).collect())
     } else {
-        None // Mismatch — fall back to heuristic
+        // Too few — pad with heuristic fallback
+        eprintln!("[masking] summarizer returned {} lines, expected {}, padding with heuristic", summaries.len(), expected);
+        let mut padded = summaries;
+        for i in padded.len()..expected {
+            let (_, name, args, content) = &results[i];
+            padded.push(compress::summarize_tool_result(name, args, content));
+        }
+        Some(padded)
     }
 }
 
