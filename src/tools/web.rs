@@ -263,10 +263,36 @@ pub async fn fetch(args: &Value, config: &Config) -> Result<ToolResult> {
     match client.get(&fetch_url).send().await {
         Ok(response) => {
             let content = response.text().await.unwrap_or_default();
+            let budget = config.tool_output_budget_chars();
+            let total_chars = content.chars().count();
 
-            let truncated = crate::truncate_chars(&content, config.tool_output_budget_chars());
+            if total_chars <= budget {
+                // Fits in budget — return full content
+                Ok(ToolResult::ok(format!("[fetch: {url} — {total_chars} chars]\n{content}")))
+            } else {
+                // Too large — save full content to file, return preview + pointer
+                let cache_dir = config.miniswe_dir().join("web_cache");
+                let _ = std::fs::create_dir_all(&cache_dir);
 
-            Ok(ToolResult::ok(format!("[fetch: {url}]\n{truncated}")))
+                // Sanitize URL to filename
+                let filename = url.replace("://", "_")
+                    .replace(['/', '?', '&', '#', '='], "_")
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+                    + ".md";
+                let cache_path = cache_dir.join(&filename);
+                let _ = std::fs::write(&cache_path, &content);
+
+                let rel_path = format!(".miniswe/web_cache/{filename}");
+                let preview = crate::truncate_chars(&content, budget);
+
+                Ok(ToolResult::ok(format!(
+                    "[fetch: {url} — {total_chars} chars, showing first {budget}]\n\
+                     {preview}\n\n\
+                     [Full content saved to {rel_path} — use read_file(\"{rel_path}\") for more]"
+                )))
+            }
         }
         Err(e) => Ok(ToolResult::err(format!("Failed to fetch {url}: {e}"))),
     }
@@ -299,7 +325,18 @@ pub async fn docs_lookup(args: &Value, config: &Config) -> Result<ToolResult> {
                 let content = fs::read_to_string(entry.path()).unwrap_or_default();
 
                 if topic.is_empty() {
-                    found.push_str(&crate::truncate_chars(&content, config.tool_output_budget_chars()));
+                    let budget = config.tool_output_budget_chars();
+                    let total_chars = content.chars().count();
+                    if total_chars <= budget {
+                        found.push_str(&content);
+                    } else {
+                        // Save full content, return preview + pointer
+                        let rel_path = format!(".miniswe/docs/{name}");
+                        let preview = crate::truncate_chars(&content, budget);
+                        found.push_str(&format!(
+                            "{preview}\n\n[Full doc: {total_chars} chars — use read_file(\"{rel_path}\") for more]"
+                        ));
+                    }
                 } else {
                     let sections = extract_relevant_sections(&content, topic);
                     found.push_str(&sections);

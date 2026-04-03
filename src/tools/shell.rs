@@ -119,31 +119,46 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 
     let lines: Vec<&str> = combined.lines().collect();
     let truncated = lines.len() > max_output_lines;
-    let display_lines = if truncated {
-        let skip = lines.len() - max_output_lines;
-        &lines[skip..]
-    } else {
-        &lines[..]
-    };
 
     let mut result = format!("[shell: exit {exit_code}");
+
     if truncated {
+        // Save full output to file, show tail + pointer
+        let cache_dir = config.miniswe_dir().join("shell_output");
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let filename = format!("cmd_{}.txt", chrono::Local::now().format("%H%M%S"));
+        let cache_path = cache_dir.join(&filename);
+        let _ = std::fs::write(&cache_path, &combined);
+        let rel_path = format!(".miniswe/shell_output/{filename}");
+
         result.push_str(&format!(
             ", showing last {} of {} lines",
             max_output_lines, lines.len()
         ));
-    }
-    result.push_str("]\n");
+        result.push_str("]\n");
 
-    // Join display lines, truncating any that exceed MAX_LINE_CHARS
-    for (i, line) in display_lines.iter().enumerate() {
-        if i > 0 {
-            result.push('\n');
+        let skip = lines.len() - max_output_lines;
+        for (i, line) in lines[skip..].iter().enumerate() {
+            if i > 0 { result.push('\n'); }
+            if line.chars().count() > MAX_LINE_CHARS {
+                result.push_str(&crate::truncate_chars(line, MAX_LINE_CHARS));
+            } else {
+                result.push_str(line);
+            }
         }
-        if line.chars().count() > MAX_LINE_CHARS {
-            result.push_str(&crate::truncate_chars(line, MAX_LINE_CHARS));
-        } else {
-            result.push_str(line);
+
+        result.push_str(&format!(
+            "\n\n[Full output saved to {rel_path} — use read_file(\"{rel_path}\") for more]"
+        ));
+    } else {
+        result.push_str("]\n");
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 { result.push('\n'); }
+            if line.chars().count() > MAX_LINE_CHARS {
+                result.push_str(&crate::truncate_chars(line, MAX_LINE_CHARS));
+            } else {
+                result.push_str(line);
+            }
         }
     }
 
