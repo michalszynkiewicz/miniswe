@@ -565,9 +565,9 @@ async fn llm_summarize_tool_results(
             .or(args["query"].as_str())
             .or(args["command"].as_str())
             .unwrap_or("?");
-        // Truncate content to keep prompt manageable
-        let truncated = if content.len() > 1000 {
-            &content[..1000]
+        // Truncate content to keep summarization prompt manageable
+        let truncated = if content.len() > 4000 {
+            &content[..4000]
         } else {
             content
         };
