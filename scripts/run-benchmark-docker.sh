@@ -147,6 +147,11 @@ cd /work
 git -C /repo archive "${SHA}" | tar -x
 rm -rf target .miniswe
 
+# Fix LFS pointer files (git archive doesn't resolve LFS)
+if grep -q "git-lfs" .gitignore 2>/dev/null; then
+    echo -e "target/\n.miniswe/\n*.log" > .gitignore
+fi
+
 # Write config and init
 mkdir -p .miniswe
 cp /config/config.toml .miniswe/config.toml
