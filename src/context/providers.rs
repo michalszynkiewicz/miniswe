@@ -80,9 +80,10 @@ impl ContextProvider for ProjectNotesProvider {
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
         let path = input.config.project_root.join(".ai").join("README.md");
         let content = fs::read_to_string(path).ok()?;
+        let budget = input.config.tool_output_budget_chars();
         Some(ContextBlock {
             header: "[PROJECT NOTES]",
-            content: crate::truncate_chars(&content, 4000),
+            content: crate::truncate_chars(&content, budget),
         })
     }
 }

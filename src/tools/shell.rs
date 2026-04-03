@@ -12,10 +12,7 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use super::ToolResult;
 
-/// Maximum output lines (tail-priority for error visibility).
-const MAX_OUTPUT_LINES: usize = 100;
-
-/// Maximum characters per output line before truncation.
+/// Maximum characters per output line before truncation (display).
 const MAX_LINE_CHARS: usize = 1000;
 
 /// Maximum total bytes to read from stdout+stderr combined.
@@ -117,10 +114,13 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     }
 
     // Tail-truncate for error visibility, and cap long lines
+    // Max output lines from context budget (~80 chars/line)
+    let max_output_lines = config.tool_output_budget_chars() / 80;
+
     let lines: Vec<&str> = combined.lines().collect();
-    let truncated = lines.len() > MAX_OUTPUT_LINES;
+    let truncated = lines.len() > max_output_lines;
     let display_lines = if truncated {
-        let skip = lines.len() - MAX_OUTPUT_LINES;
+        let skip = lines.len() - max_output_lines;
         &lines[skip..]
     } else {
         &lines[..]
@@ -129,8 +129,8 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let mut result = format!("[shell: exit {exit_code}");
     if truncated {
         result.push_str(&format!(
-            ", showing last {MAX_OUTPUT_LINES} of {} lines",
-            lines.len()
+            ", showing last {} of {} lines",
+            max_output_lines, lines.len()
         ));
     }
     result.push_str("]\n");
