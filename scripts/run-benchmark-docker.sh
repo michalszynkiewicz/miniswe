@@ -106,6 +106,12 @@ fetch_backend = "jina"
 enabled = $(_dis lsp)
 diagnostic_timeout_ms = 2000
 
+[tools]
+context_tools = $(_dis context_tools)
+lsp_tools = $(_dis lsp_tools)
+transform = $(_dis transform)
+web_tools = $(_dis web_tools)
+
 [logging]
 level = "trace"
 enabled = true
@@ -376,7 +382,7 @@ echo "═══ Phase 1: baseline vs all_off ═══"
 echo ""
 
 run_variant "00_baseline" ""
-run_variant "01_all_off" "profile,guide,project_notes,plan,lessons,repo_map,mcp,scratchpad,usage_guide,plan_mode,lsp"
+run_variant "01_no_extra_tools" "context_tools,lsp_tools,transform,lsp"
 
 # Summary
 echo ""

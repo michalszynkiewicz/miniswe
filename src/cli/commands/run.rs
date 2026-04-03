@@ -38,8 +38,26 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         PermissionManager::new(&config)
     };
     let mut tool_defs = tools::tool_definitions();
-    // Context tools — pull-based access to repo map, profile, architecture notes
-    tool_defs.extend(tools::definitions::context_tool_definitions());
+    // Filter tools based on config
+    let disabled_tools: Vec<&str> = {
+        let mut d = Vec::new();
+        if !config.tools.context_tools {
+            d.extend_from_slice(&["get_repo_map", "get_project_info", "get_architecture_notes"]);
+        }
+        if !config.tools.transform {
+            d.push("transform");
+        }
+        if !config.tools.web_tools {
+            d.extend_from_slice(&["web_search", "web_fetch", "docs_lookup"]);
+        }
+        d
+    };
+    tool_defs.retain(|t| !disabled_tools.contains(&t.function.name.as_str()));
+
+    // Conditional: context tools
+    if config.tools.context_tools {
+        tool_defs.extend(tools::definitions::context_tool_definitions());
+    }
 
     // Clear stale scratchpad/plan from previous sessions
     let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
@@ -80,8 +98,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         None
     };
 
-    // Add LSP tool definitions if available
-    if lsp_client.is_some() {
+    // Add LSP tool definitions if available and enabled
+    if lsp_client.is_some() && config.tools.lsp_tools {
         tool_defs.extend(tools::definitions::lsp_tool_definitions());
     }
 
