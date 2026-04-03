@@ -16,7 +16,6 @@ use anyhow::Result;
 
 use crate::config::{Config, ModelRole};
 use crate::context;
-use crate::context::compress;
 use crate::llm::{ChatRequest, Message, ModelRouter};
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
@@ -147,10 +146,6 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let mut calls_since_last_edit = 0u32;
     let mut edit_fail_count: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
-    // Track tool results for observation masking
-    // (tool_call_id, name, args, content) — id used to match messages in masking
-    let mut tool_result_log: Vec<(String, String, serde_json::Value, String)> = Vec::new();
-    let mut archived_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // Ctrl+C cancellation flag
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -214,20 +209,11 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             ));
         }
 
-        // Apply observation masking: replace old tool results with summaries
-        // Budget = half the context window for tool results
-        let tool_result_budget = config.model.context_window / 2;
-        let pre_mask = tool_result_log.len();
-        mask_old_tool_results(
-            &mut messages,
-            &tool_result_log,
-            tool_result_budget,
-            &config.project_root,
-            &router,
-            &mut archived_indices,
-        ).await;
+        // Unified context compression — handles both tool results and conversation
+        let pre_mask = messages.len();
+        context::compressor::maybe_compress(&mut messages, &config, &router).await;
         log.masking_applied(
-            messages.iter().filter(|m| m.role == "tool" && m.content.as_ref().is_some_and(|c| c.starts_with('['))).count(),
+            pre_mask.saturating_sub(messages.len()),
             pre_mask,
         );
 
@@ -452,14 +438,6 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 }
             }
 
-            // Log for future observation masking
-            tool_result_log.push((
-                tc.id.clone(),
-                tc.function.name.clone(),
-                args.clone(),
-                result.content.clone(),
-            ));
-
             let result_msg = Message::tool_result(&tc.id, &result.content);
             messages.push(result_msg.clone());
             conversation_history.push(result_msg);
@@ -498,247 +476,6 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 /// For each tool type, keeps the N most recent results in full (where N
 /// depends on the tool type — reads are kept longer than writes/searches).
 /// Older results are replaced with one-line summaries.
-/// Token-budget-aware observation masking with LLM-driven summarization.
-///
-/// When tool results exceed the token budget, the oldest results are
-/// batched and sent to the LLM for summarization. The LLM decides
-/// what's important and returns concise summaries. Full content is
-/// archived to `.miniswe/tool_history.md` for retrieval.
-///
-/// Falls back to heuristic summaries if the LLM call fails.
-async fn mask_old_tool_results(
-    messages: &mut Vec<Message>,
-    tool_result_log: &[(String, String, serde_json::Value, String)],
-    tool_result_token_budget: usize,
-    project_root: &std::path::Path,
-    router: &ModelRouter,
-    archived_indices: &mut std::collections::HashSet<usize>,
-) {
-    if tool_result_log.is_empty() {
-        return;
-    }
-
-    // Walk backwards (newest first), accumulate tokens
-    let mut used_tokens = 0;
-    let mut should_mask: Vec<bool> = vec![false; tool_result_log.len()];
-
-    for i in (0..tool_result_log.len()).rev() {
-        let tokens = context::estimate_tokens(&tool_result_log[i].3);
-        used_tokens += tokens;
-        if used_tokens > tool_result_token_budget {
-            should_mask[i] = true;
-        }
-    }
-
-    if !should_mask.iter().any(|m| *m) {
-        return;
-    }
-
-    // Collect results that need summarization
-    let to_summarize: Vec<(usize, &str, &serde_json::Value, &str)> = tool_result_log
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| should_mask[*i])
-        .map(|(i, (_id, name, args, content))| (i, name.as_str(), args, content.as_str()))
-        .collect();
-
-    // Try LLM-driven summarization
-    let llm_summaries = llm_summarize_tool_results(&to_summarize, router).await;
-
-    // Build final summaries — LLM if available, heuristic fallback
-    let summaries: Vec<Option<String>> = tool_result_log
-        .iter()
-        .enumerate()
-        .map(|(i, (_id, name, args, content))| {
-            if !should_mask[i] {
-                return None;
-            }
-            // Find this index in llm_summaries
-            if let Some(llm_summary) = llm_summaries.as_ref() {
-                let pos = to_summarize.iter().position(|(idx, _, _, _)| *idx == i);
-                if let Some(pos) = pos {
-                    if let Some(summary) = llm_summary.get(pos) {
-                        if !summary.is_empty() && summary != "[drop]" {
-                            return Some(summary.clone());
-                        }
-                        if summary == "[drop]" {
-                            return Some("[dropped by summarizer]".into());
-                        }
-                    }
-                }
-            }
-            // Fallback to heuristic
-            Some(compress::summarize_tool_result(name, args, content))
-        })
-        .collect();
-
-    // Archive full content of newly masked results (skip already-archived)
-    let archive_path = project_root.join(".miniswe").join("tool_history.md");
-    let mut new_archives = String::new();
-    for (i, (_id, name, args, content)) in tool_result_log.iter().enumerate() {
-        if should_mask[i] && !archived_indices.contains(&i) {
-            let path = args["path"].as_str().or(args["query"].as_str()).unwrap_or("?");
-            let truncated = crate::truncate_chars(content, 2000);
-            new_archives.push_str(&format!("## {}({})\n{}\n\n", name, path, truncated));
-            archived_indices.insert(i);
-        }
-    }
-    if !new_archives.is_empty() {
-        let mut archive = std::fs::read_to_string(&archive_path).unwrap_or_default();
-        archive.push_str(&new_archives);
-        let _ = std::fs::write(&archive_path, &archive);
-    }
-
-    // Apply summaries to messages — match by tool_call_id
-    // (tool messages from loop detection, invalid JSON, etc. have different IDs
-    // and won't match, so they're left untouched)
-    for msg in messages.iter_mut() {
-        if msg.role == "tool" {
-            if let Some(tool_call_id) = &msg.tool_call_id {
-                // Find this tool_call_id in the log
-                if let Some(log_idx) = tool_result_log.iter().position(|(id, _, _, _)| id == tool_call_id) {
-                    if let Some(Some(summary)) = summaries.get(log_idx) {
-                        msg.content = Some(summary.clone());
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Ask the LLM to summarize tool results in chunks that fit the context window.
-/// Processes newest results first (most relevant). Each chunk is one LLM call.
-/// Returns None only if ALL chunks fail.
-async fn llm_summarize_tool_results(
-    results: &[(usize, &str, &serde_json::Value, &str)],
-    router: &ModelRouter,
-) -> Option<Vec<String>> {
-    if results.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let max_prompt_chars = router.config_for(ModelRole::Fast).context_window * 3;
-    let system_msg = "You are a concise summarizer. Respond with numbered lines only.";
-    let preamble = "Summarize these tool results from earlier in a coding session. \
-         For each, write ONE concise line capturing what's important \
-         (key functions, types, patterns found). \
-         Write [drop] if the result has no future value.\n\
-         Respond with exactly one line per result, numbered.\n\n";
-    let overhead = system_msg.len() + preamble.len() + 200;
-
-    // Build entries for all results
-    let entries: Vec<(usize, String)> = results.iter().enumerate().map(|(idx, (_, name, args, content))| {
-        let path = args["path"].as_str()
-            .or(args["query"].as_str())
-            .or(args["command"].as_str())
-            .unwrap_or("?");
-        (idx, format!("{}. {}({}):\n{}\n\n", idx + 1, name, path, content))
-    }).collect();
-
-    // Split into chunks that fit the context window, newest first
-    let mut chunks: Vec<Vec<usize>> = Vec::new();
-    let mut current_chunk = Vec::new();
-    let mut current_len = 0;
-
-    for (idx, entry) in entries.iter().rev() {
-        if overhead + current_len + entry.len() > max_prompt_chars && !current_chunk.is_empty() {
-            // Current chunk is full, start a new one
-            chunks.push(current_chunk);
-            current_chunk = Vec::new();
-            current_len = 0;
-        }
-        // Skip entries that are individually too large for a single chunk
-        if overhead + entry.len() > max_prompt_chars {
-            continue;
-        }
-        current_len += entry.len();
-        current_chunk.push(*idx);
-    }
-    if !current_chunk.is_empty() {
-        chunks.push(current_chunk);
-    }
-
-    if chunks.is_empty() {
-        return None;
-    }
-
-    // Process each chunk with an LLM call
-    let mut all_summaries: Vec<Option<String>> = vec![None; results.len()];
-    let mut any_succeeded = false;
-
-    for (chunk_num, chunk_indices) in chunks.iter().enumerate() {
-        // Reverse to chronological order for the prompt
-        let mut sorted = chunk_indices.clone();
-        sorted.sort();
-
-        let mut prompt = String::from(preamble);
-        for (local_num, &idx) in sorted.iter().enumerate() {
-            let (_, entry) = &entries[idx];
-            // Renumber for this chunk
-            prompt.push_str(&format!("{}. {}", local_num + 1,
-                entry.splitn(2, ". ").nth(1).unwrap_or(entry)));
-        }
-
-        eprintln!("[masking] LLM summarizing chunk {}/{} ({} results, {} chars)",
-            chunk_num + 1, chunks.len(), sorted.len(), prompt.len());
-
-        let request = ChatRequest {
-            messages: vec![
-                Message::system(system_msg),
-                Message::user(&prompt),
-            ],
-            tools: None,
-            tool_choice: None,
-        };
-
-        let response = match router.chat(ModelRole::Fast, &request).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[masking] chunk {} failed: {e}", chunk_num + 1);
-                continue;
-            }
-        };
-
-        let text = match response.choices.first().and_then(|c| c.message.content.as_deref()) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        eprintln!("[masking] chunk {} responded ({} chars)", chunk_num + 1, text.len());
-
-        // Parse numbered lines
-        let summaries: Vec<String> = text.lines()
-            .map(|line| {
-                line.trim()
-                    .trim_start_matches(|c: char| c.is_ascii_digit())
-                    .trim_start_matches(['.', ')', ':', ' '])
-                    .trim()
-                    .to_string()
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        // Map summaries back to result indices
-        for (i, &idx) in sorted.iter().enumerate() {
-            if let Some(summary) = summaries.get(i) {
-                all_summaries[idx] = Some(summary.clone());
-                any_succeeded = true;
-            }
-        }
-    }
-
-    if !any_succeeded {
-        return None;
-    }
-
-    // Fill gaps with heuristic
-    let final_summaries: Vec<String> = results.iter().enumerate().map(|(i, (_, name, args, content))| {
-        all_summaries[i].clone()
-            .unwrap_or_else(|| compress::summarize_tool_result(name, args, content))
-    }).collect();
-
-    Some(final_summaries)
-}
 
 /// Create a brief summary of tool arguments for display.
 fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
