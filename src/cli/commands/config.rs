@@ -1,4 +1,4 @@
-//! `miniswe config` — Show/edit configuration.
+//! `miniswe config` — Show configuration.
 
 use anyhow::Result;
 
