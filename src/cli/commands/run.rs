@@ -128,7 +128,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let mut consecutive_loops = 0u32;
 
     // Track tool results for observation masking
-    let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
+    // (tool_call_id, name, args, content) — id used to match messages in masking
+    let mut tool_result_log: Vec<(String, String, serde_json::Value, String)> = Vec::new();
+    let mut archived_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // Ctrl+C cancellation flag
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -202,6 +204,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             tool_result_budget,
             &config.project_root,
             &router,
+            &mut archived_indices,
         ).await;
         log.masking_applied(
             messages.iter().filter(|m| m.role == "tool" && m.content.as_ref().is_some_and(|c| c.starts_with('['))).count(),
@@ -411,6 +414,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
             // Log for future observation masking
             tool_result_log.push((
+                tc.id.clone(),
                 tc.function.name.clone(),
                 args.clone(),
                 result.content.clone(),
@@ -454,10 +458,11 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 /// Falls back to heuristic summaries if the LLM call fails.
 async fn mask_old_tool_results(
     messages: &mut Vec<Message>,
-    tool_result_log: &[(String, serde_json::Value, String)],
+    tool_result_log: &[(String, String, serde_json::Value, String)],
     tool_result_token_budget: usize,
     project_root: &std::path::Path,
     router: &ModelRouter,
+    archived_indices: &mut std::collections::HashSet<usize>,
 ) {
     if tool_result_log.is_empty() {
         return;
@@ -468,7 +473,7 @@ async fn mask_old_tool_results(
     let mut should_mask: Vec<bool> = vec![false; tool_result_log.len()];
 
     for i in (0..tool_result_log.len()).rev() {
-        let tokens = context::estimate_tokens(&tool_result_log[i].2);
+        let tokens = context::estimate_tokens(&tool_result_log[i].3);
         used_tokens += tokens;
         if used_tokens > tool_result_token_budget {
             should_mask[i] = true;
@@ -484,7 +489,7 @@ async fn mask_old_tool_results(
         .iter()
         .enumerate()
         .filter(|(i, _)| should_mask[*i])
-        .map(|(i, (name, args, content))| (i, name.as_str(), args, content.as_str()))
+        .map(|(i, (_id, name, args, content))| (i, name.as_str(), args, content.as_str()))
         .collect();
 
     // Try LLM-driven summarization
@@ -494,7 +499,7 @@ async fn mask_old_tool_results(
     let summaries: Vec<Option<String>> = tool_result_log
         .iter()
         .enumerate()
-        .map(|(i, (name, args, content))| {
+        .map(|(i, (_id, name, args, content))| {
             if !should_mask[i] {
                 return None;
             }
@@ -517,26 +522,36 @@ async fn mask_old_tool_results(
         })
         .collect();
 
-    // Archive full content of masked results
+    // Archive full content of newly masked results (skip already-archived)
     let archive_path = project_root.join(".miniswe").join("tool_history.md");
-    let mut archive = std::fs::read_to_string(&archive_path).unwrap_or_default();
-    for (i, (name, args, content)) in tool_result_log.iter().enumerate() {
-        if should_mask[i] {
+    let mut new_archives = String::new();
+    for (i, (_id, name, args, content)) in tool_result_log.iter().enumerate() {
+        if should_mask[i] && !archived_indices.contains(&i) {
             let path = args["path"].as_str().or(args["query"].as_str()).unwrap_or("?");
-            archive.push_str(&format!("## {}({})\n{}\n\n", name, path,
-                if content.len() > 2000 { &content[..2000] } else { content }));
+            let truncated = crate::truncate_chars(content, 2000);
+            new_archives.push_str(&format!("## {}({})\n{}\n\n", name, path, truncated));
+            archived_indices.insert(i);
         }
     }
-    let _ = std::fs::write(&archive_path, &archive);
+    if !new_archives.is_empty() {
+        let mut archive = std::fs::read_to_string(&archive_path).unwrap_or_default();
+        archive.push_str(&new_archives);
+        let _ = std::fs::write(&archive_path, &archive);
+    }
 
-    // Apply summaries to messages
-    let mut tool_msg_idx = 0;
+    // Apply summaries to messages — match by tool_call_id
+    // (tool messages from loop detection, invalid JSON, etc. have different IDs
+    // and won't match, so they're left untouched)
     for msg in messages.iter_mut() {
         if msg.role == "tool" {
-            if let Some(Some(summary)) = summaries.get(tool_msg_idx) {
-                msg.content = Some(summary.clone());
+            if let Some(tool_call_id) = &msg.tool_call_id {
+                // Find this tool_call_id in the log
+                if let Some(log_idx) = tool_result_log.iter().position(|(id, _, _, _)| id == tool_call_id) {
+                    if let Some(Some(summary)) = summaries.get(log_idx) {
+                        msg.content = Some(summary.clone());
+                    }
+                }
             }
-            tool_msg_idx += 1;
         }
     }
 }
@@ -700,11 +715,7 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
         }
         "shell" => {
             let cmd = args["command"].as_str().unwrap_or("?");
-            if cmd.len() > 50 {
-                format!("{}...", &cmd[..47])
-            } else {
-                cmd.to_string()
-            }
+            crate::truncate_chars(cmd, 47)
         }
         "task_update" => "scratchpad".to_string(),
         "web_search" => args["query"].as_str().unwrap_or("?").to_string(),

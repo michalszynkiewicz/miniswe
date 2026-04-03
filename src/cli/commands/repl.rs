@@ -709,11 +709,7 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
         "edit" | "write_file" => args["path"].as_str().unwrap_or("?").to_string(),
         "shell" => {
             let cmd = args["command"].as_str().unwrap_or("?");
-            if cmd.len() > 50 {
-                format!("{}...", &cmd[..47])
-            } else {
-                cmd.to_string()
-            }
+            crate::truncate_chars(cmd, 47)
         }
         "task_update" => "scratchpad".to_string(),
         "web_search" => args["query"].as_str().unwrap_or("?").to_string(),
