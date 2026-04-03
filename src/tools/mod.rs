@@ -291,8 +291,7 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
     result.content.push_str(&format!("\n[{checker_name}]\n"));
     result.content.push_str(&relevant.join("\n"));
 
-    // Parse error locations and include source context so the model can fix
-    // errors without a separate read_file call.
+    // Parse error locations and include source context
     let locations = extract_error_locations(&stderr);
     if !locations.is_empty() {
         result.content.push_str("\n[source context]\n");
@@ -300,6 +299,29 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
             if let Some(ctx) = read_source_context(file, *line_num, &project_root) {
                 result.content.push_str(&ctx);
             }
+        }
+    }
+
+    // Interpret common errors into actionable hints
+    let joined = relevant.join("\n");
+    let mut hints = Vec::new();
+    if joined.contains("expected") && joined.contains("argument") && joined.contains("found") {
+        hints.push("ACTION: Function signature changed but call sites not updated. Use search(\"function_name\") to find ALL callers and update them.");
+    }
+    if joined.contains("cannot find") {
+        hints.push("ACTION: A symbol was renamed/removed but references remain. Search for the old name and update.");
+    }
+    if joined.contains("unclosed delimiter") || joined.contains("unexpected closing") {
+        hints.push("ACTION: Broken syntax (missing/extra bracket). Use write_file to rewrite the file — edit is unreliable for structural fixes.");
+    }
+    if joined.contains("mismatched types") {
+        hints.push("ACTION: Type mismatch. Check the function signature and update the caller to pass the correct type.");
+    }
+    if !hints.is_empty() {
+        result.content.push_str("\n[action needed]\n");
+        for hint in &hints {
+            result.content.push_str(hint);
+            result.content.push('\n');
         }
     }
 

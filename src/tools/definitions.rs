@@ -81,7 +81,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "edit".into(),
-                description: "Replace a section in a file. `old` must match exactly and uniquely. Include 3+ surrounding lines for a unique match. ONLY for targeted fixes in large files (>100 lines). For new files or full rewrites, use write_file.".into(),
+                description: "Replace text in a file. RULES: (1) 'old' must match file content EXACTLY including whitespace (2) include 3+ unchanged lines for unique match (3) ONLY use for single targeted fix in files >200 lines (4) if edit fails, switch to write_file. AFTER editing a function signature: use search() to find all callers and update them.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -106,7 +106,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "write_file".into(),
-                description: "Write complete file contents. Use this for: new files, multiple changes to a file, or any file under 200 lines. More reliable than edit.".into(),
+                description: "Write complete file contents. PREFERRED for most changes. Use for: new files, ANY file under 200 lines, multiple changes to one file, or when edit fails. Always include the COMPLETE file content — do not omit sections with comments like '// rest unchanged'.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {

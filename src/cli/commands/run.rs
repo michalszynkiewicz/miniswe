@@ -126,6 +126,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     // Track tool calls for loop detection
     let mut recent_calls: Vec<String> = Vec::new();
     let mut consecutive_loops = 0u32;
+    let mut rounds_since_last_edit = 0u32;
+    let mut edit_fail_count: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
     // Track tool results for observation masking
     // (tool_call_id, name, args, content) — id used to match messages in masking
@@ -378,7 +380,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             }
 
             // Handle MCP tool calls
-            let result = if tc.function.name == "mcp_use" {
+            let mut result = if tc.function.name == "mcp_use" {
                 let server = args["server"].as_str().unwrap_or("");
                 let tool = args["tool"].as_str().unwrap_or("");
                 let tool_args = args.get("arguments").cloned().unwrap_or_default();
@@ -404,12 +406,27 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             log.tool_result_detail(&tc.function.name, result.success, &result.content);
             tui::print_tool_result(&tc.function.name, result.success, first_line);
 
-            // A successful edit/write means code changed — the next shell/test
-            // call is on different code, so it's not a loop. Reset the tracker.
+            // A successful edit/write means code changed — reset trackers.
             if result.success
                 && (tc.function.name == "edit" || tc.function.name == "write_file")
             {
                 recent_calls.clear();
+                rounds_since_last_edit = 0;
+            } else {
+                rounds_since_last_edit += 1;
+            }
+
+            // Track edit failures per file — suggest write_file after 2 failures
+            if tc.function.name == "edit" && !result.success {
+                let path = args["path"].as_str().unwrap_or("").to_string();
+                let count = edit_fail_count.entry(path.clone()).or_insert(0);
+                *count += 1;
+                if *count >= 2 {
+                    result.content.push_str(&format!(
+                        "\nERROR: edit has failed {} times on {path}. STOP using edit. Use write_file instead — read the file first, then write the complete new content.\n",
+                        count
+                    ));
+                }
             }
 
             // Log for future observation masking
@@ -423,6 +440,16 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             let result_msg = Message::tool_result(&tc.id, &result.content);
             messages.push(result_msg.clone());
             conversation_history.push(result_msg);
+        }
+
+        // Stall detection: too many rounds without any edits
+        if rounds_since_last_edit >= 10 && rounds_since_last_edit % 10 == 0 {
+            messages.push(Message::user(
+                "[WARNING: You have used 10+ tool calls without making any edits. \
+                 You likely have enough information. Start making changes now. \
+                 Use write_file for files under 200 lines. \
+                 If you're stuck, explain what's blocking you.]"
+            ));
         }
     }
 

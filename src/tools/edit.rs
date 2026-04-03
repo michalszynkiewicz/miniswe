@@ -42,14 +42,48 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let count = content.matches(old).count();
 
     if count == 0 {
-        // Show what the file actually contains near where the match might be,
-        // so the model can fix its edit without a separate read_file call.
-        let file_lines: Vec<&str> = content.lines().collect();
+        // Try whitespace-normalized matching as a fallback
+        let content_lines: Vec<&str> = content.lines().collect();
+        let old_lines: Vec<&str> = old.lines().collect();
+
+        if let Some(start) = find_normalized_match(&content_lines, &old_lines) {
+            // Found a match ignoring whitespace — do the replacement using actual text
+            let end = start + old_lines.len();
+            let original_old = content_lines[start..end].join("\n");
+            let new_content = content.replacen(&original_old, new, 1);
+            fs::write(&path, &new_content)?;
+
+            let edited_lines: Vec<&str> = new_content.lines().collect();
+            let total_lines = edited_lines.len();
+            let new_lines: Vec<&str> = new.lines().collect();
+            let context_start = start.saturating_sub(10);
+            let context_end = (start + new_lines.len() + 10).min(edited_lines.len());
+
+            let mut output = format!(
+                "✓ Edited {path_str} (1 replacement, showing L{}-{})\n",
+                context_start + 1, context_end
+            );
+            for i in context_start..context_end {
+                let marker = if i >= start && i < start + new_lines.len() { "+" } else { " " };
+                output.push_str(&format!("{marker}{:>4}│{}\n", i + 1, edited_lines[i]));
+            }
+            output.push_str("Note: matched with normalized whitespace — your 'old' text had different indentation.\n");
+            if total_lines < 200 {
+                output.push_str(&format!(
+                    "Note: {path_str} is {total_lines} lines. For multiple changes, use write_file to rewrite the whole file in one call.\n"
+                ));
+            }
+            return Ok(ToolResult::ok(output));
+        }
+
+        // No match at all — show context to help the model
+        let file_lines = &content_lines;
         let mut err_msg = format!(
             "old_content not found in {path_str}. Make sure the text matches exactly (including whitespace).\n"
         );
         let first_old_line = old.lines().next().unwrap_or("").trim();
         if !first_old_line.is_empty() {
+            let mut matches_shown = 0;
             for (i, line) in file_lines.iter().enumerate() {
                 if line.contains(first_old_line) {
                     let ctx_start = i.saturating_sub(5);
@@ -59,11 +93,13 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
                         let marker = if j == i { ">" } else { " " };
                         err_msg.push_str(&format!("{marker}{:>4}│{}\n", j + 1, file_lines[j]));
                     }
-                    break;
+                    matches_shown += 1;
+                    if matches_shown >= 3 { break; }
                 }
             }
         }
         err_msg.push_str(&format!("[{path_str}: {} lines total]\n", file_lines.len()));
+        err_msg.push_str("HINT: Copy the exact text from the line numbers shown above into 'old'. Or use write_file to rewrite the whole file.\n");
         return Ok(ToolResult::err(err_msg));
     }
 
@@ -133,7 +169,47 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         ));
     }
 
+    // Detect function signature changes and nudge about call sites
+    if old.contains("fn ") && new.contains("fn ") {
+        if let Some(fn_name) = extract_fn_name(new) {
+            output.push_str(&format!(
+                "\nIMPORTANT: You changed a function signature. Use search(\"{fn_name}\") to find ALL call sites and update them.\n"
+            ));
+        }
+    }
+
     Ok(ToolResult::ok(output))
+}
+
+/// Find a whitespace-normalized match of `old_lines` in `content_lines`.
+fn find_normalized_match(content_lines: &[&str], old_lines: &[&str]) -> Option<usize> {
+    if old_lines.is_empty() { return None; }
+    let max = content_lines.len().saturating_sub(old_lines.len().saturating_sub(1));
+    'outer: for i in 0..max {
+        for (j, old_line) in old_lines.iter().enumerate() {
+            if content_lines[i + j].trim() != old_line.trim() {
+                continue 'outer;
+            }
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// Extract a function name from text containing "fn name(...)".
+fn extract_fn_name(text: &str) -> Option<&str> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        for prefix in &["pub async fn ", "pub fn ", "async fn ", "fn "] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                let name = rest.split(|c: char| !c.is_alphanumeric() && c != '_').next()?;
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn resolve_path(path_str: &str, config: &Config) -> PathBuf {
