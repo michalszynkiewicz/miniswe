@@ -513,3 +513,191 @@ async fn shell_missing_command() {
     assert!(!result.success);
     assert!(result.content.contains("command") || result.content.contains("Missing"));
 }
+
+// ── whitespace-normalized edit fallback ────────────────────────────
+
+#[tokio::test]
+async fn edit_whitespace_normalized_fallback() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // File has 4-space indent
+    let content = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+    fs::write(helpers::project_path(&config, "ws_test.rs"), content).unwrap();
+
+    // old has 2-space indent (wrong whitespace, but same content)
+    let args = json!({
+        "path": "ws_test.rs",
+        "old": "  let x = 1;\n  let y = 2;",
+        "new": "    let x = 42;\n    let y = 99;"
+    });
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "whitespace-normalized edit should succeed: {}", result.content);
+    assert!(result.content.contains("normalized whitespace"),
+        "should mention normalized whitespace: {}", result.content);
+
+    let disk = fs::read_to_string(helpers::project_path(&config, "ws_test.rs")).unwrap();
+    assert!(disk.contains("let x = 42;"), "replacement should be applied");
+    assert!(disk.contains("let y = 99;"), "replacement should be applied");
+}
+
+#[tokio::test]
+async fn edit_whitespace_normalized_single_line() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let content = "    let value = 10;\n";
+    fs::write(helpers::project_path(&config, "ws_single.rs"), content).unwrap();
+
+    // Wrong indentation in old
+    let args = json!({
+        "path": "ws_single.rs",
+        "old": "let value = 10;",
+        "new": "    let value = 20;"
+    });
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "single-line normalized edit should succeed: {}", result.content);
+    let disk = fs::read_to_string(helpers::project_path(&config, "ws_single.rs")).unwrap();
+    assert!(disk.contains("let value = 20;"));
+}
+
+// ── function signature change detection ───────────────────────────
+
+#[tokio::test]
+async fn edit_detects_function_signature_change() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let content = "pub fn run(config: Config) -> Result<()> {\n    todo!()\n}\n";
+    fs::write(helpers::project_path(&config, "sig_test.rs"), content).unwrap();
+
+    let args = json!({
+        "path": "sig_test.rs",
+        "old": "pub fn run(config: Config) -> Result<()> {",
+        "new": "pub fn run(config: Config, headless: bool) -> Result<()> {"
+    });
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("IMPORTANT"),
+        "should warn about call sites: {}", result.content);
+    assert!(result.content.contains("search(\"run\")") || result.content.contains("search"),
+        "should suggest searching for callers: {}", result.content);
+}
+
+#[tokio::test]
+async fn edit_no_signature_warning_for_non_fn_changes() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let content = "let x = 1;\nlet y = 2;\n";
+    fs::write(helpers::project_path(&config, "no_sig.rs"), content).unwrap();
+
+    let args = json!({
+        "path": "no_sig.rs",
+        "old": "let x = 1;",
+        "new": "let x = 42;"
+    });
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(!result.content.contains("IMPORTANT"),
+        "should NOT warn about call sites for non-fn edits: {}", result.content);
+}
+
+// ── edit failure hints ────────────────────────────────────────────
+
+#[tokio::test]
+async fn edit_not_found_suggests_write_file() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    fs::write(helpers::project_path(&config, "hint_test.txt"), "actual content\n").unwrap();
+
+    let args = json!({
+        "path": "hint_test.txt",
+        "old": "nonexistent content",
+        "new": "replacement"
+    });
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(!result.success);
+    assert!(result.content.contains("write_file"),
+        "should suggest write_file: {}", result.content);
+}
+
+// ── context pull-based tools ──────────────────────────────────────
+
+#[tokio::test]
+async fn get_project_info_returns_profile() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    fs::write(
+        config.miniswe_path("profile.md"),
+        "# Test\n## Overview\n- Name: test-proj\n- Language: Rust\n",
+    ).unwrap();
+
+    let args = json!({});
+    let result = tools::execute_tool("get_project_info", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("test-proj") || result.content.contains("PROFILE"),
+        "should contain profile: {}", result.content);
+}
+
+#[tokio::test]
+async fn get_architecture_notes_missing_file() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let args = json!({});
+    let result = tools::execute_tool("get_architecture_notes", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("does not exist"),
+        "should say file doesn't exist: {}", result.content);
+}
+
+#[tokio::test]
+async fn get_architecture_notes_returns_content() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let ai_dir = helpers::project_path(&config, ".ai");
+    fs::create_dir_all(&ai_dir).unwrap();
+    fs::write(ai_dir.join("README.md"), "# Architecture\nLayered design.\n").unwrap();
+
+    let args = json!({});
+    let result = tools::execute_tool("get_architecture_notes", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("Layered design"),
+        "should contain notes: {}", result.content);
+}
+
+// ── dynamic tool output budget ────────────────────────────────────
+
+#[test]
+fn tool_output_budget_scales_with_context() {
+    let mut config = miniswe::config::Config::default();
+
+    config.model.context_window = 32000;
+    assert_eq!(config.tool_output_budget_chars(), 3200);
+
+    config.model.context_window = 50000;
+    assert_eq!(config.tool_output_budget_chars(), 5000);
+
+    config.model.context_window = 128000;
+    assert_eq!(config.tool_output_budget_chars(), 12800);
+}
