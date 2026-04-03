@@ -196,7 +196,13 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         // Budget = half the context window for tool results
         let tool_result_budget = config.model.context_window / 2;
         let pre_mask = tool_result_log.len();
-        mask_old_tool_results(&mut messages, &tool_result_log, tool_result_budget, &config.project_root);
+        mask_old_tool_results(
+            &mut messages,
+            &tool_result_log,
+            tool_result_budget,
+            &config.project_root,
+            &router,
+        ).await;
         log.masking_applied(
             messages.iter().filter(|m| m.role == "tool" && m.content.as_ref().is_some_and(|c| c.starts_with('['))).count(),
             pre_mask,
@@ -438,25 +444,20 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 /// For each tool type, keeps the N most recent results in full (where N
 /// depends on the tool type — reads are kept longer than writes/searches).
 /// Older results are replaced with one-line summaries.
-/// Token-budget-aware observation masking with tiered storage.
+/// Token-budget-aware observation masking with LLM-driven summarization.
 ///
-/// Three tiers:
-/// 1. **Full results** — newest, within budget. Model sees complete tool output.
-/// 2. **Inline summaries** — older, kept as compact summaries in context (up to
-///    SUMMARY_KEEP_COUNT). Model sees signatures/key info.
-/// 3. **Archived** — oldest summaries written to `.miniswe/tool_history.md`.
-///    A one-liner in context tells the model the archive exists.
+/// When tool results exceed the token budget, the oldest results are
+/// batched and sent to the LLM for summarization. The LLM decides
+/// what's important and returns concise summaries. Full content is
+/// archived to `.miniswe/tool_history.md` for retrieval.
 ///
-/// This prevents the re-read loop: even when full results are masked,
-/// the model retains enough info (signatures, struct definitions) to
-/// know what it already read without re-reading.
-const SUMMARY_KEEP_COUNT: usize = 20;
-
-fn mask_old_tool_results(
+/// Falls back to heuristic summaries if the LLM call fails.
+async fn mask_old_tool_results(
     messages: &mut Vec<Message>,
     tool_result_log: &[(String, serde_json::Value, String)],
     tool_result_token_budget: usize,
     project_root: &std::path::Path,
+    router: &ModelRouter,
 ) {
     if tool_result_log.is_empty() {
         return;
@@ -467,10 +468,8 @@ fn mask_old_tool_results(
     let mut should_mask: Vec<bool> = vec![false; tool_result_log.len()];
 
     for i in (0..tool_result_log.len()).rev() {
-        let content = &tool_result_log[i].2;
-        let tokens = context::estimate_tokens(content);
+        let tokens = context::estimate_tokens(&tool_result_log[i].2);
         used_tokens += tokens;
-
         if used_tokens > tool_result_token_budget {
             should_mask[i] = true;
         }
@@ -480,68 +479,141 @@ fn mask_old_tool_results(
         return;
     }
 
-    // Build summaries for masked results
+    // Collect results that need summarization
+    let to_summarize: Vec<(usize, &str, &serde_json::Value, &str)> = tool_result_log
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| should_mask[*i])
+        .map(|(i, (name, args, content))| (i, name.as_str(), args, content.as_str()))
+        .collect();
+
+    // Try LLM-driven summarization
+    let llm_summaries = llm_summarize_tool_results(&to_summarize, router).await;
+
+    // Build final summaries — LLM if available, heuristic fallback
     let summaries: Vec<Option<String>> = tool_result_log
         .iter()
         .enumerate()
         .map(|(i, (name, args, content))| {
-            if should_mask[i] {
-                Some(compress::summarize_tool_result(name, args, content))
-            } else {
+            if !should_mask[i] {
+                return None;
+            }
+            // Find this index in llm_summaries
+            if let Some(llm_summary) = llm_summaries.as_ref() {
+                let pos = to_summarize.iter().position(|(idx, _, _, _)| *idx == i);
+                if let Some(pos) = pos {
+                    if let Some(summary) = llm_summary.get(pos) {
+                        if !summary.is_empty() && summary != "[drop]" {
+                            return Some(summary.clone());
+                        }
+                        if summary == "[drop]" {
+                            return Some("[dropped by summarizer]".into());
+                        }
+                    }
+                }
+            }
+            // Fallback to heuristic
+            Some(compress::summarize_tool_result(name, args, content))
+        })
+        .collect();
+
+    // Archive full content of masked results
+    let archive_path = project_root.join(".miniswe").join("tool_history.md");
+    let mut archive = std::fs::read_to_string(&archive_path).unwrap_or_default();
+    for (i, (name, args, content)) in tool_result_log.iter().enumerate() {
+        if should_mask[i] {
+            let path = args["path"].as_str().or(args["query"].as_str()).unwrap_or("?");
+            archive.push_str(&format!("## {}({})\n{}\n\n", name, path,
+                if content.len() > 2000 { &content[..2000] } else { content }));
+        }
+    }
+    let _ = std::fs::write(&archive_path, &archive);
+
+    // Apply summaries to messages
+    let mut tool_msg_idx = 0;
+    for msg in messages.iter_mut() {
+        if msg.role == "tool" {
+            if let Some(Some(summary)) = summaries.get(tool_msg_idx) {
+                msg.content = Some(summary.clone());
+            }
+            tool_msg_idx += 1;
+        }
+    }
+}
+
+/// Ask the LLM to summarize a batch of tool results.
+/// Returns None if the call fails (caller falls back to heuristic).
+async fn llm_summarize_tool_results(
+    results: &[(usize, &str, &serde_json::Value, &str)],
+    router: &ModelRouter,
+) -> Option<Vec<String>> {
+    if results.is_empty() {
+        return Some(Vec::new());
+    }
+
+    // Build the summarization prompt
+    let mut prompt = String::from(
+        "Summarize these tool results from earlier in a coding session. \
+         For each, write ONE concise line capturing what's important \
+         (key functions, types, patterns found). \
+         Write [drop] if the result has no future value.\n\
+         Respond with exactly one line per result, numbered.\n\n"
+    );
+
+    for (idx, (_, name, args, content)) in results.iter().enumerate() {
+        let path = args["path"].as_str()
+            .or(args["query"].as_str())
+            .or(args["command"].as_str())
+            .unwrap_or("?");
+        // Truncate content to keep prompt manageable
+        let truncated = if content.len() > 1000 {
+            &content[..1000]
+        } else {
+            content
+        };
+        prompt.push_str(&format!("{}. {}({}):\n{}\n\n", idx + 1, name, path, truncated));
+    }
+
+    let request = ChatRequest {
+        messages: vec![
+            Message::system("You are a concise summarizer. Respond with numbered lines only."),
+            Message::user(&prompt),
+        ],
+        tools: None,
+        tool_choice: None,
+    };
+
+    // Use Fast role if available, otherwise Default
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let response = router
+        .chat_stream(ModelRole::Fast, &request, |_| {}, &cancelled)
+        .await
+        .ok()?;
+
+    let text = response.choices.first()?.message.content.as_deref()?;
+
+    // Parse numbered lines
+    let summaries: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            // Strip leading number + period/parenthesis
+            let content = trimmed
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .trim_start_matches(['.', ')', ':', ' ']);
+            if content.is_empty() {
                 None
+            } else {
+                Some(content.trim().to_string())
             }
         })
         .collect();
 
-    // Count how many summaries we have
-    let summary_count = summaries.iter().filter(|s| s.is_some()).count();
-
-    // Archive old summaries to file if there are too many
-    if summary_count > SUMMARY_KEEP_COUNT {
-        let archive_path = project_root.join(".miniswe").join("tool_history.md");
-        let mut archive = String::new();
-        // Read existing archive
-        if let Ok(existing) = std::fs::read_to_string(&archive_path) {
-            archive = existing;
-        }
-        // Append oldest summaries (those beyond SUMMARY_KEEP_COUNT)
-        let mut archived_count = 0;
-        let excess = summary_count - SUMMARY_KEEP_COUNT;
-        for summary in &summaries {
-            if let Some(s) = summary {
-                if archived_count < excess {
-                    archive.push_str(s);
-                    archive.push('\n');
-                    archived_count += 1;
-                }
-            }
-        }
-        let _ = std::fs::write(&archive_path, &archive);
-    }
-
-    // Apply to messages: keep SUMMARY_KEEP_COUNT most recent summaries inline,
-    // replace older ones with a compact archive pointer
-    let mut tool_msg_idx = 0;
-    let total_summaries = summaries.iter().filter(|s| s.is_some()).count();
-
-    for msg in messages.iter_mut() {
-        if msg.role == "tool" {
-            if let Some(Some(summary)) = summaries.get(tool_msg_idx) {
-                let summary_pos_from_start = summaries[..=tool_msg_idx]
-                    .iter()
-                    .filter(|s| s.is_some())
-                    .count();
-                let from_end = total_summaries - summary_pos_from_start;
-                if from_end < SUMMARY_KEEP_COUNT {
-                    // Keep inline
-                    msg.content = Some(summary.clone());
-                } else {
-                    // Archive pointer
-                    msg.content = Some("[archived — use read_file(\".miniswe/tool_history.md\") to recall]".into());
-                }
-            }
-            tool_msg_idx += 1;
-        }
+    // Must match the number of results
+    if summaries.len() == results.len() {
+        Some(summaries)
+    } else {
+        None // Mismatch — fall back to heuristic
     }
 }
 
