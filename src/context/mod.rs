@@ -318,32 +318,15 @@ pub fn assemble(
     messages.push(Message::system(&system_context));
     used_tokens += estimate_tokens(&system_context);
 
-    // 8. Conversation history (only user/assistant/tool messages — no system)
-    // Devstral requires strict role alternation: user→assistant→user→assistant
-    let history_budget = config.context.history_budget;
-    let keep_raw = config.context.history_turns * 2;
-
-    let compressed_history = compress_history(conversation_history, keep_raw);
-
+    // 8. Conversation history — add directly, unified compressor handles compression
+    // (compress_history was previously called here but is now redundant since
+    // maybe_compress() in the agent loop handles all compression)
     let mut history_tokens = 0;
-    for msg in &compressed_history {
-        // Skip any system messages in history (they break role alternation)
+    for msg in conversation_history {
         if msg.role == "system" {
             continue;
         }
         let msg_tokens = estimate_tokens(msg.content.as_deref().unwrap_or(""));
-        if let Some(tool_calls) = &msg.tool_calls {
-            for tc in tool_calls {
-                let tc_tokens = estimate_tokens(&tc.function.arguments) + 5;
-                if history_tokens + tc_tokens > history_budget {
-                    break;
-                }
-                history_tokens += tc_tokens;
-            }
-        }
-        if history_tokens + msg_tokens > history_budget {
-            break;
-        }
         messages.push(msg.clone());
         history_tokens += msg_tokens;
     }

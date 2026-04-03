@@ -132,6 +132,11 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         .as_ref()
         .and_then(|r| r.context_summary());
 
+    // Estimate tool definition overhead for context budgeting
+    let tool_def_tokens = context::estimate_tokens(
+        &serde_json::to_string(&tool_defs).unwrap_or_default()
+    );
+
     let max_rounds = config.context.max_rounds;
     let pause_at = config.context.pause_after_rounds;
 
@@ -211,7 +216,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
         // Unified context compression — handles both tool results and conversation
         let pre_mask = messages.len();
-        context::compressor::maybe_compress(&mut messages, &config, &router).await;
+        context::compressor::maybe_compress(&mut messages, &config, &router, tool_def_tokens).await;
         log.masking_applied(
             pre_mask.saturating_sub(messages.len()),
             pre_mask,
@@ -446,7 +451,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         // Stall detection: too many tool calls without any edits
         if calls_since_last_edit >= 20 && calls_since_last_edit % 20 == 0 {
             messages.push(Message::user(
-                "[WARNING: You have used 10+ tool calls without making any edits. \
+                "[WARNING: You have used 20+ tool calls without making any edits. \
                  You likely have enough information. Start making changes now. \
                  Use write_file for files under 200 lines. \
                  If you're stuck, explain what's blocking you.]"
