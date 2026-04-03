@@ -541,8 +541,9 @@ async fn mask_old_tool_results(
     }
 }
 
-/// Ask the LLM to summarize a batch of tool results.
-/// Returns None if the call fails (caller falls back to heuristic).
+/// Ask the LLM to summarize tool results in chunks that fit the context window.
+/// Processes newest results first (most relevant). Each chunk is one LLM call.
+/// Returns None only if ALL chunks fail.
 async fn llm_summarize_tool_results(
     results: &[(usize, &str, &serde_json::Value, &str)],
     router: &ModelRouter,
@@ -551,123 +552,127 @@ async fn llm_summarize_tool_results(
         return Some(Vec::new());
     }
 
-    // Build the summarization prompt
-    // Budget: use at most 1/3 of context window for the summarization prompt.
-    // This leaves room for the system message + LLM response.
-    let max_prompt_chars = router.config_for(ModelRole::Fast).context_window * 3; // ~3 chars/token, 1/3 window
-
+    let max_prompt_chars = router.config_for(ModelRole::Fast).context_window * 3;
     let system_msg = "You are a concise summarizer. Respond with numbered lines only.";
     let preamble = "Summarize these tool results from earlier in a coding session. \
          For each, write ONE concise line capturing what's important \
          (key functions, types, patterns found). \
          Write [drop] if the result has no future value.\n\
          Respond with exactly one line per result, numbered.\n\n";
-
-    let included_indices: Vec<usize>;
     let overhead = system_msg.len() + preamble.len() + 200;
 
-    // Collect entries from the END (newest masked results are most relevant)
-    let mut entries: Vec<(usize, String)> = Vec::new();
-    let mut total_len = 0;
-    for (idx, (_, name, args, content)) in results.iter().enumerate().rev() {
+    // Build entries for all results
+    let entries: Vec<(usize, String)> = results.iter().enumerate().map(|(idx, (_, name, args, content))| {
         let path = args["path"].as_str()
             .or(args["query"].as_str())
             .or(args["command"].as_str())
             .unwrap_or("?");
-        let entry = format!("{}. {}({}):\n{}\n\n", idx + 1, name, path, content);
+        (idx, format!("{}. {}({}):\n{}\n\n", idx + 1, name, path, content))
+    }).collect();
 
-        if overhead + total_len + entry.len() > max_prompt_chars {
-            break;
+    // Split into chunks that fit the context window, newest first
+    let mut chunks: Vec<Vec<usize>> = Vec::new();
+    let mut current_chunk = Vec::new();
+    let mut current_len = 0;
+
+    for (idx, entry) in entries.iter().rev() {
+        if overhead + current_len + entry.len() > max_prompt_chars && !current_chunk.is_empty() {
+            // Current chunk is full, start a new one
+            chunks.push(current_chunk);
+            current_chunk = Vec::new();
+            current_len = 0;
         }
-        total_len += entry.len();
-        entries.push((idx, entry));
+        // Skip entries that are individually too large for a single chunk
+        if overhead + entry.len() > max_prompt_chars {
+            continue;
+        }
+        current_len += entry.len();
+        current_chunk.push(*idx);
+    }
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
     }
 
-    if entries.is_empty() {
+    if chunks.is_empty() {
         return None;
     }
 
-    // Reverse to chronological order and build prompt
-    entries.reverse();
-    included_indices = entries.iter().map(|(idx, _)| *idx).collect();
-    let mut prompt = String::from(preamble);
-    for (_, entry) in &entries {
-        prompt.push_str(entry);
-    }
+    // Process each chunk with an LLM call
+    let mut all_summaries: Vec<Option<String>> = vec![None; results.len()];
+    let mut any_succeeded = false;
 
-    eprintln!("[masking] LLM summarizing {} of {} results ({} chars)", included_indices.len(), results.len(), prompt.len());
+    for (chunk_num, chunk_indices) in chunks.iter().enumerate() {
+        // Reverse to chronological order for the prompt
+        let mut sorted = chunk_indices.clone();
+        sorted.sort();
 
-    let request = ChatRequest {
-        messages: vec![
-            Message::system(system_msg),
-            Message::user(&prompt),
-        ],
-        tools: None,
-        tool_choice: None,
-    };
-
-    // Use Fast role if available, otherwise Default (non-streaming)
-    let response = match router.chat(ModelRole::Fast, &request).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[masking] LLM summarization failed: {e}");
-            return None;
+        let mut prompt = String::from(preamble);
+        for (local_num, &idx) in sorted.iter().enumerate() {
+            let (_, entry) = &entries[idx];
+            // Renumber for this chunk
+            prompt.push_str(&format!("{}. {}", local_num + 1,
+                entry.splitn(2, ". ").nth(1).unwrap_or(entry)));
         }
-    };
 
-    let text = match response.choices.first().and_then(|c| c.message.content.as_deref()) {
-        Some(t) => t,
-        None => {
-            eprintln!("[masking] LLM summarizer returned empty response");
-            return None;
-        }
-    };
+        eprintln!("[masking] LLM summarizing chunk {}/{} ({} results, {} chars)",
+            chunk_num + 1, chunks.len(), sorted.len(), prompt.len());
 
-    eprintln!("[masking] LLM summarizer responded ({} chars)", text.len());
+        let request = ChatRequest {
+            messages: vec![
+                Message::system(system_msg),
+                Message::user(&prompt),
+            ],
+            tools: None,
+            tool_choice: None,
+        };
 
-    // Parse lines — strip numbering, skip blanks
-    let summaries: Vec<String> = text
-        .lines()
-        .map(|line| {
-            line.trim()
-                .trim_start_matches(|c: char| c.is_ascii_digit())
-                .trim_start_matches(['.', ')', ':', ' '])
-                .trim()
-                .to_string()
-        })
-        .filter(|s| !s.is_empty())
-        .collect();
+        let response = match router.chat(ModelRole::Fast, &request).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[masking] chunk {} failed: {e}", chunk_num + 1);
+                continue;
+            }
+        };
 
-    // Match LLM summaries to included results, heuristic for the rest
-    let included_count = included_indices.len();
-    let mut llm_summaries: Vec<String> = summaries;
+        let text = match response.choices.first().and_then(|c| c.message.content.as_deref()) {
+            Some(t) => t,
+            None => continue,
+        };
 
-    // Trim or pad LLM output to match included count
-    if llm_summaries.len() > included_count {
-        eprintln!("[masking] summarizer returned {} lines, expected {}, taking first {}", llm_summaries.len(), included_count, included_count);
-        llm_summaries.truncate(included_count);
-    } else if llm_summaries.len() < included_count {
-        eprintln!("[masking] summarizer returned {} lines, expected {}, padding", llm_summaries.len(), included_count);
-        for i in llm_summaries.len()..included_count {
-            let (_, name, args, content) = &results[included_indices[i]];
-            llm_summaries.push(compress::summarize_tool_result(name, args, content));
+        eprintln!("[masking] chunk {} responded ({} chars)", chunk_num + 1, text.len());
+
+        // Parse numbered lines
+        let summaries: Vec<String> = text.lines()
+            .map(|line| {
+                line.trim()
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .trim_start_matches(['.', ')', ':', ' '])
+                    .trim()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // Map summaries back to result indices
+        for (i, &idx) in sorted.iter().enumerate() {
+            if let Some(summary) = summaries.get(i) {
+                all_summaries[idx] = Some(summary.clone());
+                any_succeeded = true;
+            }
         }
     }
 
-    // Build full result: LLM summaries for included, heuristic for overflow
-    let mut all_summaries = Vec::with_capacity(results.len());
-    let mut llm_idx = 0;
-    for (i, (_, name, args, content)) in results.iter().enumerate() {
-        if llm_idx < included_indices.len() && included_indices[llm_idx] == i {
-            all_summaries.push(llm_summaries[llm_idx].clone());
-            llm_idx += 1;
-        } else {
-            // Not included in LLM batch — use heuristic
-            all_summaries.push(compress::summarize_tool_result(name, args, content));
-        }
+    if !any_succeeded {
+        return None;
     }
 
-    Some(all_summaries)
+    // Fill gaps with heuristic
+    let final_summaries: Vec<String> = results.iter().enumerate().map(|(i, (_, name, args, content))| {
+        all_summaries[i].clone()
+            .unwrap_or_else(|| compress::summarize_tool_result(name, args, content))
+    }).collect();
+
+    Some(final_summaries)
 }
 
 /// Create a brief summary of tool arguments for display.
