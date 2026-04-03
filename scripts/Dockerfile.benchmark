@@ -17,8 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev git curl ca-certificates maven \
     && rm -rf /var/lib/apt/lists/*
 
-# Install rust-analyzer component (not included in base rust image)
-RUN rustup component add rust-analyzer
+# Note: rust-analyzer is NOT installed here — miniswe auto-downloads
+# it to ~/.miniswe/lsp-servers/ if the rustup proxy doesn't work
 
 WORKDIR /build
 
