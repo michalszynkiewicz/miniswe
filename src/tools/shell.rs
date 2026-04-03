@@ -140,9 +140,8 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         if i > 0 {
             result.push('\n');
         }
-        if line.len() > MAX_LINE_CHARS {
-            result.push_str(&line[..MAX_LINE_CHARS]);
-            result.push_str("...(truncated)");
+        if line.chars().count() > MAX_LINE_CHARS {
+            result.push_str(&crate::truncate_chars(line, MAX_LINE_CHARS));
         } else {
             result.push_str(line);
         }

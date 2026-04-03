@@ -65,7 +65,8 @@ impl ModelRouter {
         let key = self.key_for(role);
         self.clients
             .get(key)
-            .unwrap_or_else(|| self.clients.get(&self.default_key).unwrap())
+            .or_else(|| self.clients.get(&self.default_key))
+            .expect("no LLM client configured — check [model] or [models] in config.toml")
     }
 
     /// Get the model config for a given role (for display / context budgeting).
@@ -73,7 +74,8 @@ impl ModelRouter {
         let key = self.key_for(role);
         self.configs
             .get(key)
-            .unwrap_or_else(|| self.configs.get(&self.default_key).unwrap())
+            .or_else(|| self.configs.get(&self.default_key))
+            .expect("no model config found — check [model] or [models] in config.toml")
     }
 
     /// Whether multiple distinct models are configured.

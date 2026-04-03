@@ -317,6 +317,14 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
 
     // Cleanup
     app.save_history(&history_file);
+
+    // Shut down LSP
+    if let Some(lsp) = lsp_client {
+        if let Ok(lsp) = Arc::try_unwrap(lsp) {
+            lsp.shutdown().await;
+        }
+    }
+
     terminal::disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
 

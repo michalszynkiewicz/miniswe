@@ -81,9 +81,5 @@ pub fn read_input(prompt: &str) -> Option<String> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max - 3])
-    }
+    crate::truncate_chars(s, max.saturating_sub(3))
 }
