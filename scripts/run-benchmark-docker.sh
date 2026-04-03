@@ -68,7 +68,7 @@ generate_config() {
 provider = "llama-cpp"
 endpoint = "http://localhost:8464"
 model = "devstral-small-2"
-context_window = 50000
+context_window = 32000
 temperature = ${TEMPERATURE}
 max_output_tokens = 16384
 
@@ -181,8 +181,10 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
         2> /output/stderr_attempt${ATTEMPT}.txt \
         || true
 
-    # Copy logs
+    # Copy logs and scratchpad
     cp .miniswe/logs/*.log /output/ 2>/dev/null || true
+    cp .miniswe/scratchpad.md /output/ 2>/dev/null || true
+    cp .miniswe/tool_history.md /output/ 2>/dev/null || true
 
     # Capture changes
     git diff --name-only > /output/changed_files.txt 2>/dev/null || true
