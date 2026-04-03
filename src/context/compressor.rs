@@ -22,10 +22,13 @@ pub async fn maybe_compress(
     messages: &mut Vec<Message>,
     config: &Config,
     router: &ModelRouter,
+    tool_def_tokens: usize,
 ) {
     let context_window = config.model.context_window;
-    let raw_budget = context_window / 4;       // 1/4 for raw recent
-    let summary_budget = context_window / 6;   // 1/6 for compressed summary
+    // Subtract fixed overhead: tool definitions + output headroom
+    let available = context_window.saturating_sub(tool_def_tokens).saturating_sub(context_window / 6);
+    let raw_budget = available / 3;            // 1/3 of available for raw recent
+    let summary_budget = available / 4;        // 1/4 of available for compressed summary
 
     // Count tokens in non-system messages (the conversation)
     let mut total_tokens = 0;
