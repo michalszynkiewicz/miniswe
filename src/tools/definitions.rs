@@ -56,7 +56,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "search".into(),
-                description: "Search the codebase using ripgrep. Returns matching lines with file:line context.".into(),
+                description: "Search the codebase using ripgrep. Returns matching lines with file:line context. USE THIS after changing a function name or signature to find all call sites. Use plain text queries (e.g. 'fn run' not 'fn run\\(') — regex special characters are interpreted literally.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
