@@ -810,15 +810,7 @@ fn extract_doc_header(content: &str, ext: &str) -> Option<String> {
 }
 
 fn truncate_summary(s: &str) -> String {
-    if s.len() <= 100 {
-        s.to_string()
-    } else {
-        let mut end = 97;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &s[..end])
-    }
+    crate::truncate_chars(s, 97)
 }
 
 /// Check file sizes and return warnings for large files.

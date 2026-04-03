@@ -155,7 +155,11 @@ fi
 # Write config and init
 mkdir -p .miniswe
 cp /config/config.toml .miniswe/config.toml
-miniswe init 2>/dev/null || true
+if ! miniswe init 2>/output/miniswe_init.txt; then
+    echo "ERROR: miniswe init failed:"
+    cat /output/miniswe_init.txt
+    exit 1
+fi
 mkdir -p .miniswe/logs
 
 # Init git for diff tracking

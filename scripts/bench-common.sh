@@ -144,7 +144,11 @@ prepare_workdir() {
     # Initialize miniswe fresh for this SHA's code
     rm -rf "${WORK_DIR}/.miniswe"
     cd "${WORK_DIR}"
-    "${MINISWE}" init 2>/dev/null || true
+    if ! "${MINISWE}" init 2>"${WORK_DIR}/.miniswe/init.log"; then
+        echo "ERROR: miniswe init failed:"
+        cat "${WORK_DIR}/.miniswe/init.log"
+        exit 1
+    fi
     cd - > /dev/null
     mkdir -p "${WORK_DIR}/.miniswe/logs"
 
