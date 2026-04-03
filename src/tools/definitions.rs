@@ -56,13 +56,17 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "search".into(),
-                description: "Search the codebase using ripgrep. Returns matching lines with file:line context. USE THIS after changing a function name or signature to find all call sites. Use plain text queries (e.g. 'fn run' not 'fn run\\(') — regex special characters are interpreted literally.".into(),
+                description: "Search the codebase. Returns matching lines with file:line context. USE THIS after changing a function name or signature to find all call sites that need updating.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Search pattern (regex supported)"
+                            "description": "Plain text to search for (e.g. 'fn assemble' or 'max_rounds'). No escaping needed."
+                        },
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regex pattern for advanced searches (e.g. 'fn\\s+run\\b'). Use query for simple text searches."
                         },
                         "scope": {
                             "type": "string",
@@ -72,8 +76,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                             "type": "integer",
                             "description": "Maximum results to return (default: 20)"
                         }
-                    },
-                    "required": ["query"]
+                    }
                 }),
             },
         },

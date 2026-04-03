@@ -8,13 +8,17 @@ use crate::config::Config;
 use super::ToolResult;
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
-    let query = args["query"]
-        .as_str()
-        .unwrap_or("");
+    let query = args["query"].as_str().unwrap_or("");
+    let pattern = args["pattern"].as_str().unwrap_or("");
 
-    if query.is_empty() {
-        return Ok(ToolResult::err("Missing required parameter: query".into()));
-    }
+    // Exactly one of query (literal) or pattern (regex) must be provided
+    let (search_term, use_fixed_strings) = if !query.is_empty() {
+        (query, true)
+    } else if !pattern.is_empty() {
+        (pattern, false)
+    } else {
+        return Ok(ToolResult::err("Provide either 'query' (plain text) or 'pattern' (regex).".into()));
+    };
 
     let max_results = args["max_results"]
         .as_u64()
@@ -37,19 +41,24 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     };
 
     // Use ripgrep (rg) for fast search
+    let mut rg_args = vec![
+        "--line-number",
+        "--no-heading",
+        "--color=never",
+        "--max-columns", "200",
+    ];
+    if use_fixed_strings {
+        rg_args.push("--fixed-strings");
+    }
+    let max_str = max_results.to_string();
+    rg_args.extend_from_slice(&["--max-count", &max_str]);
+    let type_spec = "code:*.{rs,py,js,ts,tsx,jsx,go,java,c,cpp,h,hpp,rb,php,swift,kt,scala,zig,hs,ml,ex,exs,clj,sh,bash,zsh,toml,yaml,yml,json,md}";
+    rg_args.extend_from_slice(&["--type-add", type_spec, "-t", "code"]);
+    rg_args.push(search_term);
+    rg_args.push(&search_dir);
+
     let output = Command::new("rg")
-        .args([
-            "--line-number",
-            "--no-heading",
-            "--color=never",
-            "--fixed-strings",
-            "--max-count", &max_results.to_string(),
-            "--max-columns", "200",
-            "--type-add", "code:*.{rs,py,js,ts,tsx,jsx,go,java,c,cpp,h,hpp,rb,php,swift,kt,scala,zig,hs,ml,ex,exs,clj,sh,bash,zsh,toml,yaml,yml,json,md}",
-            "-t", "code",
-            query,
-            &search_dir,
-        ])
+        .args(&rg_args)
         .output();
 
     match output {
@@ -58,12 +67,12 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
             let stderr = String::from_utf8_lossy(&result.stderr);
 
             if stdout.is_empty() && result.status.code() == Some(1) {
-                return Ok(ToolResult::ok(format!("No matches found for: {query}")));
+                return Ok(ToolResult::ok(format!("No matches found for: {search_term}")));
             }
 
             if !result.status.success() && !stderr.is_empty() {
-                // rg might not be installed, fall back to grep
-                return fallback_grep(query, &search_dir, max_results).await;
+                // rg error (bad regex, not installed, etc.) — fall back to grep
+                return fallback_grep(search_term, &search_dir, max_results).await;
             }
 
             // Strip the project root prefix from paths for cleaner output
@@ -76,11 +85,11 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
                 .join("\n");
 
             let match_count = cleaned.lines().count();
-            let mut output = format!("[search \"{query}\": {match_count} matches]\n");
+            let mut output = format!("[search \"{search_term}\": {match_count} matches]\n");
             output.push_str(&cleaned);
             Ok(ToolResult::ok(output))
         }
-        Err(_) => fallback_grep(query, &search_dir, max_results).await,
+        Err(_) => fallback_grep(search_term, &search_dir, max_results).await,
     }
 }
 
