@@ -91,11 +91,27 @@ impl LspServer {
         }
     }
 
+    /// Args to verify the binary works (e.g. --version).
+    fn version_args(&self) -> &[&str] {
+        match self {
+            Self::RustAnalyzer => &["--version"],
+            Self::TypeScriptLanguageServer => &["--version"],
+            Self::Pyright => &["--version"],
+            Self::Gopls => &["version"],
+            Self::Clangd => &["--version"],
+            Self::Jdtls => &["--version"],
+        }
+    }
+
     /// Find or install the server binary. Returns the path to the executable.
     pub async fn ensure_binary(&self) -> Result<PathBuf> {
-        // 1. Check system PATH
+        // 1. Check system PATH — verify the binary actually works
+        //    (rustup proxies exist in PATH but fail if the component isn't installed)
         if let Some(path) = find_in_path(self.binary_name()) {
-            return Ok(path);
+            if verify_binary(&path, self.version_args()) {
+                return Ok(path);
+            }
+            eprintln!("[lsp] {} found in PATH but doesn't work, downloading...", self.binary_name());
         }
 
         // 2. Check our local cache
@@ -160,6 +176,17 @@ impl LspServer {
 fn lsp_cache_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("no home directory")?;
     Ok(home.join(".miniswe").join("lsp-servers"))
+}
+
+/// Verify a binary actually works by running it with version args.
+fn verify_binary(path: &Path, args: &[&str]) -> bool {
+    Command::new(path)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Check if a binary exists in PATH.
