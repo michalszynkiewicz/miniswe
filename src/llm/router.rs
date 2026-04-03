@@ -118,6 +118,11 @@ impl ModelRouter {
         lines
     }
 
+    /// Non-streaming chat request (for summarization, etc.).
+    pub async fn chat(&self, role: ModelRole, request: &ChatRequest) -> Result<ChatResponse> {
+        self.client_for(role).chat(request).await
+    }
+
     /// Convenience: stream a chat request using the client for the given role.
     pub async fn chat_stream<F>(
         &self,
