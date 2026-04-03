@@ -42,6 +42,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
             "--line-number",
             "--no-heading",
             "--color=never",
+            "--fixed-strings",
             "--max-count", &max_results.to_string(),
             "--max-columns", "200",
             "--type-add", "code:*.{rs,py,js,ts,tsx,jsx,go,java,c,cpp,h,hpp,rb,php,swift,kt,scala,zig,hs,ml,ex,exs,clj,sh,bash,zsh,toml,yaml,yml,json,md}",
