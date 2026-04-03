@@ -208,11 +208,7 @@ pub fn compress_history(
                     summary_lines.push(first_line.to_string());
                 } else {
                     // Truncate to first line as a simple summary
-                    let truncated = if first_line.len() > 80 {
-                        format!("{}...", &first_line[..77])
-                    } else {
-                        first_line.to_string()
-                    };
+                    let truncated = crate::truncate_chars(first_line, 77);
                     summary_lines.push(truncated);
                 }
             }
@@ -226,21 +222,13 @@ pub fn compress_history(
                     summary_lines.push(format!("[called:{}]", call_names.join(",")));
                 } else if let Some(content) = &msg.content {
                     let first = content.lines().next().unwrap_or("");
-                    let truncated = if first.len() > 60 {
-                        format!("{}...", &first[..57])
-                    } else {
-                        first.to_string()
-                    };
+                    let truncated = crate::truncate_chars(first, 57);
                     summary_lines.push(truncated);
                 }
             }
             "user" => {
                 if let Some(content) = &msg.content {
-                    let truncated = if content.len() > 60 {
-                        format!("user: {}...", &content[..57])
-                    } else {
-                        format!("user: {content}")
-                    };
+                    let truncated = format!("user: {}", crate::truncate_chars(content, 57));
                     summary_lines.push(truncated);
                 }
             }

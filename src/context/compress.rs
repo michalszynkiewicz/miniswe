@@ -477,11 +477,7 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
         }
         "shell" => {
             let cmd = args["command"].as_str().unwrap_or("?");
-            let short_cmd = if cmd.len() > 30 {
-                &cmd[..30]
-            } else {
-                cmd
-            };
+            let short_cmd = crate::truncate_chars(cmd, 30);
             let exit_code = if content.contains("exit 0") {
                 "ok"
             } else {
