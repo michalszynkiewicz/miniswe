@@ -133,6 +133,11 @@ prepare_workdir() {
 
     git -C "${REPO_DIR}" archive "${SHA}" | tar -x -C "${WORK_DIR}"
 
+    # Fix LFS pointer files (git archive doesn't resolve LFS)
+    if grep -q "git-lfs" "${WORK_DIR}/.gitignore" 2>/dev/null; then
+        echo -e "target/\n.miniswe/\n*.log" > "${WORK_DIR}/.gitignore"
+    fi
+
     # Clear cached builds from previous attempts
     rm -rf "${WORK_DIR}/target"
 
