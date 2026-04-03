@@ -381,11 +381,13 @@ impl Config {
         self.miniswe_dir().is_dir()
     }
 
-    /// Max characters for a single tool result (1/6 of context window, in chars).
-    /// Prevents any one tool call from filling the context.
+    /// Max characters for a single tool result.
+    ///
+    /// Budget: raw history gets 1/4 of context. We want ~10 recent results
+    /// to fit unmasked. So each result ≈ context_window/40 tokens ≈ context_window/10 chars.
+    /// For 32K context: ~3200 chars (~80 lines). For 50K: ~5000 chars (~125 lines).
     pub fn tool_output_budget_chars(&self) -> usize {
-        // ~4 chars per token, 1/6 of context for a single result
-        self.model.context_window * 4 / 6
+        self.model.context_window / 10
     }
 
     /// Get the model config for a given role.
