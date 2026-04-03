@@ -611,7 +611,8 @@ def hello():
         let args = serde_json::json!({"path": "src/main.rs"});
         let content = "pub fn main() {\n    println!(\"hello\");\n}\n";
         let summary = summarize_tool_result("read_file", &args, content);
-        assert!(summary.starts_with("[read:src/main.rs→"));
+        assert!(summary.contains("src/main.rs"), "should have path: {summary}");
+        assert!(summary.contains("read_file"), "should hint at re-read: {summary}");
     }
 
     #[test]

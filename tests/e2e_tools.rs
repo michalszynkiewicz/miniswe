@@ -696,11 +696,13 @@ async fn get_architecture_notes_returns_content() {
 async fn transform_missing_params() {
     let (_tmp, config) = helpers::create_test_project();
 
-    // Missing find
+    // Missing both find and start_line/end_line — needs one or the other
+    fs::write(helpers::project_path(&config, "test.rs"), "fn main() {}\n").unwrap();
     let args = json!({"path": "test.rs", "instruction": "do something"});
     let result = miniswe::tools::transform::execute(&args, &config, &mock_router()).await.unwrap();
-    assert!(!result.success);
-    assert!(result.content.contains("find"));
+    assert!(!result.success, "should fail without find or line range: {}", result.content);
+    assert!(result.content.contains("find") || result.content.contains("block"),
+        "should mention find or block mode: {}", result.content);
 
     // Missing instruction
     let args = json!({"path": "test.rs", "find": "something"});

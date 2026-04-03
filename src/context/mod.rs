@@ -11,6 +11,7 @@
 //! 8. Current user message
 
 pub mod compress;
+pub mod compressor;
 pub mod providers;
 
 use crate::config::Config;
