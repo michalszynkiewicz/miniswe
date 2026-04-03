@@ -1,102 +1,43 @@
-# Unified Context Compression Design
+# Context Compression (Partially Implemented)
 
-## Problem
+## Current State
 
-Two separate compression systems (tool result masking + history compression) treat the conversation as disconnected fragments. The model experiences it as one narrative — the compressor should too.
+### Implemented: Token-budget tool result masking
 
-## Design: Single-pass timeline compression
+In `src/cli/commands/run.rs` `mask_old_tool_results()`:
 
-Instead of separate tool/history compression, one unified compressor that sees the entire message stream and produces:
+- **Token budget**: `context_window / 2` for tool results
+- **Newest-first**: walks backwards, keeps newest results full
+- **LLM summarization**: batches masked results into chunks, sends to LLM for summarization
+- **Chunking**: splits across multiple LLM calls if batch exceeds 1/3 context window
+- **Heuristic fallback**: rich summaries (function signatures, struct defs) if LLM fails
+- **Archive**: full content saved to `.miniswe/tool_history.md`, pointer in context
+- **Dedup**: `archived_indices` HashSet prevents re-archiving same results
+- **tool_call_id matching**: matches messages by ID, not positional counting
 
-1. **A narrative summary** of older rounds (decisions, discoveries, failures)
-2. **Pointers to archived content** for full retrieval via `read_file`
-3. **Raw recent rounds** kept in full
+### Implemented: Dynamic tool output limits
 
-## Context Budget (fractions of context_window)
+`config.tool_output_budget_chars() = context_window / 10`
 
-```
-┌─────────────────────────────────────┐
-│ Work zone        (rest, ~42%)       │  system prompt + tool schemas + 
-│                                     │  current round content
-├─────────────────────────────────────┤
-│ Raw history      (1/4, ~25%)        │  last N rounds in full
-├─────────────────────────────────────┤
-│ Compressed summary (1/6, ~17%)      │  LLM-written narrative of old rounds
-├─────────────────────────────────────┤
-│ Output headroom  (1/6, ~17%)        │  reserved for model response
-└─────────────────────────────────────┘
-```
+Large results from web_fetch, shell, docs_lookup get saved to file with preview + pointer:
+- web_fetch → `.miniswe/web_cache/<url>.md`
+- shell → `.miniswe/shell_output/cmd_<time>.txt`
+- docs_lookup → points to `.miniswe/docs/<lib>.txt`
 
-For 32K context: work=~13K, raw=~8K, summary=~5K, output=~5K.
+### Not yet implemented: Unified timeline compression
 
-## Triggers
+Design for replacing separate tool masking + history compression with a single timeline-aware compressor.
 
-1. **Raw → Summary**: when raw history tokens > context_window/4, compress
-   the oldest half of raw into the summary zone via LLM call.
-2. **Summary → File**: when summary tokens > context_window/6, archive the
-   oldest summary to `.miniswe/session_archive.md` and re-summarize.
+**Budget split** (fractions of context_window):
+- Output headroom: 1/6 (~17%)
+- Compressed summary: 1/6 (~17%)
+- Raw history: 1/4 (~25%)
+- Work zone: rest (~42%)
 
-## Compression Flow
+**Triggers**:
+1. Raw history > 1/4 context → compress oldest half into summary via LLM
+2. Summary > 1/6 context → archive oldest summary to file, re-summarize
 
-```
-Before compression:
-  [system] [summary_of_1-20] [raw_round_21] [raw_round_22] ... [raw_round_40] [current]
-                                                                    ↑ exceeds 1/4
+**Key idea**: one summary block that captures decisions, discoveries, failures, and pointers to archived content. The model calls `read_file(".miniswe/session_archive.md")` for details.
 
-After compression:
-  [system] [summary_of_1-30] [raw_round_31] ... [raw_round_40] [current]
-                ↑ LLM summarized rounds 21-30 into the existing summary
-```
-
-## LLM Summarization Prompt
-
-```
-Summarize this segment of a coding session. Include:
-- What was attempted and why
-- Key discoveries (file locations, function signatures, patterns)
-- What succeeded and what failed
-- Current state and next steps
-
-Conversation segment:
-[round 21-30 messages here, including tool calls and results]
-
-Previous summary (incorporate into yours):
-[existing summary of rounds 1-20]
-```
-
-## Archive Format (.miniswe/session_archive.md)
-
-```markdown
-# Session Archive
-
-## Rounds 1-20 (compressed at round 30)
-Explored codebase for CLI flag implementation. Found Cli struct in
-src/cli/mod.rs:8, max_rounds config in src/config/mod.rs:256.
-Agent loop in src/cli/commands/run.rs:171, repl loop in repl.rs:41.
-
-## Full reads (retrievable via read_file)
-- src/cli/mod.rs: 59 lines, Cli struct with message/continue/yes fields
-- src/main.rs: 49 lines, dispatch to run/repl based on cli.command
-- src/config/mod.rs: 383 lines, Config struct with ContextConfig.max_rounds
-```
-
-## What Replaces
-
-- `compress_history()` in context/mod.rs — replaced entirely
-- `mask_old_tool_results()` in run.rs/repl.rs — merged into unified compressor
-- `summarize_tool_result()` in compress.rs — used as fallback only
-- `tool_result_log` tracking — replaced by timeline-aware compression
-
-## Implementation Plan
-
-1. Create `src/context/compressor.rs` with `UnifiedCompressor` struct
-2. It holds: raw messages, summary text, archive path, token budgets
-3. After each round, call `compressor.maybe_compress(router)` which:
-   - Counts raw history tokens
-   - If over budget: batches oldest raw messages + current summary
-   - Sends to LLM for summarization
-   - Replaces old messages with new summary
-   - Archives full content to file
-4. `assemble()` uses the compressor's output instead of `compress_history()`
-5. Remove separate `mask_old_tool_results` — the compressor handles it
-6. Keep heuristic fallback for when LLM summarization fails
+This replaces both `compress_history()` (currently dumb first-line truncation) and `mask_old_tool_results()` (currently separate system).

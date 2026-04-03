@@ -1,126 +1,51 @@
-# LSP (rust-analyzer) Integration Design
+# LSP Integration (Implemented)
 
-## Context
+## Overview
 
-The model's auto-check runs `cargo check` after every file write (2-5s). This is slow — the model can make 3 bad edits before seeing the first error. rust-analyzer provides ~200ms diagnostics plus navigation tools (goto-definition, find-references) that eliminate blind exploration.
+rust-analyzer (or other language servers) provides fast diagnostics and code navigation. Integrated in `src/lsp/`.
 
-## Two Integration Modes
-
-1. **Automatic** — replace `cargo check` in `auto_check()` with LSP diagnostics after writes
-2. **Tools** — expose `goto_definition` and `find_references` for model-invoked navigation
-
-## File Structure
+## Architecture
 
 ```
 src/lsp/
-  mod.rs         — LspClient public API, re-exports
-  client.rs      — spawn, initialize, document sync, queries, shutdown
+  mod.rs         — Re-exports
+  client.rs      — LspClient: spawn, retry, init, diagnostics, queries, shutdown
   transport.rs   — Content-Length JSON-RPC framing, background reader
+  servers.rs     — Multi-language server detection, auto-download, verification
 ```
 
-## Key Structs
+## Supported Languages
 
-### LspClient
+| Language | Server | Detection | Install method |
+|---|---|---|---|
+| Rust | rust-analyzer | Cargo.toml | GitHub release or rustup |
+| TypeScript/JS | typescript-language-server | tsconfig.json/package.json | npm install |
+| Python | pyright | pyproject.toml/setup.py | npm install |
+| Go | gopls | go.mod | go install |
+| C/C++ | clangd | CMakeLists.txt | GitHub release |
+| Java | jdtls | pom.xml/build.gradle | GitHub release |
 
-```rust
-pub struct LspClient {
-    transport: Arc<LspTransport>,
-    child: Mutex<Child>,
-    ready: AtomicBool,                     // false until init handshake done
-    crashed: AtomicBool,                   // true if rust-analyzer dies
-    opened_files: Mutex<HashSet<String>>,  // track didOpen state
-    project_root: PathBuf,
-    _reader_handle: JoinHandle<()>,
-}
-```
+## Key Features
 
-### LspTransport
-
-```rust
-pub struct LspTransport {
-    writer: Mutex<BufWriter<ChildStdin>>,
-    pending: DashMap<i64, oneshot::Sender<Value>>,     // request/response correlation
-    diagnostics: DashMap<String, Vec<Diagnostic>>,      // URI → latest diagnostics
-    next_id: AtomicI64,
-}
-```
-
-Background reader thread reads Content-Length framed messages from stdout:
-- Response (has "id") → dispatch via oneshot channel
-- `publishDiagnostics` notification → store in diagnostics DashMap
-- EOF → set crashed flag
-
-## Lifecycle
-
-```
-Session start → LspClient::spawn()
-  ├─ Spawns rust-analyzer --stdio
-  ├─ Starts background reader thread
-  ├─ Sends initialize request
-  ├─ Waits for response (30s timeout)
-  ├─ Sends initialized notification
-  └─ Sets ready = true
-
-Agent loop (per round)
-  ├─ edit/write_file → auto_check()
-  │   ├─ LSP ready? → didChange → wait 2s for diagnostics → inject
-  │   └─ LSP not ready? → cargo check (existing fallback)
-  └─ goto_definition / find_references → LSP request → format result
-
-Session end → LspClient::shutdown()
-  ├─ Sends shutdown + exit
-  └─ Kills process if needed
-```
+- **Auto-download**: if not in PATH (or PATH binary doesn't work, e.g. rustup proxy), downloads to `~/.miniswe/lsp-servers/`
+- **Binary verification**: runs `--version` to verify the binary works before using it
+- **Retry logic**: 3 attempts with 2s delays if server crashes on startup
+- **Stderr logging**: captures first 20 lines of server stderr for debugging
+- **Graceful degradation**: falls back to cargo check/mvn compile if LSP unavailable
 
 ## Integration Points
 
-### 1. `execute_tool` — add LSP parameter
+1. **Auto-check** (`src/tools/mod.rs`): after edit/write_file, sends `didChange` to LSP, waits for diagnostics (~200ms vs 2-5s for cargo check)
+2. **Tools**: `goto_definition(path, line, column)` and `find_references(path, line, column)` — registered when LSP is available and `config.tools.lsp_tools = true`
+3. **Diagnostics tool**: tries LSP first, falls back to cargo check
 
-```rust
-pub async fn execute_tool(name, args, config, perms, lsp: Option<&LspClient>)
-```
-
-Update call sites: `run.rs:361`, `repl.rs:568`
-
-### 2. `auto_check` — try LSP first, fallback to cargo check
-
-```rust
-async fn auto_check(path, config, result, lsp: Option<&LspClient>) {
-    if let Some(lsp) = lsp && lsp.is_ready() && !lsp.has_crashed() {
-        // send didChange, wait for publishDiagnostics (2s timeout)
-        // if received: format + append to result, return
-    }
-    // existing cargo check logic (unchanged)
-}
-```
-
-### 3. New tools
-
-- `goto_definition(path, line, column)` → definition location + source context
-- `find_references(path, line, column)` → list of reference locations
-
-### 4. Config
+## Config
 
 ```toml
 [lsp]
 enabled = true
 diagnostic_timeout_ms = 2000
+
+[tools]
+lsp_tools = true
 ```
-
-### 5. Dependencies
-
-```toml
-lsp-types = "0.97"
-dashmap = "6"
-```
-
-## Graceful Degradation
-
-- rust-analyzer not installed → log warning, use cargo check
-- rust-analyzer crashes mid-session → set crashed flag, fallback to cargo check
-- LSP not ready yet (startup) → cargo check until ready flag set
-- Diagnostic timeout → cargo check for that one call
-
-## Benchmark
-
-Add `lsp` to provider ablation list. Toggle via `[lsp] enabled = false` in config.
