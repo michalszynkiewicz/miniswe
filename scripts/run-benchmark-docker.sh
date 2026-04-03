@@ -135,7 +135,8 @@ run_variant() {
     local container_script
     container_script=$(cat <<'SCRIPT'
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
+# Note: no set -e — validation commands are expected to fail
 
 SHA="$1"
 TASK="$2"
