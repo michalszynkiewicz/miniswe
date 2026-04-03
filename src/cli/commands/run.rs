@@ -577,12 +577,14 @@ async fn llm_summarize_tool_results(
         tool_choice: None,
     };
 
-    // Use Fast role if available, otherwise Default
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let response = router
-        .chat_stream(ModelRole::Fast, &request, |_| {}, &cancelled)
-        .await
-        .ok()?;
+    // Use Fast role if available, otherwise Default (non-streaming)
+    let response = match router.chat(ModelRole::Fast, &request).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[masking] LLM summarization failed: {e}");
+            return None;
+        }
+    };
 
     let text = response.choices.first()?.message.content.as_deref()?;
 
