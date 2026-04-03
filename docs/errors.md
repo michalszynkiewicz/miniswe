@@ -1,5 +1,48 @@
 # Benchmark Analysis & Known Issues
 
+## Run: docker_20260403_235511 (pre-unified-compressor build)
+
+### Results
+| Variant | Rounds | Attempts | Time | Result |
+|---|---|---|---|---|
+| baseline | 74 | 2 | 2420s | 5/6 (test:FAIL) |
+
+### What happened
+
+**Attempt 1 (compile:FAIL):**
+- Model edited all the right files (cli/mod.rs, main.rs, run.rs, repl.rs, context/mod.rs)
+- Hit **32K context overflow** (32485 tokens) — the old masking didn't account for tool definition tokens
+- Edits were incomplete when overflow killed the round
+
+**Attempt 2 (5/6, test:FAIL):**
+- Model used `transform` extensively (9 calls!) to fix test call sites
+- BUT it called transform per-test-string instead of once for all: `transform(find: "context::assemble(&config, \"test\"")`, `transform(find: "context::assemble(&config, \"hello\"")`, etc.
+- Each call updated 1-4 occurrences — correct but inefficient (9 calls instead of 1)
+- The correct call would be: `transform(find: "context::assemble(", instruction: "add None as 6th argument")`
+- Final test:FAIL was `unexpected closing delimiter: }` in e2e_context.rs — transform mangled the syntax on one of the 9 passes
+
+**Root causes:**
+1. **Context overflow (fixed)**: unified compressor with tool_def_tokens accounting prevents this
+2. **Transform called too specifically**: model searched for each unique call pattern instead of the common prefix. The transform description could hint: "use the shortest unique pattern that covers all occurrences"
+3. **Transform cumulative errors**: 9 sequential transforms on one file — each pass changes the file, and later passes may conflict with earlier changes. One pass left a stray `}`
+
+### Are our fixes sufficient?
+
+| Fix | Addresses | Sufficient? |
+|---|---|---|
+| Unified compressor + token accounting | Context overflow | YES — won't hit 32K anymore |
+| Remove double compression | Data loss | YES |
+| Transform exists | Call site updates | PARTIALLY — model calls it per-pattern instead of once |
+| Transform auto-revert | Syntax errors | NO — only runs cargo check at end, doesn't catch mid-sequence errors |
+
+### Remaining improvement needed
+- Transform should hint "use shortest common pattern" in the description
+- Transform on sequential calls should check compilation between each pass (not just at end)
+- Or: model should use `transform(find: "context::assemble(", ...)` not `transform(find: "context::assemble(&config, \"test\"", ...)`
+
+---
+
+
 ## Latest Results (docker_20260403_214456)
 
 Task: Add --system-prompt-override CLI flag
