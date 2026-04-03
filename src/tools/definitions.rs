@@ -247,7 +247,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "transform".into(),
-                description: "Apply the SAME change to MANY locations in a file. Finds every line containing 'find', applies the instruction to each independently. ONLY for repetitive changes: adding/removing a function argument at every call site, renaming a variable, changing an import. NOT for structural changes (wrapping in if/else, moving code blocks) — use edit or write_file for those.".into(),
+                description: "LLM-powered code transformation. Two modes: (1) PATTERN mode: provide 'find' to apply the same change to every occurrence (add/remove argument, rename). (2) BLOCK mode: provide 'start_line'+'end_line' to transform a specific range (wrap in if/else, restructure). Auto-reverts if the result doesn't compile.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -257,14 +257,22 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         },
                         "find": {
                             "type": "string",
-                            "description": "Text pattern to find (plain text, every line containing this will be transformed)"
+                            "description": "Pattern mode: text to find (every matching line gets the instruction applied independently)"
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "Block mode: first line of the range to transform (1-indexed)"
+                        },
+                        "end_line": {
+                            "type": "integer",
+                            "description": "Block mode: last line of the range to transform (1-indexed)"
                         },
                         "instruction": {
                             "type": "string",
-                            "description": "What to do with each occurrence (e.g. 'add None as the last argument' or 'rename config to cfg')"
+                            "description": "What to do (e.g. 'add None as last argument' or 'wrap this block in if let Some(override) = system_prompt_override')"
                         }
                     },
-                    "required": ["path", "find", "instruction"]
+                    "required": ["path", "instruction"]
                 }),
             },
         },
