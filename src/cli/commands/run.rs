@@ -563,29 +563,39 @@ async fn llm_summarize_tool_results(
          Write [drop] if the result has no future value.\n\
          Respond with exactly one line per result, numbered.\n\n";
 
-    let mut prompt = String::from(preamble);
-    let mut included_indices = Vec::new();
-    let overhead = system_msg.len() + preamble.len() + 200; // 200 for response headroom
+    let included_indices: Vec<usize>;
+    let overhead = system_msg.len() + preamble.len() + 200;
 
-    for (idx, (_, name, args, content)) in results.iter().enumerate() {
+    // Collect entries from the END (newest masked results are most relevant)
+    let mut entries: Vec<(usize, String)> = Vec::new();
+    let mut total_len = 0;
+    for (idx, (_, name, args, content)) in results.iter().enumerate().rev() {
         let path = args["path"].as_str()
             .or(args["query"].as_str())
             .or(args["command"].as_str())
             .unwrap_or("?");
         let entry = format!("{}. {}({}):\n{}\n\n", idx + 1, name, path, content);
 
-        if overhead + prompt.len() + entry.len() > max_prompt_chars {
-            // Won't fit — stop adding, summarize what we have
+        if overhead + total_len + entry.len() > max_prompt_chars {
             break;
         }
-        prompt.push_str(&entry);
-        included_indices.push(idx);
+        total_len += entry.len();
+        entries.push((idx, entry));
     }
 
-    if included_indices.is_empty() {
-        // Nothing fits — fall back to heuristic for all
+    if entries.is_empty() {
         return None;
     }
+
+    // Reverse to chronological order and build prompt
+    entries.reverse();
+    included_indices = entries.iter().map(|(idx, _)| *idx).collect();
+    let mut prompt = String::from(preamble);
+    for (_, entry) in &entries {
+        prompt.push_str(entry);
+    }
+
+    eprintln!("[masking] LLM summarizing {} of {} results ({} chars)", included_indices.len(), results.len(), prompt.len());
 
     let request = ChatRequest {
         messages: vec![
