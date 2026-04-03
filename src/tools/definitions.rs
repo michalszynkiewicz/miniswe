@@ -243,6 +243,31 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 }),
             },
         },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "transform".into(),
+                description: "Transform all occurrences of a pattern in a file using an instruction. Finds every line containing 'find', extracts it with surrounding context, applies the instruction via LLM, and splices the result back. IDEAL for: adding/removing function parameters across many call sites, renaming variables, or any repetitive code change.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path relative to project root"
+                        },
+                        "find": {
+                            "type": "string",
+                            "description": "Text pattern to find (plain text, every line containing this will be transformed)"
+                        },
+                        "instruction": {
+                            "type": "string",
+                            "description": "What to do with each occurrence (e.g. 'add None as the last argument' or 'rename config to cfg')"
+                        }
+                    },
+                    "required": ["path", "find", "instruction"]
+                }),
+            },
+        },
     ]
 }
 

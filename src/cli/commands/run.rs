@@ -379,8 +379,13 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 continue;
             }
 
-            // Handle MCP tool calls
-            let mut result = if tc.function.name == "mcp_use" {
+            // Handle special tool calls that need extra context
+            let mut result = if tc.function.name == "transform" {
+                match tools::transform::execute(&args, &config, &router).await {
+                    Ok(r) => r,
+                    Err(e) => crate::tools::ToolResult::err(format!("Transform error: {e}")),
+                }
+            } else if tc.function.name == "mcp_use" {
                 let server = args["server"].as_str().unwrap_or("");
                 let tool = args["tool"].as_str().unwrap_or("");
                 let tool_args = args.get("arguments").cloned().unwrap_or_default();
