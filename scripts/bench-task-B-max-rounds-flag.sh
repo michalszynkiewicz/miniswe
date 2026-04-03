@@ -1,37 +1,34 @@
 #!/usr/bin/env bash
-# bench-task-B — Benchmark: "Add --max-rounds CLI flag"
+# bench-task-B — Benchmark: "Add --system-prompt-override CLI flag"
 #
-# Validates by building, running the binary, running tests, and
-# doing a live smoke test with the LLM to confirm the flag works.
+# Validates by building, running, and checking predictable output.
 # On failure, feeds errors back to miniswe for a retry.
 #
 # Validation:
-#   1. cargo check — does it compile?
-#   2. cargo build — can we get a binary?
-#   3. binary --help — does it show the rounds flag?
-#   4. binary <flag> 5 --help — does the flag parse?
-#   5. cargo test — do the model's own tests pass?
-#   6. live smoke test — run with rounds=1, verify log shows 1 round
+#   1. cargo check — compiles?
+#   2. cargo build — binary?
+#   3. --help — shows the flag?
+#   4. flag parses without error?
+#   5. cargo test — tests pass?
+#   6. smoke: run with override prompt, check predictable output
 #
 # Usage:
-#   ./scripts/bench-task-B-max-rounds-flag.sh [--runs 3] [--timeout 600]
+#   ./scripts/bench-task-B-max-rounds-flag.sh [--timeout 1800] [--max-rounds 80]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/bench-common.sh"
 
-TASK_NAME="task_B_max_rounds_flag"
-TASK="Add a CLI flag that lets the user limit the maximum number of agent rounds per session. It should override whatever the config file says. Make sure it works for both single-shot and interactive modes. Write a test that verifies the flag actually limits the number of rounds."
+TASK_NAME="task_B_system_prompt_override"
+TASK="Add a CLI flag --system-prompt-override (short: -s) that takes a string and replaces the default system prompt with the provided text. When this flag is set, skip all context providers and just use the override text as the system message. Make sure it works for both single-shot and interactive modes."
 
 # ── Validation ──────────────────────────────────────────────────────────
 
-# Detect the flag name the model chose (might be --max-rounds, --rounds, etc.)
 detect_flag_name() {
     local help_output="$1"
-    # Look for common patterns in help output
     local flag
-    flag=$(echo "${help_output}" | grep -oE -- '--[a-z-]*round[a-z-]*' | head -1 || true)
+    flag=$(echo "${help_output}" | grep -oE -- '--[a-z-]*prompt[a-z-]*' | head -1 || true)
     echo "${flag}"
 }
 
@@ -61,7 +58,7 @@ ${err_lines}"
     fi
     echo "${check_output}" > "${attempt_dir}/cargo_check.txt"
 
-    # Check 2: cargo build (only if check passed)
+    # Check 2: cargo build
     (( ++checks ))
     if [ "$passed" -ge 1 ]; then
         local build_output
@@ -77,11 +74,9 @@ $(echo "${build_output}" | grep -E '^error' | head -10)"
         echo "${build_output}" > "${attempt_dir}/cargo_build.txt"
     else
         details="${details}build:SKIP "
-        errors="${errors}
-BUILD: skipped (compile failed)"
     fi
 
-    # Check 3: --help shows some kind of rounds flag
+    # Check 3: --help shows prompt flag
     (( ++checks ))
     if [ -f "${binary}" ]; then
         local help_output
@@ -95,32 +90,27 @@ BUILD: skipped (compile failed)"
         else
             details="${details}help:FAIL "
             errors="${errors}
---help output does not contain a flag related to 'rounds'. Full output:
+--help does not show a flag related to 'prompt'. Full output:
 ${help_output}"
         fi
     else
         details="${details}help:SKIP "
-        errors="${errors}
-HELP: skipped (no binary)"
     fi
 
-    # Check 4: flag parses without error
+    # Check 4: flag parses
     (( ++checks ))
     if [ -f "${binary}" ] && [ -n "${flag_name}" ]; then
         local flag_output
         local flag_exit=0
-        flag_output=$("${binary}" ${flag_name} 5 --help 2>&1) || flag_exit=$?
+        flag_output=$("${binary}" ${flag_name} "test prompt" --help 2>&1) || flag_exit=$?
         echo "${flag_output}" > "${attempt_dir}/flag_test.txt"
-        echo "exit_code=${flag_exit}" >> "${attempt_dir}/flag_test.txt"
-
         if [ "$flag_exit" -eq 0 ]; then
             (( ++passed ))
             details="${details}parse:PASS "
         else
             details="${details}parse:FAIL "
             errors="${errors}
-'miniswe ${flag_name} 5 --help' exited with code ${flag_exit}. Output:
-$(echo "${flag_output}" | head -10)"
+'miniswe ${flag_name} \"test prompt\" --help' exited with code ${flag_exit}."
         fi
     else
         details="${details}parse:SKIP "
@@ -133,7 +123,6 @@ $(echo "${flag_output}" | head -10)"
         local test_exit=0
         test_output=$(cd "${work_dir}" && RUSTFLAGS="-A warnings" cargo test 2>&1) || test_exit=$?
         echo "${test_output}" > "${attempt_dir}/cargo_test.txt"
-
         if [ "$test_exit" -eq 0 ]; then
             (( ++passed ))
             details="${details}test:PASS "
@@ -147,68 +136,33 @@ ${failures}"
         fi
     else
         details="${details}test:SKIP "
-        errors="${errors}
-TESTS: skipped (build failed)"
     fi
 
-    # Check 6: smoke test — run a multi-round task with and without the flag.
-    # Verifies the flag actually limits rounds, not just parses.
+    # Check 6: smoke test — run with override prompt, check predictable output
     (( ++checks ))
     if [ -f "${binary}" ] && [ -n "${flag_name}" ] && [ "$passed" -ge 4 ]; then
-        mkdir -p "${work_dir}/.miniswe/logs"
+        local smoke_output
+        local smoke_exit=0
 
-        # Run WITHOUT flag to get baseline round count
-        rm -f "${work_dir}/.miniswe/logs/"*.log
-        cd "${work_dir}"
-        timeout 120 "${binary}" --yes "Read every .rs file in src/ and list their names" \
-            > "${attempt_dir}/smoke_baseline_stdout.txt" \
-            2> "${attempt_dir}/smoke_baseline_stderr.txt" \
-            || true
-        cd - > /dev/null
-        local baseline_rounds=0
-        for f in "${work_dir}/.miniswe/logs/"*.log; do
-            [ -f "$f" ] || continue
-            local r; r=$(grep -c '\[round ' "$f" || true)
-            baseline_rounds=$((baseline_rounds + ${r:-0}))
-        done
+        # The override prompt tells the model to respond with exactly "PONG_42"
+        smoke_output=$(cd "${work_dir}" && timeout 120 "${binary}" \
+            ${flag_name} "You must respond with exactly the text PONG_42 and nothing else. No explanation, no formatting, just PONG_42." \
+            --yes "ping" 2>/dev/null) || smoke_exit=$?
 
-        # Run WITH flag set to 2
-        rm -f "${work_dir}/.miniswe/logs/"*.log
-        cd "${work_dir}"
-        timeout 120 "${binary}" ${flag_name} 2 --yes "Read every .rs file in src/ and list their names" \
-            > "${attempt_dir}/smoke_stdout.txt" \
-            2> "${attempt_dir}/smoke_stderr.txt" \
-            || true
-        cd - > /dev/null
-        local limited_rounds=0
-        for f in "${work_dir}/.miniswe/logs/"*.log; do
-            [ -f "$f" ] || continue
-            local r; r=$(grep -c '\[round ' "$f" || true)
-            limited_rounds=$((limited_rounds + ${r:-0}))
-        done
+        echo "${smoke_output}" > "${attempt_dir}/smoke_output.txt"
+        echo "smoke_exit=${smoke_exit}" >> "${attempt_dir}/smoke_output.txt"
 
-        echo "baseline=${baseline_rounds} limited=${limited_rounds}" > "${attempt_dir}/smoke_result.txt"
-
-        # Note: round N+1 gets logged before break check, so --max-rounds 2
-        # logs 3 [round entries. Accept limited <= limit+1.
-        if [ "${limited_rounds}" -le 3 ] && [ "${baseline_rounds}" -gt 3 ]; then
+        if echo "${smoke_output}" | grep -q "PONG_42"; then
             (( ++passed ))
-            details="${details}smoke:PASS(base=${baseline_rounds}r,lim=${limited_rounds}r) "
-        elif [ "${limited_rounds}" -le 3 ] && [ "${baseline_rounds}" -le 3 ]; then
-            # Both finish quickly — inconclusive but give benefit of doubt
-            if [ "$passed" -ge 5 ]; then
-                (( ++passed ))
-            fi
-            details="${details}smoke:INCONCLUSIVE(both≤2r) "
+            details="${details}smoke:PASS "
         else
-            details="${details}smoke:FAIL(base=${baseline_rounds}r,lim=${limited_rounds}r) "
+            details="${details}smoke:FAIL "
             errors="${errors}
-SMOKE TEST: flag should limit to 2 rounds but got ${limited_rounds}. Without flag: ${baseline_rounds} rounds. The flag is not wired to the agent loop."
+SMOKE TEST: ran with override prompt 'respond with PONG_42' but output does not contain PONG_42.
+Output: $(echo "${smoke_output}" | head -5)"
         fi
     else
         details="${details}smoke:SKIP "
-        errors="${errors}
-SMOKE TEST: skipped (earlier checks failed)"
     fi
 
     # Verdict

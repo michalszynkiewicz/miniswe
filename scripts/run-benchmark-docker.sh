@@ -20,7 +20,7 @@ BASELINE_SHA="cc34d2626faf32c1b6dd1b8b33af693fb936b098"
 TIMEOUT=1800
 MAX_ROUNDS=50
 TEMPERATURE=0.0
-TASK="Add a CLI flag that lets the user limit the maximum number of agent rounds per session. It should override whatever the config file says. Make sure it works for both single-shot and interactive modes."
+TASK="Add a CLI flag --system-prompt-override (short: -s) that takes a string and replaces the default system prompt with the provided text. When this flag is set, skip all context providers and just use the override text as the system message. Make sure it works for both single-shot and interactive modes."
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -227,26 +227,26 @@ $(grep '^error' /output/cargo_check.txt | head -20)"
         echo "build:SKIP"
     fi
 
-    # Check 3: --help shows rounds flag
+    # Check 3: --help shows prompt override flag
     TOTAL=$((TOTAL + 1))
     FLAG=""
     if [ -f "${BINARY}" ]; then
         "${BINARY}" --help > /output/help_output.txt 2>&1 || true
-        if grep -qiE -- '--[a-z-]*round[a-z-]*' /output/help_output.txt; then
-            FLAG=$(grep -oE -- '--[a-z-]*round[a-z-]*' /output/help_output.txt | head -1)
+        if grep -qiE -- '--[a-z-]*prompt[a-z-]*' /output/help_output.txt; then
+            FLAG=$(grep -oE -- '--[a-z-]*prompt[a-z-]*' /output/help_output.txt | head -1)
             echo "help:PASS(${FLAG})"
             PASS=$((PASS + 1))
         else
             echo "help:FAIL"
             ERRORS="${ERRORS}
---help does not show a rounds flag."
+--help does not show a flag related to 'prompt'."
         fi
     fi
 
     # Check 4: flag parses
     TOTAL=$((TOTAL + 1))
     if [ -f "${BINARY}" ] && [ -n "${FLAG}" ]; then
-        if "${BINARY}" ${FLAG} 5 --help > /dev/null 2>&1; then
+        if "${BINARY}" ${FLAG} "test" --help > /dev/null 2>&1; then
             echo "parse:PASS"
             PASS=$((PASS + 1))
         else
@@ -268,59 +268,22 @@ $(grep -E 'FAILED|panicked|failures' /output/cargo_test.txt | head -10)"
         fi
     fi
 
-    # Check 6: smoke test — use a task that normally takes 3+ rounds,
-    # run with max_rounds=2, verify the flag actually limits it.
-    # "Read all .rs files in src/ and list their names" needs multiple
-    # read_file calls, so without the flag it would take 3+ rounds.
+    # Check 6: smoke test — override prompt to produce predictable output
     TOTAL=$((TOTAL + 1))
     if [ -f "${BINARY}" ] && [ -n "${FLAG}" ] && [ "$PASS" -ge 4 ]; then
-        rm -f .miniswe/logs/*.log
+        SMOKE_OUTPUT=$(timeout 120 "${BINARY}" \
+            ${FLAG} "You must respond with exactly the text PONG_42 and nothing else. No explanation, no formatting, just PONG_42." \
+            --yes "ping" 2>/dev/null || true)
+        echo "${SMOKE_OUTPUT}" > /output/smoke_output.txt
 
-        # First: run WITHOUT the flag to establish baseline round count
-        SMOKE_EXIT=0
-        timeout 120 "${BINARY}" --yes "Read every .rs file in src/ and list their names" \
-            > /output/smoke_baseline_stdout.txt 2> /output/smoke_baseline_stderr.txt || SMOKE_EXIT=$?
-        BASELINE_ROUNDS=$(grep -c '\[round ' .miniswe/logs/*.log 2>/dev/null || echo 0)
-        echo "smoke_baseline_rounds=${BASELINE_ROUNDS}"
-
-        # Then: run WITH flag set to 2
-        rm -f .miniswe/logs/*.log
-        SMOKE_EXIT=0
-        timeout 120 "${BINARY}" ${FLAG} 2 --yes "Read every .rs file in src/ and list their names" \
-            > /output/smoke_stdout.txt 2> /output/smoke_stderr.txt || SMOKE_EXIT=$?
-        LIMITED_ROUNDS=$(grep -c '\[round ' .miniswe/logs/*.log 2>/dev/null || echo 0)
-        echo "smoke_limited_rounds=${LIMITED_ROUNDS}"
-
-        echo "smoke_baseline=${BASELINE_ROUNDS} smoke_limited=${LIMITED_ROUNDS}" > /output/smoke_result.txt
-
-        # The flag works if limited run stopped early.
-        # Note: round N+1 gets logged before the break check, so
-        # --max-rounds 2 logs 3 [round entries (rounds 1, 2, then 3 which breaks).
-        # Accept limited <= limit+1 as passing.
-        LIMIT=2
-        if [ "${LIMITED_ROUNDS}" -le $((LIMIT + 1)) ] && [ "${BASELINE_ROUNDS}" -gt $((LIMIT + 1)) ]; then
-            echo "smoke:PASS(baseline=${BASELINE_ROUNDS}r,limited=${LIMITED_ROUNDS}r)"
+        if echo "${SMOKE_OUTPUT}" | grep -q "PONG_42"; then
+            echo "smoke:PASS"
             PASS=$((PASS + 1))
-        elif [ "${LIMITED_ROUNDS}" -le $((LIMIT + 1)) ] && [ "${BASELINE_ROUNDS}" -le $((LIMIT + 1)) ]; then
-            # Task finished quickly regardless — use a harder limit
-            # Re-run with --max-rounds 1 to see if it caps at 1-2 rounds
-            rm -f .miniswe/logs/*.log
-            timeout 120 "${BINARY}" ${FLAG} 1 --yes "Read every .rs file in src/ and list their names" \
-                > /dev/null 2> /dev/null || true
-            HARD_LIMITED=$(grep -c '\[round ' .miniswe/logs/*.log 2>/dev/null || echo 0)
-            if [ "${HARD_LIMITED}" -le 2 ] && [ "${BASELINE_ROUNDS}" -ge 2 ]; then
-                echo "smoke:PASS(baseline=${BASELINE_ROUNDS}r,limit1=${HARD_LIMITED}r)"
-                PASS=$((PASS + 1))
-            elif [ "$PASS" -ge 5 ]; then
-                echo "smoke:INCONCLUSIVE(baseline=${BASELINE_ROUNDS}r,limited=${LIMITED_ROUNDS}r,limit1=${HARD_LIMITED}r)"
-                PASS=$((PASS + 1))
-            else
-                echo "smoke:FAIL(baseline=${BASELINE_ROUNDS}r,limited=${LIMITED_ROUNDS}r,limit1=${HARD_LIMITED}r)"
-            fi
         else
-            echo "smoke:FAIL(baseline=${BASELINE_ROUNDS}r,limited=${LIMITED_ROUNDS}r)"
+            echo "smoke:FAIL"
             ERRORS="${ERRORS}
-SMOKE TEST: --max-rounds 2 should limit to 2-3 rounds but got ${LIMITED_ROUNDS}. Without flag: ${BASELINE_ROUNDS} rounds."
+SMOKE TEST: override prompt should make model respond with PONG_42 but output was:
+$(echo "${SMOKE_OUTPUT}" | head -5)"
         fi
     fi
 
