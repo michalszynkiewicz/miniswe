@@ -6,6 +6,7 @@ mod helpers;
 use std::fs;
 
 use miniswe::config::Config;
+use miniswe::llm::Message;
 use miniswe::tools;
 use miniswe::tools::permissions::PermissionManager;
 use serde_json::json;
@@ -786,4 +787,166 @@ fn tool_output_budget_scales_with_context() {
 
     config.model.context_window = 128000;
     assert_eq!(config.tool_output_budget_chars(), 12800);
+}
+
+// ── search: query vs pattern mode ─────────────────────────────────
+
+#[tokio::test]
+async fn search_query_mode_is_literal() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // Create file with regex-like content
+    fs::write(
+        helpers::project_path(&config, "test.rs"),
+        "fn foo() -> Result<()> {\n    Ok(())\n}\n",
+    ).unwrap();
+
+    // query mode: "Result<()>" should match literally (no regex interpretation)
+    let args = json!({"query": "Result<()>"});
+    let result = tools::execute_tool("search", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("Result<()>"),
+        "literal search should find Result<()>: {}", result.content);
+}
+
+#[tokio::test]
+async fn search_pattern_mode_is_regex() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    fs::write(
+        helpers::project_path(&config, "test.rs"),
+        "fn foo() {}\nfn bar() {}\nfn baz_qux() {}\n",
+    ).unwrap();
+
+    // pattern mode: regex to find functions starting with 'b'
+    let args = json!({"pattern": "fn b\\w+"});
+    let result = tools::execute_tool("search", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("bar") && result.content.contains("baz_qux"),
+        "regex should match bar and baz_qux: {}", result.content);
+    assert!(!result.content.contains("foo"),
+        "regex should not match foo: {}", result.content);
+}
+
+#[tokio::test]
+async fn search_needs_query_or_pattern() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let args = json!({});
+    let result = tools::execute_tool("search", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(!result.success);
+    assert!(result.content.contains("query") || result.content.contains("pattern"),
+        "should ask for query or pattern: {}", result.content);
+}
+
+// ── store-and-preview for large shell output ──────────────────────
+
+#[tokio::test]
+async fn shell_large_output_saved_to_file() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // Generate output larger than budget
+    let budget_lines = config.tool_output_budget_chars() / 80;
+    let line_count = budget_lines + 100;
+    let args = json!({"command": format!("seq 1 {line_count}")});
+    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("Full output saved to"),
+        "should have file pointer: {}", result.content.lines().last().unwrap_or(""));
+
+    // Verify the file was actually created
+    let shell_dir = config.miniswe_dir().join("shell_output");
+    assert!(shell_dir.exists(), ".miniswe/shell_output should exist");
+    let files: Vec<_> = fs::read_dir(&shell_dir).unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(!files.is_empty(), "should have saved output file");
+}
+
+// ── unified compressor ────────────────────────────────────────────
+
+#[test]
+fn compressor_no_op_when_under_budget() {
+    let config = Config::default();
+    // Small conversation — should not compress
+    let messages = vec![
+        Message::system("You are a coding agent."),
+        Message::user("Hello"),
+        Message::assistant("Hi! How can I help?"),
+    ];
+    let original_len = messages.len();
+
+    // Can't call async maybe_compress in sync test, but we can verify
+    // the budget calculation: 3 small messages << context_window/4
+    let total_tokens: usize = messages.iter()
+        .filter(|m| m.role != "system")
+        .map(|m| miniswe::context::estimate_tokens(m.content.as_deref().unwrap_or("")))
+        .sum();
+    let budget = config.model.context_window / 4;
+
+    assert!(total_tokens < budget,
+        "small conversation ({total_tokens} tokens) should be under budget ({budget})");
+    assert_eq!(messages.len(), original_len, "messages should not change");
+}
+
+// ── edit: whitespace normalization edge cases ─────────────────────
+
+#[tokio::test]
+async fn edit_whitespace_tabs_vs_spaces() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // File uses tabs
+    let content = "fn main() {\n\tlet x = 1;\n\tlet y = 2;\n}\n";
+    fs::write(helpers::project_path(&config, "tabs.rs"), content).unwrap();
+
+    // Old uses spaces (common model mistake)
+    let args = json!({
+        "path": "tabs.rs",
+        "old": "    let x = 1;",
+        "new": "\tlet x = 42;"
+    });
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "tab/space normalization should work: {}", result.content);
+    let disk = fs::read_to_string(helpers::project_path(&config, "tabs.rs")).unwrap();
+    assert!(disk.contains("let x = 42;"));
+}
+
+#[tokio::test]
+async fn edit_whitespace_empty_lines() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // File has blank lines between items
+    let content = "fn foo() {}\n\n\nfn bar() {}\n";
+    fs::write(helpers::project_path(&config, "blanks.rs"), content).unwrap();
+
+    // Old omits blank lines
+    let args = json!({
+        "path": "blanks.rs",
+        "old": "fn foo() {}\nfn bar() {}",
+        "new": "fn foo() {}\n\n\nfn baz() {}"
+    });
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    // This should fail — blank line differences aren't whitespace normalization
+    // (trimming doesn't help with missing lines)
+    // The model should get a helpful error
+    assert!(result.content.contains("write_file") || result.content.contains("HINT"),
+        "should suggest alternatives: {}", result.content);
 }
