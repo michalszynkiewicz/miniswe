@@ -126,7 +126,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     // Track tool calls for loop detection
     let mut recent_calls: Vec<String> = Vec::new();
     let mut consecutive_loops = 0u32;
-    let mut rounds_since_last_edit = 0u32;
+    let mut calls_since_last_edit = 0u32;
     let mut edit_fail_count: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
     // Track tool results for observation masking
@@ -411,9 +411,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 && (tc.function.name == "edit" || tc.function.name == "write_file")
             {
                 recent_calls.clear();
-                rounds_since_last_edit = 0;
+                calls_since_last_edit = 0;
             } else {
-                rounds_since_last_edit += 1;
+                calls_since_last_edit += 1;
             }
 
             // Track edit failures per file — suggest write_file after 2 failures
@@ -442,8 +442,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             conversation_history.push(result_msg);
         }
 
-        // Stall detection: too many rounds without any edits
-        if rounds_since_last_edit >= 10 && rounds_since_last_edit % 10 == 0 {
+        // Stall detection: too many tool calls without any edits
+        if calls_since_last_edit >= 20 && calls_since_last_edit % 20 == 0 {
             messages.push(Message::user(
                 "[WARNING: You have used 10+ tool calls without making any edits. \
                  You likely have enough information. Start making changes now. \
