@@ -381,6 +381,13 @@ impl Config {
         self.miniswe_dir().is_dir()
     }
 
+    /// Max characters for a single tool result (1/6 of context window, in chars).
+    /// Prevents any one tool call from filling the context.
+    pub fn tool_output_budget_chars(&self) -> usize {
+        // ~4 chars per token, 1/6 of context for a single result
+        self.model.context_window * 4 / 6
+    }
+
     /// Get the model config for a given role.
     /// Returns the named model from `[models]` if configured, otherwise falls
     /// back to the single `[model]` config.

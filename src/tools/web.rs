@@ -264,7 +264,7 @@ pub async fn fetch(args: &Value, config: &Config) -> Result<ToolResult> {
         Ok(response) => {
             let content = response.text().await.unwrap_or_default();
 
-            let truncated = crate::truncate_chars(&content, 16000);
+            let truncated = crate::truncate_chars(&content, config.tool_output_budget_chars());
 
             Ok(ToolResult::ok(format!("[fetch: {url}]\n{truncated}")))
         }
@@ -299,7 +299,7 @@ pub async fn docs_lookup(args: &Value, config: &Config) -> Result<ToolResult> {
                 let content = fs::read_to_string(entry.path()).unwrap_or_default();
 
                 if topic.is_empty() {
-                    found.push_str(&crate::truncate_chars(&content, 8000));
+                    found.push_str(&crate::truncate_chars(&content, config.tool_output_budget_chars()));
                 } else {
                     let sections = extract_relevant_sections(&content, topic);
                     found.push_str(&sections);

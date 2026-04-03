@@ -12,8 +12,8 @@ use crate::config::Config;
 use crate::context::compress;
 use super::ToolResult;
 
-/// Maximum lines to return before truncation.
-const MAX_LINES: usize = 500;
+/// Fallback max lines if config is not available.
+
 
 /// File extensions that get compression applied.
 const COMPRESSIBLE: &[&str] = &[
@@ -22,6 +22,9 @@ const COMPRESSIBLE: &[&str] = &[
 ];
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
+    // Max lines derived from context budget (~80 chars/line)
+    let max_lines = config.tool_output_budget_chars() / 80;
+
     let path_str = args["path"]
         .as_str()
         .unwrap_or("");
@@ -106,7 +109,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 
         let mut lines_shown = 0;
         for i in (start_line - 1)..end_line {
-            if lines_shown >= MAX_LINES {
+            if lines_shown >= max_lines {
                 let remaining = end_line - i;
                 output.push_str(&format!(
                     "\n... truncated ({remaining} more lines). Use start_line/end_line to read specific ranges."
@@ -124,9 +127,9 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         // Non-code files: output raw with line numbers
         let lines: Vec<&str> = content.lines().collect();
         let selected = &lines[start_line.saturating_sub(1)..end_line];
-        let truncated = selected.len() > MAX_LINES;
+        let truncated = selected.len() > max_lines;
         let display_lines = if truncated {
-            &selected[..MAX_LINES]
+            &selected[..max_lines]
         } else {
             selected
         };
@@ -145,7 +148,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         if truncated {
             output.push_str(&format!(
                 "\n... truncated ({} more lines). Use start_line/end_line to read specific ranges.",
-                selected.len() - MAX_LINES
+                selected.len() - max_lines
             ));
         }
     }

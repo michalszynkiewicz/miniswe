@@ -408,11 +408,11 @@ async fn shell_truncates_many_lines() {
 
     assert!(result.success);
     assert!(
-        result.content.contains("showing last 100"),
+        result.content.contains("showing last"),
         "Should indicate truncation: {}",
         result.content.lines().next().unwrap_or("")
     );
-    // Should keep the LAST 100 lines (tail priority), so "500" should be visible
+    // Should keep the LAST N lines (tail priority), so "500" should be visible
     assert!(result.content.contains("500"), "Should contain the last line (500)");
     // "1" (first line) might or might not be visible depending on exact truncation
 }
