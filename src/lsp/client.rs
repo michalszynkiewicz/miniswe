@@ -35,27 +35,79 @@ impl LspClient {
     pub async fn spawn(project_root: PathBuf) -> Result<Self> {
         use crate::lsp::servers::LspServer;
 
-        // Detect language and find/download the right LSP server
         let server = LspServer::detect(&project_root)
             .context("no supported language detected for LSP")?;
 
         let binary_path = server.ensure_binary().await
             .with_context(|| format!("failed to get {} binary", server.name()))?;
 
-        let mut cmd = server.build_command(&binary_path, &project_root);
+        // Retry up to 3 times — rust-analyzer sometimes crashes on first start
+        let max_attempts = 3;
+        for attempt in 1..=max_attempts {
+            match Self::try_spawn(&server, &binary_path, &project_root).await {
+                Ok(client) if client.is_ready() => return Ok(client),
+                Ok(client) => {
+                    // Spawned but init failed — kill and retry
+                    if attempt < max_attempts {
+                        eprintln!("[lsp] attempt {attempt}/{max_attempts} failed, retrying in 2s...");
+                        // Kill the failed process
+                        if let Ok(mut child) = client.child.lock() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    } else {
+                        // Last attempt — return the non-ready client (fallback to cargo check)
+                        return Ok(client);
+                    }
+                }
+                Err(e) => {
+                    if attempt < max_attempts {
+                        eprintln!("[lsp] attempt {attempt}/{max_attempts} spawn failed: {e}, retrying...");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    async fn try_spawn(
+        server: &crate::lsp::servers::LspServer,
+        binary_path: &Path,
+        project_root: &Path,
+    ) -> Result<Self> {
+        let mut cmd = server.build_command(binary_path, project_root);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("Failed to spawn {}", binary_path.display()))?;
 
         let stdin = child.stdin.take().context("No stdin")?;
         let stdout = child.stdout.take().context("No stdout")?;
+        let stderr = child.stderr.take();
+
+        // Log stderr in background for debugging
+        if let Some(stderr) = stderr {
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(stderr);
+                for line in reader.lines().take(20) {
+                    if let Ok(line) = line {
+                        if !line.trim().is_empty() {
+                            eprintln!("[lsp:stderr] {}", crate::truncate_chars(&line, 200));
+                        }
+                    }
+                }
+            });
+        }
 
         let transport = Arc::new(LspTransport::new(stdin));
 
-        // Start background reader
         let transport_clone = Arc::clone(&transport);
         let reader_handle = tokio::task::spawn_blocking(move || {
             LspTransport::reader_loop(transport_clone, stdout);
@@ -66,12 +118,11 @@ impl LspClient {
             child: std::sync::Mutex::new(child),
             ready: AtomicBool::new(false),
             opened_files: std::sync::Mutex::new(HashSet::new()),
-            project_root: project_root.clone(),
+            project_root: project_root.to_path_buf(),
             _reader_handle: reader_handle,
         };
 
-        // Initialize — send handshake and wait for response
-        match initialize(&transport, &project_root).await {
+        match initialize(&transport, project_root).await {
             Ok(()) => {
                 client.ready.store(true, Ordering::Release);
             }

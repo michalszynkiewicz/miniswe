@@ -729,6 +729,47 @@ fn mock_router() -> miniswe::llm::ModelRouter {
     miniswe::llm::ModelRouter::new(&miniswe::config::Config::default())
 }
 
+// ── tool enabling/disabling ───────────────────────────────────────
+
+#[test]
+fn tools_config_disables_context_tools() {
+    let mut config = miniswe::config::Config::default();
+    config.tools.context_tools = false;
+
+    let mut defs = miniswe::tools::tool_definitions();
+    // Filter like run.rs does
+    let disabled = vec!["get_repo_map", "get_project_info", "get_architecture_notes"];
+    defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
+
+    let names: Vec<&str> = defs.iter().map(|t| t.function.name.as_str()).collect();
+    assert!(!names.contains(&"get_repo_map"), "should not have get_repo_map");
+    assert!(!names.contains(&"get_project_info"), "should not have get_project_info");
+    assert!(names.contains(&"read_file"), "should still have read_file");
+    assert!(names.contains(&"edit"), "should still have edit");
+}
+
+#[test]
+fn tools_config_disables_transform() {
+    let mut config = miniswe::config::Config::default();
+    config.tools.transform = false;
+
+    let mut defs = miniswe::tools::tool_definitions();
+    defs.retain(|t| t.function.name != "transform");
+
+    let names: Vec<&str> = defs.iter().map(|t| t.function.name.as_str()).collect();
+    assert!(!names.contains(&"transform"), "should not have transform");
+    assert!(names.contains(&"edit"), "should still have edit");
+}
+
+#[test]
+fn tools_config_all_enabled_by_default() {
+    let config = miniswe::config::Config::default();
+    assert!(config.tools.context_tools);
+    assert!(config.tools.lsp_tools);
+    assert!(config.tools.transform);
+    assert!(config.tools.web_tools);
+}
+
 // ── dynamic tool output budget ────────────────────────────────────
 
 #[test]
