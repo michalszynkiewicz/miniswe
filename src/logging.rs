@@ -209,15 +209,13 @@ impl SessionLog {
 }
 
 /// Truncate a string for logging, avoiding mid-line cuts.
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.replace('\n', "\\n")
+fn truncate(s: &str, max_chars: usize) -> String {
+    let flat = s.replace('\n', "\\n");
+    let char_count = flat.chars().count();
+    if char_count <= max_chars {
+        flat
     } else {
-        // Find nearest char boundary at or before max
-        let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...({}B total)", s[..end].replace('\n', "\\n"), s.len())
+        let truncated: String = flat.chars().take(max_chars).collect();
+        format!("{truncated}...({}B total)", s.len())
     }
 }
