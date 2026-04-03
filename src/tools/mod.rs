@@ -649,9 +649,7 @@ fn context_tool_architecture_notes(config: &Config) -> Result<ToolResult> {
     let path = config.project_root.join(".ai").join("README.md");
     match std::fs::read_to_string(&path) {
         Ok(content) => {
-            let max = 4000;
-            let truncated = if content.len() > max { &content[..max] } else { &content };
-            Ok(ToolResult::ok(truncated.to_string()))
+            Ok(ToolResult::ok(crate::truncate_chars(&content, 4000)))
         }
         Err(_) => Ok(ToolResult::ok("No architecture notes found (.ai/README.md does not exist).".into())),
     }
