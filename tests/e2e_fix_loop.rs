@@ -327,3 +327,69 @@ fn rich_summary_includes_function_signatures() {
     assert!(summary.contains("pub struct Cli"), "should have struct signature");
     assert!(summary.contains("pub fn run_cli"), "should have function signature");
 }
+
+#[test]
+fn rich_summary_includes_impl_blocks() {
+    use miniswe::context::compress::summarize_tool_result;
+
+    let content = r#"[src/config.rs: 30 lines]
+   1│pub struct Config {
+   2│    pub name: String,
+   3│}
+   4│
+   5│impl Config {
+   6│    pub fn new() -> Self {
+   7│        Config { name: "default".into() }
+   8│    }
+   9│}
+  10│
+  11│pub trait Loadable {
+  12│    fn load(path: &str) -> Self;
+  13│}
+"#;
+
+    let summary = summarize_tool_result(
+        "read_file",
+        &json!({"path": "src/config.rs"}),
+        content,
+    );
+
+    assert!(summary.contains("pub struct Config"), "should have struct: {summary}");
+    assert!(summary.contains("pub fn new"), "should have method: {summary}");
+    assert!(summary.contains("pub trait Loadable"), "should have trait: {summary}");
+    assert!(summary.contains("read_file"), "should hint at read_file for re-reading: {summary}");
+}
+
+#[test]
+fn rich_summary_edit_with_errors() {
+    use miniswe::context::compress::summarize_tool_result;
+
+    let content = "✓ Edited src/main.rs (1 replacement)\n[cargo check]\nerror[E0061]: expected 4 arguments\n";
+
+    let summary = summarize_tool_result(
+        "edit",
+        &json!({"path": "src/main.rs"}),
+        content,
+    );
+
+    assert!(summary.contains("src/main.rs"), "should have path: {summary}");
+    assert!(summary.contains("error") || summary.contains("FAILED"),
+        "should mention the error: {summary}");
+}
+
+#[test]
+fn rich_summary_edit_success() {
+    use miniswe::context::compress::summarize_tool_result;
+
+    let content = "✓ Edited src/main.rs (1 replacement)\n[cargo check] OK\n";
+
+    let summary = summarize_tool_result(
+        "edit",
+        &json!({"path": "src/main.rs"}),
+        content,
+    );
+
+    assert!(summary.contains("src/main.rs"), "should have path: {summary}");
+    assert!(!summary.contains("error") && !summary.contains("FAILED"),
+        "should not mention errors: {summary}");
+}

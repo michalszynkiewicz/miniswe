@@ -437,10 +437,10 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
                 }
             }
             if sigs.is_empty() {
-                format!("[read:{path}→{line_count}L]")
+                format!("[read:{path} ({line_count}L) — use read_file(\"{path}\") to re-read]")
             } else {
                 format!(
-                    "[read:{path}→{line_count}L]\n{}",
+                    "[read:{path} ({line_count}L) — use read_file(\"{path}\") to re-read]\n{}",
                     sigs.join("\n")
                 )
             }
@@ -461,9 +461,22 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
         "edit" => {
             let path = args["path"].as_str().unwrap_or("?");
             if content.contains('✓') {
-                format!("[edit:{path}→ok]")
+                // Check if diagnostics found errors after the edit
+                if content.contains("error") && (content.contains("[cargo check]") || content.contains("[lsp]")) {
+                    let errors: Vec<&str> = content.lines()
+                        .filter(|l| l.contains("error"))
+                        .take(2)
+                        .collect();
+                    format!("[edit:{path}→ok but errors: {}]", errors.join("; "))
+                } else {
+                    format!("[edit:{path}→ok]")
+                }
             } else {
-                format!("[edit:{path}→failed]")
+                let reason = content.lines()
+                    .find(|l| l.contains("not found") || l.contains("matches"))
+                    .map(|l| crate::truncate_chars(l.trim(), 60))
+                    .unwrap_or_else(|| "unknown".into());
+                format!("[edit:{path}→FAILED: {reason}]")
             }
         }
         "write_file" => {
