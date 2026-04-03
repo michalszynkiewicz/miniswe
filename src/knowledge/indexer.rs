@@ -813,7 +813,11 @@ fn truncate_summary(s: &str) -> String {
     if s.len() <= 100 {
         s.to_string()
     } else {
-        format!("{}...", &s[..97])
+        let mut end = 97;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     }
 }
 
