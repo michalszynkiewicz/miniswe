@@ -2,7 +2,7 @@
 
 A lightweight CLI coding agent for local LLMs.
 
-Optimized for quantized small LLMs (Devstral Small 2 Q4_K_XL, Qwen 2.5 Coder, etc.) running locally via llama.cpp, Ollama, or vLLM. Works with any OpenAI-compatible API.
+Optimized for quantized small LLMs (Devstral Small 2, Qwen 2.5 Coder, etc.) running locally via llama.cpp, Ollama, or vLLM. Works with any OpenAI-compatible API.
 
 ## Quick Start
 
@@ -32,28 +32,29 @@ miniswe plan "how should I refactor the auth module?"
 
 ## Architecture
 
-miniswe operates on one principle: **assemble exactly the right context for each step — never dump everything in and hope.**
+miniswe operates on one principle: **give the model the right tools and let it decide what context it needs.**
 
 ### Core Components
 
-- **Context Assembler** — Per-turn context building within a strict token budget. Compressed system prompt, profile, repo map, scratchpad, history with observation masking.
+- **Pull-based Context** — Context tools (`get_repo_map`, `get_project_info`, `get_architecture_notes`) let the model fetch project knowledge on demand instead of injecting everything into the system prompt.
+- **Unified Compression** — Single-pass timeline compression. When conversation exceeds the token budget, older messages are LLM-summarized into a narrative and archived to `.miniswe/session_archive.md`.
 - **Knowledge Engine** — Tree-sitter AST parsing (19 languages), PageRank-based dependency graph, doc-header extraction for file summaries, incremental re-indexing after edits.
-- **Compression Pipeline** — Deterministic compression: structured context format, stdlib import elision, history-as-diffs, observation masking.
-- **Tool System** — 11 built-in tools + unlimited MCP tools via lazy-loading bridge. Path jailing, shell approval, per-query web access control.
-- **LLM Interface** — OpenAI-compatible API client with streaming, tool call parsing, and Ctrl+C interruption.
-- **MCP Support** — Standard `.mcp.json` config (Claude Code compatible). Lazy-loading: only one-line summaries in context (~10 tokens/server), full schemas resolved at execution time.
+- **LSP Integration** — Auto-downloads rust-analyzer (or other language servers). Provides ~200ms diagnostics after edits (vs 2-5s cargo check) plus `goto_definition` and `find_references` tools.
+- **Transform Tool** — LLM-powered multi-site code transformation. Pattern mode (same change to every occurrence) and block mode (structural change on a line range). Auto-reverts on compile failure.
+- **Smart Edit** — Whitespace-normalized fallback, function signature change detection (warns to update call sites), edit failure tracking (forces write_file after 2 failures).
+- **Tool System** — 18+ built-in tools + unlimited MCP tools. Path jailing, shell approval, per-query web access control.
+- **LLM Interface** — OpenAI-compatible API with streaming, tool call parsing, multi-model routing (plan/code/fast roles).
 
-### Token Budget (50K window, Devstral Small 2 Q4_K_XL on RTX 3090)
+### Context Budget (dynamic, based on context_window)
 
-| Component | Tokens | % |
-|-----------|--------|---|
-| System prompt (compressed) | 1,200 | 2.4% |
-| Project profile (compressed) | 350 | 0.7% |
-| Repo map (PageRank-ranked) | 5,000 | 10% |
-| MCP summaries | ~50 | 0.1% |
-| Scratchpad | 1,500 | 3% |
-| Conversation history (compressed) | 6,000 | 12% |
-| **Available for output** | **~24,000** | **48%** |
+| Zone | Budget | Content |
+|------|--------|---------|
+| Work zone | ~42% | System prompt, tool schemas, current round |
+| Raw history | 1/4 (25%) | Recent rounds in full |
+| Compressed summary | 1/6 (17%) | LLM narrative of older rounds |
+| Output headroom | 1/6 (17%) | Reserved for model response |
+
+Per-result budget: `context_window / 10` (~3200 chars at 32K). Large results (web_fetch, shell) saved to file with preview + pointer.
 
 ## Commands
 
@@ -79,94 +80,61 @@ miniswe operates on one principle: **assemble exactly the right context for each
 | `quit` | Exit |
 | `Ctrl+C` | Interrupt current LLM generation |
 | `Ctrl+R` | Search input history |
-| `Ctrl+D` | Exit |
 
 ## Tools
 
-### Built-in (11 tools)
+### Core (always available)
 
 | Tool | Purpose |
 |------|---------|
-| `read_file` | Read file contents with line numbers (comments preserved, stdlib imports elided) |
-| `read_symbol` | Look up a function/class/type by name via index coordinates |
-| `search` | ripgrep-based code search |
-| `write_file` | Create or rewrite files (primary editing tool — writes complete file content) |
-| `shell` | Execute shell commands (30s default timeout, permission required) |
+| `read_file` | Read file contents with line numbers (auto-truncated to budget) |
+| `read_symbol` | Look up a function/class/type by name via tree-sitter index |
+| `search` | ripgrep search — `query` (plain text) or `pattern` (regex) |
+| `edit` | Replace text in a file (whitespace-normalized fallback, signature change detection) |
+| `write_file` | Create or rewrite files (preferred for files under 200 lines) |
+| `transform` | LLM-powered multi-site transformation — pattern mode or block mode |
+| `shell` | Execute shell commands (output saved to file if large) |
 | `task_update` | Update the task scratchpad (agent's memory) |
-| `diagnostics` | Get compiler/linter errors |
-| `web_search` | Web search via Serper or GitHub (shows query, asks permission) |
-| `web_fetch` | Fetch URL as clean markdown via Jina Reader (shows URL, asks permission) |
-| `docs_lookup` | Search local documentation cache (no network, always allowed) |
+| `diagnostics` | Get compiler/linter errors (LSP-accelerated if available) |
+
+### Context (pull-based, toggleable via `[tools]` config)
+
+| Tool | Purpose |
+|------|---------|
+| `get_repo_map` | PageRank-scored code structure overview |
+| `get_project_info` | Project profile, guide, lessons |
+| `get_architecture_notes` | Architecture decisions from `.ai/README.md` |
+
+### LSP (when language server is available)
+
+| Tool | Purpose |
+|------|---------|
+| `goto_definition` | Jump to symbol definition with source context |
+| `find_references` | Find all references to a symbol |
+
+### Web (toggleable via `[tools]` config)
+
+| Tool | Purpose |
+|------|---------|
+| `web_search` | Web search via Serper (shows query, asks permission) |
+| `web_fetch` | Fetch URL as markdown (large pages saved to file with preview) |
+| `docs_lookup` | Search local documentation cache |
 | `mcp_use` | Call any tool on a connected MCP server |
 
-### Web Search
+## LSP Support
 
-Web search uses Serper (Google results) when an API key is available, falling back to GitHub repository search (no key needed, uses `gh` token if available for higher rate limits).
+Auto-detects project language and downloads the right LSP server:
 
-```bash
-# Option 1: Serper key file (recommended — free 2,500 queries/month at serper.dev)
-mkdir -p ~/.miniswe
-echo "your-serper-key" > ~/.miniswe/serper.key
+| Language | Server | Detection |
+|----------|--------|-----------|
+| Rust | rust-analyzer | Cargo.toml |
+| TypeScript/JS | typescript-language-server | tsconfig.json |
+| Python | pyright | pyproject.toml |
+| Go | gopls | go.mod |
+| Java | jdtls | pom.xml / build.gradle |
+| C/C++ | clangd | CMakeLists.txt |
 
-# Option 2: environment variable
-export SERPER_API_KEY="your-key"
-
-# Option 3: no key — falls back to GitHub repo search (10-30 req/min)
-```
-
-### MCP Tools (unlimited, via `.mcp.json`)
-
-miniswe supports the standard `.mcp.json` configuration (same format as Claude Code):
-
-```json
-{
-  "mcpServers": {
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": { "GITHUB_TOKEN": "ghp_..." }
-    }
-  }
-}
-```
-
-On startup, miniswe connects to MCP servers, fetches tool schemas, and caches them. Only a one-line summary per server goes into LLM context (~10 tokens each). Full schemas are resolved at execution time.
-
-## Permission System
-
-All file access is jailed to the project root. Destructive actions require user approval:
-
-| Action | Permission |
-|--------|-----------|
-| Read/write files in project | Always allowed (path-jailed) |
-| Absolute paths or `../` traversal | Blocked |
-| Shell commands (cargo, git, ls, etc.) | Auto-approved (allowlist) |
-| Shell commands (other) | Prompted per command |
-| Web search | Prompted (shows query being sent) |
-| Web fetch | Prompted (shows URL and proxy info) |
-| MCP tool calls | Prompted per server |
-| `-y` flag | Auto-approves everything |
-
-See [docs/safe-headless-execution.md](docs/safe-headless-execution.md) for running safely in CI/Docker.
-
-## Tree-sitter Language Support
-
-AST-based symbol extraction with tree-sitter. Each language is a feature flag:
-
-**Default (Tier 1):** Rust, Python, JavaScript, TypeScript, Go
-
-**Opt-in (Tier 2):** Java, C, C++, Ruby, PHP, C#, Kotlin, Swift, Scala, Zig, Elixir, Haskell, Lua
-
-```bash
-# Build with specific languages
-cargo build --release --features "lang-rust,lang-java,lang-cpp"
-
-# Build with all languages
-cargo build --release --features all-languages
-
-# Build without tree-sitter (regex fallback only)
-cargo build --release --no-default-features
-```
+Servers are downloaded to `~/.miniswe/lsp-servers/` on first use. No manual installation needed.
 
 ## Configuration
 
@@ -174,97 +142,66 @@ cargo build --release --no-default-features
 
 ```toml
 [model]
-provider = "llama-cpp"          # or "ollama", "vllm", "openai-compatible"
+provider = "llama-cpp"
 endpoint = "http://localhost:8464"
 model = "devstral-small-2"
-context_window = 50000
+context_window = 32000
 temperature = 0.15
-max_output_tokens = 16384
+max_output_tokens = 4096
 
 [context]
 repo_map_budget = 5000
-snippet_budget = 12000
-history_turns = 5
-history_budget = 6000
-scratchpad_budget = 1500
-max_rounds = 100                # hard limit on tool call rounds
-pause_after_rounds = 50         # ask user to confirm continuation
+max_rounds = 80
+pause_after_rounds = 50
 
-[hardware]
-vram_gb = 24
-vram_reserve_gb = 3             # reserved for OS/display (usable: 21GB)
-ram_budget_gb = 80
+[lsp]
+enabled = true
+diagnostic_timeout_ms = 2000
+
+[tools]
+context_tools = true    # get_repo_map, get_project_info, get_architecture_notes
+lsp_tools = true        # goto_definition, find_references
+transform = true        # LLM-powered multi-site transformation
+web_tools = true        # web_search, web_fetch, docs_lookup
 
 [web]
-search_backend = "serper"       # or "github", "searxng"
-search_api_key = ""             # or use ~/.miniswe/serper.key
-fetch_backend = "jina"          # or "local"
+search_backend = "serper"
+fetch_backend = "jina"
 ```
 
-A config for RTX 4050 laptops (6GB VRAM) is included at [4050-config.toml](4050-config.toml).
+## Benchmarking
 
-## LLM Server Setup
-
-### llama.cpp (recommended)
-
-Use the included start script:
+Provider/tool benchmarks with Docker isolation:
 
 ```bash
-# Download the model (first time)
-mkdir -p models
-hf download unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF \
-  --include 'Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL.gguf' \
-  --local-dir models/
+# Compare baseline (all tools) vs core-only
+./scripts/run-benchmark-docker.sh --timeout 2400 --max-rounds 80
 
-# Start the server
-./start-devstral-small-2.sh
+# Local (faster, less isolated)
+./scripts/bench-task-B-max-rounds-flag.sh --timeout 1800
 ```
 
-Or manually:
+See [docs/errors.md](docs/errors.md) for benchmark analysis and tool effectiveness data.
+
+## Tree-sitter Language Support
+
+**Default (Tier 1):** Rust, Python, JavaScript, TypeScript, Go
+
+**Opt-in (Tier 2):** Java, C, C++, Ruby, PHP, C#, Kotlin, Swift, Scala, Zig, Elixir, Haskell, Lua
 
 ```bash
-llama-server \
-  --model Devstral-Small-2-24B-UD-Q4_K_XL.gguf \
-  --ctx-size 50000 \
-  --cache-type-k q8_0 --cache-type-v q8_0 \
-  --n-gpu-layers 99 \
-  --flash-attn on \
-  --threads 8 \
-  --port 8464 --metrics
-```
-
-### Ollama
-
-```bash
-export OLLAMA_CONTEXT_LENGTH=50000
-export OLLAMA_KV_CACHE_TYPE=q8_0
-export OLLAMA_FLASH_ATTENTION=1
-ollama serve
-
-# In .miniswe/config.toml:
-# provider = "ollama"
-# endpoint = "http://localhost:11434"
-```
-
-## Debugging
-
-```bash
-# Show role sequence, token usage, and KV cache stats before each LLM call
-MINISWE_DEBUG=1 miniswe
+# Build with all languages
+cargo build --release --features all-languages
 ```
 
 ## Development
 
 ```bash
 cargo build                     # debug build
-cargo test                      # run tests
+cargo test                      # run 136+ tests
 cargo clippy                    # lint
-RUST_LOG=debug cargo run -- init  # with tracing
+cargo test --test e2e_lsp       # LSP integration tests (needs rust-analyzer)
 ```
-
-## Design Document
-
-See [design.md](design.md) for the full architecture specification, context budget analysis, and rationale behind every design decision.
 
 ## License
 

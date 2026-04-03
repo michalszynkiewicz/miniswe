@@ -1,4 +1,4 @@
-# Context Compression (Partially Implemented)
+# Context Compression (Implemented)
 
 ## Current State
 
@@ -24,9 +24,9 @@ Large results from web_fetch, shell, docs_lookup get saved to file with preview 
 - shell → `.miniswe/shell_output/cmd_<time>.txt`
 - docs_lookup → points to `.miniswe/docs/<lib>.txt`
 
-### Not yet implemented: Unified timeline compression
+### Implemented: Unified timeline compression
 
-Design for replacing separate tool masking + history compression with a single timeline-aware compressor.
+`src/context/compressor.rs` — replaces separate tool masking + history compression.
 
 **Budget split** (fractions of context_window):
 - Output headroom: 1/6 (~17%)
@@ -34,10 +34,14 @@ Design for replacing separate tool masking + history compression with a single t
 - Raw history: 1/4 (~25%)
 - Work zone: rest (~42%)
 
-**Triggers**:
-1. Raw history > 1/4 context → compress oldest half into summary via LLM
-2. Summary > 1/6 context → archive oldest summary to file, re-summarize
+**Trigger**: when non-system message tokens exceed 1/4 context_window.
 
-**Key idea**: one summary block that captures decisions, discoveries, failures, and pointers to archived content. The model calls `read_file(".miniswe/session_archive.md")` for details.
+**Flow**:
+1. Count tokens in conversation (excluding system prompt)
+2. If over budget, find split point to keep newest within 1/4
+3. Send older messages to LLM for narrative summarization
+4. Archive full content to `.miniswe/session_archive.md`
+5. Replace compressed messages with `[Session summary]` + assistant acknowledgment
+6. Model can `read_file(".miniswe/session_archive.md")` for details
 
-This replaces both `compress_history()` (currently dumb first-line truncation) and `mask_old_tool_results()` (currently separate system).
+**Replaces**: `mask_old_tool_results()` (removed, 240 lines) and `compress_history()` (still exists for `--continue` sessions but unified compressor handles in-session compression).
