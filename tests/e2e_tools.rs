@@ -686,6 +686,49 @@ async fn get_architecture_notes_returns_content() {
         "should contain notes: {}", result.content);
 }
 
+// ── transform tool ────────────────────────────────────────────────
+
+// Note: transform needs a ModelRouter which requires an LLM server.
+// These tests verify the non-LLM parts (pattern finding, chunk building).
+// Full integration testing happens in benchmarks.
+
+#[tokio::test]
+async fn transform_missing_params() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // Missing find
+    let args = json!({"path": "test.rs", "instruction": "do something"});
+    let result = miniswe::tools::transform::execute(&args, &config, &mock_router()).await.unwrap();
+    assert!(!result.success);
+    assert!(result.content.contains("find"));
+
+    // Missing instruction
+    let args = json!({"path": "test.rs", "find": "something"});
+    let result = miniswe::tools::transform::execute(&args, &config, &mock_router()).await.unwrap();
+    assert!(!result.success);
+    assert!(result.content.contains("instruction"));
+}
+
+#[tokio::test]
+async fn transform_pattern_not_found() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    fs::write(helpers::project_path(&config, "target.rs"), "fn main() {}\n").unwrap();
+
+    let args = json!({
+        "path": "target.rs",
+        "find": "nonexistent_pattern",
+        "instruction": "do something"
+    });
+    let result = miniswe::tools::transform::execute(&args, &config, &mock_router()).await.unwrap();
+    assert!(!result.success);
+    assert!(result.content.contains("not found"));
+}
+
+fn mock_router() -> miniswe::llm::ModelRouter {
+    miniswe::llm::ModelRouter::new(&miniswe::config::Config::default())
+}
+
 // ── dynamic tool output budget ────────────────────────────────────
 
 #[test]

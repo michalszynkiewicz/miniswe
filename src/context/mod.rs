@@ -75,6 +75,7 @@ fn build_system_prompt() -> String {
            -If edit fails twice on the same file, switch to write_file\n\
          3.AFTER CHANGING A FUNCTION SIGNATURE(adding/removing parameters):\n\
            -Use search(\"function_name\") to find ALL call sites\n\
+           -Use transform(path,find,instruction) to update many call sites in one file at once\n\
            -Update EVERY call site before running diagnostics\n\
          4.task_update after progress(##Current Task+##Plan)\n\
          5.Verify—run diagnostics after edits. Fix all errors before moving on\n\
