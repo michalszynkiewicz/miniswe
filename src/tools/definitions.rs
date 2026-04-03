@@ -247,7 +247,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "transform".into(),
-                description: "Transform all occurrences of a pattern in a file using an instruction. Finds every line containing 'find', extracts it with surrounding context, applies the instruction via LLM, and splices the result back. IDEAL for: adding/removing function parameters across many call sites, renaming variables, or any repetitive code change.".into(),
+                description: "Apply the SAME change to MANY locations in a file. Finds every line containing 'find', applies the instruction to each independently. ONLY for repetitive changes: adding/removing a function argument at every call site, renaming a variable, changing an import. NOT for structural changes (wrapping in if/else, moving code blocks) — use edit or write_file for those.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {

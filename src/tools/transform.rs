@@ -135,7 +135,6 @@ pub async fn execute(
 
     // Write the file
     let new_content = new_lines.join("\n");
-    // Preserve trailing newline if original had one
     let final_content = if content.ends_with('\n') && !new_content.ends_with('\n') {
         format!("{new_content}\n")
     } else {
@@ -143,6 +142,31 @@ pub async fn execute(
     };
 
     std::fs::write(&path, &final_content)?;
+
+    // Quick syntax check — if the transform broke the file, auto-revert
+    if path_str.ends_with(".rs") && config.project_root.join("Cargo.toml").exists() {
+        let check = std::process::Command::new("cargo")
+            .args(["check", "--message-format=short"])
+            .current_dir(&config.project_root)
+            .output();
+        if let Ok(result) = check {
+            if !result.status.success() {
+                // Revert — transform broke the code
+                std::fs::write(&path, &content)?;
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                let errors: String = stderr.lines()
+                    .filter(|l| l.contains("error"))
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Ok(ToolResult::err(format!(
+                    "Transform broke the code — auto-reverted {path_str}.\nErrors:\n{errors}\n\n\
+                     HINT: transform is for repetitive changes (add/remove argument, rename). \
+                     For structural changes (wrapping in if/else, moving code), use edit or write_file instead."
+                )));
+            }
+        }
+    }
 
     let total_lines = final_content.lines().count();
     output.push_str(&format!(
