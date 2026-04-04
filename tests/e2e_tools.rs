@@ -951,6 +951,56 @@ async fn edit_whitespace_empty_lines() {
         "should suggest alternatives: {}", result.content);
 }
 
+// ── docs_lookup ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn docs_lookup_finds_cached_doc() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // Create a cached doc file
+    let docs_dir = config.miniswe_path("docs");
+    fs::create_dir_all(&docs_dir).unwrap();
+    fs::write(docs_dir.join("tokio.txt"), "# Tokio\n\n## Runtime\nUse tokio::main macro.\n\n## Spawn\ntokio::spawn for async tasks.\n").unwrap();
+
+    let args = json!({"library": "tokio"});
+    let result = tools::execute_tool("docs_lookup", &args, &config, &perms(&config), None)
+        .await.unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("Runtime") || result.content.contains("Spawn"),
+        "should return doc content: {}", result.content);
+}
+
+#[tokio::test]
+async fn docs_lookup_with_topic_filters() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let docs_dir = config.miniswe_path("docs");
+    fs::create_dir_all(&docs_dir).unwrap();
+    fs::write(docs_dir.join("serde.txt"), "# Serde\n\n## Derive\nUse #[derive(Serialize)].\n\n## Custom\nImpl Serialize trait manually.\n").unwrap();
+
+    let args = json!({"library": "serde", "topic": "Derive"});
+    let result = tools::execute_tool("docs_lookup", &args, &config, &perms(&config), None)
+        .await.unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("Derive"),
+        "should contain the matching section: {}", result.content);
+}
+
+#[tokio::test]
+async fn docs_lookup_no_docs_cached() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let args = json!({"library": "nonexistent_lib"});
+    let result = tools::execute_tool("docs_lookup", &args, &config, &perms(&config), None)
+        .await.unwrap();
+
+    assert!(result.success); // returns ok with "no docs found"
+    assert!(result.content.contains("No docs") || result.content.contains("No local docs"),
+        "should say no docs: {}", result.content);
+}
+
 // ── tool response content tests ───────────────────────────────────
 // Verify what the model actually sees in tool results
 

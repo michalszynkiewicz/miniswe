@@ -198,10 +198,20 @@ cargo build --release --features all-languages
 
 ```bash
 cargo build                     # debug build
-cargo test                      # run 136+ tests
+cargo test                      # run 160+ tests
 cargo clippy                    # lint
 cargo test --test e2e_lsp       # LSP integration tests (needs rust-analyzer)
+cargo test --test e2e_snapshots # Snapshot/revert tests
 ```
+
+### Test coverage
+
+16/19 tools have e2e tests. Not tested (require network/external services):
+- `web_search`, `web_fetch` — need Serper API key or network
+- `mcp_use` — needs a running MCP server
+
+LSP tools (`goto_definition`, `find_references`) are tested in `e2e_lsp.rs`.
+Revert is tested in `e2e_snapshots.rs`.
 
 ## License
 
