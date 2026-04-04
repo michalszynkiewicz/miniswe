@@ -80,6 +80,12 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
     }
 }
 
+/// Check if a plan has been created.
+pub fn plan_exists(config: &Config) -> bool {
+    let plan_path = config.miniswe_dir().join("plan.md");
+    plan_path.exists() && fs::read_to_string(&plan_path).map(|c| !c.trim().is_empty()).unwrap_or(false)
+}
+
 /// Load the current plan for context injection.
 pub fn load_plan(config: &Config) -> Option<String> {
     let plan_path = config.miniswe_dir().join("plan.md");
