@@ -415,6 +415,11 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     }
                     None => crate::tools::ToolResult::err("Snapshot system not available (git not found?)".into()),
                 }
+            } else if tc.function.name == "plan" {
+                match tools::plan::execute(&args, &config, round).await {
+                    Ok(r) => r,
+                    Err(e) => crate::tools::ToolResult::err(format!("plan error: {e}")),
+                }
             } else if tc.function.name == "fix_file" {
                 match tools::fix_file::execute(&args, &config, &router).await {
                     Ok(r) => r,
@@ -445,6 +450,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     Err(e) => crate::tools::ToolResult::err(format!("Tool error: {e}")),
                 }
             };
+
+            // Append round number to every tool result
+            result.content.push_str(&format!("\n[round {round}/{max_rounds}]"));
 
             let first_line = result.content.lines().next().unwrap_or("(empty)");
             log.tool_call(&tc.function.name, &args_summary, result.success, first_line);

@@ -168,6 +168,31 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "diagnostics".into(),
+                description: "Manage a structured plan. Actions: 'set' (create plan), 'check' (mark step done), 'show' (view plan).".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "One of: 'set' (create/replace plan), 'check' (mark a step complete), 'show' (view current plan)"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "For action='set': the plan in markdown with '- [ ] step' checkboxes"
+                        },
+                        "step": {
+                            "type": "integer",
+                            "description": "For action='check': which step number to mark complete (1-indexed)"
+                        }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "diagnostics".into(),
                 description: "Get compiler errors and warnings for the project.".into(),
                 parameters: json!({
                     "type": "object",

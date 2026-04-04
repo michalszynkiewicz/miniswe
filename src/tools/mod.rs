@@ -11,6 +11,7 @@ mod search;
 mod shell;
 mod task_update;
 pub mod fix_file;
+pub mod plan;
 pub mod snapshots;
 pub mod transform;
 mod web;
