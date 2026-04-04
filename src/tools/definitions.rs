@@ -168,7 +168,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "diagnostics".into(),
-                description: "Get LSP/linter errors and warnings for a file or the whole project.".into(),
+                description: "Get compiler errors and warnings. Run AFTER updating all files in a refactor — not after each file. Many errors during multi-file changes are normal until all call sites are updated.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {

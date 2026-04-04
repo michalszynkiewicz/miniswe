@@ -192,14 +192,18 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
                         if errors.is_empty() {
                             result.content.push_str("\n[lsp] OK");
                         } else {
-                            result.content.push_str("\n[lsp]\n");
-                            for diag in &errors {
+                            let capped = errors.len().min(5);
+                            result.content.push_str(&format!("\n[lsp] {} error(s) in {path}:\n", errors.len()));
+                            for diag in &errors[..capped] {
                                 let line = diag.range.start.line + 1;
                                 let col = diag.range.start.character + 1;
                                 result.content.push_str(&format!(
                                     "{}:{}:{}: error: {}\n",
                                     path, line, col, diag.message
                                 ));
+                            }
+                            if errors.len() > capped {
+                                result.content.push_str(&format!("... and {} more errors\n", errors.len() - capped));
                             }
                             // Add source context around errors
                             let project_root = config.project_root.clone();
@@ -492,9 +496,24 @@ async fn lsp_project_diagnostics(config: &Config, lsp: &LspClient) -> Option<Too
     if output.is_empty() {
         Some(ToolResult::ok("[rust-analyzer] No errors or warnings".into()))
     } else {
-        let summary = format!("[rust-analyzer] {error_count} error(s), {warning_count} warning(s)\n");
+        // Cap output to first 10 errors — the model can't fix 290 at once
+        let capped_output: String = output.lines().take(10).collect::<Vec<_>>().join("\n");
+        let shown = capped_output.lines().count();
+        let total = output.lines().count();
+
+        let mut summary = format!("[rust-analyzer] {error_count} error(s), {warning_count} warning(s)");
+        if total > shown {
+            summary.push_str(&format!(" (showing first {shown})"));
+        }
+        summary.push('\n');
+        summary.push_str(&capped_output);
+
+        if error_count > 20 {
+            summary.push_str("\n\nNOTE: Many errors often mean a function signature was changed but call sites aren't updated yet. This is normal during a multi-file refactor. Use search() to find remaining call sites and update them.");
+        }
+
         let success = error_count == 0;
-        Some(ToolResult { content: format!("{summary}{output}"), success })
+        Some(ToolResult { content: summary, success })
     }
 }
 
