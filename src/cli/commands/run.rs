@@ -49,6 +49,12 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         if !config.tools.web_tools {
             d.extend_from_slice(&["web_search", "web_fetch", "docs_lookup"]);
         }
+        if !config.tools.plan {
+            d.push("plan");
+        }
+        if !config.tools.scratchpad {
+            d.push("task_update");
+        }
         d
     };
     tool_defs.retain(|t| !disabled_tools.contains(&t.function.name.as_str()));

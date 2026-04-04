@@ -111,6 +111,8 @@ context_tools = $(_dis context_tools)
 lsp_tools = $(_dis lsp_tools)
 transform = $(_dis transform)
 web_tools = $(_dis web_tools)
+plan = $(_dis plan)
+scratchpad = $(_dis scratchpad)
 
 [logging]
 level = "trace"
@@ -382,7 +384,9 @@ echo "═══ Phase 1: baseline vs all_off ═══"
 echo ""
 
 run_variant "00_baseline" ""
-run_variant "01_no_extra_tools" "context_tools,lsp_tools,transform,lsp"
+run_variant "01_plan_only" "scratchpad"
+run_variant "02_scratchpad_only" "plan"
+run_variant "03_no_extra_tools" "context_tools,lsp_tools,transform,lsp,plan"
 
 # Summary
 echo ""
