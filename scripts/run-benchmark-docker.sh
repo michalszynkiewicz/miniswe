@@ -384,9 +384,10 @@ echo "═══ Phase 1: baseline vs all_off ═══"
 echo ""
 
 run_variant "00_baseline" ""
-run_variant "01_plan_only" "scratchpad"
-run_variant "02_scratchpad_only" "plan"
-run_variant "03_no_extra_tools" "context_tools,lsp_tools,transform,lsp,plan"
+# Uncomment for full comparison:
+# run_variant "01_plan_only" "scratchpad"
+# run_variant "02_scratchpad_only" "plan"
+# run_variant "03_no_extra_tools" "context_tools,lsp_tools,transform,lsp,plan"
 
 # Summary
 echo ""
