@@ -111,14 +111,12 @@ pub async fn maybe_compress(
     // Archive full content
     archive_messages(&to_compress_refs, config);
 
-    let compress_count = to_compress.len();
-
     // Replace compressed messages with summary
     let after_split: Vec<Message> = messages[split_idx..].to_vec();
     messages.truncate(compress_start);
 
     messages.push(Message::user(&format!(
-        "[Your earlier work in this session ({compress_count} messages compressed)]\n{summary}\n[Continue from where you left off. Do not re-introduce yourself or restart the task.]"
+        "[Your earlier work in this session]\n{summary}\n[Details: read_file(\".miniswe/session_archive.md\"). Continue from where you left off.]"
     )));
 
     messages.extend(after_split);
@@ -177,19 +175,18 @@ async fn llm_summarize_timeline(
     }
 
     let prompt = format!(
-        "Summarize what YOU did in this coding session so far. Write in first person past tense.\n\
-         IMPORTANT: Preserve exact function signatures and type names you encountered.\n\
-         For each file you read or changed, include the actual function signatures.\n\
-         Example: 'I changed run.rs: pub async fn run(config: Config, msg: &str, plan_only: bool, headless: bool) to add system_prompt_override: Option<String>'\n\
-         Include: what you changed, what's left to do, any errors.\n\
-         Keep it under {} tokens.\n\n\
+        "List WHAT you accomplished, one line per file changed. Use this format:\n\
+         - file.rs: what changed (include exact function signatures if modified)\n\
+         - file.rs: ✗ attempted but failed — reason\n\
+         End with: Still need: [what's left]\n\
+         Keep it under {} tokens. No process narrative.\n\n\
          {timeline}",
         budget_tokens
     );
 
     let request = ChatRequest {
         messages: vec![
-            Message::system("You write concise session summaries for a coding agent. Include file paths, function names, and what worked/failed."),
+            Message::system("List completed actions, one per line. Include exact signatures when functions were changed. No explanation."),
             Message::user(&prompt),
         ],
         tools: None,
