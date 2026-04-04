@@ -59,6 +59,27 @@ pub async fn execute(
     }
 
     // Replace all occurrences
+    // If only 1 match and old is long, suggest a shorter pattern
+    if count == 1 && old.len() > 30 {
+        // Check if a shorter prefix would match more
+        let short = if let Some(paren) = old.find('(') {
+            &old[..paren + 1]
+        } else {
+            &old[..old.len().min(20)]
+        };
+        let short_count = content.matches(short).count();
+        if short_count > 1 {
+            let result = format!(
+                "✓ Replaced 1 occurrence in {path_str}.\n\
+                 TIP: Your 'old' text matched only 1 call site. Use a shorter pattern like \
+                 \"{short}\" to match all {short_count} occurrences at once.\n"
+            );
+            let new_content = content.replace(old, new);
+            std::fs::write(&path, &new_content)?;
+            return Ok(ToolResult::ok(result));
+        }
+    }
+
     let new_content = content.replace(old, new);
     std::fs::write(&path, &new_content)?;
 
