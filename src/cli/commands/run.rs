@@ -44,7 +44,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             d.extend_from_slice(&["get_repo_map", "get_project_info", "get_architecture_notes"]);
         }
         if !config.tools.transform {
-            d.push("transform");
+            d.push("replace_all");
         }
         if !config.tools.web_tools {
             d.extend_from_slice(&["web_search", "web_fetch", "docs_lookup"]);
@@ -415,7 +415,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     }
                     None => crate::tools::ToolResult::err("Snapshot system not available (git not found?)".into()),
                 }
-            } else if tc.function.name == "transform" {
+            } else if tc.function.name == "replace_all" {
                 match tools::transform::execute(&args, &config, &router).await {
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("Transform error: {e}")),

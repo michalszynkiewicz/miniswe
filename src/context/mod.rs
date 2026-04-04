@@ -76,7 +76,7 @@ fn build_system_prompt() -> String {
            -If edit fails twice on the same file, switch to write_file\n\
          3.AFTER CHANGING A FUNCTION SIGNATURE(adding/removing parameters):\n\
            -Use search(\"function_name\") to find ALL call sites\n\
-           -Use transform(path,find,instruction) to update many call sites in one file at once\n\
+           -Use replace_all(path,find,instruction) to update ALL call sites in a file at once\n\
            -Update EVERY call site before running diagnostics\n\
          4.USE task_update to save your plan BEFORE starting and after each major step.\n\
            The scratchpad persists between rounds—write your checklist there.\n\
