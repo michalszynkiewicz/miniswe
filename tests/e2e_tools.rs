@@ -694,42 +694,64 @@ async fn get_architecture_notes_returns_content() {
 // Full integration testing happens in benchmarks.
 
 #[tokio::test]
-async fn transform_missing_params() {
+async fn replace_all_missing_params() {
     let (_tmp, config) = helpers::create_test_project();
 
-    // Missing both find and start_line/end_line — needs one or the other
     fs::write(helpers::project_path(&config, "test.rs"), "fn main() {}\n").unwrap();
-    let args = json!({"path": "test.rs", "instruction": "do something"});
-    let result = miniswe::tools::transform::execute(&args, &config, &mock_router()).await.unwrap();
-    assert!(!result.success, "should fail without find or line range: {}", result.content);
-    assert!(result.content.contains("find") || result.content.contains("block"),
-        "should mention find or block mode: {}", result.content);
 
-    // Missing instruction
-    let args = json!({"path": "test.rs", "find": "something"});
-    let result = miniswe::tools::transform::execute(&args, &config, &mock_router()).await.unwrap();
+    // Missing old
+    let args = json!({"path": "test.rs", "new": "replacement"});
+    let result = miniswe::tools::transform::execute(&args, &config).await.unwrap();
     assert!(!result.success);
-    assert!(result.content.contains("instruction"));
+    assert!(result.content.contains("old"));
 }
 
 #[tokio::test]
-async fn transform_pattern_not_found() {
+async fn replace_all_not_found() {
     let (_tmp, config) = helpers::create_test_project();
 
     fs::write(helpers::project_path(&config, "target.rs"), "fn main() {}\n").unwrap();
 
-    let args = json!({
-        "path": "target.rs",
-        "find": "nonexistent_pattern",
-        "instruction": "do something"
-    });
-    let result = miniswe::tools::transform::execute(&args, &config, &mock_router()).await.unwrap();
+    let args = json!({"path": "target.rs", "old": "nonexistent", "new": "replacement"});
+    let result = miniswe::tools::transform::execute(&args, &config).await.unwrap();
     assert!(!result.success);
     assert!(result.content.contains("not found"));
 }
 
-fn mock_router() -> miniswe::llm::ModelRouter {
-    miniswe::llm::ModelRouter::new(&miniswe::config::Config::default())
+#[tokio::test]
+async fn replace_all_replaces_every_occurrence() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let content = "foo(1);\nfoo(2);\nbar();\nfoo(3);\n";
+    fs::write(helpers::project_path(&config, "multi.rs"), content).unwrap();
+
+    let args = json!({"path": "multi.rs", "old": "foo(", "new": "baz("});
+    let result = miniswe::tools::transform::execute(&args, &config).await.unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("3 occurrence"), "should replace 3: {}", result.content);
+
+    let disk = fs::read_to_string(helpers::project_path(&config, "multi.rs")).unwrap();
+    assert!(!disk.contains("foo("), "no foo( should remain");
+    assert_eq!(disk.matches("baz(").count(), 3, "should have 3 baz(");
+    assert!(disk.contains("bar()"), "bar should be untouched");
+}
+
+#[tokio::test]
+async fn replace_all_for_adding_argument() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let content = "assemble(&config, \"test\", &[], false, None);\nassemble(&config, \"hello\", &[], true, None);\n";
+    fs::write(helpers::project_path(&config, "calls.rs"), content).unwrap();
+
+    let args = json!({"path": "calls.rs", "old": "assemble(&config,", "new": "assemble(&config, override_prompt,"});
+    let result = miniswe::tools::transform::execute(&args, &config).await.unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("2 occurrence"), "should replace 2: {}", result.content);
+
+    let disk = fs::read_to_string(helpers::project_path(&config, "calls.rs")).unwrap();
+    assert_eq!(disk.matches("override_prompt,").count(), 2);
 }
 
 // ── tool enabling/disabling ───────────────────────────────────────

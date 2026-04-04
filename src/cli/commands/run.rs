@@ -416,9 +416,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     None => crate::tools::ToolResult::err("Snapshot system not available (git not found?)".into()),
                 }
             } else if tc.function.name == "replace_all" {
-                match tools::transform::execute(&args, &config, &router).await {
+                match tools::transform::execute(&args, &config).await {
                     Ok(r) => r,
-                    Err(e) => crate::tools::ToolResult::err(format!("Transform error: {e}")),
+                    Err(e) => crate::tools::ToolResult::err(format!("replace_all error: {e}")),
                 }
             } else if tc.function.name == "mcp_use" {
                 let server = args["server"].as_str().unwrap_or("");

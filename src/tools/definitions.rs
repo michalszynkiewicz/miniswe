@@ -247,7 +247,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "replace_all".into(),
-                description: "Find and replace across a file. Two modes: (1) PATTERN: provide 'find' to apply the SAME instruction to ALL matching lines at once. Use the shortest common pattern. (2) BLOCK: provide 'start_line'+'end_line' to change a specific range.".into(),
+                description: "Replace ALL occurrences of 'old' with 'new' in a file. Like edit but replaces EVERY match, not just one. Use for: updating all call sites after a signature change, renaming a variable everywhere, changing an import path. Deterministic — no LLM involved.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -255,24 +255,16 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                             "type": "string",
                             "description": "File path relative to project root"
                         },
-                        "find": {
+                        "old": {
                             "type": "string",
-                            "description": "Pattern mode: text to find. Use the SHORTEST pattern that matches ALL occurrences you want to change (e.g. 'my_function(' not 'my_function(arg1, arg2'). Every matching line gets the instruction applied."
+                            "description": "Exact text to find (every occurrence will be replaced)"
                         },
-                        "start_line": {
-                            "type": "integer",
-                            "description": "Block mode: first line of the range to transform (1-indexed)"
-                        },
-                        "end_line": {
-                            "type": "integer",
-                            "description": "Block mode: last line of the range to transform (1-indexed)"
-                        },
-                        "instruction": {
+                        "new": {
                             "type": "string",
-                            "description": "What to do (e.g. 'add None as last argument' or 'wrap this block in if let Some(override) = system_prompt_override')"
+                            "description": "Replacement text"
                         }
                     },
-                    "required": ["path", "instruction"]
+                    "required": ["path", "old", "new"]
                 }),
             },
         },
