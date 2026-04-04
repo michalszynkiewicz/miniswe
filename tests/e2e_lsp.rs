@@ -209,7 +209,7 @@ async fn lsp_auto_check_integration() {
         result.content
     );
     assert!(
-        result.content.contains("[rust-analyzer]") || result.content.contains("[cargo check]"),
+        result.content.contains("[lsp]") || result.content.contains("[cargo check]"),
         "should have diagnostics from LSP or cargo check: {}",
         result.content
     );
