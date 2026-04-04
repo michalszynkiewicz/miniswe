@@ -415,6 +415,11 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     }
                     None => crate::tools::ToolResult::err("Snapshot system not available (git not found?)".into()),
                 }
+            } else if tc.function.name == "fix_file" {
+                match tools::fix_file::execute(&args, &config, &router).await {
+                    Ok(r) => r,
+                    Err(e) => crate::tools::ToolResult::err(format!("fix_file error: {e}")),
+                }
             } else if tc.function.name == "replace_all" {
                 match tools::transform::execute(&args, &config).await {
                     Ok(r) => r,
