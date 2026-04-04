@@ -10,7 +10,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "read_file".into(),
-                description: "Read a file or line range. Auto-truncates to 4K tokens with line numbers.".into(),
+                description: "Read a file or line range with line numbers.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -35,7 +35,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "read_symbol".into(),
-                description: "Read the source code of a specific function, class, or type by name. Uses tree-sitter for precision.".into(),
+                description: "Read a function, class, or type definition by name.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -56,7 +56,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "search".into(),
-                description: "Search the codebase. Returns matching lines with file:line context. USE THIS after changing a function name or signature to find all call sites that need updating.".into(),
+                description: "Search the codebase for text or patterns. Returns matching lines with file:line context.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -84,7 +84,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "edit".into(),
-                description: "Replace text in a file. RULES: (1) 'old' must match file content EXACTLY including whitespace (2) include 3+ unchanged lines for unique match (3) ONLY use for single targeted fix in files >200 lines (4) if edit fails, switch to write_file. AFTER editing a function signature: use search() to find all callers and update them.".into(),
+                description: "Replace one occurrence of 'old' with 'new' in a file. The 'old' text must match exactly and uniquely.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -109,7 +109,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "write_file".into(),
-                description: "Write complete file contents. PREFERRED for most changes. Use for: new files, ANY file under 200 lines, multiple changes to one file, or when edit fails. Always include the COMPLETE file content — do not omit sections with comments like '// rest unchanged'.".into(),
+                description: "Create or overwrite a file with complete content.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -130,7 +130,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "shell".into(),
-                description: "Execute a shell command and return stdout/stderr. Output tail-truncated to 3K tokens.".into(),
+                description: "Execute a shell command and return stdout/stderr.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -151,7 +151,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "task_update".into(),
-                description: "Rewrite the task scratchpad with current state. Must contain ## Current Task and ## Plan sections.".into(),
+                description: "Save notes and progress to the scratchpad. Persists across rounds.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -168,7 +168,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "diagnostics".into(),
-                description: "Get compiler errors and warnings. Run AFTER updating all files in a refactor — not after each file. Many errors during multi-file changes are normal until all call sites are updated.".into(),
+                description: "Get compiler errors and warnings for the project.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -184,7 +184,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "web_search".into(),
-                description: "Search the web. Returns title+URL+snippet for top results.".into(),
+                description: "Search the web for documentation or solutions.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -205,7 +205,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "web_fetch".into(),
-                description: "Fetch a URL and extract main content as clean markdown. Truncated to 4K tokens.".into(),
+                description: "Fetch a URL and extract content as markdown.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -226,7 +226,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "docs_lookup".into(),
-                description: "Search local llms.txt documentation cache for a library's API info.".into(),
+                description: "Search cached local documentation for a library.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -247,7 +247,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "fix_file".into(),
-                description: "Apply a coding task to a file. Describe what needs to change and the tool reads the file, figures out which lines to edit, and applies the changes. Use for: updating function call sites, fixing errors across a file, applying a pattern change. Provide enough detail in the task for the changes to be unambiguous (types, parameter names, values).".into(),
+                description: "Describe a change and it gets applied across the file. Provide specific details (types, parameter names, values).".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -268,7 +268,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "replace_all".into(),
-                description: "Replace ALL occurrences of 'old' with 'new' in a file. Like edit but replaces EVERY match, not just one. Use for: updating all call sites after a signature change, renaming a variable everywhere, changing an import path. Deterministic — no LLM involved.".into(),
+                description: "Replace ALL occurrences of 'old' with 'new' in a file.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -293,7 +293,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "revert".into(),
-                description: "Revert files to a previous state. Use when your changes broke something and you want to go back. Reverts are tracked per round — each round is automatically snapshotted.".into(),
+                description: "Revert files to a previous round's state. Each round is automatically snapshotted.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -319,7 +319,7 @@ pub fn lsp_tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "goto_definition".into(),
-                description: "Jump to the definition of a symbol at a given file location. Returns the definition's file, line, and surrounding source code.".into(),
+                description: "Jump to a symbol's definition. Returns file, line, and source context.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -344,7 +344,7 @@ pub fn lsp_tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "find_references".into(),
-                description: "Find all references to the symbol at a given file location. Returns a list of file:line locations with the referencing code.".into(),
+                description: "Find all references to a symbol. Returns file:line locations.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -375,7 +375,7 @@ pub fn context_tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "get_repo_map".into(),
-                description: "Get the project's code structure overview — files ranked by importance with function/type signatures. Use this when you need to understand the codebase layout before making changes. Optionally filter by keywords to focus on relevant areas.".into(),
+                description: "Get the project's code structure: files ranked by importance with function/type signatures.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -391,7 +391,7 @@ pub fn context_tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "get_project_info".into(),
-                description: "Get project metadata: language, build system, entry points, coding guidelines, and accumulated tips. Useful at the start of a task to understand the project.".into(),
+                description: "Get project metadata: language, build system, entry points, guidelines.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {}
@@ -402,7 +402,7 @@ pub fn context_tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "get_architecture_notes".into(),
-                description: "Get architecture overview and key decisions from previous sessions (.ai/README.md). Useful when you need to understand design decisions or overall system structure.".into(),
+                description: "Get architecture overview and key decisions from .ai/README.md.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {}
@@ -418,7 +418,7 @@ pub fn mcp_tool_definition() -> ToolDefinition {
         r#type: "function".into(),
         function: FunctionDefinition {
             name: "mcp_use".into(),
-            description: "Call a tool on an MCP server. Use the [MCP:name] entries in context to see available servers and tools.".into(),
+            description: "Call a tool on a connected MCP server.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
