@@ -247,7 +247,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "transform".into(),
-                description: "LLM-powered code transformation. Two modes: (1) PATTERN mode: provide 'find' to apply the same change to every occurrence (add/remove argument, rename). (2) BLOCK mode: provide 'start_line'+'end_line' to transform a specific range (wrap in if/else, restructure). Auto-reverts if the result doesn't compile.".into(),
+                description: "LLM-powered code transformation. Two modes: (1) PATTERN mode: provide 'find' to apply the same change to every occurrence (add/remove argument, rename). (2) BLOCK mode: provide 'start_line'+'end_line' to transform a specific range (wrap in if/else, restructure).".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
