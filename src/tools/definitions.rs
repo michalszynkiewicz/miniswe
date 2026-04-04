@@ -257,7 +257,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         },
                         "find": {
                             "type": "string",
-                            "description": "Pattern mode: text to find (every matching line gets the instruction applied independently)"
+                            "description": "Pattern mode: text to find. Use the SHORTEST pattern that matches ALL occurrences you want to change (e.g. 'my_function(' not 'my_function(arg1, arg2'). Every matching line gets the instruction applied."
                         },
                         "start_line": {
                             "type": "integer",
