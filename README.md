@@ -2,7 +2,10 @@
 
 A lightweight CLI coding agent for local LLMs.
 
-Optimized for quantized small LLMs (Devstral Small 2, Qwen 2.5 Coder, etc.) running locally via llama.cpp, Ollama, or vLLM. Works with any OpenAI-compatible API.
+Optimized for quantized small LLMs running locally via llama.cpp, Ollama, or vLLM. Works with any OpenAI-compatible API.
+
+> **Tested with:** Devstral Small 2 (24B, Q4_K_XL and Q6_K) via llama.cpp on RTX 3090.
+> Multi-model support (Qwen, Llama, etc.) is planned but not yet validated — different models have different chat template constraints that may require adjustments to message formatting and role handling.
 
 ## Quick Start
 
