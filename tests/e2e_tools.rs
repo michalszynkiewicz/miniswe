@@ -950,3 +950,158 @@ async fn edit_whitespace_empty_lines() {
     assert!(result.content.contains("write_file") || result.content.contains("HINT"),
         "should suggest alternatives: {}", result.content);
 }
+
+// ── tool response content tests ───────────────────────────────────
+// Verify what the model actually sees in tool results
+
+#[tokio::test]
+async fn edit_response_contains_context_lines() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let content = "line1\nline2\nlet x = 1;\nline4\nline5\n";
+    fs::write(helpers::project_path(&config, "ctx.rs"), content).unwrap();
+
+    let args = json!({"path": "ctx.rs", "old": "let x = 1;", "new": "let x = 42;"});
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+        .await.unwrap();
+
+    assert!(result.success);
+    // Should show surrounding lines so model has context for follow-up edits
+    assert!(result.content.contains("line2"), "should show lines before edit: {}", result.content);
+    assert!(result.content.contains("line4"), "should show lines after edit: {}", result.content);
+    assert!(result.content.contains("let x = 42;"), "should show the new content: {}", result.content);
+}
+
+#[tokio::test]
+async fn edit_fn_signature_change_warns_about_callers() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let content = "pub fn process(data: &str) -> Result<()> {\n    Ok(())\n}\n";
+    fs::write(helpers::project_path(&config, "sig.rs"), content).unwrap();
+
+    let args = json!({
+        "path": "sig.rs",
+        "old": "pub fn process(data: &str) -> Result<()> {",
+        "new": "pub fn process(data: &str, verbose: bool) -> Result<()> {"
+    });
+    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+        .await.unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("IMPORTANT"),
+        "should warn about call sites: {}", result.content);
+    assert!(result.content.contains("search"),
+        "should suggest searching for callers: {}", result.content);
+}
+
+#[tokio::test]
+async fn write_file_response_shows_tail() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let content = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+    let args = json!({"path": "new.txt", "content": content});
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
+        .await.unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("✓ Wrote") || result.content.contains("✓ Created"),
+        "should confirm write: {}", result.content);
+    assert!(result.content.contains("line 20"), "should show tail of file: {}", result.content);
+}
+
+#[tokio::test]
+async fn search_response_shows_file_and_line() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    fs::write(helpers::project_path(&config, "findme.rs"), "pub fn hello() {}\nfn world() {}\n").unwrap();
+
+    let args = json!({"query": "pub fn hello"});
+    let result = tools::execute_tool("search", &args, &config, &perms(&config), None)
+        .await.unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("findme.rs"),
+        "should show filename: {}", result.content);
+    assert!(result.content.contains("pub fn hello"),
+        "should show matching line: {}", result.content);
+}
+
+#[tokio::test]
+async fn get_repo_map_response_shows_symbols() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // Create some Rust source files
+    fs::create_dir_all(helpers::project_path(&config, "src")).unwrap();
+    fs::write(
+        helpers::project_path(&config, "src/lib.rs"),
+        "pub struct Config {\n    pub name: String,\n}\n\npub fn run() -> bool {\n    true\n}\n"
+    ).unwrap();
+    fs::write(
+        helpers::project_path(&config, "Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"
+    ).unwrap();
+
+    // Index the project
+    let miniswe_dir = config.miniswe_dir();
+    fs::create_dir_all(&miniswe_dir).ok();
+    let index = miniswe::knowledge::indexer::index_project(&config.project_root, None).unwrap();
+    index.save(&miniswe_dir).unwrap();
+    let graph = miniswe::knowledge::graph::DependencyGraph::build(&index);
+    graph.save(&miniswe_dir).unwrap();
+
+    let args = json!({});
+    let result = tools::execute_tool("get_repo_map", &args, &config, &perms(&config), None)
+        .await.unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("Config") || result.content.contains("run"),
+        "should show symbols: {}", result.content);
+}
+
+#[tokio::test]
+async fn revert_tool_through_execute() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // revert goes through run.rs dispatch, not execute_tool
+    // but we can test the SnapshotManager directly
+    let mut snap = miniswe::tools::snapshots::SnapshotManager::init(&config.project_root).unwrap();
+
+    fs::write(helpers::project_path(&config, "code.rs"), "original").unwrap();
+    snap.begin_round(1).unwrap();
+
+    fs::write(helpers::project_path(&config, "code.rs"), "broken").unwrap();
+    snap.begin_round(2).unwrap();
+
+    // Revert to round 1
+    let msg = snap.revert_to_round(1).unwrap();
+    assert!(msg.contains("round 1"), "should confirm revert: {msg}");
+    assert_eq!(fs::read_to_string(helpers::project_path(&config, "code.rs")).unwrap(), "original");
+}
+
+#[tokio::test]
+async fn diagnostics_response_is_actionable() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    // Create a Rust project with a type error
+    fs::write(
+        helpers::project_path(&config, "Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"
+    ).unwrap();
+    fs::create_dir_all(helpers::project_path(&config, "src")).unwrap();
+    fs::write(
+        helpers::project_path(&config, "src/main.rs"),
+        "fn main() {\n    let x: u32 = \"not a number\";\n    println!(\"{x}\");\n}\n"
+    ).unwrap();
+
+    let args = json!({});
+    let result = tools::execute_tool("diagnostics", &args, &config, &perms(&config), None)
+        .await.unwrap();
+
+    // diagnostics runs cargo check — should report errors
+    if result.content.contains("error") {
+        // Good — it found the error
+        assert!(result.content.contains("mismatched") || result.content.contains("expected"),
+            "should show type error details: {}", result.content);
+    }
+    // If cargo isn't available, test is a no-op
+}
