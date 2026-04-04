@@ -163,6 +163,10 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         }
     });
 
+    // Initialize snapshot manager for revert support
+    let mut snapshots = tools::snapshots::SnapshotManager::init(&config.project_root)
+        .ok();
+
     // Initial context assembly
     let assembled = context::assemble(
         &config,
@@ -185,6 +189,11 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         }
         round += 1;
         log.round_start(round);
+
+        // Snapshot at start of each round for revert support
+        if let Some(ref mut snap) = snapshots {
+            let _ = snap.begin_round(round);
+        }
         if round > max_rounds {
             tui::print_error("Maximum tool rounds reached. Stopping.");
             break;
@@ -389,7 +398,24 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             }
 
             // Handle special tool calls that need extra context
-            let mut result = if tc.function.name == "transform" {
+            let mut result = if tc.function.name == "revert" {
+                let to_round = args["to_round"].as_u64().unwrap_or(0) as usize;
+                let path = args["path"].as_str().unwrap_or("");
+                match &snapshots {
+                    Some(snap) => {
+                        let res = if !path.is_empty() {
+                            snap.revert_file(path, to_round)
+                        } else {
+                            snap.revert_to_round(to_round)
+                        };
+                        match res {
+                            Ok(msg) => crate::tools::ToolResult::ok(msg),
+                            Err(e) => crate::tools::ToolResult::err(format!("Revert failed: {e}")),
+                        }
+                    }
+                    None => crate::tools::ToolResult::err("Snapshot system not available (git not found?)".into()),
+                }
+            } else if tc.function.name == "transform" {
                 match tools::transform::execute(&args, &config, &router).await {
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("Transform error: {e}")),

@@ -10,6 +10,7 @@ mod read_symbol;
 mod search;
 mod shell;
 mod task_update;
+pub mod snapshots;
 pub mod transform;
 mod web;
 mod write_file;
