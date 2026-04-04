@@ -45,6 +45,8 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         }
         if !config.tools.transform { disabled.push("replace_all"); }
         if !config.tools.web_tools { disabled.extend_from_slice(&["web_search", "web_fetch", "docs_lookup"]); }
+        if !config.tools.plan { disabled.push("plan"); }
+        if !config.tools.scratchpad { disabled.push("task_update"); }
         tool_defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
     }
     if config.tools.context_tools {

@@ -230,6 +230,10 @@ pub struct ToolsConfig {
     pub transform: bool,
     /// Web tools: web_search, web_fetch, docs_lookup
     pub web_tools: bool,
+    /// Structured plan tool
+    pub plan: bool,
+    /// Scratchpad (task_update)
+    pub scratchpad: bool,
 }
 
 impl Default for ToolsConfig {
@@ -239,6 +243,8 @@ impl Default for ToolsConfig {
             lsp_tools: true,
             transform: true,
             web_tools: true,
+            plan: true,
+            scratchpad: true,
         }
     }
 }
