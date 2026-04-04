@@ -156,6 +156,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let mut consecutive_loops = 0u32;
     let mut calls_since_last_edit = 0u32;
     let mut edit_fail_count: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut plan_update_requested = false;
 
 
     // Ctrl+C cancellation flag
@@ -238,7 +239,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
         // Unified context compression — handles both tool results and conversation
         let pre_mask = messages.len();
-        context::compressor::maybe_compress(&mut messages, &config, &router, tool_def_tokens).await;
+        context::compressor::maybe_compress(&mut messages, &config, &router, tool_def_tokens, &mut plan_update_requested).await;
         log.masking_applied(
             pre_mask.saturating_sub(messages.len()),
             pre_mask,
@@ -407,6 +408,21 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
                 tui::print_tool_result(&tc.function.name, false, "blocked in plan mode");
+                continue;
+            }
+
+            // Write gating: require plan before write tools
+            if config.tools.plan
+                && !tools::plan::plan_exists(&config)
+                && matches!(tc.function.name.as_str(), "edit" | "write_file" | "replace_all" | "fix_file")
+            {
+                let result_msg = Message::tool_result(
+                    &tc.id,
+                    "Create a plan first: use plan(action='set') with your step-by-step approach before making changes.",
+                );
+                messages.push(result_msg.clone());
+                conversation_history.push(result_msg);
+                tui::print_tool_result(&tc.function.name, false, "blocked: no plan");
                 continue;
             }
 

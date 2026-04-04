@@ -13,22 +13,64 @@ use crate::config::{Config, ModelRole};
 use crate::context::estimate_tokens;
 use crate::llm::{ChatRequest, Message, ModelRouter};
 
+/// Check if compression is needed without doing it.
+pub fn needs_compression(
+    messages: &[Message],
+    config: &Config,
+    tool_def_tokens: usize,
+) -> bool {
+    let context_window = config.model.context_window;
+    let available = context_window.saturating_sub(tool_def_tokens).saturating_sub(context_window / 6);
+    let raw_budget = available / 3;
+
+    let total_tokens: usize = messages.iter()
+        .filter(|m| m.role != "system")
+        .map(|m| estimate_tokens(m.content.as_deref().unwrap_or("")))
+        .sum();
+
+    total_tokens > raw_budget
+}
+
 /// Compress old messages when raw history exceeds budget.
 ///
-/// Walks the messages, keeps the newest within the raw budget,
-/// summarizes older messages via LLM into a narrative block,
-/// and archives full content to `.miniswe/session_archive.md`.
+/// If plan tool is enabled, first asks the model to update its plan.
+/// The actual compression uses the plan as an anchor for the summary.
 pub async fn maybe_compress(
     messages: &mut Vec<Message>,
     config: &Config,
     router: &ModelRouter,
     tool_def_tokens: usize,
+    plan_update_requested: &mut bool,
 ) {
     let context_window = config.model.context_window;
     // Subtract fixed overhead: tool definitions + output headroom
     let available = context_window.saturating_sub(tool_def_tokens).saturating_sub(context_window / 6);
     let raw_budget = available / 3;            // 1/3 of available for raw recent
     let summary_budget = available / 4;        // 1/4 of available for compressed summary
+
+    // If plan is enabled and we haven't asked for an update yet,
+    // ask the model to update its plan before compressing
+    if config.tools.plan && !*plan_update_requested {
+        let total: usize = messages.iter()
+            .filter(|m| m.role != "system")
+            .map(|m| estimate_tokens(m.content.as_deref().unwrap_or("")))
+            .sum();
+
+        if total > raw_budget {
+            // Inject plan update request instead of compressing
+            messages.push(Message::user(
+                "[Context is getting large. Before I compress, update your plan: \
+                 call plan(action='check', step=N) for any completed steps, \
+                 or plan(action='set') if the plan needs revision. \
+                 Then I'll compress and continue.]"
+            ));
+            *plan_update_requested = true;
+            return;
+        }
+    }
+
+    // Reset the flag — plan was updated (or not needed), proceed with compression
+    *plan_update_requested = false;
 
     // Count tokens in non-system messages (the conversation)
     let mut total_tokens = 0;
