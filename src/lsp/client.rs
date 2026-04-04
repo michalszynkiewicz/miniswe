@@ -42,7 +42,7 @@ impl LspClient {
             .with_context(|| format!("failed to get {} binary", server.name()))?;
 
         // Retry up to 3 times — rust-analyzer sometimes crashes on first start
-        let max_attempts = 3;
+        let max_attempts = 2;
         for attempt in 1..=max_attempts {
             match Self::try_spawn(&server, &binary_path, &project_root).await {
                 Ok(client) if client.is_ready() => return Ok(client),
@@ -341,8 +341,8 @@ async fn initialize(transport: &LspTransport, project_root: &Path) -> Result<()>
         }),
     )?;
 
-    // Wait for initialize response (up to 60s — first load can be slow)
-    let _response = tokio::time::timeout(Duration::from_secs(60), rx)
+    // Wait for initialize response (up to 30s)
+    let _response = tokio::time::timeout(Duration::from_secs(30), rx)
         .await
         .context("initialize timed out")?
         .context("channel closed")?;
