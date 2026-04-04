@@ -276,6 +276,26 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 }),
             },
         },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "revert".into(),
+                description: "Revert files to a previous state. Use when your changes broke something and you want to go back. Reverts are tracked per round — each round is automatically snapshotted.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "to_round": {
+                            "type": "integer",
+                            "description": "Round number to revert to (0 = session start). Omit to revert everything to session start."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Revert only this file (optional — omit to revert all files)"
+                        }
+                    }
+                }),
+            },
+        },
     ]
 }
 
