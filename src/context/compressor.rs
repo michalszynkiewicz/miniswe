@@ -118,7 +118,7 @@ pub async fn maybe_compress(
     messages.truncate(compress_start);
 
     messages.push(Message::user(&format!(
-        "[Session summary — {compress_count} messages compressed. Full archive: .miniswe/session_archive.md]\n{summary}"
+        "[Your earlier work in this session ({compress_count} messages compressed)]\n{summary}\n[Continue from where you left off. Do not re-introduce yourself or restart the task.]"
     )));
 
     messages.extend(after_split);
@@ -144,7 +144,7 @@ async fn llm_summarize_timeline(
         let content = msg.content.as_deref().unwrap_or("");
 
         // Skip existing summary messages
-        if content.starts_with("[Session summary") {
+        if content.starts_with("[Your earlier work") || content.starts_with("[Session summary") {
             continue;
         }
 
@@ -177,9 +177,8 @@ async fn llm_summarize_timeline(
     }
 
     let prompt = format!(
-        "Summarize this coding session timeline into a concise narrative.\n\
-         Include: what was attempted, key files discovered, changes made, \
-         errors encountered, and current state.\n\
+        "Summarize what YOU did in this coding session so far. Write in first person past tense.\n\
+         Include: what you changed, which files, what errors you hit, what's left to do.\n\
          Keep it under {} tokens. Use file:line references.\n\n\
          {timeline}",
         budget_tokens
@@ -259,7 +258,7 @@ fn archive_messages(messages: &[&Message], config: &Config) {
         let content = msg.content.as_deref().unwrap_or("");
 
         // Skip old summaries
-        if content.starts_with("[Session summary") {
+        if content.starts_with("[Your earlier work") || content.starts_with("[Session summary") {
             continue;
         }
 
