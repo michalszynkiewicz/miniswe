@@ -246,8 +246,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
-                name: "transform".into(),
-                description: "LLM-powered code transformation. Two modes: (1) PATTERN mode: provide 'find' to apply the same change to every occurrence (add/remove argument, rename). (2) BLOCK mode: provide 'start_line'+'end_line' to transform a specific range (wrap in if/else, restructure).".into(),
+                name: "replace_all".into(),
+                description: "Find and replace across a file. Two modes: (1) PATTERN: provide 'find' to apply the SAME instruction to ALL matching lines at once. Use the shortest common pattern. (2) BLOCK: provide 'start_line'+'end_line' to change a specific range.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {

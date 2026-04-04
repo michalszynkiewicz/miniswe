@@ -757,10 +757,10 @@ fn tools_config_disables_transform() {
     config.tools.transform = false;
 
     let mut defs = miniswe::tools::tool_definitions();
-    defs.retain(|t| t.function.name != "transform");
+    defs.retain(|t| t.function.name != "replace_all");
 
     let names: Vec<&str> = defs.iter().map(|t| t.function.name.as_str()).collect();
-    assert!(!names.contains(&"transform"), "should not have transform");
+    assert!(!names.contains(&"replace_all"), "should not have replace_all");
     assert!(names.contains(&"edit"), "should still have edit");
 }
 
