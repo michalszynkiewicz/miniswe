@@ -120,7 +120,6 @@ pub async fn maybe_compress(
     messages.push(Message::user(&format!(
         "[Session summary — {compress_count} messages compressed. Full archive: .miniswe/session_archive.md]\n{summary}"
     )));
-    messages.push(Message::assistant("Understood, continuing from where we left off."));
 
     messages.extend(after_split);
 }
