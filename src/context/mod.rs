@@ -295,6 +295,13 @@ pub fn assemble(
         }
     }
 
+    // Inject structured plan if it exists
+    if let Some(plan_content) = crate::tools::plan::load_plan(config) {
+        system_context.push_str("\n[PLAN]\n");
+        system_context.push_str(&plan_content);
+        system_context.push('\n');
+    }
+
     messages.push(Message::system(&system_context));
     used_tokens += estimate_tokens(&system_context);
 
