@@ -187,7 +187,8 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
                 if lsp.notify_file_changed(&abs_path).is_ok() {
                     let timeout = std::time::Duration::from_millis(config.lsp.diagnostic_timeout_ms);
                     let diags = lsp.get_diagnostics(&abs_path, timeout).await;
-                    if !diags.is_empty() || timeout.as_millis() >= config.lsp.diagnostic_timeout_ms as u128 {
+                    // Always proceed — get_diagnostics already waited for the timeout
+                    {
                         let errors: Vec<&lsp_types::Diagnostic> = diags.iter()
                             .filter(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
                             .collect();

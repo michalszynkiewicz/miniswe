@@ -170,7 +170,7 @@ async fn lsp_auto_check_integration() {
     let (_tmp, mut config) = helpers::create_test_project();
     create_rust_project(&config.project_root);
     config.lsp.enabled = true;
-    config.lsp.diagnostic_timeout_ms = 30000; // 30s for CI
+    config.lsp.diagnostic_timeout_ms = 5000; // 5s for tests
 
     let client = LspClient::spawn(config.project_root.clone())
         .await
