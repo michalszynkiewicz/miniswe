@@ -189,6 +189,13 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
     let mut messages = assembled.messages;
 
+    // Nudge the model to plan before editing (if plan tool is available)
+    if config.tools.plan {
+        messages.push(Message::user(
+            "[Before making changes, explore the codebase and use the plan tool to outline your approach. Check off steps as you complete them.]"
+        ));
+    }
+
     loop {
         if had_error {
             break;

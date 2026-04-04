@@ -59,6 +59,15 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         format!("✓ Wrote {path_str} ({new_lines} lines, {new_chars} chars, {diff} lines)\n")
     };
 
+    // Warn if file shrank dramatically — likely accidental truncation
+    if !is_new && old_lines > 50 && new_lines < old_lines / 2 {
+        output.push_str(&format!(
+            "⚠ WARNING: File shrank from {old_lines} to {new_lines} lines (lost {}). \
+             Did you include the COMPLETE file content? If not, use revert() to restore and try edit or replace_all instead.\n",
+            old_lines - new_lines
+        ));
+    }
+
     // Warn if file is getting large
     if new_lines > LARGE_FILE_WARNING {
         output.push_str(&format!(
