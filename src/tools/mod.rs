@@ -508,10 +508,6 @@ async fn lsp_project_diagnostics(config: &Config, lsp: &LspClient) -> Option<Too
         summary.push('\n');
         summary.push_str(&capped_output);
 
-        if error_count > 20 {
-            summary.push_str("\n\nNOTE: Many errors often mean a function signature was changed but call sites aren't updated yet. This is normal during a multi-file refactor. Use search() to find remaining call sites and update them.");
-        }
-
         let success = error_count == 0;
         Some(ToolResult { content: summary, success })
     }
