@@ -246,6 +246,27 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
+                name: "fix_file".into(),
+                description: "Apply a coding task to a file. Describe what needs to change and the tool reads the file, figures out which lines to edit, and applies the changes. Use for: updating function call sites, fixing errors across a file, applying a pattern change. Provide enough detail in the task for the changes to be unambiguous (types, parameter names, values).".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path relative to project root"
+                        },
+                        "task": {
+                            "type": "string",
+                            "description": "What to change and why. Be specific: include types, parameter names, values. E.g. 'Add system_prompt_override: Option<&str> as the 6th parameter to every call to context::assemble(), passing None for now.'"
+                        }
+                    },
+                    "required": ["path", "task"]
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
                 name: "replace_all".into(),
                 description: "Replace ALL occurrences of 'old' with 'new' in a file. Like edit but replaces EVERY match, not just one. Use for: updating all call sites after a signature change, renaming a variable everywhere, changing an import path. Deterministic — no LLM involved.".into(),
                 parameters: json!({

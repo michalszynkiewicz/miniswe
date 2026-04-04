@@ -51,6 +51,10 @@
 
 * **Progress reporting** — after each round, log: "Round N: [tool calls made] [files changed] [errors]" in a structured format. Helps with debugging and benchmark analysis.
 
+## Large file handling note
+
+`fix_file` uses windowing (800 lines per window, 100 line overlap) for files over 800 lines. For a 24B model at 32K context, reliable recall drops significantly beyond ~800 lines. Consider not supporting fix_file for files over ~1500 lines and falling back to manual edit/replace_all. The model can still use read_file with line ranges + edit for surgical changes on any file size.
+
 ## Architecture improvements
 
 * **Extract masking/compression to shared module** — run.rs and repl.rs duplicate masking logic. The unified compressor is only in run.rs. REPL still uses old per-type-count masking. Should share the compressor.
