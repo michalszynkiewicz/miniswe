@@ -178,8 +178,11 @@ async fn llm_summarize_timeline(
 
     let prompt = format!(
         "Summarize what YOU did in this coding session so far. Write in first person past tense.\n\
-         Include: what you changed, which files, what errors you hit, what's left to do.\n\
-         Keep it under {} tokens. Use file:line references.\n\n\
+         IMPORTANT: Preserve exact function signatures and type names you encountered.\n\
+         For each file you read or changed, include the actual function signatures.\n\
+         Example: 'I changed run.rs: pub async fn run(config: Config, msg: &str, plan_only: bool, headless: bool) to add system_prompt_override: Option<String>'\n\
+         Include: what you changed, what's left to do, any errors.\n\
+         Keep it under {} tokens.\n\n\
          {timeline}",
         budget_tokens
     );
