@@ -339,7 +339,7 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
 
 /// Run a check command with a timeout, draining pipes to prevent deadlock.
 /// Returns Some((success, stderr)) or None if the command couldn't be spawned.
-fn run_check_with_timeout(
+pub fn run_check_with_timeout(
     cmd: &str,
     args: &[String],
     project_root: &std::path::Path,
