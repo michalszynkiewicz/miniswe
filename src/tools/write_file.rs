@@ -42,10 +42,26 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         0
     };
 
+    // Block writes that would truncate >50% of an existing file.
+    // This prevents catastrophic data loss when the model sends partial content.
+    let new_lines = content.lines().count();
+    if !is_new && old_lines > 50 && new_lines < old_lines / 2 {
+        return Ok(ToolResult::err(format!(
+            "BLOCKED: This would truncate {path_str} from {old_lines} to {new_lines} lines \
+             (losing {} lines). This is almost certainly accidental — you probably forgot to \
+             include the complete file content.\n\
+             Options:\n\
+             1. Use edit() to change only the specific lines you need\n\
+             2. Use replace_all() for find-and-replace across the file\n\
+             3. Use read_file() first, then write_file() with the COMPLETE content\n\
+             4. If the file is already corrupted, use revert() to restore it",
+            old_lines - new_lines
+        )));
+    }
+
     // Write the file
     fs::write(&path, content)?;
 
-    let new_lines = content.lines().count();
     let new_chars = content.len();
 
     let mut output = if is_new {
@@ -58,15 +74,6 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         };
         format!("✓ Wrote {path_str} ({new_lines} lines, {new_chars} chars, {diff} lines)\n")
     };
-
-    // Warn if file shrank dramatically — likely accidental truncation
-    if !is_new && old_lines > 50 && new_lines < old_lines / 2 {
-        output.push_str(&format!(
-            "⚠ WARNING: File shrank from {old_lines} to {new_lines} lines (lost {}). \
-             Did you include the COMPLETE file content? If not, use revert() to restore and try edit or replace_all instead.\n",
-            old_lines - new_lines
-        ));
-    }
 
     // Warn if file is getting large
     if new_lines > LARGE_FILE_WARNING {
