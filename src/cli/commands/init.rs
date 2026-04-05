@@ -74,7 +74,11 @@ pub async fn run() -> Result<()> {
                  - Read compiler errors carefully — they usually contain the fix\n\
                  - Keep files under 200 lines; split into modules early\n\
                  - For async traits: use async-trait crate or return Pin<Box<dyn Future>>\n\
-                 - When writing trait impls: read the trait definition first to understand required methods\n\n",
+                 - When writing trait impls: read the trait definition first to understand required methods\n\
+                 - When changing a function signature, search for ALL callers including in tests/ directory before proceeding\n\
+                 - Run cargo test (not just cargo check) to verify — cargo check does NOT compile test targets\n\
+                 - When adding new struct fields or CLI flags, ADD alongside existing ones — never replace or remove existing fields\n\
+                 - Use edit() with minimal old/new text to add fields; do not include unrelated fields in the old text\n\n",
             );
         }
 

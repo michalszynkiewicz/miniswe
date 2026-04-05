@@ -113,7 +113,10 @@ impl ContextProvider for LessonsProvider {
         if content.contains("<!-- Accumulated tips") && content.lines().count() <= 5 {
             return None;
         }
-        if input.keywords.is_empty() {
+        // Short lessons files (< 2000 chars) are always injected in full —
+        // they're cheap and the keyword filter often misses relevant sections
+        // when section headings don't overlap with the user's phrasing.
+        if input.keywords.is_empty() || content.len() < 2000 {
             return Some(ContextBlock { header: "[LESSONS]", content });
         }
         // Extract only sections matching keywords
