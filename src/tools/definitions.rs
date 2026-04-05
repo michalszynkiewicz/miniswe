@@ -167,7 +167,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
-                name: "diagnostics".into(),
+                name: "plan".into(),
                 description: "Manage a structured plan. Actions: 'set' (create plan), 'check' (mark step done), 'show' (view plan).".into(),
                 parameters: json!({
                     "type": "object",
