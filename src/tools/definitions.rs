@@ -168,21 +168,47 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "plan".into(),
-                description: "Manage a structured plan. Actions: 'set' (create plan), 'check' (mark step done), 'show' (view plan).".into(),
+                description: "Manage a structured plan with compile gates. Actions: 'set' (create plan), 'check' (mark step done — runs cargo check if compile-gated), 'refine' (split a step into substeps), 'show' (view plan). Each step has compile: true (default) meaning cargo check must pass to check it off, or compile: false with a reason if the step intentionally leaves the tree broken.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "description": "One of: 'set' (create/replace plan), 'check' (mark a step complete), 'show' (view current plan)"
+                            "description": "One of: 'set', 'check', 'refine', 'show'"
                         },
                         "content": {
                             "type": "string",
-                            "description": "For action='set': the plan in markdown with '- [ ] step' checkboxes"
+                            "description": "For action='set': the plan in markdown with '- [ ] step [compile]' or '- [ ] step [no-compile: reason]' tags"
+                        },
+                        "steps": {
+                            "type": "array",
+                            "description": "For action='set': structured step list (alternative to content)",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "description": { "type": "string" },
+                                    "compile": { "type": "boolean", "description": "true (default) = cargo check must pass to complete this step. false = step intentionally leaves tree broken." },
+                                    "reason": { "type": "string", "description": "Required when compile=false: why the tree will be broken" }
+                                },
+                                "required": ["description"]
+                            }
                         },
                         "step": {
                             "type": "integer",
-                            "description": "For action='check': which step number to mark complete (1-indexed)"
+                            "description": "For action='check' or 'refine': which step number (1-indexed)"
+                        },
+                        "substeps": {
+                            "type": "array",
+                            "description": "For action='refine': substeps to replace the target step",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "description": { "type": "string" },
+                                    "compile": { "type": "boolean" },
+                                    "reason": { "type": "string" }
+                                },
+                                "required": ["description"]
+                            }
                         }
                     },
                     "required": ["action"]
