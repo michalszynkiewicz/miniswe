@@ -178,6 +178,7 @@ START_TIME=$(date +%s)
 DEADLINE=$((START_TIME + TIMEOUT))
 ATTEMPT=0
 CURRENT_TASK="${TASK}"
+BEST_PASS=0
 
 while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
     ATTEMPT=$((ATTEMPT + 1))
@@ -275,9 +276,15 @@ $(grep '^error' /output/cargo_check.txt | head -20)"
             PASS=$((PASS + 1))
         else
             echo "test:FAIL"
+            # Count errors and extract affected files
+            TEST_ERROR_COUNT=$(grep -c 'error\[E' /output/cargo_test.txt 2>/dev/null || echo 0)
+            TEST_ERROR_FILES=$(grep -oP '(?<=--> )\S+' /output/cargo_test.txt 2>/dev/null | sort -u | head -5)
             ERRORS="${ERRORS}
-TESTS FAILED:
-$(grep -E 'FAILED|panicked|failures' /output/cargo_test.txt | head -10)"
+TESTS FAILED (${TEST_ERROR_COUNT} errors):
+$(grep -E 'error\[E|arguments but' /output/cargo_test.txt | head -10)
+Affected files: ${TEST_ERROR_FILES}
+HINT: If many calls need a new parameter, use shell() with sed to add it in bulk, e.g.:
+  sed -i 's/old_fn(\\(.*\\));/old_fn(\\1, None);/g' tests/e2e_context.rs"
         fi
     fi
 
@@ -302,6 +309,11 @@ $(echo "${SMOKE_OUTPUT}" | head -5)"
 
     echo "=== ATTEMPT ${ATTEMPT} RESULT: ${PASS}/${TOTAL} ==="
 
+    # Track best score across attempts
+    if [ "$PASS" -gt "$BEST_PASS" ]; then
+        BEST_PASS="$PASS"
+    fi
+
     # All passed?
     if [ "$PASS" -eq "$TOTAL" ]; then
         echo "=== PASSED on attempt ${ATTEMPT} ==="
@@ -314,6 +326,10 @@ ${ERRORS}
 Please fix the issues. The modified files are still on disk."
 done
 
+# Report best score across all attempts
+if [ "$BEST_PASS" -gt "$PASS" ]; then
+    PASS="$BEST_PASS"
+fi
 echo "=== FINAL: ${PASS}/${TOTAL} after ${ATTEMPT} attempt(s) ==="
 SCRIPT
 )

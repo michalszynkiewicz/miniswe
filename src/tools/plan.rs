@@ -150,7 +150,7 @@ async fn run_compile_check(config: &Config) -> (bool, String) {
     let result = tokio::task::spawn_blocking(move || {
         super::run_check_with_timeout(
             "cargo",
-            &["check".into(), "--message-format=short".into()],
+            &["check".into(), "--tests".into(), "--message-format=short".into()],
             &project_root,
             30,
         )

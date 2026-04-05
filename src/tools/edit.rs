@@ -172,8 +172,27 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     // Detect function signature changes and nudge about call sites
     if old.contains("fn ") && new.contains("fn ") {
         if let Some(fn_name) = extract_fn_name(new) {
+            let (caller_count, caller_list) = find_callers(fn_name, config);
+            if caller_count > 0 {
+                output.push_str(&format!(
+                    "\n⚠ SIGNATURE CHANGED: Found {caller_count} call site(s) for `{fn_name}()` that need updating:\n  {caller_list}\n\
+                     Update ALL of these call sites now. For bulk updates, use shell() with sed.\n"
+                ));
+            }
+        }
+    }
+
+    // For .rs files, check bracket balance after edit — catches common
+    // mistakes like `});` instead of `));` in macro calls.
+    if path_str.ends_with(".rs") {
+        let full = edited_lines.join("\n");
+        let parens = full.matches('(').count() as i64 - full.matches(')').count() as i64;
+        let braces = full.matches('{').count() as i64 - full.matches('}').count() as i64;
+        if parens != 0 || braces != 0 {
             output.push_str(&format!(
-                "\nIMPORTANT: You changed a function signature. Use search(\"{fn_name}\") to find ALL call sites and update them.\n"
+                "\n⚠ WARNING: {path_str} has unbalanced delimiters after this edit \
+                 (parens: {parens:+}, braces: {braces:+}). This will cause a compile error. \
+                 Fix immediately — check for `}})` vs `))` in macro calls.\n"
             ));
         }
     }
@@ -325,6 +344,37 @@ fn extract_fn_name(text: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Quick grep to find all call sites of `fn_name(` in src/ and tests/.
+/// Returns (count, list of file:line locations).
+fn find_callers(fn_name: &str, config: &Config) -> (usize, String) {
+    let pattern = format!("{}(", fn_name);
+    let root = &config.project_root;
+    let mut locations = Vec::new();
+    for dir in &["src", "tests"] {
+        let dir_path = root.join(dir);
+        if !dir_path.exists() { continue; }
+        if let Ok(output) = std::process::Command::new("grep")
+            .args(["-rn", "--include=*.rs", &pattern])
+            .arg(&dir_path)
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                // Strip the project root prefix for cleaner output
+                let clean = line.strip_prefix(&format!("{}/", root.display()))
+                    .unwrap_or(line);
+                // Skip the definition itself (contains "fn ")
+                if !clean.contains("fn ") {
+                    locations.push(clean.to_string());
+                }
+            }
+        }
+    }
+    let count = locations.len();
+    let list = locations.into_iter().take(20).collect::<Vec<_>>().join("\n  ");
+    (count, list)
 }
 
 fn resolve_path(path_str: &str, config: &Config) -> PathBuf {
