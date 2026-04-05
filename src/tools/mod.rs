@@ -4,6 +4,7 @@
 //! root. Destructive actions (shell, web, MCP) require user permission.
 //! After file edits, the index is incrementally updated.
 
+mod describe_code;
 mod edit;
 mod read_file;
 mod read_symbol;
@@ -152,6 +153,7 @@ pub async fn execute_tool(
             web::fetch(args, config).await
         }
         "docs_lookup" => web::docs_lookup(args, config).await,
+        "describe_code" => describe_code::execute(args, config).await,
         "get_repo_map" => {
             let keywords_str = args["keywords"].as_str().unwrap_or("");
             context_tool_repo_map(keywords_str, config)

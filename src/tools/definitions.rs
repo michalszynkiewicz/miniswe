@@ -400,7 +400,7 @@ pub fn context_tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "get_repo_map".into(),
-                description: "Get the project's code structure: files ranked by importance with function/type signatures.".into(),
+                description: "Get the project's code structure: files ranked by importance with function/type signatures. Use describe_code for details on specific files.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -409,6 +409,27 @@ pub fn context_tool_definitions() -> Vec<ToolDefinition> {
                             "description": "Space-separated keywords to focus the map on (e.g. 'config cli run'). Optional — omit for full overview."
                         }
                     }
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "describe_code".into(),
+                description: "Get detailed descriptions for a file's functions and types: doc comments, parameter details, what each symbol does. Use after get_repo_map to understand specific files before reading them.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path relative to project root"
+                        },
+                        "symbols": {
+                            "type": "string",
+                            "description": "Comma-separated symbol names to describe (optional — omit for all symbols in the file)"
+                        }
+                    },
+                    "required": ["path"]
                 }),
             },
         },

@@ -41,7 +41,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
     {
         let mut disabled = Vec::new();
         if !config.tools.context_tools {
-            disabled.extend_from_slice(&["get_repo_map", "get_project_info", "get_architecture_notes"]);
+            disabled.extend_from_slice(&["get_repo_map", "get_project_info", "get_architecture_notes", "describe_code"]);
         }
         if !config.tools.transform { disabled.push("replace_all"); }
         if !config.tools.web_tools { disabled.extend_from_slice(&["web_search", "web_fetch", "docs_lookup"]); }
