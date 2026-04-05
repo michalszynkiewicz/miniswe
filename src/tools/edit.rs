@@ -67,7 +67,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
                 let marker = if i >= start && i < start + new_lines.len() { "+" } else { " " };
                 output.push_str(&format!("{marker}{:>4}│{}\n", i + 1, edited_lines[i]));
             }
-            output.push_str("Note: matched with normalized whitespace — your 'old' text had different indentation.\n");
+            output.push_str("Note: matched with fuzzy/normalized matching — your 'old' text didn't match exactly.\n");
             if total_lines < 200 {
                 output.push_str(&format!(
                     "Note: {path_str} is {total_lines} lines. For multiple changes, use write_file to rewrite the whole file in one call.\n"
@@ -182,18 +182,133 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 }
 
 /// Find a whitespace-normalized match of `old_lines` in `content_lines`.
+///
+/// Uses a layered matching strategy (inspired by Aider):
+/// 1. Exact whitespace-trimmed match (existing behavior)
+/// 2. Indentation-preserving match (same content, different indent level)
+/// 3. Fuzzy match via line similarity (handles minor hallucinations)
 fn find_normalized_match(content_lines: &[&str], old_lines: &[&str]) -> Option<usize> {
     if old_lines.is_empty() { return None; }
-    let max = content_lines.len().saturating_sub(old_lines.len().saturating_sub(1));
-    'outer: for i in 0..max {
+    let old_len = old_lines.len();
+    let max = content_lines.len().saturating_sub(old_len.saturating_sub(1));
+
+    // Layer 1: Exact trimmed match
+    'exact: for i in 0..max {
         for (j, old_line) in old_lines.iter().enumerate() {
             if content_lines[i + j].trim() != old_line.trim() {
-                continue 'outer;
+                continue 'exact;
             }
         }
         return Some(i);
     }
+
+    // Layer 2: Indentation-preserving match — same stripped content but
+    // with a consistent indent delta across all lines
+    'indent: for i in 0..max {
+        let mut delta: Option<isize> = None;
+        for (j, old_line) in old_lines.iter().enumerate() {
+            let content_stripped = content_lines[i + j].trim();
+            let old_stripped = old_line.trim();
+            if content_stripped != old_stripped {
+                continue 'indent;
+            }
+            // Check indent consistency (skip blank lines)
+            if !old_stripped.is_empty() {
+                let content_indent = content_lines[i + j].len() - content_lines[i + j].trim_start().len();
+                let old_indent = old_line.len() - old_line.trim_start().len();
+                let d = content_indent as isize - old_indent as isize;
+                match delta {
+                    None => delta = Some(d),
+                    Some(existing) if existing != d => continue 'indent,
+                    _ => {}
+                }
+            }
+        }
+        // Layer 2 only matches if indent delta is non-zero (layer 1 already handles zero)
+        if delta.unwrap_or(0) != 0 {
+            return Some(i);
+        }
+    }
+
+    // Layer 3: Fuzzy match — allow minor per-line differences (typos, small
+    // hallucinations). Require ≥80% of lines to match exactly (trimmed) and
+    // the remaining lines to be ≥60% similar by character overlap.
+    if old_len >= 3 {
+        let mut best_pos = None;
+        let mut best_score: f64 = 0.0;
+        let match_threshold = 0.80; // 80% of lines must be exact
+        let similarity_threshold = 0.60; // non-exact lines must be ≥60% similar
+        let overall_threshold = 0.90; // weighted score must be ≥90%
+
+        for i in 0..max {
+            let mut exact_count = 0;
+            let mut sim_sum: f64 = 0.0;
+            let mut all_above_threshold = true;
+
+            for (j, old_line) in old_lines.iter().enumerate() {
+                let content_trimmed = content_lines[i + j].trim();
+                let old_trimmed = old_line.trim();
+
+                if content_trimmed == old_trimmed {
+                    exact_count += 1;
+                    sim_sum += 1.0;
+                } else {
+                    let sim = line_similarity(content_trimmed, old_trimmed);
+                    if sim < similarity_threshold {
+                        all_above_threshold = false;
+                        break;
+                    }
+                    sim_sum += sim;
+                }
+            }
+
+            if !all_above_threshold {
+                continue;
+            }
+
+            let exact_ratio = exact_count as f64 / old_len as f64;
+            let overall_score = sim_sum / old_len as f64;
+
+            if exact_ratio >= match_threshold && overall_score >= overall_threshold && overall_score > best_score {
+                best_score = overall_score;
+                best_pos = Some(i);
+            }
+        }
+
+        if best_pos.is_some() {
+            return best_pos;
+        }
+    }
+
     None
+}
+
+/// Character-level similarity between two strings (Dice coefficient on bigrams).
+/// Returns 0.0 for completely different, 1.0 for identical.
+fn line_similarity(a: &str, b: &str) -> f64 {
+    if a == b { return 1.0; }
+    if a.is_empty() || b.is_empty() { return 0.0; }
+    if a.len() == 1 || b.len() == 1 {
+        return if a == b { 1.0 } else { 0.0 };
+    }
+
+    let bigrams_a: Vec<(char, char)> = a.chars().zip(a.chars().skip(1)).collect();
+    let bigrams_b: Vec<(char, char)> = b.chars().zip(b.chars().skip(1)).collect();
+
+    let mut matches = 0;
+    let mut used = vec![false; bigrams_b.len()];
+
+    for ba in &bigrams_a {
+        for (j, bb) in bigrams_b.iter().enumerate() {
+            if !used[j] && ba == bb {
+                matches += 1;
+                used[j] = true;
+                break;
+            }
+        }
+    }
+
+    (2.0 * matches as f64) / (bigrams_a.len() + bigrams_b.len()) as f64
 }
 
 /// Extract a function name from text containing "fn name(...)".
