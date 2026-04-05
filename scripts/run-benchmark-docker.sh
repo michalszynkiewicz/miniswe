@@ -333,12 +333,15 @@ SCRIPT
     # - Output dir mounted as /output
     # - Network host for LLM access
     # - Timeout on the container itself
+    # Remove stale endpoint if it exists
+    docker rm -f "miniswe-bench-${name}" 2>/dev/null || true
+
     docker run --rm \
         --network=host \
         -v "${variant_dir}:/output" \
         -v "${variant_dir}/config.toml:/config/config.toml:ro" \
         -v "${tmp_script}:/run.sh:ro" \
-        --name "miniswe-bench-${name}" \
+        --name "miniswe-bench-${name}-$$" \
         "${IMAGE_NAME}" \
         bash /run.sh "${BASELINE_SHA}" "${TASK}" "${TIMEOUT}" \
         2>&1 | tee "${variant_dir}/container.log"
