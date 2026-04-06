@@ -700,8 +700,8 @@ async fn replace_all_missing_params() {
     fs::write(helpers::project_path(&config, "test.rs"), "fn main() {}\n").unwrap();
 
     // Missing old
-    let args = json!({"path": "test.rs", "new": "replacement"});
-    let result = miniswe::tools::transform::execute(&args, &config).await.unwrap();
+    let args = json!({"path": "test.rs", "new": "replacement", "all": true});
+    let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
     assert!(!result.success);
     assert!(result.content.contains("old"));
 }
@@ -712,8 +712,8 @@ async fn replace_all_not_found() {
 
     fs::write(helpers::project_path(&config, "target.rs"), "fn main() {}\n").unwrap();
 
-    let args = json!({"path": "target.rs", "old": "nonexistent", "new": "replacement"});
-    let result = miniswe::tools::transform::execute(&args, &config).await.unwrap();
+    let args = json!({"path": "target.rs", "old": "nonexistent", "new": "replacement", "all": true});
+    let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
     assert!(!result.success);
     assert!(result.content.contains("not found"));
 }
@@ -725,8 +725,8 @@ async fn replace_all_replaces_every_occurrence() {
     let content = "foo(1);\nfoo(2);\nbar();\nfoo(3);\n";
     fs::write(helpers::project_path(&config, "multi.rs"), content).unwrap();
 
-    let args = json!({"path": "multi.rs", "old": "foo(", "new": "baz("});
-    let result = miniswe::tools::transform::execute(&args, &config).await.unwrap();
+    let args = json!({"path": "multi.rs", "old": "foo(", "new": "baz(", "all": true});
+    let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
 
     assert!(result.success);
     assert!(result.content.contains("3 occurrence"), "should replace 3: {}", result.content);
@@ -744,8 +744,8 @@ async fn replace_all_for_adding_argument() {
     let content = "assemble(&config, \"test\", &[], false, None);\nassemble(&config, \"hello\", &[], true, None);\n";
     fs::write(helpers::project_path(&config, "calls.rs"), content).unwrap();
 
-    let args = json!({"path": "calls.rs", "old": "assemble(&config,", "new": "assemble(&config, override_prompt,"});
-    let result = miniswe::tools::transform::execute(&args, &config).await.unwrap();
+    let args = json!({"path": "calls.rs", "old": "assemble(&config,", "new": "assemble(&config, override_prompt,", "all": true});
+    let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
 
     assert!(result.success);
     assert!(result.content.contains("2 occurrence"), "should replace 2: {}", result.content);
@@ -774,25 +774,20 @@ fn tools_config_disables_context_tools() {
 }
 
 #[test]
-fn tools_config_disables_transform() {
-    let mut config = miniswe::config::Config::default();
-    config.tools.transform = false;
-
-    let mut defs = miniswe::tools::tool_definitions();
-    defs.retain(|t| t.function.name != "replace_all");
-
-    let names: Vec<&str> = defs.iter().map(|t| t.function.name.as_str()).collect();
-    assert!(!names.contains(&"replace_all"), "should not have replace_all");
-    assert!(names.contains(&"edit"), "should still have edit");
-}
-
-#[test]
 fn tools_config_all_enabled_by_default() {
     let config = miniswe::config::Config::default();
     assert!(config.tools.context_tools);
     assert!(config.tools.lsp_tools);
-    assert!(config.tools.transform);
     assert!(config.tools.web_tools);
+}
+
+#[test]
+fn tools_has_replace_not_replace_all() {
+    let defs = miniswe::tools::tool_definitions();
+    let names: Vec<&str> = defs.iter().map(|t| t.function.name.as_str()).collect();
+    assert!(names.contains(&"replace"), "should have replace");
+    assert!(!names.contains(&"replace_all"), "replace_all should be gone");
+    assert!(!names.contains(&"edit"), "edit should be renamed to replace");
 }
 
 // ── dynamic tool output budget ────────────────────────────────────

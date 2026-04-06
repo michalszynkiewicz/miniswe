@@ -43,8 +43,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         if !config.tools.context_tools {
             disabled.extend_from_slice(&["get_repo_map", "get_project_info", "get_architecture_notes"]);
         }
-        if !config.tools.transform { disabled.push("replace_all"); }
-        if !config.tools.web_tools { disabled.extend_from_slice(&["web_search", "web_fetch", "docs_lookup"]); }
+if !config.tools.web_tools { disabled.extend_from_slice(&["web_search", "web_fetch"]); }
         if !config.tools.plan { disabled.push("plan"); }
         if !config.tools.scratchpad { disabled.push("task_update"); }
         tool_defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
@@ -613,7 +612,7 @@ async fn run_agent_loop(
 
             // Successful edit/write = code changed, reset loop detector
             if result.success
-                && (tc.function.name == "edit" || tc.function.name == "write_file")
+                && (tc.function.name == "replace" || tc.function.name == "write_file")
             {
                 recent_calls.clear();
             }
@@ -724,13 +723,12 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                 _ => path.to_string(),
             }
         }
-        "read_symbol" => args["name"].as_str().unwrap_or("?").to_string(),
         "search" => {
             let query = args["query"].as_str().unwrap_or("?");
             let scope = args["scope"].as_str().unwrap_or("project");
             format!("\"{query}\" in {scope}")
         }
-        "edit" | "write_file" => args["path"].as_str().unwrap_or("?").to_string(),
+        "replace" | "write_file" => args["path"].as_str().unwrap_or("?").to_string(),
         "shell" => {
             let cmd = args["command"].as_str().unwrap_or("?");
             crate::truncate_chars(cmd, 47)
@@ -738,11 +736,6 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
         "task_update" => "scratchpad".to_string(),
         "web_search" => args["query"].as_str().unwrap_or("?").to_string(),
         "web_fetch" => args["url"].as_str().unwrap_or("?").to_string(),
-        "docs_lookup" => {
-            let lib = args["library"].as_str().unwrap_or("?");
-            let topic = args["topic"].as_str().unwrap_or("");
-            if topic.is_empty() { lib.to_string() } else { format!("{lib}/{topic}") }
-        }
         "mcp_use" => {
             let server = args["server"].as_str().unwrap_or("?");
             let tool = args["tool"].as_str().unwrap_or("?");

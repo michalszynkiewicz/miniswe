@@ -445,11 +445,6 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
                 )
             }
         }
-        "read_symbol" => {
-            let name = args["name"].as_str().unwrap_or("?");
-            let line_count = content.lines().count();
-            format!("[symbol:{name}→{line_count}L]")
-        }
         "search" => {
             let query = args["query"].as_str().unwrap_or("?");
             let match_count = content
@@ -458,7 +453,7 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
                 .count();
             format!("[search:\"{query}\"→{match_count} matches]")
         }
-        "edit" => {
+        "replace" => {
             let path = args["path"].as_str().unwrap_or("?");
             if content.contains('✓') {
                 // Check if diagnostics found errors after the edit
@@ -467,16 +462,16 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
                         .filter(|l| l.contains("error"))
                         .take(2)
                         .collect();
-                    format!("[edit:{path}→ok but errors: {}]", errors.join("; "))
+                    format!("[replace:{path}→ok but errors: {}]", errors.join("; "))
                 } else {
-                    format!("[edit:{path}→ok]")
+                    format!("[replace:{path}→ok]")
                 }
             } else {
                 let reason = content.lines()
                     .find(|l| l.contains("not found") || l.contains("matches"))
                     .map(|l| crate::truncate_chars(l.trim(), 60))
                     .unwrap_or_else(|| "unknown".into());
-                format!("[edit:{path}→FAILED: {reason}]")
+                format!("[replace:{path}→FAILED: {reason}]")
             }
         }
         "write_file" => {
@@ -523,11 +518,7 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
             let char_count = content.len();
             format!("[web_fetch:{url}→{char_count}chars]")
         }
-        "docs_lookup" => {
-            let lib = args["library"].as_str().unwrap_or("?");
-            format!("[docs:{lib}→found]")
-        }
-        "mcp_use" => {
+"mcp_use" => {
             let server = args["server"].as_str().unwrap_or("?");
             let tool = args["tool"].as_str().unwrap_or("?");
             let chars = content.len();

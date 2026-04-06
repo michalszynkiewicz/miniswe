@@ -51,8 +51,8 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
              (losing {} lines). This is almost certainly accidental — you probably forgot to \
              include the complete file content.\n\
              Options:\n\
-             1. Use edit() to change only the specific lines you need\n\
-             2. Use replace_all() for find-and-replace across the file\n\
+             1. Use replace() to change only the specific lines you need\n\
+             2. Use replace(all=true) for find-and-replace across the file\n\
              3. Use read_file() first, then write_file() with the COMPLETE content\n\
              4. If the file is already corrupted, use revert() to restore it",
             old_lines - new_lines

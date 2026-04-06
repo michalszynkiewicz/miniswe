@@ -38,22 +38,5 @@ pub enum Command {
         message: String,
     },
 
-    /// Manage documentation cache
-    Docs {
-        #[command(subcommand)]
-        subcommand: DocsSubcommand,
-    },
 }
 
-#[derive(Subcommand, Debug)]
-pub enum DocsSubcommand {
-    /// Add a documentation source
-    Add {
-        /// URL to fetch docs from (e.g., https://docs.astro.build/llms.txt)
-        url: String,
-    },
-    /// List cached documentation
-    List,
-    /// Refresh all cached docs
-    Refresh,
-}

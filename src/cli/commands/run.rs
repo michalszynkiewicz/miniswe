@@ -43,11 +43,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         if !config.tools.context_tools {
             d.extend_from_slice(&["get_repo_map", "get_project_info", "get_architecture_notes"]);
         }
-        if !config.tools.transform {
-            d.push("replace_all");
-        }
-        if !config.tools.web_tools {
-            d.extend_from_slice(&["web_search", "web_fetch", "docs_lookup"]);
+if !config.tools.web_tools {
+            d.extend_from_slice(&["web_search", "web_fetch"]);
         }
         if !config.tools.plan {
             d.push("plan");
@@ -401,7 +398,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
             // Block edit tools in plan-only mode
             if plan_only
-                && (tc.function.name == "edit"
+                && (tc.function.name == "replace"
                     || tc.function.name == "write_file"
                     || tc.function.name == "shell")
             {
@@ -418,7 +415,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             // Write gating: require plan before write tools
             if config.tools.plan
                 && !tools::plan::plan_exists(&config)
-                && matches!(tc.function.name.as_str(), "edit" | "write_file" | "replace_all" | "fix_file")
+                && matches!(tc.function.name.as_str(), "replace" | "write_file" | "fix_file")
             {
                 let result_msg = Message::tool_result(
                     &tc.id,
@@ -458,11 +455,6 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("fix_file error: {e}")),
                 }
-            } else if tc.function.name == "replace_all" {
-                match tools::transform::execute(&args, &config).await {
-                    Ok(r) => r,
-                    Err(e) => crate::tools::ToolResult::err(format!("replace_all error: {e}")),
-                }
             } else if tc.function.name == "mcp_use" {
                 let server = args["server"].as_str().unwrap_or("");
                 let tool = args["tool"].as_str().unwrap_or("");
@@ -494,7 +486,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
             // A successful edit/write means code changed — reset trackers.
             if result.success
-                && (tc.function.name == "edit" || tc.function.name == "write_file")
+                && (tc.function.name == "replace" || tc.function.name == "write_file")
             {
                 recent_calls.clear();
                 calls_since_last_edit = 0;
@@ -503,7 +495,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             }
 
             // Track edit failures per file — suggest write_file after 2 failures
-            if tc.function.name == "edit" && !result.success {
+            if tc.function.name == "replace" && !result.success {
                 let path = args["path"].as_str().unwrap_or("").to_string();
                 let count = edit_fail_count.entry(path.clone()).or_insert(0);
                 *count += 1;
@@ -567,13 +559,12 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                 _ => path.to_string(),
             }
         }
-        "read_symbol" => args["name"].as_str().unwrap_or("?").to_string(),
         "search" => {
             let query = args["query"].as_str().unwrap_or("?");
             let scope = args["scope"].as_str().unwrap_or("project");
             format!("\"{query}\" in {scope}")
         }
-        "edit" | "write_file" => {
+        "replace" | "write_file" => {
             let path = args["path"].as_str().unwrap_or("?");
             format!("{path}")
         }
@@ -584,15 +575,6 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
         "task_update" => "scratchpad".to_string(),
         "web_search" => args["query"].as_str().unwrap_or("?").to_string(),
         "web_fetch" => args["url"].as_str().unwrap_or("?").to_string(),
-        "docs_lookup" => {
-            let lib = args["library"].as_str().unwrap_or("?");
-            let topic = args["topic"].as_str().unwrap_or("");
-            if topic.is_empty() {
-                lib.to_string()
-            } else {
-                format!("{lib}/{topic}")
-            }
-        }
         "mcp_use" => {
             let server = args["server"].as_str().unwrap_or("?");
             let tool = args["tool"].as_str().unwrap_or("?");

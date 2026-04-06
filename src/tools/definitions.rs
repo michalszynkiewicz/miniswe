@@ -34,27 +34,6 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
-                name: "read_symbol".into(),
-                description: "Read a function, class, or type definition by name.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Symbol name to look up"
-                        },
-                        "follow_deps": {
-                            "type": "boolean",
-                            "description": "Also include type definitions this symbol depends on"
-                        }
-                    },
-                    "required": ["name"]
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
                 name: "search".into(),
                 description: "Search the codebase for text or patterns. Returns matching lines with file:line context.".into(),
                 parameters: json!({
@@ -83,8 +62,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
-                name: "edit".into(),
-                description: "Replace one occurrence of 'old' with 'new' in a file. The 'old' text must match exactly and uniquely.".into(),
+                name: "replace".into(),
+                description: "Replace text in a file. Default: replaces one unique occurrence with fuzzy fallback. Set all=true to replace every occurrence (rename, find-and-replace).".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -99,6 +78,10 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "new": {
                             "type": "string",
                             "description": "Replacement text"
+                        },
+                        "all": {
+                            "type": "boolean",
+                            "description": "If true, replace every occurrence instead of requiring a unique match"
                         }
                     },
                     "required": ["path", "old", "new"]
@@ -276,27 +259,6 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
-                name: "docs_lookup".into(),
-                description: "Search cached local documentation for a library.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "library": {
-                            "type": "string",
-                            "description": "Library name (e.g., 'prisma', 'next')"
-                        },
-                        "topic": {
-                            "type": "string",
-                            "description": "Specific topic to search for (optional)"
-                        }
-                    },
-                    "required": ["library"]
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
                 name: "fix_file".into(),
                 description: "Describe a change and it gets applied across the file. Provide specific details (types, parameter names, values).".into(),
                 parameters: json!({
@@ -312,31 +274,6 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         }
                     },
                     "required": ["path", "task"]
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "replace_all".into(),
-                description: "Replace ALL occurrences of 'old' with 'new' in a file.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path relative to project root"
-                        },
-                        "old": {
-                            "type": "string",
-                            "description": "Exact text to find (every occurrence will be replaced)"
-                        },
-                        "new": {
-                            "type": "string",
-                            "description": "Replacement text"
-                        }
-                    },
-                    "required": ["path", "old", "new"]
                 }),
             },
         },

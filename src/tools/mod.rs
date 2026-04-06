@@ -4,16 +4,14 @@
 //! root. Destructive actions (shell, web, MCP) require user permission.
 //! After file edits, the index is incrementally updated.
 
-mod edit;
+pub mod edit;
 mod read_file;
-mod read_symbol;
 mod search;
 mod shell;
 mod task_update;
 pub mod fix_file;
 pub mod plan;
 pub mod snapshots;
-pub mod transform;
 mod web;
 mod write_file;
 
@@ -74,9 +72,8 @@ pub async fn execute_tool(
             }
             read_file::execute(args, config).await
         }
-        "read_symbol" => read_symbol::execute(args, config).await,
         "search" => search::execute(args, config).await,
-        "edit" => {
+        "replace" => {
             let path = args["path"].as_str().unwrap_or("");
             if let Err(e) = perms.resolve_and_check_path(path) {
                 return Ok(ToolResult::err(e));
@@ -151,8 +148,7 @@ pub async fn execute_tool(
             }
             web::fetch(args, config).await
         }
-        "docs_lookup" => web::docs_lookup(args, config).await,
-        "get_repo_map" => {
+"get_repo_map" => {
             let keywords_str = args["keywords"].as_str().unwrap_or("");
             context_tool_repo_map(keywords_str, config)
         }
