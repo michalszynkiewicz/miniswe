@@ -467,10 +467,14 @@ fn read_source_context(
 
 /// Gather project-wide diagnostics from LSP.
 async fn lsp_project_diagnostics(config: &Config, lsp: &LspClient) -> Option<ToolResult> {
-    // Trigger a full check by notifying on Cargo.toml (forces re-analysis)
-    let cargo_toml = config.project_root.join("Cargo.toml");
-    if cargo_toml.exists() {
-        let _ = lsp.notify_file_changed(&cargo_toml);
+    // Trigger a full check by notifying on a project config file (forces re-analysis)
+    let config_files = ["Cargo.toml", "tsconfig.json", "package.json", "go.mod", "pyproject.toml", "pom.xml", "build.gradle"];
+    for name in config_files {
+        let path = config.project_root.join(name);
+        if path.exists() {
+            let _ = lsp.notify_file_changed(&path);
+            break;
+        }
     }
 
     let timeout = std::time::Duration::from_millis(config.lsp.diagnostic_timeout_ms);
@@ -497,14 +501,14 @@ async fn lsp_project_diagnostics(config: &Config, lsp: &LspClient) -> Option<Too
     }
 
     if output.is_empty() {
-        Some(ToolResult::ok("[rust-analyzer] No errors or warnings".into()))
+        Some(ToolResult::ok("[lsp] No errors or warnings".into()))
     } else {
         // Cap output to first 10 errors — the model can't fix 290 at once
         let capped_output: String = output.lines().take(10).collect::<Vec<_>>().join("\n");
         let shown = capped_output.lines().count();
         let total = output.lines().count();
 
-        let mut summary = format!("[rust-analyzer] {error_count} error(s), {warning_count} warning(s)");
+        let mut summary = format!("[lsp] {error_count} error(s), {warning_count} warning(s)");
         if total > shown {
             summary.push_str(&format!(" (showing first {shown})"));
         }

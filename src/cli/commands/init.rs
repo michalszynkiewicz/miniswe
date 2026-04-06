@@ -63,25 +63,6 @@ pub async fn run() -> Result<()> {
     if !lessons_path.exists() {
         let mut lessons = String::from("# Lessons\n\n");
 
-        // Seed Rust lessons if Cargo.toml exists
-        if root.join("Cargo.toml").exists() {
-            lessons.push_str(
-                "## Rust\n\
-                 - Return Result<T, E> in library code, never unwrap\n\
-                 - Prefer impl Trait over dyn Trait in function arguments\n\
-                 - Use thiserror for library error types, anyhow for applications\n\
-                 - When borrow checker rejects code: try Clone, Arc, or restructure ownership before adding lifetimes\n\
-                 - Read compiler errors carefully — they usually contain the fix\n\
-                 - Keep files under 200 lines; split into modules early\n\
-                 - For async traits: use async-trait crate or return Pin<Box<dyn Future>>\n\
-                 - When writing trait impls: read the trait definition first to understand required methods\n\
-                 - When changing a function signature, search for ALL callers including in tests/ directory before proceeding\n\
-                 - Run cargo test (not just cargo check) to verify — cargo check does NOT compile test targets\n\
-                 - When adding new struct fields or CLI flags, ADD alongside existing ones — never replace or remove existing fields\n\
-                 - Use edit() with minimal old/new text to add fields; do not include unrelated fields in the old text\n\n",
-            );
-        }
-
         fs::write(&lessons_path, &lessons)?;
         tui::print_status("  Created lessons.md");
     }

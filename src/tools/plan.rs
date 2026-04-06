@@ -143,23 +143,38 @@ fn validate_steps(steps: &[Step]) -> Result<(), String> {
 /// Max total plan steps.
 const MAX_PLAN_STEPS: usize = 30;
 
-/// Run the project-level compile check (`cargo check` or equivalent).
+/// Run the project-level compile check (language-agnostic).
 /// Returns (success, output).
 async fn run_compile_check(config: &Config) -> (bool, String) {
     let project_root = config.project_root.clone();
+
+    // Detect language from project markers
+    let (cmd, args): (&str, Vec<String>) =
+        if project_root.join("Cargo.toml").exists() {
+            ("cargo", vec!["check".into(), "--tests".into(), "--message-format=short".into()])
+        } else if project_root.join("tsconfig.json").exists() || project_root.join("package.json").exists() {
+            ("npx", vec!["tsc".into(), "--noEmit".into(), "--pretty".into(), "false".into()])
+        } else if project_root.join("go.mod").exists() {
+            ("go", vec!["build".into(), "./...".into()])
+        } else if project_root.join("pyproject.toml").exists() || project_root.join("setup.py").exists() {
+            ("python3", vec!["-m".into(), "py_compile".into()])
+        } else if project_root.join("pom.xml").exists() {
+            ("mvn", vec!["compile".into(), "-q".into()])
+        } else if project_root.join("build.gradle").exists() {
+            ("gradle", vec!["compileJava".into(), "-q".into()])
+        } else {
+            return (true, "No recognized build system — skipping compile check.".into());
+        };
+
+    let cmd = cmd.to_string();
     let result = tokio::task::spawn_blocking(move || {
-        super::run_check_with_timeout(
-            "cargo",
-            &["check".into(), "--tests".into(), "--message-format=short".into()],
-            &project_root,
-            30,
-        )
+        super::run_check_with_timeout(&cmd, &args, &project_root, 30)
     })
     .await;
 
     match result {
         Ok(Some((success, output))) => (success, output),
-        Ok(None) => (false, "Could not run cargo check (not available?)".into()),
+        Ok(None) => (false, "Compile check not available or timed out.".into()),
         Err(e) => (false, format!("Check task failed: {e}")),
     }
 }

@@ -91,7 +91,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let lsp_client: Option<Arc<LspClient>> = if config.lsp.enabled {
         match LspClient::spawn(config.project_root.clone()).await {
             Ok(client) => {
-                tui::print_status("LSP: rust-analyzer starting...");
+                tui::print_status("LSP: starting...");
                 Some(Arc::new(client))
             }
             Err(e) => {
@@ -194,7 +194,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     if config.tools.plan {
         messages.push(Message::user(
             "[Before making changes, explore the codebase and use the plan tool to outline your approach. \
-             Each step has compile: true (default) — cargo check must pass to check it off. \
+             Each step has compile: true (default) — the compiler must pass to check it off. \
              Set compile: false with a reason only if a step intentionally breaks the tree (e.g. renaming a function before updating callers). \
              If a step proves too complex, use action='refine' to split it into substeps. \
              Check off steps as you complete them.]"
