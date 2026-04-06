@@ -62,7 +62,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Plain text to search for (e.g. 'fn assemble' or 'max_rounds'). No escaping needed."
+                            "description": "Plain text to search for (e.g. 'assemble' or 'max_rounds'). No escaping needed."
                         },
                         "pattern": {
                             "type": "string",
@@ -168,7 +168,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "plan".into(),
-                description: "Manage a structured plan with compile gates. Actions: 'set' (create plan), 'check' (mark step done — runs cargo check if compile-gated), 'refine' (split a step into substeps), 'show' (view plan). Each step has compile: true (default) meaning cargo check must pass to check it off, or compile: false with a reason if the step intentionally leaves the tree broken.".into(),
+                description: "Manage a structured plan with compile gates. Actions: 'set' (create plan), 'check' (mark step done — runs the project's type checker/compiler if compile-gated), 'refine' (split a step into substeps), 'show' (view plan). Each step has compile: true (default) meaning the compiler must pass to check it off, or compile: false with a reason if the step intentionally leaves the tree broken.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -187,7 +187,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                                 "type": "object",
                                 "properties": {
                                     "description": { "type": "string" },
-                                    "compile": { "type": "boolean", "description": "true (default) = cargo check must pass to complete this step. false = step intentionally leaves tree broken." },
+                                    "compile": { "type": "boolean", "description": "true (default) = compiler/type checker must pass to complete this step. false = step intentionally leaves tree broken." },
                                     "reason": { "type": "string", "description": "Required when compile=false: why the tree will be broken" }
                                 },
                                 "required": ["description"]
@@ -308,7 +308,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         },
                         "task": {
                             "type": "string",
-                            "description": "What to change and why. Be specific: include types, parameter names, values. E.g. 'Add system_prompt_override: Option<&str> as the 6th parameter to every call to context::assemble(), passing None for now.'"
+                            "description": "What to change and why. Be specific: include types, parameter names, values. E.g. 'Add a timeout_ms parameter with default value 5000 to every call to send_request(), passing 5000 for now.'"
                         }
                     },
                     "required": ["path", "task"]

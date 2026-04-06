@@ -169,22 +169,10 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         ));
     }
 
-    // Detect function signature changes and nudge about call sites
-    if old.contains("fn ") && new.contains("fn ") {
-        if let Some(fn_name) = extract_fn_name(new) {
-            let (caller_count, caller_list) = find_callers(fn_name, config);
-            if caller_count > 0 {
-                output.push_str(&format!(
-                    "\n⚠ SIGNATURE CHANGED: Found {caller_count} call site(s) for `{fn_name}()` that need updating:\n  {caller_list}\n\
-                     Update ALL of these call sites now. For bulk updates, use shell() with sed.\n"
-                ));
-            }
-        }
-    }
-
-    // For .rs files, check bracket balance after edit — catches common
+    // For brace-based languages, check bracket balance after edit — catches common
     // mistakes like `});` instead of `));` in macro calls.
-    if path_str.ends_with(".rs") {
+    let brace_langs = ["rs","js","ts","tsx","jsx","go","java","c","cpp","h","hpp","cs","kt","swift","scala","zig"];
+    if brace_langs.iter().any(|ext| path_str.ends_with(&format!(".{ext}"))) {
         let full = edited_lines.join("\n");
         let parens = full.matches('(').count() as i64 - full.matches(')').count() as i64;
         let braces = full.matches('{').count() as i64 - full.matches('}').count() as i64;
@@ -328,53 +316,6 @@ fn line_similarity(a: &str, b: &str) -> f64 {
     }
 
     (2.0 * matches as f64) / (bigrams_a.len() + bigrams_b.len()) as f64
-}
-
-/// Extract a function name from text containing "fn name(...)".
-fn extract_fn_name(text: &str) -> Option<&str> {
-    for line in text.lines() {
-        let trimmed = line.trim();
-        for prefix in &["pub async fn ", "pub fn ", "async fn ", "fn "] {
-            if let Some(rest) = trimmed.strip_prefix(prefix) {
-                let name = rest.split(|c: char| !c.is_alphanumeric() && c != '_').next()?;
-                if !name.is_empty() {
-                    return Some(name);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Quick grep to find all call sites of `fn_name(` in src/ and tests/.
-/// Returns (count, list of file:line locations).
-fn find_callers(fn_name: &str, config: &Config) -> (usize, String) {
-    let pattern = format!("{}(", fn_name);
-    let root = &config.project_root;
-    let mut locations = Vec::new();
-    for dir in &["src", "tests"] {
-        let dir_path = root.join(dir);
-        if !dir_path.exists() { continue; }
-        if let Ok(output) = std::process::Command::new("grep")
-            .args(["-rn", "--include=*.rs", &pattern])
-            .arg(&dir_path)
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                // Strip the project root prefix for cleaner output
-                let clean = line.strip_prefix(&format!("{}/", root.display()))
-                    .unwrap_or(line);
-                // Skip the definition itself (contains "fn ")
-                if !clean.contains("fn ") {
-                    locations.push(clean.to_string());
-                }
-            }
-        }
-    }
-    let count = locations.len();
-    let list = locations.into_iter().take(20).collect::<Vec<_>>().join("\n  ");
-    (count, list)
 }
 
 fn resolve_path(path_str: &str, config: &Config) -> PathBuf {
