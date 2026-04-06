@@ -327,21 +327,21 @@ async fn plan_mode_blocks_write_file() {
     // In plan mode, the run loop blocks edit/write_file/shell tool calls.
     // We test the logic directly here.
     let plan_only = true;
-    let blocked_tools = ["edit", "write_file", "shell"];
+    let blocked_tools = ["replace", "write_file", "shell"];
 
     for tool in &blocked_tools {
         assert!(
             plan_only
-                && (*tool == "edit" || *tool == "write_file" || *tool == "shell"),
+                && (*tool == "replace" || *tool == "write_file" || *tool == "shell"),
             "plan mode should block: {tool}"
         );
     }
 
     // Allowed tools in plan mode
-    let allowed_tools = ["read_file", "search", "task_update", "read_symbol"];
+    let allowed_tools = ["read_file", "search", "task_update"];
     for tool in &allowed_tools {
         assert!(
-            !(*tool == "edit" || *tool == "write_file" || *tool == "shell"),
+            !(*tool == "replace" || *tool == "write_file" || *tool == "shell"),
             "plan mode should allow: {tool}"
         );
     }
@@ -459,11 +459,10 @@ fn tool_definitions_are_valid() {
     let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
     assert!(names.contains(&"read_file"));
     assert!(names.contains(&"write_file"));
-    assert!(names.contains(&"edit"));
+    assert!(names.contains(&"replace"));
     assert!(names.contains(&"search"));
     assert!(names.contains(&"shell"));
     assert!(names.contains(&"task_update"));
-    assert!(names.contains(&"read_symbol"));
 
     // Each definition should have required fields
     for def in &defs {

@@ -226,9 +226,7 @@ pub struct ToolsConfig {
     pub context_tools: bool,
     /// LSP tools: goto_definition, find_references
     pub lsp_tools: bool,
-    /// Transform tool: LLM-powered multi-site code transformation
-    pub transform: bool,
-    /// Web tools: web_search, web_fetch, docs_lookup
+    /// Web tools: web_search, web_fetch
     pub web_tools: bool,
     /// Structured plan tool
     pub plan: bool,
@@ -241,7 +239,6 @@ impl Default for ToolsConfig {
         Self {
             context_tools: true,
             lsp_tools: true,
-            transform: true,
             web_tools: true,
             plan: true,
             scratchpad: true,

@@ -36,7 +36,7 @@ async fn edit_shows_10_lines_context() {
         "old": "line 15",
         "new": "EDITED LINE 15"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("replace", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -64,7 +64,7 @@ async fn edit_not_found_shows_near_match() {
         "old": "let x = 42;\n    println!(\"wrong\");",
         "new": "let x = 99;"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("replace", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -98,7 +98,7 @@ async fn edit_not_found_no_near_match() {
         "old": "completely different text that does not appear",
         "new": "replacement"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("replace", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -367,7 +367,7 @@ fn rich_summary_edit_with_errors() {
     let content = "✓ Edited src/main.rs (1 replacement)\n[cargo check]\nerror[E0061]: expected 4 arguments\n";
 
     let summary = summarize_tool_result(
-        "edit",
+        "replace",
         &json!({"path": "src/main.rs"}),
         content,
     );
@@ -384,7 +384,7 @@ fn rich_summary_edit_success() {
     let content = "✓ Edited src/main.rs (1 replacement)\n[cargo check] OK\n";
 
     let summary = summarize_tool_result(
-        "edit",
+        "replace",
         &json!({"path": "src/main.rs"}),
         content,
     );

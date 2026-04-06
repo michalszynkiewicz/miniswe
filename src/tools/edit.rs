@@ -1,4 +1,7 @@
-//! edit tool — Search-and-replace file editing.
+//! replace tool — Search-and-replace file editing.
+//!
+//! With `all=false` (default): replaces one unique occurrence with fuzzy matching fallback.
+//! With `all=true`: replaces every occurrence (simple deterministic find-and-replace).
 
 use anyhow::Result;
 use serde_json::Value;
@@ -12,6 +15,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let path_str = args["path"].as_str().unwrap_or("");
     let old = args["old"].as_str().unwrap_or("");
     let new = args["new"].as_str().unwrap_or("");
+    let replace_all = args["all"].as_bool().unwrap_or(false);
 
     if path_str.is_empty() {
         return Ok(ToolResult::err("Missing required parameter: path".into()));
@@ -21,6 +25,42 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     }
 
     let path = resolve_path(path_str, config);
+
+    // replace_all branch: deterministic, replace every occurrence
+    if replace_all {
+        if !path.exists() {
+            return Ok(ToolResult::err(format!("File not found: {path_str}")));
+        }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("Failed to read {path_str}: {e}"))?;
+        let count = content.matches(old).count();
+        if count == 0 {
+            return Ok(ToolResult::err(format!(
+                "'{old}' not found in {path_str}. Use read_file to check the exact content."
+            )));
+        }
+        let new_content = content.replace(old, new);
+        std::fs::write(&path, &new_content)?;
+        let total_lines = new_content.lines().count();
+        let mut output = format!(
+            "✓ Replaced {count} occurrence(s) in {path_str} ({total_lines} lines total)\n"
+        );
+        if let Some(pos) = new_content.find(new) {
+            let line_num = new_content[..pos].chars().filter(|&c| c == '\n').count() + 1;
+            let lines: Vec<&str> = new_content.lines().collect();
+            let start = line_num.saturating_sub(3);
+            let end = (line_num + 3).min(lines.len());
+            output.push_str(&format!("[first replacement at L{line_num}]\n"));
+            for i in start..end {
+                let marker = if i + 1 == line_num { ">" } else { " " };
+                output.push_str(&format!("{marker}{:>4}│{}\n", i + 1, lines[i]));
+            }
+        }
+        if count > 1 {
+            output.push_str(&format!("({} more replacement(s) not shown)\n", count - 1));
+        }
+        return Ok(ToolResult::ok(output));
+    }
 
     // For new files, create them if old is empty and file doesn't exist
     if !path.exists() && old.is_empty() {

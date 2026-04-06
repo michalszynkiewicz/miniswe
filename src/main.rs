@@ -30,10 +30,7 @@ async fn main() -> Result<()> {
             let config = Config::load()?;
             miniswe::cli::commands::run::run(config, &message, true, cli.yes).await?;
         }
-        Some(Command::Docs { subcommand }) => {
-            miniswe::cli::commands::docs::run(subcommand).await?;
-        }
-        None => {
+None => {
             let config = Config::load()?;
             if let Some(message) = cli.message {
                 // Single-shot mode

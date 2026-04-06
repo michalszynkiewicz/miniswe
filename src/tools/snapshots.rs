@@ -45,6 +45,10 @@ impl SnapshotManager {
             current_round: 0,
         };
 
+        // Set identity so commits work in any environment
+        manager.git_config("user.email", "miniswe@local")?;
+        manager.git_config("user.name", "miniswe")?;
+
         // Initial snapshot
         manager.snapshot("session start")?;
 
@@ -135,6 +139,18 @@ impl SnapshotManager {
             .stderr(std::process::Stdio::null())
             .status()
             .context("failed to run git")
+    }
+
+    /// Set a config value in the shadow git repo.
+    fn git_config(&self, key: &str, value: &str) -> Result<()> {
+        Command::new("git")
+            .arg("--git-dir").arg(&self.git_dir)
+            .args(["config", key, value])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .context("failed to run git config")?;
+        Ok(())
     }
 
     /// Run a git command and capture stdout.

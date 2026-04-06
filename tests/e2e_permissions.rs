@@ -91,7 +91,7 @@ async fn path_jail_blocks_edit_traversal() {
         "old": "root",
         "new": "hacked"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("replace", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
