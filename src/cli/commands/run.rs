@@ -24,6 +24,10 @@ use crate::tools;
 use crate::tools::permissions::{Action, PermissionManager};
 use crate::tui;
 
+const PLAN_CHECKPOINT_AFTER_EDITS: u32 = 5;
+const PLAN_CHECKPOINT_MESSAGE: &str = "\
+Plan checkpoint pending. Review the plan before more edits: use plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet.";
+
 /// Run the agent for a single message.
 pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()> {
     let log = SessionLog::new(&config);
@@ -137,6 +141,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let mut calls_since_last_edit = 0u32;
     let mut edit_fail_count: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
+    let mut successful_edits_since_plan_update = 0u32;
+    let mut plan_checkpoint_pending = false;
     let mut plan_update_requested = false;
 
     // Ctrl+C cancellation flag
@@ -375,7 +381,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 consecutive_loops += 1;
                 let result_msg = Message::tool_result(
                     &tc.id,
-                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times. Try a completely different approach. Remember: you have tools like get_repo_map(), search(), read_file(), write_file(), diagnostics() available.",
+                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or fix_file for semantic edits.",
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
@@ -422,6 +428,13 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
                 tui::print_tool_result(&tc.function.name, false, "blocked: no plan");
+                continue;
+            }
+            if config.tools.plan && plan_checkpoint_pending && is_write_action {
+                let result_msg = Message::tool_result(&tc.id, PLAN_CHECKPOINT_MESSAGE);
+                messages.push(result_msg.clone());
+                conversation_history.push(result_msg);
+                tui::print_tool_result(&tc.function.name, false, "blocked: plan checkpoint");
                 continue;
             }
 
@@ -510,6 +523,11 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             log.tool_result_detail(&tc.function.name, result.success, &result.content);
             tui::print_tool_result(&tc.function.name, result.success, first_line);
 
+            if result.success && tc.function.name == "plan" {
+                plan_checkpoint_pending = false;
+                successful_edits_since_plan_update = 0;
+            }
+
             // A successful file write means code changed — reset trackers.
             let is_file_write = (tc.function.name == "file"
                 && matches!(file_action, "replace" | "write"))
@@ -517,6 +535,12 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             if result.success && is_file_write {
                 recent_calls.clear();
                 calls_since_last_edit = 0;
+                if config.tools.plan {
+                    successful_edits_since_plan_update += 1;
+                    if successful_edits_since_plan_update >= PLAN_CHECKPOINT_AFTER_EDITS {
+                        plan_checkpoint_pending = true;
+                    }
+                }
             } else {
                 calls_since_last_edit += 1;
             }
@@ -544,7 +568,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             messages.push(Message::user(
                 "[WARNING: You have used 20+ tool calls without making any edits. \
                  You likely have enough information. Start making changes now. \
-                 Use write_file for files under 200 lines. \
+                 Use fix_file for semantic file edits. \
                  If you're stuck, explain what's blocking you.]",
             ));
         }
