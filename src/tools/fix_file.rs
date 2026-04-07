@@ -21,7 +21,7 @@ const WINDOW_SIZE: usize = 800;
 /// Overlap between windows to catch edits at boundaries.
 const WINDOW_OVERLAP: usize = 100;
 const MAX_PATCH_ATTEMPTS: usize = 3;
-const MAX_SPLIT_REGIONS: usize = 3;
+const MAX_PLANNED_REGIONS: usize = 5;
 const LARGE_TRUNCATION_MIN_LINES: usize = 50;
 
 pub async fn execute(
@@ -51,6 +51,32 @@ pub async fn execute(
 
     let content = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("Failed to read {path_str}: {e}"))?;
+
+    if should_preplan(task) {
+        match execute_preplanned_regions(
+            path_str,
+            task,
+            &path,
+            &content,
+            router,
+            config,
+            lsp,
+            lsp_validation,
+        )
+        .await
+        {
+            Ok(Some(candidate_result)) => {
+                std::fs::write(&path, &candidate_result.content)?;
+                return Ok(ToolResult::ok(candidate_result.message));
+            }
+            Ok(None) => {}
+            Err(_) => {
+                // Treat pre-planning as an optimization only. If the region plan
+                // is malformed or a scoped region edit fails, fall back to the
+                // established broad patch path and its repair loop.
+            }
+        }
+    }
 
     let mut feedback: Option<String> = None;
     let mut last_error = String::new();
@@ -165,6 +191,22 @@ struct SplitResult {
     message: String,
 }
 
+fn should_preplan(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    [
+        "all ",
+        "every ",
+        "call site",
+        "call sites",
+        " calls",
+        "matches",
+        "throughout",
+        "multiple",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LspValidationMode {
     Auto,
@@ -191,6 +233,38 @@ impl LspValidationMode {
     }
 }
 
+async fn execute_preplanned_regions(
+    path_str: &str,
+    task: &str,
+    path: &std::path::Path,
+    original: &str,
+    router: &ModelRouter,
+    config: &Config,
+    lsp: Option<&LspClient>,
+    lsp_validation: LspValidationMode,
+) -> Result<Option<SplitResult>> {
+    let regions = request_preplan_regions(path_str, task, original, router).await?;
+    if regions.is_empty() {
+        return Ok(None);
+    }
+
+    let region_count = regions.len();
+    execute_planned_regions(
+        path_str,
+        path,
+        original,
+        router,
+        config,
+        lsp,
+        lsp_validation,
+        regions,
+        format!("Pre-plan: {region_count} region(s) planned"),
+        "via pre-plan",
+    )
+    .await
+    .map(Some)
+}
+
 async fn execute_split_fallback(
     path_str: &str,
     task: &str,
@@ -207,12 +281,42 @@ async fn execute_split_fallback(
         return Ok(None);
     }
 
+    let region_count = regions.len();
+    execute_planned_regions(
+        path_str,
+        path,
+        original,
+        router,
+        config,
+        lsp,
+        lsp_validation,
+        regions,
+        format!(
+            "Broad patch failed: {broad_error}\nSplit fallback: {region_count} region(s) planned"
+        ),
+        "via split fallback",
+    )
+    .await
+    .map(Some)
+}
+
+async fn execute_planned_regions(
+    path_str: &str,
+    path: &std::path::Path,
+    original: &str,
+    router: &ModelRouter,
+    config: &Config,
+    lsp: Option<&LspClient>,
+    lsp_validation: LspValidationMode,
+    regions: Vec<EditRegion>,
+    mut message: String,
+    success_label: &str,
+) -> Result<SplitResult> {
     let mut current = original.to_string();
     let mut total_ops = 0usize;
-    let mut message = format!(
-        "Broad patch failed: {broad_error}\nSplit fallback: {} region(s) planned\n",
-        regions.len()
-    );
+    if !message.ends_with('\n') {
+        message.push('\n');
+    }
 
     let mut regions_desc = regions;
     regions_desc.sort_by(|a, b| b.start.cmp(&a.start).then_with(|| b.end.cmp(&a.end)));
@@ -303,14 +407,14 @@ async fn execute_split_fallback(
         message.push('\n');
     }
     message.push_str(&format!(
-        "✓ Applied {total_ops} operation(s) to {path_str} via split fallback ({} lines)\n",
+        "✓ Applied {total_ops} operation(s) to {path_str} {success_label} ({} lines)\n",
         current.lines().count()
     ));
 
-    Ok(Some(SplitResult {
+    Ok(SplitResult {
         content: current,
         message,
-    }))
+    })
 }
 
 async fn validate_candidate_for_write(
@@ -666,6 +770,94 @@ async fn request_patch_for_region(
     Ok((ops, output))
 }
 
+async fn request_preplan_regions(
+    path_str: &str,
+    task: &str,
+    content: &str,
+    router: &ModelRouter,
+) -> Result<Vec<EditRegion>> {
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    let windows = build_windows(total_lines, WINDOW_SIZE, WINDOW_OVERLAP);
+    let mut regions = Vec::new();
+
+    for (win_idx, (start, end)) in windows.iter().enumerate() {
+        if regions.len() >= MAX_PLANNED_REGIONS {
+            break;
+        }
+
+        let window_content = lines[*start..*end]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{:>4}│{}", start + i + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let remaining = MAX_PLANNED_REGIONS - regions.len();
+
+        let prompt = format!(
+            "Plan small edit regions for one file.\n\n\
+             File: {path_str}\n\
+             Task: {task}\n\n\
+             Return up to {remaining} non-overlapping regions to edit within this window.\n\
+             Use small regions. Each region should cover at most 5 edit sites.\n\
+             For repeated call-site updates, group nearby calls together.\n\
+             For code, prefer functions/classes/import blocks.\n\
+             For config/text files, prefer logical sections.\n\
+             Line numbers refer to the full file shown below.\n\n\
+             Output only:\n\
+             REGION <start> <end>\n\
+             TASK: <specific edit for this region>\n\
+             END\n\n\
+             Or exactly:\n\
+             NO_REGIONS\n\n\
+             Window {}/{} lines {}-{} of {}:\n{window_content}",
+            win_idx + 1,
+            windows.len(),
+            start + 1,
+            end,
+            total_lines
+        );
+
+        let request = ChatRequest {
+            messages: vec![
+                Message::system(
+                    "You output only strict REGION blocks. No explanations, no markdown.",
+                ),
+                Message::user(&prompt),
+            ],
+            tools: None,
+            tool_choice: None,
+        };
+
+        let response = router.chat(ModelRole::Fast, &request).await?;
+        let text = response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_deref())
+            .unwrap_or("");
+
+        let mut planned = parse_region_plan(text)?;
+        for region in &planned {
+            if region.start < start + 1 || region.end > *end {
+                bail!(
+                    "planned region L{}-L{} falls outside window L{}-L{}",
+                    region.start,
+                    region.end,
+                    start + 1,
+                    end
+                );
+            }
+        }
+        regions.append(&mut planned);
+        if regions.len() > MAX_PLANNED_REGIONS {
+            regions.truncate(MAX_PLANNED_REGIONS);
+        }
+    }
+
+    validate_regions_in_file(&regions, total_lines)?;
+    Ok(regions)
+}
+
 async fn request_region_plan(
     path_str: &str,
     task: &str,
@@ -679,7 +871,7 @@ async fn request_region_plan(
     let mut regions = Vec::new();
 
     for (win_idx, (start, end)) in windows.iter().enumerate() {
-        if regions.len() >= MAX_SPLIT_REGIONS {
+        if regions.len() >= MAX_PLANNED_REGIONS {
             break;
         }
 
@@ -689,7 +881,7 @@ async fn request_region_plan(
             .map(|(i, line)| format!("{:>4}│{}", start + i + 1, line))
             .collect::<Vec<_>>()
             .join("\n");
-        let remaining = MAX_SPLIT_REGIONS - regions.len();
+        let remaining = MAX_PLANNED_REGIONS - regions.len();
 
         let prompt = format!(
             "A broad patch for {path_str} failed.\n\
@@ -742,13 +934,26 @@ async fn request_region_plan(
             }
         }
         regions.append(&mut planned);
-        if regions.len() > MAX_SPLIT_REGIONS {
-            regions.truncate(MAX_SPLIT_REGIONS);
+        if regions.len() > MAX_PLANNED_REGIONS {
+            regions.truncate(MAX_PLANNED_REGIONS);
         }
     }
 
     reject_overlapping_regions(&regions)?;
     Ok(regions)
+}
+
+fn validate_regions_in_file(regions: &[EditRegion], total_lines: usize) -> Result<()> {
+    for region in regions {
+        if region.end > total_lines {
+            bail!(
+                "planned region L{}-L{} falls outside file with {total_lines} lines",
+                region.start,
+                region.end
+            );
+        }
+    }
+    reject_overlapping_regions(regions)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -837,9 +1042,9 @@ pub fn parse_region_plan(text: &str) -> Result<Vec<EditRegion>> {
         regions.push(EditRegion { start, end, task });
     }
 
-    if regions.len() > MAX_SPLIT_REGIONS {
+    if regions.len() > MAX_PLANNED_REGIONS {
         bail!(
-            "region plan returned {} regions, maximum is {MAX_SPLIT_REGIONS}",
+            "region plan returned {} regions, maximum is {MAX_PLANNED_REGIONS}",
             regions.len()
         );
     }

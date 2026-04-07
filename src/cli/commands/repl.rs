@@ -641,7 +641,15 @@ async fn run_agent_loop(
                     None => crate::tools::ToolResult::err("No MCP servers connected".into()),
                 }
             } else if tc.function.name == "fix_file" {
-                match crate::tools::fix_file::execute(&args, config, router, lsp.as_deref()).await {
+                match crate::tools::execute_fix_file_tool(
+                    &args,
+                    config,
+                    perms,
+                    router,
+                    lsp.as_deref(),
+                )
+                .await
+                {
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("fix_file error: {e}")),
                 }

@@ -6,7 +6,11 @@ use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use miniswe::knowledge::ProjectIndex;
+use miniswe::knowledge::indexer;
+use miniswe::tools;
 use miniswe::tools::fix_file::{self, PatchOp};
+use miniswe::tools::permissions::PermissionManager;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -125,6 +129,30 @@ END
     assert_eq!(regions[1].start, 30);
     assert_eq!(regions[1].end, 35);
     assert_eq!(regions[1].task, "update another logical block");
+}
+
+#[test]
+fn parse_region_plan_allows_five_regions() {
+    let plan = "\
+REGION 1 1
+TASK: one
+END
+REGION 3 3
+TASK: two
+END
+REGION 5 5
+TASK: three
+END
+REGION 7 7
+TASK: four
+END
+REGION 9 9
+TASK: five
+END
+";
+
+    let regions = fix_file::parse_region_plan(plan).unwrap();
+    assert_eq!(regions.len(), 5);
 }
 
 #[test]
@@ -460,6 +488,101 @@ async fn execute_split_fallback_after_broad_overlap_failure() {
 }
 
 #[tokio::test]
+async fn execute_preplans_bulk_edit_into_regions() {
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => helpers::mock_text_response(
+                    "REGION 1 1\nTASK: update first call\nEND\n\nREGION 3 3\nTASK: update last call\nEND\n",
+                ),
+                1 => helpers::mock_text_response(
+                    "REPLACE_AT 3\nOLD:\ncall_c();\nEND_OLD\nNEW:\ncall_c(None);\nEND_NEW\n",
+                ),
+                _ => helpers::mock_text_response(
+                    "REPLACE_AT 1\nOLD:\ncall_a();\nEND_OLD\nNEW:\ncall_a(None);\nEND_NEW\n",
+                ),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(
+        config.project_root.join("main.rs"),
+        "call_a();\nkeep();\ncall_c();\n",
+    )
+    .unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "update all call sites",
+        "lsp_validation": "off"
+    });
+    let result = fix_file::execute(&args, &config, &router, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("Pre-plan: 2 region(s) planned"));
+    assert!(result.content.contains("via pre-plan"));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "call_a(None);\nkeep();\ncall_c(None);\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_preplan_parse_failure_falls_back_to_broad_patch() {
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                helpers::mock_text_response("I would edit lines 1-2.")
+            } else {
+                helpers::mock_text_response(
+                    "REPLACE_AT 1\nOLD:\nold();\nEND_OLD\nNEW:\nnew();\nEND_NEW\n",
+                )
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "old();\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "update all calls",
+        "lsp_validation": "off"
+    });
+    let result = fix_file::execute(&args, &config, &router, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("Window 1: 1 operation"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "new();\n"
+    );
+}
+
+#[tokio::test]
 async fn execute_no_changes_leaves_file_unchanged() {
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -545,6 +668,54 @@ async fn execute_rejects_invalid_lsp_validation_mode() {
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "original\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_fix_file_tool_reindexes_successful_edit() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(helpers::mock_text_response(
+            "REPLACE_AT 1\nOLD:\npub fn original() {}\nEND_OLD\nNEW:\npub fn replacement() {}\nEND_NEW\n",
+        ))
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::create_dir_all(config.project_root.join("src")).unwrap();
+    fs::write(
+        config.project_root.join("src/lib.rs"),
+        "pub fn original() {}\n",
+    )
+    .unwrap();
+
+    let index = indexer::index_project(&config.project_root, None).unwrap();
+    index.save(&config.miniswe_dir()).unwrap();
+    assert!(!index.lookup("original").is_empty());
+    assert!(index.lookup("replacement").is_empty());
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let perms = PermissionManager::headless(&config);
+    let args = serde_json::json!({
+        "path": "src/lib.rs",
+        "task": "rename original to replacement",
+        "lsp_validation": "off"
+    });
+    let result = tools::execute_fix_file_tool(&args, &config, &perms, &router, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    let updated_index = ProjectIndex::load(&config.miniswe_dir()).unwrap();
+    assert!(
+        !updated_index.lookup("replacement").is_empty(),
+        "Index should contain replacement after fix_file reindex"
+    );
+    assert!(
+        updated_index.lookup("original").is_empty(),
+        "Index should no longer contain original after fix_file reindex"
     );
 }
 

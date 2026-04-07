@@ -452,7 +452,14 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     Err(e) => crate::tools::ToolResult::err(format!("plan error: {e}")),
                 }
             } else if tc.function.name == "fix_file" {
-                match tools::fix_file::execute(&args, &config, &router, lsp_client.as_deref()).await
+                match tools::execute_fix_file_tool(
+                    &args,
+                    &config,
+                    &perms,
+                    &router,
+                    lsp_client.as_deref(),
+                )
+                .await
                 {
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("fix_file error: {e}")),

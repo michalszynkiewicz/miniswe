@@ -6,13 +6,13 @@
 //! After file edits, the index is incrementally updated.
 
 pub mod edit;
+pub mod fix_file;
+pub mod plan;
 mod read_file;
 mod search;
 mod shell;
-mod task_update;
-pub mod fix_file;
-pub mod plan;
 pub mod snapshots;
+mod task_update;
 mod web;
 mod write_file;
 
@@ -28,8 +28,9 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::context::compress;
 use crate::knowledge::graph::DependencyGraph;
-use crate::knowledge::{ProjectIndex, repo_map};
 use crate::knowledge::indexer;
+use crate::knowledge::{ProjectIndex, repo_map};
+use crate::llm::ModelRouter;
 use crate::lsp::LspClient;
 
 /// Result of executing a tool.
@@ -111,8 +112,7 @@ async fn execute_file_tool(
             }
             let mut result = write_file::execute(args, config).await?;
             if result.success {
-                reindex_changed_file(path, config);
-                auto_check(path, config, &mut result, lsp).await;
+                finalize_file_edit(path, config, &mut result, lsp).await;
             }
             Ok(result)
         }
@@ -124,8 +124,7 @@ async fn execute_file_tool(
             }
             let mut result = edit::execute(args, config).await?;
             if result.success {
-                reindex_changed_file(path, config);
-                auto_check(path, config, &mut result, lsp).await;
+                finalize_file_edit(path, config, &mut result, lsp).await;
             }
             Ok(result)
         }
@@ -143,7 +142,9 @@ async fn execute_file_tool(
         "revert" => {
             // Revert is handled specially in run.rs (needs snapshot manager).
             // If called through execute_tool, it means snapshot system isn't available.
-            Ok(ToolResult::err("Revert must be called through the run loop (needs snapshot manager).".into()))
+            Ok(ToolResult::err(
+                "Revert must be called through the run loop (needs snapshot manager).".into(),
+            ))
         }
 
         _ => Ok(ToolResult::err(format!(
@@ -244,6 +245,38 @@ async fn execute_web_tool(
     }
 }
 
+/// Execute `fix_file` through the same permission and post-edit path used by
+/// file(write/replace). The inner fixer still owns patch generation and
+/// candidate validation.
+pub async fn execute_fix_file_tool(
+    args: &Value,
+    config: &Config,
+    perms: &PermissionManager,
+    router: &ModelRouter,
+    lsp: Option<&LspClient>,
+) -> Result<ToolResult> {
+    let path = args["path"].as_str().unwrap_or("");
+    if let Err(e) = perms.resolve_and_check_path(path) {
+        return Ok(ToolResult::err(e));
+    }
+
+    let mut result = fix_file::execute(args, config, router, lsp).await?;
+    if result.success {
+        finalize_file_edit(path, config, &mut result, lsp).await;
+    }
+    Ok(result)
+}
+
+async fn finalize_file_edit(
+    path: &str,
+    config: &Config,
+    result: &mut ToolResult,
+    lsp: Option<&LspClient>,
+) {
+    reindex_changed_file(path, config);
+    auto_check(path, config, result, lsp).await;
+}
+
 /// Re-index a single changed file. Best-effort — doesn't fail the tool call.
 fn reindex_changed_file(rel_path: &str, config: &Config) {
     let miniswe_dir = config.miniswe_dir();
@@ -267,18 +300,23 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
             if lsp.is_ready() && !lsp.has_crashed() {
                 let abs_path = config.project_root.join(path);
                 if lsp.notify_file_changed(&abs_path).is_ok() {
-                    let timeout = std::time::Duration::from_millis(config.lsp.diagnostic_timeout_ms);
+                    let timeout =
+                        std::time::Duration::from_millis(config.lsp.diagnostic_timeout_ms);
                     let diags = lsp.get_diagnostics(&abs_path, timeout).await;
                     // Always proceed — get_diagnostics already waited for the timeout
                     {
-                        let errors: Vec<&lsp_types::Diagnostic> = diags.iter()
+                        let errors: Vec<&lsp_types::Diagnostic> = diags
+                            .iter()
                             .filter(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
                             .collect();
                         if errors.is_empty() {
                             result.content.push_str("\n[lsp] OK");
                         } else {
                             let capped = errors.len().min(5);
-                            result.content.push_str(&format!("\n[lsp] {} error(s) in {path}:\n", errors.len()));
+                            result.content.push_str(&format!(
+                                "\n[lsp] {} error(s) in {path}:\n",
+                                errors.len()
+                            ));
                             for diag in &errors[..capped] {
                                 let line = diag.range.start.line + 1;
                                 let col = diag.range.start.character + 1;
@@ -288,7 +326,10 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
                                 ));
                             }
                             if errors.len() > capped {
-                                result.content.push_str(&format!("... and {} more errors\n", errors.len() - capped));
+                                result.content.push_str(&format!(
+                                    "... and {} more errors\n",
+                                    errors.len() - capped
+                                ));
                             }
                             // Add source context around errors
                             let project_root = config.project_root.clone();
@@ -365,9 +406,7 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
     // Extract error/warning lines
     let relevant: Vec<&str> = stderr
         .lines()
-        .filter(|l| {
-            l.contains("error") || l.contains("warning") || l.starts_with("  ")
-        })
+        .filter(|l| l.contains("error") || l.contains("warning") || l.starts_with("  "))
         .take(30)
         .collect();
 
@@ -550,7 +589,15 @@ fn read_source_context(
 /// Gather project-wide diagnostics from LSP.
 async fn lsp_project_diagnostics(config: &Config, lsp: &LspClient) -> Option<ToolResult> {
     // Trigger a full check by notifying on a project config file (forces re-analysis)
-    let config_files = ["Cargo.toml", "tsconfig.json", "package.json", "go.mod", "pyproject.toml", "pom.xml", "build.gradle"];
+    let config_files = [
+        "Cargo.toml",
+        "tsconfig.json",
+        "package.json",
+        "go.mod",
+        "pyproject.toml",
+        "pom.xml",
+        "build.gradle",
+    ];
     for name in config_files {
         let path = config.project_root.join(name);
         if path.exists() {
@@ -570,15 +617,24 @@ async fn lsp_project_diagnostics(config: &Config, lsp: &LspClient) -> Option<Too
     for entry in lsp.diagnostics_snapshot() {
         for diag in entry.1 {
             let severity = match diag.severity {
-                Some(lsp_types::DiagnosticSeverity::ERROR) => { error_count += 1; "error" }
-                Some(lsp_types::DiagnosticSeverity::WARNING) => { warning_count += 1; "warning" }
+                Some(lsp_types::DiagnosticSeverity::ERROR) => {
+                    error_count += 1;
+                    "error"
+                }
+                Some(lsp_types::DiagnosticSeverity::WARNING) => {
+                    warning_count += 1;
+                    "warning"
+                }
                 _ => continue,
             };
             let line = diag.range.start.line + 1;
             let col = diag.range.start.character + 1;
             // Strip file:// prefix for readability
             let path = entry.0.strip_prefix("file://").unwrap_or(&entry.0);
-            output.push_str(&format!("{path}:{line}:{col}: {severity}: {}\n", diag.message));
+            output.push_str(&format!(
+                "{path}:{line}:{col}: {severity}: {}\n",
+                diag.message
+            ));
         }
     }
 
@@ -598,7 +654,10 @@ async fn lsp_project_diagnostics(config: &Config, lsp: &LspClient) -> Option<Too
         summary.push_str(&capped_output);
 
         let success = error_count == 0;
-        Some(ToolResult { content: summary, success })
+        Some(ToolResult {
+            content: summary,
+            success,
+        })
     }
 }
 
@@ -612,7 +671,11 @@ async fn lsp_goto_definition(
 ) -> Result<ToolResult> {
     let lsp = match lsp {
         Some(l) if l.is_ready() && !l.has_crashed() => l,
-        _ => return Ok(ToolResult::err("LSP not available. Use file(action='search') instead.".into())),
+        _ => {
+            return Ok(ToolResult::err(
+                "LSP not available. Use file(action='search') instead.".into(),
+            ));
+        }
     };
 
     let abs_path = config.project_root.join(path);
@@ -620,9 +683,9 @@ async fn lsp_goto_definition(
     let _ = lsp.notify_file_changed(&abs_path);
 
     match lsp.goto_definition(&abs_path, line, column).await {
-        Ok(locations) if locations.is_empty() => {
-            Ok(ToolResult::ok("No definition found at this location.".into()))
-        }
+        Ok(locations) if locations.is_empty() => Ok(ToolResult::ok(
+            "No definition found at this location.".into(),
+        )),
         Ok(locations) => {
             let mut output = String::new();
             for loc in &locations {
@@ -632,9 +695,13 @@ async fn lsp_goto_definition(
 
                 if let Some(ref p) = def_path {
                     // Make path relative to project root
-                    let rel = p.strip_prefix(&config.project_root)
-                        .unwrap_or(p);
-                    output.push_str(&format!("Definition: {}:{}:{}\n", rel.display(), def_line, def_col));
+                    let rel = p.strip_prefix(&config.project_root).unwrap_or(p);
+                    output.push_str(&format!(
+                        "Definition: {}:{}:{}\n",
+                        rel.display(),
+                        def_line,
+                        def_col
+                    ));
 
                     // Include source context
                     if let Some(ctx) = read_source_context(
@@ -645,7 +712,12 @@ async fn lsp_goto_definition(
                         output.push_str(&ctx);
                     }
                 } else {
-                    output.push_str(&format!("Definition: {}:{}:{}\n", loc.uri.as_str(), def_line, def_col));
+                    output.push_str(&format!(
+                        "Definition: {}:{}:{}\n",
+                        loc.uri.as_str(),
+                        def_line,
+                        def_col
+                    ));
                 }
             }
             Ok(ToolResult::ok(output))
@@ -664,16 +736,18 @@ async fn lsp_find_references(
 ) -> Result<ToolResult> {
     let lsp = match lsp {
         Some(l) if l.is_ready() && !l.has_crashed() => l,
-        _ => return Ok(ToolResult::err("LSP not available. Use file(action='search') instead.".into())),
+        _ => {
+            return Ok(ToolResult::err(
+                "LSP not available. Use file(action='search') instead.".into(),
+            ));
+        }
     };
 
     let abs_path = config.project_root.join(path);
     let _ = lsp.notify_file_changed(&abs_path);
 
     match lsp.find_references(&abs_path, line, column).await {
-        Ok(locations) if locations.is_empty() => {
-            Ok(ToolResult::ok("No references found.".into()))
-        }
+        Ok(locations) if locations.is_empty() => Ok(ToolResult::ok("No references found.".into())),
         Ok(locations) => {
             let mut output = format!("{} reference(s) found:\n", locations.len());
             for loc in &locations {
@@ -687,10 +761,18 @@ async fn lsp_find_references(
                     let line_content = std::fs::read_to_string(&abs)
                         .ok()
                         .and_then(|content| {
-                            content.lines().nth(ref_line as usize - 1).map(|l| l.trim().to_string())
+                            content
+                                .lines()
+                                .nth(ref_line as usize - 1)
+                                .map(|l| l.trim().to_string())
                         })
                         .unwrap_or_default();
-                    output.push_str(&format!("  {}:{}: {}\n", rel.display(), ref_line, line_content));
+                    output.push_str(&format!(
+                        "  {}:{}: {}\n",
+                        rel.display(),
+                        ref_line,
+                        line_content
+                    ));
                 } else {
                     output.push_str(&format!("  {}:{}\n", loc.uri.as_str(), ref_line));
                 }
@@ -708,7 +790,11 @@ fn context_tool_repo_map(keywords_str: &str, config: &Config) -> Result<ToolResu
     let miniswe_dir = config.miniswe_dir();
     let index = match ProjectIndex::load(&miniswe_dir) {
         Ok(idx) => idx,
-        Err(_) => return Ok(ToolResult::err("No project index. Run `miniswe init` first.".into())),
+        Err(_) => {
+            return Ok(ToolResult::err(
+                "No project index. Run `miniswe init` first.".into(),
+            ));
+        }
     };
     let graph = DependencyGraph::load(&miniswe_dir).unwrap_or_default();
 
@@ -727,7 +813,9 @@ fn context_tool_repo_map(keywords_str: &str, config: &Config) -> Result<ToolResu
     );
 
     if map.is_empty() {
-        Ok(ToolResult::ok("Repo map is empty (no indexed symbols).".into()))
+        Ok(ToolResult::ok(
+            "Repo map is empty (no indexed symbols).".into(),
+        ))
     } else {
         Ok(ToolResult::ok(format!(
             "Repo map ({} files indexed, {} symbols):\n{map}",
@@ -749,7 +837,9 @@ fn context_tool_project_info(config: &Config) -> Result<ToolResult> {
 
     let guide_path = config.miniswe_path("guide.md");
     if let Ok(content) = std::fs::read_to_string(&guide_path) {
-        if !content.contains("<!-- Add project-specific instructions") || content.lines().count() > 5 {
+        if !content.contains("<!-- Add project-specific instructions")
+            || content.lines().count() > 5
+        {
             output.push_str("\n[GUIDE]\n");
             output.push_str(&content);
             output.push('\n');
@@ -766,7 +856,9 @@ fn context_tool_project_info(config: &Config) -> Result<ToolResult> {
     }
 
     if output.is_empty() {
-        Ok(ToolResult::ok("No project info available. Run `miniswe init` to generate.".into()))
+        Ok(ToolResult::ok(
+            "No project info available. Run `miniswe init` to generate.".into(),
+        ))
     } else {
         Ok(ToolResult::ok(output))
     }
@@ -776,9 +868,12 @@ fn context_tool_project_info(config: &Config) -> Result<ToolResult> {
 fn context_tool_architecture_notes(config: &Config) -> Result<ToolResult> {
     let path = config.project_root.join(".ai").join("README.md");
     match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            Ok(ToolResult::ok(crate::truncate_chars(&content, config.tool_output_budget_chars())))
-        }
-        Err(_) => Ok(ToolResult::ok("No architecture notes found (.ai/README.md does not exist).".into())),
+        Ok(content) => Ok(ToolResult::ok(crate::truncate_chars(
+            &content,
+            config.tool_output_budget_chars(),
+        ))),
+        Err(_) => Ok(ToolResult::ok(
+            "No architecture notes found (.ai/README.md does not exist).".into(),
+        )),
     }
 }
