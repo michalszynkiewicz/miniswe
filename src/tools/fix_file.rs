@@ -25,6 +25,7 @@ const MAX_PLAN_ATTEMPTS: usize = 2;
 const MAX_LITERAL_FALLBACK_ATTEMPTS: usize = 2;
 const MAX_PLANNED_REGIONS: usize = 100;
 const MAX_PREPLAN_STEPS: usize = 100;
+const MAX_PREPLAN_LOG_CHARS: usize = 6000;
 const LARGE_TRUNCATION_MIN_LINES: usize = 50;
 
 pub async fn execute(
@@ -254,13 +255,18 @@ async fn execute_preplanned_steps(
     let mut last_error: Option<String> = None;
     for attempt in 1..=MAX_PLAN_ATTEMPTS {
         let step_count = steps.len();
-        let message = if let Some(error) = &last_error {
-            format!(
-                "Pre-plan repair attempt {attempt}: {step_count} step(s) planned\nPrevious plan failed: {error}"
-            )
+        let label = if last_error.is_some() {
+            format!("Pre-plan repair attempt {attempt}")
         } else {
-            format!("Pre-plan: {step_count} step(s) planned")
+            format!("Pre-plan attempt {attempt}")
         };
+        let mut message = if let Some(error) = &last_error {
+            format!("{label}; previous plan failed: {error}")
+        } else {
+            label.clone()
+        };
+        message.push('\n');
+        message.push_str(&format_preplan_log(&label, &steps));
 
         match execute_planned_steps(
             path_str,
@@ -271,6 +277,7 @@ async fn execute_preplanned_steps(
             lsp,
             lsp_validation,
             steps.clone(),
+            step_count,
             message,
             "via pre-plan",
         )
@@ -327,6 +334,7 @@ async fn execute_split_fallback(
         lsp,
         lsp_validation,
         regions,
+        region_count,
         format!(
             "Broad patch failed: {broad_error}\nSplit fallback: {region_count} region(s) planned"
         ),
@@ -345,11 +353,13 @@ async fn execute_planned_regions(
     lsp: Option<&LspClient>,
     lsp_validation: LspValidationMode,
     regions: Vec<EditRegion>,
+    planned_count: usize,
     mut message: String,
     success_label: &str,
 ) -> Result<SplitResult> {
     let mut current = original.to_string();
     let mut total_ops = 0usize;
+    let mut completed_steps = 0usize;
     if !message.ends_with('\n') {
         message.push('\n');
     }
@@ -387,6 +397,7 @@ async fn execute_planned_regions(
 
             if ops.is_empty() {
                 message.push_str(&format!("Split {region_label}: no changes\n"));
+                completed_steps += 1;
                 last_region_error.clear();
                 break;
             }
@@ -414,6 +425,7 @@ async fn execute_planned_regions(
             }
 
             total_ops += ops.len();
+            completed_steps += 1;
             current = candidate;
             message.push_str(&format!(
                 "Split {region_label}: applied {} operation(s)\n",
@@ -442,10 +454,11 @@ async fn execute_planned_regions(
         message.push_str(&note);
         message.push('\n');
     }
-    message.push_str(&format!(
-        "✓ Applied {total_ops} operation(s) to {path_str} {success_label} ({} lines)\n",
+    let summary = format!(
+        "✓ {success_label}: {completed_steps}/{planned_count} step(s) completed, {total_ops} operation(s) applied to {path_str} ({} lines)\n",
         current.lines().count()
-    ));
+    );
+    message = format!("{summary}{message}");
 
     Ok(SplitResult {
         content: current,
@@ -462,11 +475,13 @@ async fn execute_planned_steps(
     lsp: Option<&LspClient>,
     lsp_validation: LspValidationMode,
     steps: Vec<EditPlanStep>,
+    planned_count: usize,
     mut message: String,
     success_label: &str,
 ) -> Result<SplitResult> {
     let mut current = original.to_string();
     let mut total_ops = 0usize;
+    let mut completed_steps = 0usize;
     if !message.ends_with('\n') {
         message.push('\n');
     }
@@ -494,6 +509,7 @@ async fn execute_planned_steps(
                     Ok((candidate, count)) => {
                         current = candidate;
                         total_ops += count;
+                        completed_steps += 1;
                         message.push_str(&format!(
                             "Pre-plan step {} literal L{}-L{}: replaced {count} occurrence(s)\n",
                             idx + 1,
@@ -534,6 +550,7 @@ async fn execute_planned_steps(
                         })?;
                         current = candidate;
                         total_ops += count;
+                        completed_steps += 1;
                         message.push_str(&format!(
                             "Pre-plan step {} literal fallback L{}-L{}: applied {count} operation(s)\n",
                             idx + 1,
@@ -561,9 +578,11 @@ async fn execute_planned_steps(
 
                 if count == 0 {
                     message.push_str(&format!("Pre-plan {region_label}: no changes\n"));
+                    completed_steps += 1;
                 } else {
                     total_ops += count;
                     current = candidate;
+                    completed_steps += 1;
                     message.push_str(&format!(
                         "Pre-plan {region_label}: applied {count} operation(s)\n"
                     ));
@@ -586,10 +605,11 @@ async fn execute_planned_steps(
         message.push_str(&note);
         message.push('\n');
     }
-    message.push_str(&format!(
-        "✓ Applied {total_ops} operation(s) to {path_str} {success_label} ({} lines)\n",
+    let summary = format!(
+        "✓ {success_label}: {completed_steps}/{planned_count} step(s) completed, {total_ops} operation(s) applied to {path_str} ({} lines)\n",
         current.lines().count()
-    ));
+    );
+    message = format!("{summary}{message}");
 
     Ok(SplitResult {
         content: current,
@@ -1337,6 +1357,22 @@ fn format_edit_plan_steps(steps: &[EditPlanStep]) -> String {
         }
     }
     out
+}
+
+fn format_preplan_log(label: &str, steps: &[EditPlanStep]) -> String {
+    let plan = format_edit_plan_steps(steps);
+    let plan = truncate_multiline(&plan, MAX_PREPLAN_LOG_CHARS);
+    format!("Raw {label} ({} step(s), parsed):\n{plan}\n", steps.len())
+}
+
+fn truncate_multiline(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let truncated: String = text.chars().take(max_chars).collect();
+    format!("{truncated}\n...({char_count} chars total, truncated)\n")
 }
 
 pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {

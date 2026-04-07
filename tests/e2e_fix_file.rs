@@ -667,8 +667,14 @@ async fn execute_preplans_bulk_edit_into_regions() {
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert!(result.content.contains("Pre-plan: 2 step(s) planned"));
-    assert!(result.content.contains("via pre-plan"));
+    assert!(
+        result
+            .content
+            .contains("✓ via pre-plan: 2/2 step(s) completed")
+    );
+    assert!(result.content.contains("Pre-plan attempt 1"));
+    assert!(result.content.contains("Raw Pre-plan attempt 1"));
+    assert!(result.content.contains("SMART_EDIT"));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
@@ -716,6 +722,9 @@ async fn execute_preplan_uses_literal_replacements_before_smart_edits() {
         .unwrap();
 
     assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("Raw Pre-plan attempt 1"));
+    assert!(result.content.contains("LITERAL_REPLACE"));
+    assert!(result.content.contains("SMART_EDIT"));
     assert!(
         result
             .content
@@ -811,6 +820,8 @@ async fn execute_preplan_repairs_whole_plan_after_step_retries_fail() {
 
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("Pre-plan repair attempt 2"));
+    assert!(result.content.contains("Raw Pre-plan repair attempt 2"));
+    assert!(result.content.contains("OLD:\ncall(None)"));
     assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
