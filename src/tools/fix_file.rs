@@ -53,7 +53,7 @@ pub async fn execute(
         .map_err(|e| anyhow::anyhow!("Failed to read {path_str}: {e}"))?;
 
     if should_preplan(task) {
-        match execute_preplanned_regions(
+        match execute_preplanned_steps(
             path_str,
             task,
             &path,
@@ -71,8 +71,8 @@ pub async fn execute(
             }
             Ok(None) => {}
             Err(_) => {
-                // Treat pre-planning as an optimization only. If the region plan
-                // is malformed or a scoped region edit fails, fall back to the
+                // Treat pre-planning as an optimization only. If the mixed plan
+                // is malformed or a scoped step fails, fall back to the
                 // established broad patch path and its repair loop.
             }
         }
@@ -233,7 +233,7 @@ impl LspValidationMode {
     }
 }
 
-async fn execute_preplanned_regions(
+async fn execute_preplanned_steps(
     path_str: &str,
     task: &str,
     path: &std::path::Path,
@@ -243,13 +243,13 @@ async fn execute_preplanned_regions(
     lsp: Option<&LspClient>,
     lsp_validation: LspValidationMode,
 ) -> Result<Option<SplitResult>> {
-    let regions = request_preplan_regions(path_str, task, original, router).await?;
-    if regions.is_empty() {
+    let steps = request_preplan_steps(path_str, task, original, router).await?;
+    if steps.is_empty() {
         return Ok(None);
     }
 
-    let region_count = regions.len();
-    execute_planned_regions(
+    let step_count = steps.len();
+    execute_planned_steps(
         path_str,
         path,
         original,
@@ -257,8 +257,8 @@ async fn execute_preplanned_regions(
         config,
         lsp,
         lsp_validation,
-        regions,
-        format!("Pre-plan: {region_count} region(s) planned"),
+        steps,
+        format!("Pre-plan: {step_count} step(s) planned"),
         "via pre-plan",
     )
     .await
@@ -389,6 +389,157 @@ async fn execute_planned_regions(
 
         if !last_region_error.is_empty() {
             bail!("{region_label} failed: {last_region_error}");
+        }
+    }
+
+    let validation_note = validate_candidate_for_write(
+        path_str,
+        path,
+        original,
+        &current,
+        config,
+        lsp,
+        lsp_validation,
+    )
+    .await?;
+    if let Some(note) = validation_note {
+        message.push_str(&note);
+        message.push('\n');
+    }
+    message.push_str(&format!(
+        "✓ Applied {total_ops} operation(s) to {path_str} {success_label} ({} lines)\n",
+        current.lines().count()
+    ));
+
+    Ok(SplitResult {
+        content: current,
+        message,
+    })
+}
+
+async fn execute_planned_steps(
+    path_str: &str,
+    path: &std::path::Path,
+    original: &str,
+    router: &ModelRouter,
+    config: &Config,
+    lsp: Option<&LspClient>,
+    lsp_validation: LspValidationMode,
+    steps: Vec<EditPlanStep>,
+    mut message: String,
+    success_label: &str,
+) -> Result<SplitResult> {
+    let mut current = original.to_string();
+    let mut total_ops = 0usize;
+    if !message.ends_with('\n') {
+        message.push('\n');
+    }
+
+    let mut steps_desc = steps;
+    steps_desc.sort_by(|a, b| b.start_line().cmp(&a.start_line()));
+
+    for (idx, step) in steps_desc.iter().enumerate() {
+        match step {
+            EditPlanStep::LiteralReplace {
+                scope_start,
+                scope_end,
+                all,
+                old,
+                new,
+            } => {
+                let (candidate, count) = apply_literal_replace_in_scope(
+                    &current,
+                    *scope_start,
+                    *scope_end,
+                    old,
+                    new,
+                    *all,
+                )
+                .map_err(|e| anyhow::anyhow!("step {} literal replace failed: {e}", idx + 1))?;
+                current = candidate;
+                total_ops += count;
+                message.push_str(&format!(
+                    "Pre-plan step {} literal L{}-L{}: replaced {count} occurrence(s)\n",
+                    idx + 1,
+                    scope_start,
+                    scope_end
+                ));
+            }
+            EditPlanStep::SmartEdit(region) => {
+                let mut feedback: Option<String> = None;
+                let mut last_region_error = String::new();
+                let region_label =
+                    format!("step {} smart L{}-L{}", idx + 1, region.start, region.end);
+
+                for attempt in 1..=MAX_PATCH_ATTEMPTS {
+                    let (ops, _) = match request_patch_for_region(
+                        path_str,
+                        &region.task,
+                        &current,
+                        router,
+                        region,
+                        feedback.as_deref(),
+                        lsp_validation,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            last_region_error = e.to_string();
+                            if attempt < MAX_PATCH_ATTEMPTS {
+                                feedback = Some(last_region_error.clone());
+                                continue;
+                            }
+                            break;
+                        }
+                    };
+
+                    if ops.is_empty() {
+                        message.push_str(&format!("Pre-plan {region_label}: no changes\n"));
+                        last_region_error.clear();
+                        break;
+                    }
+
+                    let candidate = match apply_patch_dry_run_in_region(
+                        &current,
+                        &ops,
+                        region.start,
+                        region.end,
+                    ) {
+                        Ok(candidate) => candidate,
+                        Err(e) => {
+                            last_region_error = e.to_string();
+                            if attempt < MAX_PATCH_ATTEMPTS {
+                                feedback = Some(last_region_error.clone());
+                                continue;
+                            }
+                            break;
+                        }
+                    };
+
+                    if let Err(e) = validate_candidate(path_str, &current, &candidate) {
+                        last_region_error = e.to_string();
+                        if attempt < MAX_PATCH_ATTEMPTS {
+                            feedback = Some(last_region_error.clone());
+                            continue;
+                        }
+                        break;
+                    }
+
+                    total_ops += ops.len();
+                    current = candidate;
+                    message.push_str(&format!(
+                        "Pre-plan {region_label}: applied {} operation(s)\n",
+                        ops.len()
+                    ));
+                    last_region_error.clear();
+                    break;
+                }
+
+                if !last_region_error.is_empty() {
+                    bail!("{region_label} failed: {last_region_error}");
+                }
+            }
         }
     }
 
@@ -770,19 +921,19 @@ async fn request_patch_for_region(
     Ok((ops, output))
 }
 
-async fn request_preplan_regions(
+async fn request_preplan_steps(
     path_str: &str,
     task: &str,
     content: &str,
     router: &ModelRouter,
-) -> Result<Vec<EditRegion>> {
+) -> Result<Vec<EditPlanStep>> {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
     let windows = build_windows(total_lines, WINDOW_SIZE, WINDOW_OVERLAP);
-    let mut regions = Vec::new();
+    let mut steps = Vec::new();
 
     for (win_idx, (start, end)) in windows.iter().enumerate() {
-        if regions.len() >= MAX_PLANNED_REGIONS {
+        if steps.len() >= MAX_PLANNED_REGIONS {
             break;
         }
 
@@ -792,19 +943,32 @@ async fn request_preplan_regions(
             .map(|(i, line)| format!("{:>4}│{}", start + i + 1, line))
             .collect::<Vec<_>>()
             .join("\n");
-        let remaining = MAX_PLANNED_REGIONS - regions.len();
+        let remaining = MAX_PLANNED_REGIONS - steps.len();
 
         let prompt = format!(
-            "Plan small edit regions for one file.\n\n\
+            "Plan small edit steps for one file.\n\n\
              File: {path_str}\n\
              Task: {task}\n\n\
-             Return up to {remaining} non-overlapping regions to edit within this window.\n\
-             Use small regions. Each region should cover at most 5 edit sites.\n\
-             For repeated call-site updates, group nearby calls together.\n\
+             Return up to {remaining} non-overlapping steps within this window.\n\
+             Use LITERAL_REPLACE for obvious exact text replacements.\n\
+             Use SMART_EDIT for ambiguous or structural edits.\n\
+             Each step should cover at most 5 edit sites.\n\
+             For repeated call-site updates, group nearby exact calls with LITERAL_REPLACE when safe.\n\
              For code, prefer functions/classes/import blocks.\n\
              For config/text files, prefer logical sections.\n\
              Line numbers refer to the full file shown below.\n\n\
-             Output only:\n\
+             Output only these formats:\n\n\
+             LITERAL_REPLACE\n\
+             SCOPE <start> <end>\n\
+             ALL true\n\
+             OLD:\n\
+             <exact text to replace>\n\
+             END_OLD\n\
+             NEW:\n\
+             <replacement text>\n\
+             END_NEW\n\
+             END\n\n\
+             SMART_EDIT\n\
              REGION <start> <end>\n\
              TASK: <specific edit for this region>\n\
              END\n\n\
@@ -821,7 +985,7 @@ async fn request_preplan_regions(
         let request = ChatRequest {
             messages: vec![
                 Message::system(
-                    "You output only strict REGION blocks. No explanations, no markdown.",
+                    "You output only strict edit-plan blocks. No explanations, no markdown.",
                 ),
                 Message::user(&prompt),
             ],
@@ -836,26 +1000,26 @@ async fn request_preplan_regions(
             .and_then(|c| c.message.content.as_deref())
             .unwrap_or("");
 
-        let mut planned = parse_region_plan(text)?;
-        for region in &planned {
-            if region.start < start + 1 || region.end > *end {
+        let mut planned = parse_edit_plan(text)?;
+        for step in &planned {
+            if step.start_line() < start + 1 || step.end_line() > *end {
                 bail!(
-                    "planned region L{}-L{} falls outside window L{}-L{}",
-                    region.start,
-                    region.end,
+                    "planned step L{}-L{} falls outside window L{}-L{}",
+                    step.start_line(),
+                    step.end_line(),
                     start + 1,
                     end
                 );
             }
         }
-        regions.append(&mut planned);
-        if regions.len() > MAX_PLANNED_REGIONS {
-            regions.truncate(MAX_PLANNED_REGIONS);
+        steps.append(&mut planned);
+        if steps.len() > MAX_PLANNED_REGIONS {
+            steps.truncate(MAX_PLANNED_REGIONS);
         }
     }
 
-    validate_regions_in_file(&regions, total_lines)?;
-    Ok(regions)
+    validate_steps_in_file(&steps, total_lines)?;
+    Ok(steps)
 }
 
 async fn request_region_plan(
@@ -956,6 +1120,19 @@ fn validate_regions_in_file(regions: &[EditRegion], total_lines: usize) -> Resul
     reject_overlapping_regions(regions)
 }
 
+fn validate_steps_in_file(steps: &[EditPlanStep], total_lines: usize) -> Result<()> {
+    for step in steps {
+        if step.end_line() > total_lines {
+            bail!(
+                "planned step L{}-L{} falls outside file with {total_lines} lines",
+                step.start_line(),
+                step.end_line()
+            );
+        }
+    }
+    reject_overlapping_steps(steps)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchOp {
     InsertBefore {
@@ -984,6 +1161,132 @@ pub struct EditRegion {
     pub task: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditPlanStep {
+    SmartEdit(EditRegion),
+    LiteralReplace {
+        scope_start: usize,
+        scope_end: usize,
+        all: bool,
+        old: Vec<String>,
+        new: Vec<String>,
+    },
+}
+
+impl EditPlanStep {
+    fn start_line(&self) -> usize {
+        match self {
+            Self::SmartEdit(region) => region.start,
+            Self::LiteralReplace { scope_start, .. } => *scope_start,
+        }
+    }
+
+    fn end_line(&self) -> usize {
+        match self {
+            Self::SmartEdit(region) => region.end,
+            Self::LiteralReplace { scope_end, .. } => *scope_end,
+        }
+    }
+}
+
+pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
+    if text.trim() == "NO_REGIONS" {
+        return Ok(Vec::new());
+    }
+    if text.trim().is_empty() {
+        bail!("empty edit plan");
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    let mut steps = Vec::new();
+
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+
+        if line == "SMART_EDIT" {
+            i += 1;
+            let (region, next) = parse_region_at(&lines, i)?;
+            i = next;
+            steps.push(EditPlanStep::SmartEdit(region));
+            continue;
+        }
+
+        if line.starts_with("REGION ") {
+            let (region, next) = parse_region_at(&lines, i)?;
+            i = next;
+            steps.push(EditPlanStep::SmartEdit(region));
+            continue;
+        }
+
+        if line == "LITERAL_REPLACE" {
+            i += 1;
+            let scope_line = lines
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("missing SCOPE line for literal replace"))?;
+            let Some(rest) = scope_line.strip_prefix("SCOPE ") else {
+                bail!("expected SCOPE line but found '{scope_line}'");
+            };
+            let (scope_start, scope_end) = parse_two_line_numbers(rest, scope_line, "scope")?;
+            i += 1;
+
+            let all_line = lines
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("missing ALL line for literal replace"))?;
+            let all = match all_line.strip_prefix("ALL ") {
+                Some("true") => true,
+                Some("false") => false,
+                Some(other) => bail!("invalid ALL value '{other}' in line '{all_line}'"),
+                None => bail!("expected ALL line but found '{all_line}'"),
+            };
+            i += 1;
+
+            expect_line(&lines, i, "OLD:")?;
+            i += 1;
+            let (old, next) = collect_until(&lines, i, "END_OLD")?;
+            if old.is_empty() {
+                bail!("literal OLD block must not be empty");
+            }
+            if old.iter().all(|line| line.trim().is_empty()) {
+                bail!("literal OLD block must contain non-whitespace text");
+            }
+            i = next + 1;
+
+            expect_line(&lines, i, "NEW:")?;
+            i += 1;
+            let (new, next) = collect_until(&lines, i, "END_NEW")?;
+            i = next + 1;
+
+            expect_line(&lines, i, "END")?;
+            i += 1;
+
+            steps.push(EditPlanStep::LiteralReplace {
+                scope_start,
+                scope_end,
+                all,
+                old,
+                new,
+            });
+            continue;
+        }
+
+        bail!("unexpected text in edit plan: {line}");
+    }
+
+    if steps.len() > MAX_PLANNED_REGIONS {
+        bail!(
+            "edit plan returned {} steps, maximum is {MAX_PLANNED_REGIONS}",
+            steps.len()
+        );
+    }
+    reject_overlapping_steps(&steps)?;
+    Ok(steps)
+}
+
 pub fn parse_region_plan(text: &str) -> Result<Vec<EditRegion>> {
     if text.trim() == "NO_REGIONS" {
         return Ok(Vec::new());
@@ -1003,47 +1306,9 @@ pub fn parse_region_plan(text: &str) -> Result<Vec<EditRegion>> {
             continue;
         }
 
-        let Some(rest) = line.strip_prefix("REGION ") else {
-            bail!("unexpected text in region plan: {line}");
-        };
-        let mut parts = rest.split_whitespace();
-        let start_token = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("missing region start in header: {line}"))?;
-        let start = start_token.parse::<usize>().map_err(|e| {
-            anyhow::anyhow!("invalid region start '{start_token}' in header '{line}': {e}")
-        })?;
-        let end_token = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("missing region end in header: {line}"))?;
-        let end = end_token.parse::<usize>().map_err(|e| {
-            anyhow::anyhow!("invalid region end '{end_token}' in header '{line}': {e}")
-        })?;
-        if parts.next().is_some() {
-            bail!("too many fields in region header: {line}");
-        }
-        if start == 0 || end < start {
-            bail!("invalid region L{start}-L{end}");
-        }
-
-        i += 1;
-        let task_line = lines
-            .get(i)
-            .ok_or_else(|| anyhow::anyhow!("missing TASK line for region"))?;
-        let task = task_line
-            .strip_prefix("TASK:")
-            .ok_or_else(|| anyhow::anyhow!("expected TASK line but found '{task_line}'"))?
-            .trim()
-            .to_string();
-        if task.is_empty() {
-            bail!("region task must not be empty");
-        }
-
-        i += 1;
-        expect_line(&lines, i, "END")?;
-        i += 1;
-
-        regions.push(EditRegion { start, end, task });
+        let (region, next) = parse_region_at(&lines, i)?;
+        i = next;
+        regions.push(region);
     }
 
     if regions.len() > MAX_PLANNED_REGIONS {
@@ -1054,6 +1319,54 @@ pub fn parse_region_plan(text: &str) -> Result<Vec<EditRegion>> {
     }
     reject_overlapping_regions(&regions)?;
     Ok(regions)
+}
+
+fn parse_region_at(lines: &[&str], idx: usize) -> Result<(EditRegion, usize)> {
+    let line = lines
+        .get(idx)
+        .ok_or_else(|| anyhow::anyhow!("missing REGION header"))?;
+    let Some(rest) = line.strip_prefix("REGION ") else {
+        bail!("unexpected text in region plan: {line}");
+    };
+    let (start, end) = parse_two_line_numbers(rest, line, "region")?;
+
+    let task_line = lines
+        .get(idx + 1)
+        .ok_or_else(|| anyhow::anyhow!("missing TASK line for region"))?;
+    let task = task_line
+        .strip_prefix("TASK:")
+        .ok_or_else(|| anyhow::anyhow!("expected TASK line but found '{task_line}'"))?
+        .trim()
+        .to_string();
+    if task.is_empty() {
+        bail!("region task must not be empty");
+    }
+
+    expect_line(lines, idx + 2, "END")?;
+    Ok((EditRegion { start, end, task }, idx + 3))
+}
+
+fn parse_two_line_numbers(rest: &str, header: &str, label: &str) -> Result<(usize, usize)> {
+    let mut parts = rest.split_whitespace();
+    let start_token = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing {label} start in header: {header}"))?;
+    let start = start_token.parse::<usize>().map_err(|e| {
+        anyhow::anyhow!("invalid {label} start '{start_token}' in header '{header}': {e}")
+    })?;
+    let end_token = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing {label} end in header: {header}"))?;
+    let end = end_token.parse::<usize>().map_err(|e| {
+        anyhow::anyhow!("invalid {label} end '{end_token}' in header '{header}': {e}")
+    })?;
+    if parts.next().is_some() {
+        bail!("too many fields in {label} header: {header}");
+    }
+    if start == 0 || end < start {
+        bail!("invalid {label} L{start}-L{end}");
+    }
+    Ok((start, end))
 }
 
 fn reject_overlapping_regions(regions: &[EditRegion]) -> Result<()> {
@@ -1070,6 +1383,30 @@ fn reject_overlapping_regions(regions: &[EditRegion]) -> Result<()> {
                 prev.end,
                 next.start,
                 next.end
+            );
+        }
+    }
+    Ok(())
+}
+
+fn reject_overlapping_steps(steps: &[EditPlanStep]) -> Result<()> {
+    let mut sorted: Vec<&EditPlanStep> = steps.iter().collect();
+    sorted.sort_unstable_by(|a, b| {
+        a.start_line()
+            .cmp(&b.start_line())
+            .then_with(|| a.end_line().cmp(&b.end_line()))
+    });
+
+    for pair in sorted.windows(2) {
+        let prev = pair[0];
+        let next = pair[1];
+        if next.start_line() <= prev.end_line() {
+            bail!(
+                "edit plan has overlapping steps: L{}-L{} overlaps L{}-L{}",
+                prev.start_line(),
+                prev.end_line(),
+                next.start_line(),
+                next.end_line()
             );
         }
     }
@@ -1215,6 +1552,61 @@ fn apply_patch_dry_run_in_region(
     }
 
     apply_resolved_patch(content, resolved)
+}
+
+pub fn apply_literal_replace_in_scope(
+    content: &str,
+    scope_start: usize,
+    scope_end: usize,
+    old: &[String],
+    new: &[String],
+    all: bool,
+) -> Result<(String, usize)> {
+    if scope_start == 0 || scope_end < scope_start {
+        bail!("invalid literal scope L{scope_start}-L{scope_end}");
+    }
+    if old.is_empty() {
+        bail!("literal OLD block must not be empty");
+    }
+
+    let line_count = content.lines().count();
+    if scope_end > line_count {
+        bail!("literal scope L{scope_start}-L{scope_end} outside {line_count} line file");
+    }
+
+    let parts: Vec<&str> = content.split_inclusive('\n').collect();
+    let start_byte: usize = parts[..scope_start - 1].iter().map(|part| part.len()).sum();
+    let end_byte: usize = parts[..scope_end].iter().map(|part| part.len()).sum();
+
+    let old_text = old.join("\n");
+    let new_text = new.join("\n");
+    let scoped = &content[start_byte..end_byte];
+    let count = scoped.matches(&old_text).count();
+
+    if all {
+        if count == 0 {
+            bail!(
+                "literal OLD block was not found in scope L{scope_start}-L{scope_end}\nOLD block:\n{}",
+                preview_block(old, None)
+            );
+        }
+    } else if count != 1 {
+        bail!(
+            "literal OLD block matched {count} occurrence(s) in scope L{scope_start}-L{scope_end}; expected exactly 1"
+        );
+    }
+
+    let replaced_scope = if all {
+        scoped.replace(&old_text, &new_text)
+    } else {
+        scoped.replacen(&old_text, &new_text, 1)
+    };
+
+    let mut out = String::with_capacity(content.len() + replaced_scope.len());
+    out.push_str(&content[..start_byte]);
+    out.push_str(&replaced_scope);
+    out.push_str(&content[end_byte..]);
+    Ok((out, count))
 }
 
 fn apply_resolved_patch(content: &str, mut resolved: Vec<ResolvedOp>) -> Result<String> {

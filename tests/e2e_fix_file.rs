@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use miniswe::knowledge::ProjectIndex;
 use miniswe::knowledge::indexer;
 use miniswe::tools;
-use miniswe::tools::fix_file::{self, PatchOp};
+use miniswe::tools::fix_file::{self, EditPlanStep, PatchOp};
 use miniswe::tools::permissions::PermissionManager;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -175,6 +175,72 @@ fn parse_region_plan_rejects_overlap_and_preamble() {
 }
 
 #[test]
+fn parse_edit_plan_supports_literal_and_smart_steps() {
+    let plan = "\
+LITERAL_REPLACE
+SCOPE 1 20
+ALL true
+OLD:
+context::assemble(&config, \"test\", &[], false, None)
+END_OLD
+NEW:
+context::assemble(&config, \"test\", &[], false, None, None)
+END_NEW
+END
+
+SMART_EDIT
+REGION 30 40
+TASK: update the multi-line call
+END
+";
+
+    let steps = fix_file::parse_edit_plan(plan).unwrap();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(
+        steps[0],
+        EditPlanStep::LiteralReplace {
+            scope_start: 1,
+            scope_end: 20,
+            all: true,
+            old: vec!["context::assemble(&config, \"test\", &[], false, None)".into()],
+            new: vec!["context::assemble(&config, \"test\", &[], false, None, None)".into()],
+        }
+    );
+    assert_eq!(
+        steps[1],
+        EditPlanStep::SmartEdit(fix_file::EditRegion {
+            start: 30,
+            end: 40,
+            task: "update the multi-line call".into(),
+        })
+    );
+}
+
+#[test]
+fn parse_edit_plan_rejects_overlapping_steps() {
+    let plan = "\
+LITERAL_REPLACE
+SCOPE 1 10
+ALL true
+OLD:
+a
+END_OLD
+NEW:
+b
+END_NEW
+END
+
+SMART_EDIT
+REGION 10 20
+TASK: edit another block
+END
+";
+
+    let err = fix_file::parse_edit_plan(plan).unwrap_err().to_string();
+    assert!(err.contains("overlapping steps"));
+}
+
+#[test]
 fn parse_rejects_preamble_and_malformed_blocks() {
     assert!(fix_file::parse_patch("Here is the patch:\nINSERT_AFTER 1\nCONTENT:\nx\nEND").is_err());
     assert!(fix_file::parse_patch("INSERT_AFTER 1\nCONTENT:\nx\n").is_err());
@@ -336,6 +402,43 @@ fn overlapping_replacements_report_conflicting_spans() {
     assert!(err.contains("L3"));
     assert!(err.contains("smallest enclosing REPLACE_AT"));
     assert!(err.contains("narrower fix_file task"));
+}
+
+#[test]
+fn literal_replace_in_scope_replaces_all_exact_matches() {
+    let content = "call(None)\nkeep(None)\ncall(None)\noutside(None)\n";
+    let (out, count) = fix_file::apply_literal_replace_in_scope(
+        content,
+        1,
+        3,
+        &["call(None)".into()],
+        &["call(None, None)".into()],
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(count, 2);
+    assert_eq!(
+        out,
+        "call(None, None)\nkeep(None)\ncall(None, None)\noutside(None)\n"
+    );
+}
+
+#[test]
+fn literal_replace_in_scope_requires_exact_match_count_for_single() {
+    let err = fix_file::apply_literal_replace_in_scope(
+        "a\na\n",
+        1,
+        2,
+        &["a".into()],
+        &["b".into()],
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("matched 2 occurrence"));
+    assert!(err.contains("expected exactly 1"));
 }
 
 // ── Execute/atomicity with mocked LLM ──────────────────────────────
@@ -564,12 +667,65 @@ async fn execute_preplans_bulk_edit_into_regions() {
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert!(result.content.contains("Pre-plan: 2 region(s) planned"));
+    assert!(result.content.contains("Pre-plan: 2 step(s) planned"));
     assert!(result.content.contains("via pre-plan"));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call_a(None);\nkeep();\ncall_c(None);\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_preplan_uses_literal_replacements_before_smart_edits() {
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 3\nALL true\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n\nSMART_EDIT\nREGION 4 6\nTASK: update multi-line call\nEND\n",
+                ),
+                _ => helpers::mock_text_response(
+                    "REPLACE_AT 4\nOLD:\ncall(\n    None,\n)\nEND_OLD\nNEW:\ncall(\n    None,\n    None,\n)\nEND_NEW\n",
+                ),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(
+        config.project_root.join("main.rs"),
+        "call(None)\nkeep();\ncall(None)\ncall(\n    None,\n)\n",
+    )
+    .unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "update all call sites",
+        "lsp_validation": "off"
+    });
+    let result = fix_file::execute(&args, &config, &router, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert!(
+        result
+            .content
+            .contains("literal L1-L3: replaced 2 occurrence")
+    );
+    assert!(result.content.contains("smart L4-L6: applied 1 operation"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "call(None, None)\nkeep();\ncall(None, None)\ncall(\n    None,\n    None,\n)\n"
     );
 }
 
