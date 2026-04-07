@@ -67,7 +67,14 @@ pub struct AssembledContext {
 fn build_system_prompt() -> String {
     // Compressed format per design section 13.3 — ~40% shorter than prose
     String::from(
-        "You are miniswe, a coding agent. Use your tools to complete the task.\n",
+        "You are miniswe, a coding agent. Use your tools to complete the task.\n\
+         Tool contract: grouped tools require action plus action-specific params.\n\
+         file read: {\"action\":\"read\",\"path\":\"src/main.rs\"}\n\
+         file replace: {\"action\":\"replace\",\"path\":\"src/main.rs\",\"old\":\"exact text\",\"new\":\"replacement text\"}\n\
+         file write: {\"action\":\"write\",\"path\":\"src/main.rs\",\"content\":\"complete file content\"}\n\
+         file shell: {\"action\":\"shell\",\"command\":\"cargo check\",\"timeout\":30}\n\
+         For multi-line or multi-location file edits, prefer fix_file with a semantic task.\n\
+         If a tool says a parameter is missing, retry with the exact required parameter names.\n",
     )
 }
 

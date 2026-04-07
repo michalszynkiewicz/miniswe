@@ -15,7 +15,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "file".into(),
-                description: "File operations: read, write, replace, search, shell, revert. Use action='help' for details.".into(),
+                description: "File operations: read, write, replace, search, shell, revert. Use action='help' for details. For action='replace', pass path+old+new, not start_line/end_line. For multi-line or multi-location edits, prefer fix_file.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -23,13 +23,13 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                             "type": "string",
                             "description": "One of: read, write, replace, search, shell, revert, help"
                         },
-                        "path": { "type": "string", "description": "File path (for read/write/replace/revert)" },
-                        "content": { "type": "string", "description": "File content (for write)" },
-                        "old": { "type": "string", "description": "Text to find (for replace)" },
-                        "new": { "type": "string", "description": "Replacement text (for replace)" },
+                        "path": { "type": "string", "description": "File path (required for read/write/replace/revert)" },
+                        "content": { "type": "string", "description": "File content (required for action='write')" },
+                        "old": { "type": "string", "description": "Exact text to find (required for action='replace')" },
+                        "new": { "type": "string", "description": "Replacement text (required for action='replace')" },
                         "all": { "type": "boolean", "description": "Replace all occurrences (for replace)" },
-                        "start_line": { "type": "integer", "description": "Start line for read" },
-                        "end_line": { "type": "integer", "description": "End line for read" },
+                        "start_line": { "type": "integer", "description": "Start line for action='read' only. Do not use with replace." },
+                        "end_line": { "type": "integer", "description": "End line for action='read' only. Do not use with replace." },
                         "query": { "type": "string", "description": "Search text (for search)" },
                         "pattern": { "type": "string", "description": "Regex pattern (for search)" },
                         "scope": { "type": "string", "description": "Search scope (for search)" },
@@ -140,7 +140,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "fix_file".into(),
-                description: "Describe a change and it gets applied across the file. Provide specific details (types, parameter names, values).".into(),
+                description: "Apply a semantic code change across one file using an atomic patch. Prefer this for multi-line edits, repeated call-site updates, or when file(action='replace') would need start_line/end_line.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -196,10 +196,13 @@ Available actions for `file`:
 
 - read: Read a file. Params: path (required), start_line, end_line
 - write: Create or overwrite a file. Params: path (required), content (required)
+  Example: {\"action\":\"write\",\"path\":\"src/main.rs\",\"content\":\"complete file content\"}
 - replace: Replace text. Params: path (required), old (required), new (required), all (optional bool)
+  Example: {\"action\":\"replace\",\"path\":\"src/main.rs\",\"old\":\"exact text\",\"new\":\"replacement\"}
   Default replaces one unique match. Set all=true for every occurrence.
 - search: Search codebase. Params: query or pattern (one required), scope, max_results
 - shell: Run a command. Params: command (required), timeout
+  Example: {\"action\":\"shell\",\"command\":\"cargo check\",\"timeout\":30}
 - revert: Revert files to a previous round. Params: to_round, path (both optional)"
 }
 

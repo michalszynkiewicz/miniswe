@@ -28,7 +28,9 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
 
     if command.is_empty() {
-        return Ok(ToolResult::err("Missing required parameter: command".into()));
+        return Ok(ToolResult::err(
+            "Missing required parameter: command. Expected JSON arguments: {\"action\":\"shell\",\"command\":\"cargo check\",\"timeout\":30}.".into()
+        ));
     }
 
     // Spawn the child process

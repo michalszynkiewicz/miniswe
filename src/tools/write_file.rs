@@ -20,10 +20,14 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let content = args["content"].as_str().unwrap_or("");
 
     if path_str.is_empty() {
-        return Ok(ToolResult::err("Missing required parameter: path".into()));
+        return Ok(ToolResult::err(
+            "Missing required parameter: path. Expected JSON arguments: {\"action\":\"write\",\"path\":\"src/main.rs\",\"content\":\"complete file content\"}.".into()
+        ));
     }
     if content.is_empty() {
-        return Ok(ToolResult::err("Missing required parameter: content".into()));
+        return Ok(ToolResult::err(
+            "Missing required parameter: content. Expected JSON arguments: {\"action\":\"write\",\"path\":\"src/main.rs\",\"content\":\"complete file content\"}. For multi-line or multi-location edits to an existing file, prefer fix_file.".into()
+        ));
     }
 
     let path = resolve_path(path_str, config);
