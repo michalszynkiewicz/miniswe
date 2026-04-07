@@ -140,7 +140,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "fix_file".into(),
-                description: "Apply a semantic code change across one file using an atomic patch. Prefer this for multi-line edits, repeated call-site updates, or when file(action='replace') would need start_line/end_line.".into(),
+                description: "Apply a semantic code change across one file using an atomic patch. Prefer this for multi-line edits, repeated call-site updates, or when file(action='replace') would need start_line/end_line. Supports optional LSP validation.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -151,6 +151,11 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "task": {
                             "type": "string",
                             "description": "What to change and why. Be specific: include types, parameter names, values."
+                        },
+                        "lsp_validation": {
+                            "type": "string",
+                            "enum": ["auto", "require", "off"],
+                            "description": "Optional validation policy: auto (default) uses LSP if available, require fails if LSP is unavailable or diagnostics worsen, off skips LSP validation."
                         }
                     },
                     "required": ["path", "task"]

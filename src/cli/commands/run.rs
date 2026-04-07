@@ -24,7 +24,6 @@ use crate::tools;
 use crate::tools::permissions::{Action, PermissionManager};
 use crate::tui;
 
-
 /// Run the agent for a single message.
 pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()> {
     let log = SessionLog::new(&config);
@@ -40,8 +39,12 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     // Filter tools based on config
     {
         let mut disabled = Vec::new();
-        if !config.tools.web_tools { disabled.push("web"); }
-        if !config.tools.plan { disabled.push("plan"); }
+        if !config.tools.web_tools {
+            disabled.push("web");
+        }
+        if !config.tools.plan {
+            disabled.push("plan");
+        }
         tool_defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
     }
 
@@ -61,12 +64,16 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     }
     if !router.is_multi_model() {
         tui::print_status(
-            "Tip: configure [models] in config.toml with llama-swap for multi-model routing (plan/code/fast)"
+            "Tip: configure [models] in config.toml with llama-swap for multi-model routing (plan/code/fast)",
         );
     }
 
     // Select model role: plan mode uses the plan model, normal mode uses default
-    let model_role = if plan_only { ModelRole::Plan } else { ModelRole::Default };
+    let model_role = if plan_only {
+        ModelRole::Plan
+    } else {
+        ModelRole::Default
+    };
 
     // Spawn LSP client (non-blocking — initializes in background)
     let lsp_client: Option<Arc<LspClient>> = if config.lsp.enabled {
@@ -83,7 +90,6 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     } else {
         None
     };
-
 
     // Initialize MCP servers
     let mcp_config = McpConfig::load(&config.project_root)?;
@@ -111,14 +117,11 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         None
     };
 
-    let mcp_summary = mcp_registry
-        .as_ref()
-        .and_then(|r| r.context_summary());
+    let mcp_summary = mcp_registry.as_ref().and_then(|r| r.context_summary());
 
     // Estimate tool definition overhead for context budgeting
-    let tool_def_tokens = context::estimate_tokens(
-        &serde_json::to_string(&tool_defs).unwrap_or_default()
-    );
+    let tool_def_tokens =
+        context::estimate_tokens(&serde_json::to_string(&tool_defs).unwrap_or_default());
 
     let max_rounds = config.context.max_rounds;
     let pause_at = config.context.pause_after_rounds;
@@ -132,9 +135,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let mut recent_calls: Vec<String> = Vec::new();
     let mut consecutive_loops = 0u32;
     let mut calls_since_last_edit = 0u32;
-    let mut edit_fail_count: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut edit_fail_count: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     let mut plan_update_requested = false;
-
 
     // Ctrl+C cancellation flag
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -148,8 +151,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     });
 
     // Initialize snapshot manager for revert support
-    let mut snapshots = tools::snapshots::SnapshotManager::init(&config.project_root)
-        .ok();
+    let mut snapshots = tools::snapshots::SnapshotManager::init(&config.project_root).ok();
 
     // Initial context assembly
     let assembled = context::assemble(
@@ -204,9 +206,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 }
                 _ => {
                     // Tell the LLM to wrap up
-                    messages.push(Message::user(
-                        "[Stop now. Summarize what you've done.]"
-                    ));
+                    messages.push(Message::user("[Stop now. Summarize what you've done.]"));
                 }
             }
         }
@@ -214,17 +214,21 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         // Warn the LLM when approaching the hard limit
         if round == max_rounds.saturating_sub(5) {
             messages.push(Message::user(
-                "[Approaching tool limit. Wrap up and summarize.]"
+                "[Approaching tool limit. Wrap up and summarize.]",
             ));
         }
 
         // Unified context compression — handles both tool results and conversation
         let pre_mask = messages.len();
-        context::compressor::maybe_compress(&mut messages, &config, &router, tool_def_tokens, &mut plan_update_requested).await;
-        log.masking_applied(
-            pre_mask.saturating_sub(messages.len()),
-            pre_mask,
-        );
+        context::compressor::maybe_compress(
+            &mut messages,
+            &config,
+            &router,
+            tool_def_tokens,
+            &mut plan_update_requested,
+        )
+        .await;
+        log.masking_applied(pre_mask.saturating_sub(messages.len()), pre_mask);
 
         // Sanitize message roles before sending (strict chat template compat)
         context::sanitize_messages(&mut messages);
@@ -246,14 +250,19 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         let thinking = Arc::new(AtomicBool::new(true));
 
         let response = match router
-            .chat_stream(model_role, &request, |token| {
-                if thinking.load(Ordering::Relaxed) {
-                    thinking.store(false, Ordering::Relaxed);
-                    eprint!("\r\x1b[2K");
-                    std::io::stderr().flush().ok();
-                }
-                tui::print_token(token);
-            }, &cancelled)
+            .chat_stream(
+                model_role,
+                &request,
+                |token| {
+                    if thinking.load(Ordering::Relaxed) {
+                        thinking.store(false, Ordering::Relaxed);
+                        eprint!("\r\x1b[2K");
+                        std::io::stderr().flush().ok();
+                    }
+                    tui::print_token(token);
+                },
+                &cancelled,
+            )
             .await
         {
             Ok(r) => {
@@ -272,7 +281,12 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     break;
                 }
                 let clean = if err_str.contains('<') {
-                    err_str.split('<').next().unwrap_or(&err_str).trim().to_string()
+                    err_str
+                        .split('<')
+                        .next()
+                        .unwrap_or(&err_str)
+                        .trim()
+                        .to_string()
                 } else {
                     err_str
                 };
@@ -331,7 +345,10 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 Err(e) => {
                     let result_msg = Message::tool_result(
                         &tc.id,
-                        &format!("Invalid JSON in tool arguments: {e}\nRaw: {}", tc.function.arguments),
+                        &format!(
+                            "Invalid JSON in tool arguments: {e}\nRaw: {}",
+                            tc.function.arguments
+                        ),
                     );
                     messages.push(result_msg.clone());
                     conversation_history.push(result_msg);
@@ -379,7 +396,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             // Block write tools in plan-only mode
             let file_action = args["action"].as_str().unwrap_or("");
             if plan_only
-                && ((tc.function.name == "file" && matches!(file_action, "write" | "replace" | "shell"))
+                && ((tc.function.name == "file"
+                    && matches!(file_action, "write" | "replace" | "shell"))
                     || tc.function.name == "fix_file")
             {
                 let result_msg = Message::tool_result(
@@ -393,12 +411,10 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             }
 
             // Write gating: require plan before write tools
-            let is_write_action = (tc.function.name == "file" && matches!(file_action, "write" | "replace"))
+            let is_write_action = (tc.function.name == "file"
+                && matches!(file_action, "write" | "replace"))
                 || tc.function.name == "fix_file";
-            if config.tools.plan
-                && !tools::plan::plan_exists(&config)
-                && is_write_action
-            {
+            if config.tools.plan && !tools::plan::plan_exists(&config) && is_write_action {
                 let result_msg = Message::tool_result(
                     &tc.id,
                     "Create a plan first: use plan(action='set') with your step-by-step approach before making changes.",
@@ -426,7 +442,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                             Err(e) => crate::tools::ToolResult::err(format!("Revert failed: {e}")),
                         }
                     }
-                    None => crate::tools::ToolResult::err("Snapshot system not available (git not found?)".into()),
+                    None => crate::tools::ToolResult::err(
+                        "Snapshot system not available (git not found?)".into(),
+                    ),
                 }
             } else if tc.function.name == "plan" {
                 match tools::plan::execute(&args, &config, round).await {
@@ -434,7 +452,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     Err(e) => crate::tools::ToolResult::err(format!("plan error: {e}")),
                 }
             } else if tc.function.name == "fix_file" {
-                match tools::fix_file::execute(&args, &config, &router).await {
+                match tools::fix_file::execute(&args, &config, &router, lsp_client.as_deref()).await
+                {
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("fix_file error: {e}")),
                 }
@@ -453,14 +472,24 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     },
                 }
             } else {
-                match tools::execute_tool(&tc.function.name, &args, &config, &perms, lsp_client.as_deref()).await {
+                match tools::execute_tool(
+                    &tc.function.name,
+                    &args,
+                    &config,
+                    &perms,
+                    lsp_client.as_deref(),
+                )
+                .await
+                {
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("Tool error: {e}")),
                 }
             };
 
             // Append round number to every tool result
-            result.content.push_str(&format!("\n[round {round}/{max_rounds}]"));
+            result
+                .content
+                .push_str(&format!("\n[round {round}/{max_rounds}]"));
 
             let first_line = result.content.lines().next().unwrap_or("(empty)");
             log.tool_call(&tc.function.name, &args_summary, result.success, first_line);
@@ -468,7 +497,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             tui::print_tool_result(&tc.function.name, result.success, first_line);
 
             // A successful file write means code changed — reset trackers.
-            let is_file_write = (tc.function.name == "file" && matches!(file_action, "replace" | "write"))
+            let is_file_write = (tc.function.name == "file"
+                && matches!(file_action, "replace" | "write"))
                 || tc.function.name == "fix_file";
             if result.success && is_file_write {
                 recent_calls.clear();
@@ -501,7 +531,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 "[WARNING: You have used 20+ tool calls without making any edits. \
                  You likely have enough information. Start making changes now. \
                  Use write_file for files under 200 lines. \
-                 If you're stuck, explain what's blocking you.]"
+                 If you're stuck, explain what's blocking you.]",
             ));
         }
     }
@@ -533,62 +563,54 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
     let action = args["action"].as_str().unwrap_or("");
     match tool_name {
-        "file" => {
-            match action {
-                "read" => {
-                    let path = args["path"].as_str().unwrap_or("?");
-                    let start = args["start_line"].as_u64();
-                    let end = args["end_line"].as_u64();
-                    match (start, end) {
-                        (Some(s), Some(e)) => format!("read {path}:{s}-{e}"),
-                        (Some(s), None) => format!("read {path}:{s}-"),
-                        _ => format!("read {path}"),
-                    }
+        "file" => match action {
+            "read" => {
+                let path = args["path"].as_str().unwrap_or("?");
+                let start = args["start_line"].as_u64();
+                let end = args["end_line"].as_u64();
+                match (start, end) {
+                    (Some(s), Some(e)) => format!("read {path}:{s}-{e}"),
+                    (Some(s), None) => format!("read {path}:{s}-"),
+                    _ => format!("read {path}"),
                 }
-                "search" => {
-                    let query = args["query"].as_str().unwrap_or("?");
-                    let scope = args["scope"].as_str().unwrap_or("project");
-                    format!("search \"{query}\" in {scope}")
-                }
-                "replace" | "write" => {
-                    let path = args["path"].as_str().unwrap_or("?");
-                    format!("{action} {path}")
-                }
-                "shell" => {
-                    let cmd = args["command"].as_str().unwrap_or("?");
-                    format!("shell {}", crate::truncate_chars(cmd, 40))
-                }
-                "revert" => "revert".to_string(),
-                _ => format!("{action}"),
             }
-        }
-        "code" => {
-            match action {
-                "goto_definition" | "find_references" => {
-                    let path = args["path"].as_str().unwrap_or("?");
-                    let line = args["line"].as_u64().unwrap_or(0);
-                    format!("{action} {path}:{line}")
-                }
-                _ => action.to_string(),
+            "search" => {
+                let query = args["query"].as_str().unwrap_or("?");
+                let scope = args["scope"].as_str().unwrap_or("project");
+                format!("search \"{query}\" in {scope}")
             }
-        }
-        "web" => {
-            match action {
-                "search" => {
-                    let query = args["query"].as_str().unwrap_or("?");
-                    format!("search \"{query}\"")
-                }
-                "fetch" => args["url"].as_str().unwrap_or("?").to_string(),
-                _ => action.to_string(),
+            "replace" | "write" => {
+                let path = args["path"].as_str().unwrap_or("?");
+                format!("{action} {path}")
             }
-        }
-        "plan" => {
-            match action {
-                "scratchpad" => "scratchpad".to_string(),
-                "check" => format!("check step {}", args["step"].as_u64().unwrap_or(0)),
-                _ => action.to_string(),
+            "shell" => {
+                let cmd = args["command"].as_str().unwrap_or("?");
+                format!("shell {}", crate::truncate_chars(cmd, 40))
             }
-        }
+            "revert" => "revert".to_string(),
+            _ => format!("{action}"),
+        },
+        "code" => match action {
+            "goto_definition" | "find_references" => {
+                let path = args["path"].as_str().unwrap_or("?");
+                let line = args["line"].as_u64().unwrap_or(0);
+                format!("{action} {path}:{line}")
+            }
+            _ => action.to_string(),
+        },
+        "web" => match action {
+            "search" => {
+                let query = args["query"].as_str().unwrap_or("?");
+                format!("search \"{query}\"")
+            }
+            "fetch" => args["url"].as_str().unwrap_or("?").to_string(),
+            _ => action.to_string(),
+        },
+        "plan" => match action {
+            "scratchpad" => "scratchpad".to_string(),
+            "check" => format!("check step {}", args["step"].as_u64().unwrap_or(0)),
+            _ => action.to_string(),
+        },
         "fix_file" => args["path"].as_str().unwrap_or("?").to_string(),
         "mcp_use" => {
             let server = args["server"].as_str().unwrap_or("?");

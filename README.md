@@ -44,7 +44,7 @@ miniswe operates on one principle: **give the model the right tools and let it d
 - **Unified Compression** — Single-pass timeline compression. When conversation exceeds the token budget, older messages are LLM-summarized into a narrative and archived to `.miniswe/session_archive.md`.
 - **Knowledge Engine** — Tree-sitter AST parsing (19 languages), PageRank-based dependency graph, doc-header extraction for file summaries, incremental re-indexing after edits.
 - **LSP Integration** — Auto-downloads rust-analyzer (or other language servers). Provides ~200ms diagnostics after edits (vs 2-5s cargo check) plus `code(action='goto_definition')` and `code(action='find_references')`.
-- **fix_file Tool** — LLM-powered atomic patching. Describe a change and it applies validated multi-line edits across one file.
+- **fix_file Tool** — LLM-powered atomic patching. Describe a change and it applies validated multi-line edits across one file, with split fallback for broad patches and optional LSP validation.
 - **Smart Edit** — 3-layer fuzzy matching (exact trim, indentation-preserving, line-similarity), bracket balance detection, edit failure tracking (forces write after 2 failures).
 - **Tool System** — 5 grouped tools + `fix_file` + unlimited MCP tools. Path jailing, shell approval, per-query web access control.
 - **LLM Interface** — OpenAI-compatible API with streaming, tool call parsing, multi-model routing (plan/code/fast roles).
@@ -130,8 +130,16 @@ Tools are grouped to reduce the function list for small models. Each group uses 
 
 | Tool | Purpose |
 |------|---------|
-| `fix_file` | LLM-powered code transformation — describe a change, it gets applied |
+| `fix_file` | LLM-powered code transformation — describe a change, it gets applied atomically |
 | `mcp_use` | Call any tool on a connected MCP server |
+
+`fix_file` accepts `path` and `task`, plus optional `lsp_validation`:
+
+| `lsp_validation` | Behavior |
+|------------------|----------|
+| `auto` | Default. Use LSP diagnostics if available; skip if unavailable. |
+| `require` | Require LSP diagnostics and reject patches that worsen file errors. |
+| `off` | Skip LSP diagnostics, useful for unsupported text/config files. |
 
 ## LSP Support
 
