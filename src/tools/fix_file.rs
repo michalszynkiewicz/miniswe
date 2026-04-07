@@ -21,7 +21,8 @@ const WINDOW_SIZE: usize = 800;
 /// Overlap between windows to catch edits at boundaries.
 const WINDOW_OVERLAP: usize = 100;
 const MAX_PATCH_ATTEMPTS: usize = 3;
-const MAX_PLANNED_REGIONS: usize = 5;
+const MAX_PLANNED_REGIONS: usize = 100;
+const MAX_PREPLAN_STEPS: usize = 100;
 const LARGE_TRUNCATION_MIN_LINES: usize = 50;
 
 pub async fn execute(
@@ -933,7 +934,7 @@ async fn request_preplan_steps(
     let mut steps = Vec::new();
 
     for (win_idx, (start, end)) in windows.iter().enumerate() {
-        if steps.len() >= MAX_PLANNED_REGIONS {
+        if steps.len() >= MAX_PREPLAN_STEPS {
             break;
         }
 
@@ -943,7 +944,7 @@ async fn request_preplan_steps(
             .map(|(i, line)| format!("{:>4}│{}", start + i + 1, line))
             .collect::<Vec<_>>()
             .join("\n");
-        let remaining = MAX_PLANNED_REGIONS - steps.len();
+        let remaining = MAX_PREPLAN_STEPS - steps.len();
 
         let prompt = format!(
             "Plan small edit steps for one file.\n\n\
@@ -1013,8 +1014,8 @@ async fn request_preplan_steps(
             }
         }
         steps.append(&mut planned);
-        if steps.len() > MAX_PLANNED_REGIONS {
-            steps.truncate(MAX_PLANNED_REGIONS);
+        if steps.len() > MAX_PREPLAN_STEPS {
+            steps.truncate(MAX_PREPLAN_STEPS);
         }
     }
 
@@ -1277,9 +1278,9 @@ pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
         bail!("unexpected text in edit plan: {line}");
     }
 
-    if steps.len() > MAX_PLANNED_REGIONS {
+    if steps.len() > MAX_PREPLAN_STEPS {
         bail!(
-            "edit plan returned {} steps, maximum is {MAX_PLANNED_REGIONS}",
+            "edit plan returned {} steps, maximum is {MAX_PREPLAN_STEPS}",
             steps.len()
         );
     }
