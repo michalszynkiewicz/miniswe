@@ -18,10 +18,14 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let replace_all = args["all"].as_bool().unwrap_or(false);
 
     if path_str.is_empty() {
-        return Ok(ToolResult::err("Missing required parameter: path".into()));
+        return Ok(ToolResult::err(
+            "Missing required parameter: path. Expected JSON arguments: {\"action\":\"replace\",\"path\":\"src/main.rs\",\"old\":\"exact text to replace\",\"new\":\"replacement text\"}. Do not use start_line/end_line with replace. For multi-location edits, use fix_file.".into()
+        ));
     }
     if old.is_empty() {
-        return Ok(ToolResult::err("Missing required parameter: old".into()));
+        return Ok(ToolResult::err(
+            "Missing required parameter: old. Expected JSON arguments: {\"action\":\"replace\",\"path\":\"src/main.rs\",\"old\":\"exact text to replace\",\"new\":\"replacement text\"}. Do not use start_line/end_line with replace. For multi-location edits, use fix_file.".into()
+        ));
     }
 
     let path = resolve_path(path_str, config);
