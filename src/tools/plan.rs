@@ -529,3 +529,29 @@ pub fn load_plan(config: &Config) -> Option<String> {
         Some(content)
     }
 }
+
+pub fn failure_hint(config: &Config) -> Option<String> {
+    let steps = parse_steps(&load_plan(config)?);
+    if steps.is_empty() {
+        return None;
+    }
+
+    let done = steps.iter().filter(|step| step.checked).count();
+    let next = steps
+        .iter()
+        .enumerate()
+        .find(|(_, step)| !step.checked)
+        .map(|(idx, step)| {
+            format!(
+                "; next {}: {}",
+                idx + 1,
+                crate::truncate_chars(&step.description, 90)
+            )
+        })
+        .unwrap_or_else(|| "; all steps checked".to_string());
+
+    Some(format!(
+        "Plan: {done}/{} done{next}. If this error changes direction, use plan(action='refine').",
+        steps.len()
+    ))
+}

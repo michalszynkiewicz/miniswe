@@ -629,7 +629,7 @@ async fn run_agent_loop(
             }
 
             // Execute tool (permissions already checked above for shell/web/mcp)
-            let result = if tc.function.name == "mcp_use" {
+            let mut result = if tc.function.name == "mcp_use" {
                 let server = args["server"].as_str().unwrap_or("");
                 let tool = args["tool"].as_str().unwrap_or("");
                 let tool_args = args.get("arguments").cloned().unwrap_or_default();
@@ -661,6 +661,13 @@ async fn run_agent_loop(
                     Err(e) => crate::tools::ToolResult::err(format!("Tool error: {e}")),
                 }
             };
+
+            if !result.success {
+                if let Some(hint) = tools::plan::failure_hint(config) {
+                    result.content.push_str("\n");
+                    result.content.push_str(&hint);
+                }
+            }
 
             let first_line = result.content.lines().next().unwrap_or("(empty)");
             log.tool_call(&tc.function.name, &args_summary, result.success, first_line);

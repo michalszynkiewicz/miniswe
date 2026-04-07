@@ -119,3 +119,19 @@ async fn plan_load_for_context() {
     assert!(loaded.is_some());
     assert!(loaded.unwrap().contains("Do things"));
 }
+
+#[tokio::test]
+async fn plan_failure_hint_shows_progress_and_next_step() {
+    let (_tmp, config) = helpers::create_test_project();
+    fs::create_dir_all(config.miniswe_dir()).ok();
+    fs::write(
+        config.miniswe_dir().join("plan.md"),
+        "- [x] (round 2) Add flag [compile]\n- [ ] Update call sites [compile]\n",
+    )
+    .unwrap();
+
+    let hint = plan::failure_hint(&config).unwrap();
+    assert!(hint.contains("Plan: 1/2 done"));
+    assert!(hint.contains("next 2: Update call sites"));
+    assert!(hint.contains("plan(action='refine')"));
+}
