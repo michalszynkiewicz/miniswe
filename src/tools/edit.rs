@@ -8,8 +8,8 @@ use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::config::Config;
 use super::ToolResult;
+use crate::config::Config;
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let path_str = args["path"].as_str().unwrap_or("");
@@ -46,9 +46,8 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         let new_content = content.replace(old, new);
         std::fs::write(&path, &new_content)?;
         let total_lines = new_content.lines().count();
-        let mut output = format!(
-            "✓ Replaced {count} occurrence(s) in {path_str} ({total_lines} lines total)\n"
-        );
+        let mut output =
+            format!("✓ Replaced {count} occurrence(s) in {path_str} ({total_lines} lines total)\n");
         if let Some(pos) = new_content.find(new) {
             let line_num = new_content[..pos].chars().filter(|&c| c == '\n').count() + 1;
             let lines: Vec<&str> = new_content.lines().collect();
@@ -79,8 +78,8 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         return Ok(ToolResult::err(format!("File not found: {path_str}")));
     }
 
-    let content = fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("Failed to read {path_str}: {e}"))?;
+    let content =
+        fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("Failed to read {path_str}: {e}"))?;
 
     // Count occurrences
     let count = content.matches(old).count();
@@ -105,16 +104,21 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 
             let mut output = format!(
                 "✓ Edited {path_str} (1 replacement, showing L{}-{})\n",
-                context_start + 1, context_end
+                context_start + 1,
+                context_end
             );
             for i in context_start..context_end {
-                let marker = if i >= start && i < start + new_lines.len() { "+" } else { " " };
+                let marker = if i >= start && i < start + new_lines.len() {
+                    "+"
+                } else {
+                    " "
+                };
                 output.push_str(&format!("{marker}{:>4}│{}\n", i + 1, edited_lines[i]));
             }
             output.push_str("Note: matched with fuzzy/normalized matching — your 'old' text didn't match exactly.\n");
             if total_lines < 200 {
                 output.push_str(&format!(
-                    "Note: {path_str} is {total_lines} lines. For multiple changes, use file(action='write') to rewrite the whole file in one call.\n"
+                    "Note: {path_str} is {total_lines} lines. For additional semantic edits, prefer fix_file unless you are writing the complete file content.\n"
                 ));
             }
             return Ok(ToolResult::ok(output));
@@ -138,12 +142,14 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
                         err_msg.push_str(&format!("{marker}{:>4}│{}\n", j + 1, file_lines[j]));
                     }
                     matches_shown += 1;
-                    if matches_shown >= 3 { break; }
+                    if matches_shown >= 3 {
+                        break;
+                    }
                 }
             }
         }
         err_msg.push_str(&format!("[{path_str}: {} lines total]\n", file_lines.len()));
-        err_msg.push_str("HINT: Copy the exact text from the line numbers shown above into 'old'. Or use file(action='write') to rewrite the whole file.\n");
+        err_msg.push_str("HINT: Copy the exact text from the line numbers shown above into 'old', or use fix_file for a semantic edit.\n");
         return Ok(ToolResult::err(err_msg));
     }
 
@@ -162,7 +168,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         return Ok(ToolResult::err(format!(
             "old_content matches {count} locations in {path_str} (at {}).\n\
              Include more surrounding lines in 'old' to make the match unique, \
-             or use file(action='write') to rewrite the whole file.",
+             or use fix_file for a semantic edit.",
             match_lines.join(", ")
         )));
     }
@@ -206,17 +212,23 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         output.push_str(&format!("{marker}{:>4}│{}\n", i + 1, edited_lines[i]));
     }
 
-    // Nudge model to use write_file for small files with multiple changes
+    // Nudge the model toward the semantic editor for follow-up code edits.
     if total_lines < 200 {
         output.push_str(&format!(
-            "\nNote: {path_str} is {total_lines} lines. For multiple changes, use file(action='write') to rewrite the whole file in one call.\n"
+            "\nNote: {path_str} is {total_lines} lines. For additional semantic edits, prefer fix_file unless you are writing the complete file content.\n"
         ));
     }
 
     // For brace-based languages, check bracket balance after edit — catches common
     // mistakes like `});` instead of `));` in macro calls.
-    let brace_langs = ["rs","js","ts","tsx","jsx","go","java","c","cpp","h","hpp","cs","kt","swift","scala","zig"];
-    if brace_langs.iter().any(|ext| path_str.ends_with(&format!(".{ext}"))) {
+    let brace_langs = [
+        "rs", "js", "ts", "tsx", "jsx", "go", "java", "c", "cpp", "h", "hpp", "cs", "kt", "swift",
+        "scala", "zig",
+    ];
+    if brace_langs
+        .iter()
+        .any(|ext| path_str.ends_with(&format!(".{ext}")))
+    {
         let full = edited_lines.join("\n");
         let parens = full.matches('(').count() as i64 - full.matches(')').count() as i64;
         let braces = full.matches('{').count() as i64 - full.matches('}').count() as i64;
@@ -239,9 +251,13 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 /// 2. Indentation-preserving match (same content, different indent level)
 /// 3. Fuzzy match via line similarity (handles minor hallucinations)
 fn find_normalized_match(content_lines: &[&str], old_lines: &[&str]) -> Option<usize> {
-    if old_lines.is_empty() { return None; }
+    if old_lines.is_empty() {
+        return None;
+    }
     let old_len = old_lines.len();
-    let max = content_lines.len().saturating_sub(old_len.saturating_sub(1));
+    let max = content_lines
+        .len()
+        .saturating_sub(old_len.saturating_sub(1));
 
     // Layer 1: Exact trimmed match
     'exact: for i in 0..max {
@@ -265,7 +281,8 @@ fn find_normalized_match(content_lines: &[&str], old_lines: &[&str]) -> Option<u
             }
             // Check indent consistency (skip blank lines)
             if !old_stripped.is_empty() {
-                let content_indent = content_lines[i + j].len() - content_lines[i + j].trim_start().len();
+                let content_indent =
+                    content_lines[i + j].len() - content_lines[i + j].trim_start().len();
                 let old_indent = old_line.len() - old_line.trim_start().len();
                 let d = content_indent as isize - old_indent as isize;
                 match delta {
@@ -320,7 +337,10 @@ fn find_normalized_match(content_lines: &[&str], old_lines: &[&str]) -> Option<u
             let exact_ratio = exact_count as f64 / old_len as f64;
             let overall_score = sim_sum / old_len as f64;
 
-            if exact_ratio >= match_threshold && overall_score >= overall_threshold && overall_score > best_score {
+            if exact_ratio >= match_threshold
+                && overall_score >= overall_threshold
+                && overall_score > best_score
+            {
                 best_score = overall_score;
                 best_pos = Some(i);
             }
@@ -337,8 +357,12 @@ fn find_normalized_match(content_lines: &[&str], old_lines: &[&str]) -> Option<u
 /// Character-level similarity between two strings (Dice coefficient on bigrams).
 /// Returns 0.0 for completely different, 1.0 for identical.
 fn line_similarity(a: &str, b: &str) -> f64 {
-    if a == b { return 1.0; }
-    if a.is_empty() || b.is_empty() { return 0.0; }
+    if a == b {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
     if a.len() == 1 || b.len() == 1 {
         return if a == b { 1.0 } else { 0.0 };
     }

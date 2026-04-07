@@ -442,7 +442,7 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
         hints.push("ACTION: A symbol was renamed/removed but references remain. Search for the old name and update.");
     }
     if joined.contains("unclosed delimiter") || joined.contains("unexpected closing") {
-        hints.push("ACTION: Broken syntax (missing/extra bracket). Use file(action='write') to rewrite the file — replace is unreliable for structural fixes.");
+        hints.push("ACTION: Broken syntax (missing/extra bracket). Use fix_file for the structural repair; replace is unreliable for structural fixes.");
     }
     if joined.contains("mismatched types") {
         hints.push("ACTION: Type mismatch. Check the function signature and update the caller to pass the correct type.");

@@ -71,7 +71,7 @@ fn build_system_prompt() -> String {
          Tool contract: grouped tools require action plus action-specific params.\n\
          file read: {\"action\":\"read\",\"path\":\"src/main.rs\"}\n\
          file replace: {\"action\":\"replace\",\"path\":\"src/main.rs\",\"old\":\"exact text\",\"new\":\"replacement text\"}\n\
-         file write: {\"action\":\"write\",\"path\":\"src/main.rs\",\"content\":\"complete file content\"}\n\
+         file write needs complete file text: {\"action\":\"write\",\"path\":\"src/bin/hello.rs\",\"content\":\"fn main() {\\n    println!(\\\"hello\\\");\\n}\\n\"}\n\
          file shell: {\"action\":\"shell\",\"command\":\"cargo check\",\"timeout\":30}\n\
          For multi-line or multi-location file edits, prefer fix_file with a semantic task.\n\
          If a tool says a parameter is missing, retry with the exact required parameter names.\n",

@@ -624,7 +624,7 @@ async fn edit_whitespace_normalized_single_line() {
 // ── edit failure hints ────────────────────────────────────────────
 
 #[tokio::test]
-async fn edit_not_found_suggests_write_file() {
+async fn edit_not_found_suggests_fix_file() {
     let (_tmp, config) = helpers::create_test_project();
 
     fs::write(helpers::project_path(&config, "hint_test.txt"), "actual content\n").unwrap();
@@ -639,8 +639,11 @@ async fn edit_not_found_suggests_write_file() {
         .unwrap();
 
     assert!(!result.success);
-    assert!(result.content.contains("file(action='write')"),
-        "should suggest file(action='write'): {}", result.content);
+    assert!(
+        result.content.contains("fix_file"),
+        "should suggest fix_file: {}",
+        result.content
+    );
 }
 
 // ── context pull-based tools ──────────────────────────────────────
@@ -975,8 +978,11 @@ async fn edit_whitespace_empty_lines() {
     // This should fail — blank line differences aren't whitespace normalization
     // (trimming doesn't help with missing lines)
     // The model should get a helpful error
-    assert!(result.content.contains("file(action='write')") || result.content.contains("HINT"),
-        "should suggest alternatives: {}", result.content);
+    assert!(
+        result.content.contains("fix_file") || result.content.contains("HINT"),
+        "should suggest alternatives: {}",
+        result.content
+    );
 }
 
 // ── tool response content tests ───────────────────────────────────

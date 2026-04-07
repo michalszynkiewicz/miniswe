@@ -15,7 +15,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "file".into(),
-                description: "File operations: read, write, replace, search, shell, revert. Use action='help' for details. For action='replace', pass path+old+new, not start_line/end_line. For multi-line or multi-location edits, prefer fix_file.".into(),
+                description: "File operations: read, search, shell, replace, write, revert. Use action='help' for details. For code edits, prefer fix_file. Use replace only with exact old+new text. Use write only when providing the complete file contents.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -24,7 +24,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                             "description": "One of: read, write, replace, search, shell, revert, help"
                         },
                         "path": { "type": "string", "description": "File path (required for read/write/replace/revert)" },
-                        "content": { "type": "string", "description": "File content (required for action='write')" },
+                        "content": { "type": "string", "description": "Complete file contents (required for action='write'); not a patch or snippet" },
                         "old": { "type": "string", "description": "Exact text to find (required for action='replace')" },
                         "new": { "type": "string", "description": "Replacement text (required for action='replace')" },
                         "all": { "type": "boolean", "description": "Replace all occurrences (for replace)" },
@@ -200,8 +200,9 @@ pub fn file_help() -> &'static str {
 Available actions for `file`:
 
 - read: Read a file. Params: path (required), start_line, end_line
-- write: Create or overwrite a file. Params: path (required), content (required)
-  Example: {\"action\":\"write\",\"path\":\"src/main.rs\",\"content\":\"complete file content\"}
+- write: Create or overwrite a file. Params: path (required), content (required, COMPLETE file text)
+  Example: {\"action\":\"write\",\"path\":\"src/bin/hello.rs\",\"content\":\"fn main() {\\n    println!(\\\"hello\\\");\\n}\\n\"}
+  For edits to existing code, prefer fix_file unless you are providing the whole file.
 - replace: Replace text. Params: path (required), old (required), new (required), all (optional bool)
   Example: {\"action\":\"replace\",\"path\":\"src/main.rs\",\"old\":\"exact text\",\"new\":\"replacement\"}
   Default replaces one unique match. Set all=true for every occurrence.
