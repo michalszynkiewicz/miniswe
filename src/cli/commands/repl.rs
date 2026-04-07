@@ -868,6 +868,13 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                     let cmd = args["command"].as_str().unwrap_or("?");
                     format!("shell {}", crate::truncate_chars(cmd, 40))
                 }
+                ("plan", "check") => {
+                    format!("check step {}", args["step"].as_u64().unwrap_or(0))
+                }
+                ("plan", "refine") => {
+                    format!("refine step {}", args["step"].as_u64().unwrap_or(0))
+                }
+                ("plan", "scratchpad") => "scratchpad".to_string(),
                 ("fix_file", _) => {
                     let path = args["path"].as_str().unwrap_or("?");
                     let task = args["task"].as_str().unwrap_or("");
@@ -909,6 +916,16 @@ mod tests {
             summarize_args("file", &args),
             "search \"pub fn assemble\" in src/context/mod.rs"
         );
+    }
+
+    #[test]
+    fn plan_refine_summary_includes_step() {
+        let args = json!({
+            "action": "refine",
+            "step": 2,
+        });
+
+        assert_eq!(summarize_args("plan", &args), "refine step 2");
     }
 }
 

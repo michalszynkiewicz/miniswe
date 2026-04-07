@@ -653,6 +653,7 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
         "plan" => match action {
             "scratchpad" => "scratchpad".to_string(),
             "check" => format!("check step {}", args["step"].as_u64().unwrap_or(0)),
+            "refine" => format!("refine step {}", args["step"].as_u64().unwrap_or(0)),
             _ => action.to_string(),
         },
         "fix_file" => {
@@ -693,5 +694,15 @@ mod tests {
             summarize_args("file", &args),
             "search \"system_prompt_override\" in tests"
         );
+    }
+
+    #[test]
+    fn plan_refine_summary_includes_step() {
+        let args = json!({
+            "action": "refine",
+            "step": 2,
+        });
+
+        assert_eq!(summarize_args("plan", &args), "refine step 2");
     }
 }
