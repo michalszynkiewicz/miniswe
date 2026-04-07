@@ -14,7 +14,7 @@ set -euo pipefail
 
 MODEL="${MINISWE_MODEL:-$HOME/models/devstral-small-2/Devstral-Small-2-24B-Instruct-2512-Q6_K.gguf}"
 PORT="${MINISWE_PORT:-8464}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-32000}"
+CTX_SIZE="${MINISWE_CTX_SIZE:-60000}"
 THREADS="${MINISWE_THREADS:-8}"
 
 if [ ! -f "$MODEL" ]; then
@@ -45,5 +45,6 @@ exec llama-server \
     --n-gpu-layers 99 \
     --flash-attn on \
     --threads "$THREADS" \
+    -np 1 \
     --port "$PORT" \
     --metrics
