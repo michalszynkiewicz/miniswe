@@ -1007,14 +1007,18 @@ pub fn parse_region_plan(text: &str) -> Result<Vec<EditRegion>> {
             bail!("unexpected text in region plan: {line}");
         };
         let mut parts = rest.split_whitespace();
-        let start = parts
+        let start_token = parts
             .next()
-            .ok_or_else(|| anyhow::anyhow!("missing region start"))?
-            .parse::<usize>()?;
-        let end = parts
+            .ok_or_else(|| anyhow::anyhow!("missing region start in header: {line}"))?;
+        let start = start_token.parse::<usize>().map_err(|e| {
+            anyhow::anyhow!("invalid region start '{start_token}' in header '{line}': {e}")
+        })?;
+        let end_token = parts
             .next()
-            .ok_or_else(|| anyhow::anyhow!("missing region end"))?
-            .parse::<usize>()?;
+            .ok_or_else(|| anyhow::anyhow!("missing region end in header: {line}"))?;
+        let end = end_token.parse::<usize>().map_err(|e| {
+            anyhow::anyhow!("invalid region end '{end_token}' in header '{line}': {e}")
+        })?;
         if parts.next().is_some() {
             bail!("too many fields in region header: {line}");
         }
@@ -1143,7 +1147,10 @@ pub fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
 }
 
 fn parse_line_number(text: &str) -> Result<usize> {
-    let line = text.trim().parse::<usize>()?;
+    let raw = text.trim();
+    let line = raw
+        .parse::<usize>()
+        .map_err(|e| anyhow::anyhow!("invalid line number '{raw}': {e}"))?;
     if line == 0 {
         bail!("line numbers are 1-based");
     }
@@ -1344,12 +1351,39 @@ fn resolve_old_anchor(
     let matches = find_exact_block_matches(original, old);
     match matches.as_slice() {
         [idx] => Ok(*idx),
-        [] => bail!(
-            "OLD mismatch for {op_name} {start_line}: OLD block was not found at the anchor or elsewhere"
-        ),
+        [] => {
+            let mut msg = format!(
+                "OLD mismatch for {op_name} {start_line}: OLD block was not found at the anchor or elsewhere"
+            );
+            msg.push_str(&format!(
+                "\nOLD block ({} line(s)):\n{}",
+                old.len(),
+                preview_block(old, None)
+            ));
+            msg.push_str(&format!(
+                "\nActual text at anchor:\n{}",
+                preview_anchor(original, hinted, old.len())
+            ));
+            let trimmed_matches = find_trimmed_block_matches(original, old);
+            match trimmed_matches.as_slice() {
+                [] => {}
+                [idx] => msg.push_str(&format!(
+                    "\nWhitespace-trimmed OLD would match at L{}; preserve exact indentation/spacing in OLD.",
+                    idx + 1
+                )),
+                many => msg.push_str(&format!(
+                    "\nWhitespace-trimmed OLD would match {} locations: {}. Use a more specific OLD block.",
+                    many.len(),
+                    format_line_list(many)
+                )),
+            }
+            bail!("{msg}");
+        }
         _ => bail!(
-            "OLD mismatch for {op_name} {start_line}: OLD block matched {} locations",
-            matches.len()
+            "OLD mismatch for {op_name} {start_line}: OLD block matched {} locations: {}. Use a more specific OLD block.\nOLD block:\n{}",
+            matches.len(),
+            format_line_list(&matches),
+            preview_block(old, None)
         ),
     }
 }
@@ -1366,6 +1400,72 @@ fn find_exact_block_matches(haystack: &[String], needle: &[String]) -> Vec<usize
         }
     }
     matches
+}
+
+fn find_trimmed_block_matches(haystack: &[String], needle: &[String]) -> Vec<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+    for start in 0..=haystack.len() - needle.len() {
+        if haystack[start..start + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(left, right)| left.trim() == right.trim())
+        {
+            matches.push(start);
+        }
+    }
+    matches
+}
+
+fn preview_anchor(original: &[String], start_idx: usize, desired_len: usize) -> String {
+    if start_idx >= original.len() {
+        return format!(
+            "anchor L{} is beyond end of file ({} line(s))",
+            start_idx + 1,
+            original.len()
+        );
+    }
+
+    let len = desired_len.max(1);
+    let end = (start_idx + len).min(original.len());
+    preview_block(&original[start_idx..end], Some(start_idx + 1))
+}
+
+fn preview_block(lines: &[String], first_line: Option<usize>) -> String {
+    const MAX_PREVIEW_LINES: usize = 6;
+    let mut out = String::new();
+    for (idx, line) in lines.iter().take(MAX_PREVIEW_LINES).enumerate() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        match first_line {
+            Some(first) => out.push_str(&format!("L{}: {:?}", first + idx, line)),
+            None => out.push_str(&format!("OLD{}: {:?}", idx + 1, line)),
+        }
+    }
+    if lines.len() > MAX_PREVIEW_LINES {
+        out.push_str(&format!(
+            "\n... {} more line(s)",
+            lines.len() - MAX_PREVIEW_LINES
+        ));
+    }
+    out
+}
+
+fn format_line_list(indices: &[usize]) -> String {
+    const MAX_LINES: usize = 8;
+    let mut parts: Vec<String> = indices
+        .iter()
+        .take(MAX_LINES)
+        .map(|idx| format!("L{}", idx + 1))
+        .collect();
+    if indices.len() > MAX_LINES {
+        parts.push(format!("...{} more", indices.len() - MAX_LINES));
+    }
+    parts.join(", ")
 }
 
 fn reject_overlapping_spans(ops: &[ResolvedOp]) -> Result<()> {
