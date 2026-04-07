@@ -126,12 +126,14 @@ async fn plan_failure_hint_shows_progress_and_next_step() {
     fs::create_dir_all(config.miniswe_dir()).ok();
     fs::write(
         config.miniswe_dir().join("plan.md"),
-        "- [x] (round 2) Add flag [compile]\n- [ ] Update call sites [compile]\n",
+        "- [x] (round 2) Add flag [compile]\n- [x] (round 4) Update assemble [compile]\n- [ ] Update call sites [compile]\n- [ ] Run tests [compile]\n",
     )
     .unwrap();
 
     let hint = plan::failure_hint(&config).unwrap();
-    assert!(hint.contains("Plan: 1/2 done"));
-    assert!(hint.contains("next 2: Update call sites"));
+    assert!(hint.contains("Plan: 2/4 done"));
+    assert!(hint.contains("Done: 1 Add flag; 2 Update assemble"));
+    assert!(hint.contains("Next: 3 Update call sites; 4 Run tests"));
+    assert!(hint.contains("Before fixing"));
     assert!(hint.contains("plan(action='refine')"));
 }

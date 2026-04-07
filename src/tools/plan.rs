@@ -537,21 +537,50 @@ pub fn failure_hint(config: &Config) -> Option<String> {
     }
 
     let done = steps.iter().filter(|step| step.checked).count();
-    let next = steps
+    let done_preview = steps
         .iter()
         .enumerate()
-        .find(|(_, step)| !step.checked)
+        .filter(|(_, step)| step.checked)
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
         .map(|(idx, step)| {
             format!(
-                "; next {}: {}",
+                "{} {}",
                 idx + 1,
-                crate::truncate_chars(&step.description, 90)
+                crate::truncate_chars(&step.description, 60)
             )
         })
-        .unwrap_or_else(|| "; all steps checked".to_string());
+        .collect::<Vec<_>>();
+    let next_preview = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| !step.checked)
+        .take(3)
+        .map(|(idx, step)| {
+            format!(
+                "{} {}",
+                idx + 1,
+                crate::truncate_chars(&step.description, 60)
+            )
+        })
+        .collect::<Vec<_>>();
 
-    Some(format!(
-        "Plan: {done}/{} done{next}. If this error changes direction, use plan(action='refine').",
-        steps.len()
-    ))
+    let mut parts = vec![format!("Plan: {done}/{} done.", steps.len())];
+    if !done_preview.is_empty() {
+        parts.push(format!("Done: {}.", done_preview.join("; ")));
+    }
+    if next_preview.is_empty() {
+        parts.push("Next: all checked.".to_string());
+    } else {
+        parts.push(format!("Next: {}.", next_preview.join("; ")));
+    }
+    parts.push(
+        "Before fixing, check if this error means the plan changed; if so use plan(action='refine')."
+            .to_string(),
+    );
+
+    Some(parts.join(" "))
 }
