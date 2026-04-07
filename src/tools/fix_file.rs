@@ -139,7 +139,7 @@ async fn request_patch(
         let repair = repair_feedback
             .map(|f| {
                 format!(
-                    "\nPrevious patch was not applied.\nFailure: {f}\nReturn a corrected complete patch against the original file.\n"
+                    "\nPrevious patch was not applied.\nFailure: {f}\nReturn a corrected patch against the original file. If the failure mentions overlapping spans, use the smallest enclosing REPLACE_AT block that covers the overlap, or split the patch into separate non-overlapping regions. Do not rewrite a much larger block just to avoid overlap.\n"
                 )
             })
             .unwrap_or_default();
@@ -174,6 +174,8 @@ async fn request_patch(
              - If no changes are needed, output exactly NO_CHANGES.\n\
              - Line numbers refer to the original file shown below, before any operations apply.\n\
              - For REPLACE_AT/DELETE_AT, OLD determines how many lines are changed.\n\
+             - Prefer small, non-overlapping operations. Do not output overlapping REPLACE_AT/DELETE_AT operations.\n\
+             - If two edits overlap, use the smallest enclosing REPLACE_AT block that covers the overlap; do not rewrite a much larger block.\n\
              - Preserve indentation and blank lines exactly inside CONTENT/OLD/NEW.\n\
              - Validation is atomic: if any operation fails, no changes are applied.\n\n\
              File content:\n{window_content}"
@@ -361,6 +363,7 @@ pub fn apply_patch_dry_run(content: &str, ops: &[PatchOp]) -> Result<String> {
 
 #[derive(Debug, Clone)]
 struct ResolvedOp {
+    label: String,
     start: usize,
     end: usize,
     kind: ResolvedKind,
@@ -376,11 +379,13 @@ enum ResolvedKind {
 fn resolve_ops(original: &[String], ops: &[PatchOp]) -> Result<Vec<ResolvedOp>> {
     let mut resolved = Vec::new();
 
-    for op in ops {
+    for (idx, op) in ops.iter().enumerate() {
+        let label = op_label(idx + 1, op);
         match op {
             PatchOp::InsertBefore { line, content } => {
                 validate_insert_line(*line, original.len())?;
                 resolved.push(ResolvedOp {
+                    label,
                     start: *line - 1,
                     end: *line - 1,
                     kind: ResolvedKind::Insert {
@@ -391,6 +396,7 @@ fn resolve_ops(original: &[String], ops: &[PatchOp]) -> Result<Vec<ResolvedOp>> 
             PatchOp::InsertAfter { line, content } => {
                 validate_insert_line(*line, original.len())?;
                 resolved.push(ResolvedOp {
+                    label,
                     start: *line,
                     end: *line,
                     kind: ResolvedKind::Insert {
@@ -401,6 +407,7 @@ fn resolve_ops(original: &[String], ops: &[PatchOp]) -> Result<Vec<ResolvedOp>> 
             PatchOp::ReplaceAt { start, old, new } => {
                 let start_idx = resolve_old_anchor(original, *start, old, "REPLACE_AT")?;
                 resolved.push(ResolvedOp {
+                    label,
                     start: start_idx,
                     end: start_idx + old.len(),
                     kind: ResolvedKind::Replace {
@@ -411,6 +418,7 @@ fn resolve_ops(original: &[String], ops: &[PatchOp]) -> Result<Vec<ResolvedOp>> 
             PatchOp::DeleteAt { start, old } => {
                 let start_idx = resolve_old_anchor(original, *start, old, "DELETE_AT")?;
                 resolved.push(ResolvedOp {
+                    label,
                     start: start_idx,
                     end: start_idx + old.len(),
                     kind: ResolvedKind::Delete,
@@ -421,6 +429,19 @@ fn resolve_ops(original: &[String], ops: &[PatchOp]) -> Result<Vec<ResolvedOp>> 
 
     reject_overlapping_spans(&resolved)?;
     Ok(resolved)
+}
+
+fn op_label(ordinal: usize, op: &PatchOp) -> String {
+    match op {
+        PatchOp::InsertBefore { line, .. } => format!("op {ordinal} INSERT_BEFORE {line}"),
+        PatchOp::InsertAfter { line, .. } => format!("op {ordinal} INSERT_AFTER {line}"),
+        PatchOp::ReplaceAt { start, old, .. } => {
+            format!("op {ordinal} REPLACE_AT {start} ({} OLD line(s))", old.len())
+        }
+        PatchOp::DeleteAt { start, old } => {
+            format!("op {ordinal} DELETE_AT {start} ({} OLD line(s))", old.len())
+        }
+    }
 }
 
 fn resolve_old_anchor(
@@ -469,22 +490,35 @@ fn find_exact_block_matches(haystack: &[String], needle: &[String]) -> Vec<usize
 }
 
 fn reject_overlapping_spans(ops: &[ResolvedOp]) -> Result<()> {
-    let mut spans: Vec<(usize, usize)> = ops
+    let mut spans: Vec<&ResolvedOp> = ops
         .iter()
         .filter(|op| op.start != op.end)
-        .map(|op| (op.start, op.end))
         .collect();
-    spans.sort_unstable();
+    spans.sort_unstable_by(|a, b| a.start.cmp(&b.start).then_with(|| a.end.cmp(&b.end)));
 
     for pair in spans.windows(2) {
-        let (_, prev_end) = pair[0];
-        let (next_start, _) = pair[1];
-        if next_start < prev_end {
-            bail!("patch operations have overlapping replacement/delete spans");
+        let prev = pair[0];
+        let next = pair[1];
+        if next.start < prev.end {
+            bail!(
+                "patch operations have overlapping replacement/delete spans: {} covers {}, overlaps {} covers {}. Use the smallest enclosing REPLACE_AT block for the overlap, split the patch into non-overlapping regions, or retry with a narrower fix_file task for one region/function.",
+                prev.label,
+                display_span(prev.start, prev.end),
+                next.label,
+                display_span(next.start, next.end),
+            );
         }
     }
 
     Ok(())
+}
+
+fn display_span(start: usize, end: usize) -> String {
+    if end <= start + 1 {
+        format!("L{}", start + 1)
+    } else {
+        format!("L{}-L{}", start + 1, end)
+    }
 }
 
 fn validate_insert_line(line: usize, total_lines: usize) -> Result<()> {
