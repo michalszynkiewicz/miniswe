@@ -493,6 +493,13 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 }
             };
 
+            if !result.success {
+                if let Some(hint) = tools::plan::failure_hint(&config) {
+                    result.content.push_str("\n");
+                    result.content.push_str(&hint);
+                }
+            }
+
             // Append round number to every tool result
             result
                 .content
