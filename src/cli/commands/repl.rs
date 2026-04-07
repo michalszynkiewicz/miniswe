@@ -25,6 +25,10 @@ use crate::tui::app::{App, AppMode, LineStyle};
 use crate::tui::event::{self, AppEvent};
 use crate::tui::ui;
 
+const PLAN_CHECKPOINT_AFTER_EDITS: u32 = 5;
+const PLAN_CHECKPOINT_MESSAGE: &str = "\
+Plan checkpoint pending. Review the plan before more edits: use plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet.";
+
 /// Run the interactive REPL with TUI.
 pub async fn run(config: Config, headless: bool) -> Result<()> {
     let log = SessionLog::new(&config);
@@ -389,6 +393,10 @@ async fn run_agent_loop(
     let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
     // Track recent tool calls to detect loops
     let mut recent_calls: Vec<String> = Vec::new();
+    let mut edit_fail_count: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut successful_edits_since_plan_update = 0u32;
+    let mut plan_checkpoint_pending = false;
 
     loop {
         // Check cancellation at the top of every round
@@ -541,7 +549,7 @@ async fn run_agent_loop(
                 );
                 let result_msg = Message::tool_result(
                     &tc.id,
-                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times with no edits in between. Try a different approach, or explain what's blocking you.",
+                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times with no edits in between. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or fix_file for semantic edits.",
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
@@ -628,6 +636,18 @@ async fn run_agent_loop(
                 continue;
             }
 
+            let file_action = args["action"].as_str().unwrap_or("");
+            let is_write_action = (tc.function.name == "file"
+                && matches!(file_action, "write" | "replace"))
+                || tc.function.name == "fix_file";
+            if config.tools.plan && plan_checkpoint_pending && is_write_action {
+                let result_msg = Message::tool_result(&tc.id, PLAN_CHECKPOINT_MESSAGE);
+                messages.push(result_msg.clone());
+                conversation_history.push(result_msg);
+                app.push_output("  ✗ blocked: plan checkpoint", LineStyle::ToolErr);
+                continue;
+            }
+
             // Execute tool (permissions already checked above for shell/web/mcp)
             let mut result = if tc.function.name == "mcp_use" {
                 let server = args["server"].as_str().unwrap_or("");
@@ -652,6 +672,11 @@ async fn run_agent_loop(
                 {
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("fix_file error: {e}")),
+                }
+            } else if tc.function.name == "plan" {
+                match tools::plan::execute(&args, config, round).await {
+                    Ok(r) => r,
+                    Err(e) => crate::tools::ToolResult::err(format!("plan error: {e}")),
                 }
             } else {
                 match tools::execute_tool(&tc.function.name, &args, config, perms, lsp.as_deref())
@@ -684,13 +709,35 @@ async fn run_agent_loop(
             );
             app.store_tool_result(&tc.function.name, &result.content);
 
+            if result.success && tc.function.name == "plan" {
+                plan_checkpoint_pending = false;
+                successful_edits_since_plan_update = 0;
+            }
+
             // Successful file write = code changed, reset loop detector
-            let file_action = args["action"].as_str().unwrap_or("");
             let is_file_write = (tc.function.name == "file"
                 && matches!(file_action, "replace" | "write"))
                 || tc.function.name == "fix_file";
             if result.success && is_file_write {
                 recent_calls.clear();
+                if config.tools.plan {
+                    successful_edits_since_plan_update += 1;
+                    if successful_edits_since_plan_update >= PLAN_CHECKPOINT_AFTER_EDITS {
+                        plan_checkpoint_pending = true;
+                    }
+                }
+            }
+
+            if tc.function.name == "file" && file_action == "replace" && !result.success {
+                let path = args["path"].as_str().unwrap_or("").to_string();
+                let count = edit_fail_count.entry(path.clone()).or_insert(0);
+                *count += 1;
+                if *count >= 2 {
+                    result.content.push_str(&format!(
+                        "\nERROR: replace has failed {} times on {path}. STOP using replace. Use fix_file(path, task) for this semantic edit; use file(action='write') only if you provide the complete file content.\n",
+                        count
+                    ));
+                }
             }
 
             tool_result_log.push((
