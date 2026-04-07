@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
+use crossterm::ExecutableCommand;
 use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::ExecutableCommand;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 use crate::config::{Config, ModelRole};
@@ -25,7 +25,6 @@ use crate::tui::app::{App, AppMode, LineStyle};
 use crate::tui::event::{self, AppEvent};
 use crate::tui::ui;
 
-
 /// Run the interactive REPL with TUI.
 pub async fn run(config: Config, headless: bool) -> Result<()> {
     let log = SessionLog::new(&config);
@@ -40,8 +39,12 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
     // Filter tools based on config
     {
         let mut disabled = Vec::new();
-        if !config.tools.web_tools { disabled.push("web"); }
-        if !config.tools.plan { disabled.push("plan"); }
+        if !config.tools.web_tools {
+            disabled.push("web");
+        }
+        if !config.tools.plan {
+            disabled.push("plan");
+        }
         tool_defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
     }
 
@@ -102,7 +105,11 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
     if let Some(ref mcp) = mcp_registry {
         if mcp.has_servers() {
             app.push_output(
-                &format!("MCP: {} servers, {} tools", mcp.servers.len(), mcp.tool_count()),
+                &format!(
+                    "MCP: {} servers, {} tools",
+                    mcp.servers.len(),
+                    mcp.tool_count()
+                ),
                 LineStyle::Status,
             );
         }
@@ -111,7 +118,10 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         "Type your message. Ctrl+O: details, Ctrl+C: interrupt, Ctrl+D: quit",
         LineStyle::Status,
     );
-    app.push_output("────────────────────────────────────────────────", LineStyle::Separator);
+    app.push_output(
+        "────────────────────────────────────────────────",
+        LineStyle::Separator,
+    );
 
     // Event channel
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
@@ -190,18 +200,33 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                 if input == "/clear" || input == "/new" {
                                     conversation_history.clear();
                                     if input == "/new" {
-                                        let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
-                                        let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
-                                        app.push_output("Cleared history, scratchpad, and plan.", LineStyle::Status);
+                                        let _ = std::fs::remove_file(
+                                            config.miniswe_path("scratchpad.md"),
+                                        );
+                                        let _ =
+                                            std::fs::remove_file(config.miniswe_path("plan.md"));
+                                        app.push_output(
+                                            "Cleared history, scratchpad, and plan.",
+                                            LineStyle::Status,
+                                        );
                                     } else {
-                                        app.push_output("Cleared conversation history.", LineStyle::Status);
+                                        app.push_output(
+                                            "Cleared conversation history.",
+                                            LineStyle::Status,
+                                        );
                                     }
                                     continue;
                                 }
 
                                 if input == "/help" {
-                                    app.push_output("/clear — clear conversation history", LineStyle::Status);
-                                    app.push_output("/new   — clear history + scratchpad + plan", LineStyle::Status);
+                                    app.push_output(
+                                        "/clear — clear conversation history",
+                                        LineStyle::Status,
+                                    );
+                                    app.push_output(
+                                        "/new   — clear history + scratchpad + plan",
+                                        LineStyle::Status,
+                                    );
                                     app.push_output("/help  — show this help", LineStyle::Status);
                                     app.push_output("quit   — exit", LineStyle::Status);
                                     continue;
@@ -250,11 +275,15 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                     max_rounds,
                                     &log,
                                     &lsp_client,
-                                ).await;
+                                )
+                                .await;
 
                                 app.is_thinking = false;
                                 app.flush_tokens();
-                                app.push_output("────────────────────────────────────────────────", LineStyle::Separator);
+                                app.push_output(
+                                    "────────────────────────────────────────────────",
+                                    LineStyle::Separator,
+                                );
 
                                 // Trim history
                                 let max_history = config.context.history_turns * 6;
@@ -299,7 +328,11 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                 app.push_output(&format!("  → {name}({summary})"), LineStyle::ToolCall);
             }
             AppEvent::ToolResult(name, success, summary, full_content) => {
-                let style = if success { LineStyle::ToolOk } else { LineStyle::ToolErr };
+                let style = if success {
+                    LineStyle::ToolOk
+                } else {
+                    LineStyle::ToolErr
+                };
                 let icon = if success { "✓" } else { "✗" };
                 app.push_output(&format!("  {icon} {name}: {summary}"), style);
                 app.store_tool_result(&name, &full_content);
@@ -373,7 +406,12 @@ async fn run_agent_loop(
 
         // Observation masking — budget = half the context window
         let tool_result_budget = config.model.context_window / 2;
-        mask_old_tool_results(messages, &tool_result_log, tool_result_budget, &config.project_root);
+        mask_old_tool_results(
+            messages,
+            &tool_result_log,
+            tool_result_budget,
+            &config.project_root,
+        );
 
         // Sanitize messages
         context::sanitize_messages(messages);
@@ -394,14 +432,22 @@ async fn run_agent_loop(
         // Call LLM with streaming — render on each token
         let response = {
             let mut token_count = 0u32;
-            match router.chat_stream(ModelRole::Default, &request, |token| {
-                app.push_token(token);
-                // Re-render every few tokens (not every token — too expensive)
-                token_count += 1;
-                if token_count % 3 == 0 {
-                    let _ = terminal.draw(|frame| ui::draw(frame, app));
-                }
-            }, cancelled).await {
+            match router
+                .chat_stream(
+                    ModelRole::Default,
+                    &request,
+                    |token| {
+                        app.push_token(token);
+                        // Re-render every few tokens (not every token — too expensive)
+                        token_count += 1;
+                        if token_count % 3 == 0 {
+                            let _ = terminal.draw(|frame| ui::draw(frame, app));
+                        }
+                    },
+                    cancelled,
+                )
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     let err_str = e.to_string();
@@ -409,7 +455,12 @@ async fn run_agent_loop(
                         app.push_output("Generation interrupted.", LineStyle::Status);
                     } else {
                         let clean = if err_str.contains('<') {
-                            err_str.split('<').next().unwrap_or(&err_str).trim().to_string()
+                            err_str
+                                .split('<')
+                                .next()
+                                .unwrap_or(&err_str)
+                                .trim()
+                                .to_string()
                         } else {
                             err_str
                         };
@@ -482,7 +533,10 @@ async fn run_agent_loop(
             if repeat_count >= 3 {
                 log.loop_detected(&tc.function.name, &args_summary, repeat_count);
                 app.push_output(
-                    &format!("  ✗ Loop detected: {}({}) called {} times — stopping", tc.function.name, args_summary, repeat_count),
+                    &format!(
+                        "  ✗ Loop detected: {}({}) called {} times — stopping",
+                        tc.function.name, args_summary, repeat_count
+                    ),
                     LineStyle::Error,
                 );
                 let result_msg = Message::tool_result(
@@ -507,7 +561,9 @@ async fn run_agent_loop(
             // Determine if this tool call needs a permission prompt
             let perm_action = match tc.function.name.as_str() {
                 "shell" => Some(Action::Shell(args["command"].as_str().unwrap_or("").into())),
-                "web_search" => Some(Action::WebSearch(args["query"].as_str().unwrap_or("").into())),
+                "web_search" => Some(Action::WebSearch(
+                    args["query"].as_str().unwrap_or("").into(),
+                )),
                 "web_fetch" => Some(Action::WebFetch(args["url"].as_str().unwrap_or("").into())),
                 "mcp_use" => Some(Action::McpUse(
                     args["server"].as_str().unwrap_or("").into(),
@@ -525,7 +581,10 @@ async fn run_agent_loop(
                         let result_msg = Message::tool_result(&tc.id, &e);
                         messages.push(result_msg.clone());
                         conversation_history.push(result_msg);
-                        app.push_output(&format!("  ✗ {}: {e}", tc.function.name), LineStyle::ToolErr);
+                        app.push_output(
+                            &format!("  ✗ {}: {e}", tc.function.name),
+                            LineStyle::ToolErr,
+                        );
                         continue;
                     }
                     Ok(Some(prompt)) => {
@@ -558,10 +617,8 @@ async fn run_agent_loop(
             }
 
             if perm_denied {
-                let result_msg = Message::tool_result(
-                    &tc.id,
-                    &format!("{} denied by user", tc.function.name),
-                );
+                let result_msg =
+                    Message::tool_result(&tc.id, &format!("{} denied by user", tc.function.name));
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
                 app.push_output(
@@ -583,8 +640,15 @@ async fn run_agent_loop(
                     },
                     None => crate::tools::ToolResult::err("No MCP servers connected".into()),
                 }
+            } else if tc.function.name == "fix_file" {
+                match crate::tools::fix_file::execute(&args, config, router, lsp.as_deref()).await {
+                    Ok(r) => r,
+                    Err(e) => crate::tools::ToolResult::err(format!("fix_file error: {e}")),
+                }
             } else {
-                match tools::execute_tool(&tc.function.name, &args, config, perms, lsp.as_deref()).await {
+                match tools::execute_tool(&tc.function.name, &args, config, perms, lsp.as_deref())
+                    .await
+                {
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("Tool error: {e}")),
                 }
@@ -593,14 +657,22 @@ async fn run_agent_loop(
             let first_line = result.content.lines().next().unwrap_or("(empty)");
             log.tool_call(&tc.function.name, &args_summary, result.success, first_line);
             log.tool_result_detail(&tc.function.name, result.success, &result.content);
-            let style = if result.success { LineStyle::ToolOk } else { LineStyle::ToolErr };
+            let style = if result.success {
+                LineStyle::ToolOk
+            } else {
+                LineStyle::ToolErr
+            };
             let icon = if result.success { "✓" } else { "✗" };
-            app.push_output(&format!("  {icon} {}: {first_line}", tc.function.name), style);
+            app.push_output(
+                &format!("  {icon} {}: {first_line}", tc.function.name),
+                style,
+            );
             app.store_tool_result(&tc.function.name, &result.content);
 
             // Successful file write = code changed, reset loop detector
             let file_action = args["action"].as_str().unwrap_or("");
-            let is_file_write = (tc.function.name == "file" && matches!(file_action, "replace" | "write"))
+            let is_file_write = (tc.function.name == "file"
+                && matches!(file_action, "replace" | "write"))
                 || tc.function.name == "fix_file";
             if result.success && is_file_write {
                 recent_calls.clear();
@@ -686,12 +758,17 @@ fn mask_old_tool_results(
     for msg in messages.iter_mut() {
         if msg.role == "tool" {
             if let Some(Some(summary)) = summaries.get(tool_msg_idx) {
-                let pos = summaries[..=tool_msg_idx].iter().filter(|s| s.is_some()).count();
+                let pos = summaries[..=tool_msg_idx]
+                    .iter()
+                    .filter(|s| s.is_some())
+                    .count();
                 let from_end = total_summaries - pos;
                 if from_end < keep_count {
                     msg.content = Some(summary.clone());
                 } else {
-                    msg.content = Some("[archived — use read_file(\".miniswe/tool_history.md\") to recall]".into());
+                    msg.content = Some(
+                        "[archived — use read_file(\".miniswe/tool_history.md\") to recall]".into(),
+                    );
                 }
             }
             tool_msg_idx += 1;
@@ -751,24 +828,22 @@ async fn wait_for_permission_input(
         };
 
         match evt {
-            AppEvent::Key(key) => {
-                match key.code {
-                    KeyCode::Enter => {
-                        let response = app.input.trim().to_lowercase();
-                        app.input.clear();
-                        app.cursor = 0;
-                        return response;
-                    }
-                    KeyCode::Char(c) => app.insert_char(c),
-                    KeyCode::Backspace => app.delete_char(),
-                    KeyCode::Esc => {
-                        app.input.clear();
-                        app.cursor = 0;
-                        return "n".into();
-                    }
-                    _ => {}
+            AppEvent::Key(key) => match key.code {
+                KeyCode::Enter => {
+                    let response = app.input.trim().to_lowercase();
+                    app.input.clear();
+                    app.cursor = 0;
+                    return response;
                 }
-            }
+                KeyCode::Char(c) => app.insert_char(c),
+                KeyCode::Backspace => app.delete_char(),
+                KeyCode::Esc => {
+                    app.input.clear();
+                    app.cursor = 0;
+                    return "n".into();
+                }
+                _ => {}
+            },
             AppEvent::Tick => {} // re-render
             _ => {}
         }

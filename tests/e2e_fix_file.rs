@@ -129,9 +129,15 @@ END
 
 #[test]
 fn parse_region_plan_rejects_overlap_and_preamble() {
-    assert!(fix_file::parse_region_plan("NO_REGIONS").unwrap().is_empty());
+    assert!(
+        fix_file::parse_region_plan("NO_REGIONS")
+            .unwrap()
+            .is_empty()
+    );
     assert!(fix_file::parse_region_plan("Here are regions:\nREGION 1 2\nTASK: x\nEND").is_err());
-    assert!(fix_file::parse_region_plan("REGION 1 3\nTASK: x\nEND\nREGION 3 5\nTASK: y\nEND").is_err());
+    assert!(
+        fix_file::parse_region_plan("REGION 1 3\nTASK: x\nEND\nREGION 3 5\nTASK: y\nEND").is_err()
+    );
 }
 
 #[test]
@@ -289,7 +295,9 @@ async fn execute_valid_patch_writes_file() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "add setup call"});
-    let result = fix_file::execute(&args, &config, &router).await.unwrap();
+    let result = fix_file::execute(&args, &config, &router, None)
+        .await
+        .unwrap();
 
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("Applied 1 operation"));
@@ -316,7 +324,9 @@ async fn execute_failed_patch_writes_nothing() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change line"});
-    let result = fix_file::execute(&args, &config, &router).await.unwrap();
+    let result = fix_file::execute(&args, &config, &router, None)
+        .await
+        .unwrap();
 
     assert!(!result.success);
     assert!(result.content.contains("patch was not applied"));
@@ -354,7 +364,9 @@ async fn execute_repairs_failed_first_patch() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change line"});
-    let result = fix_file::execute(&args, &config, &router).await.unwrap();
+    let result = fix_file::execute(&args, &config, &router, None)
+        .await
+        .unwrap();
 
     assert!(result.success, "{}", result.content);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -392,7 +404,9 @@ async fn execute_repairs_until_third_patch() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change line"});
-    let result = fix_file::execute(&args, &config, &router).await.unwrap();
+    let result = fix_file::execute(&args, &config, &router, None)
+        .await
+        .unwrap();
 
     assert!(result.success, "{}", result.content);
     assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -432,7 +446,9 @@ async fn execute_split_fallback_after_broad_overlap_failure() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change first block"});
-    let result = fix_file::execute(&args, &config, &router).await.unwrap();
+    let result = fix_file::execute(&args, &config, &router, None)
+        .await
+        .unwrap();
 
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("Split fallback"));
@@ -463,9 +479,69 @@ async fn execute_no_changes_leaves_file_unchanged() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "no op"});
-    let result = fix_file::execute(&args, &config, &router).await.unwrap();
+    let result = fix_file::execute(&args, &config, &router, None)
+        .await
+        .unwrap();
 
     assert!(result.success);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "original\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_lsp_off_succeeds_without_lsp_client() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(helpers::mock_text_response(
+            "REPLACE_AT 1\nOLD:\noriginal\nEND_OLD\nNEW:\nfixed\nEND_NEW\n",
+        ))
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "original\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "change line",
+        "lsp_validation": "off"
+    });
+    let result = fix_file::execute(&args, &config, &router, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("[lsp] skipped (off)"));
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "fixed\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_rejects_invalid_lsp_validation_mode() {
+    let mock_server = MockServer::start().await;
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "original\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "change line",
+        "lsp_validation": "sometimes"
+    });
+    let result = fix_file::execute(&args, &config, &router, None)
+        .await
+        .unwrap();
+
+    assert!(!result.success);
+    assert!(result.content.contains("Invalid lsp_validation"));
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "original\n"

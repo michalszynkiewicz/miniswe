@@ -5,12 +5,16 @@
 //! write. If the broad patch path fails, fix_file falls back to smaller,
 //! non-overlapping line regions and validates the combined result before writing.
 
+use std::time::Duration;
+
 use anyhow::{Result, bail};
+use lsp_types::{Diagnostic, DiagnosticSeverity};
 use serde_json::Value;
 
 use super::ToolResult;
 use crate::config::{Config, ModelRole};
 use crate::llm::{ChatRequest, Message, ModelRouter};
+use crate::lsp::LspClient;
 
 /// Max lines per window for reliable LLM recall.
 const WINDOW_SIZE: usize = 800;
@@ -20,9 +24,18 @@ const MAX_PATCH_ATTEMPTS: usize = 3;
 const MAX_SPLIT_REGIONS: usize = 3;
 const LARGE_TRUNCATION_MIN_LINES: usize = 50;
 
-pub async fn execute(args: &Value, config: &Config, router: &ModelRouter) -> Result<ToolResult> {
+pub async fn execute(
+    args: &Value,
+    config: &Config,
+    router: &ModelRouter,
+    lsp: Option<&LspClient>,
+) -> Result<ToolResult> {
     let path_str = args["path"].as_str().unwrap_or("");
     let task = args["task"].as_str().unwrap_or("");
+    let lsp_validation = match LspValidationMode::from_args(args) {
+        Ok(mode) => mode,
+        Err(e) => return Ok(ToolResult::err(e.to_string())),
+    };
 
     if path_str.is_empty() {
         return Ok(ToolResult::err("Missing required parameter: path".into()));
@@ -43,18 +56,26 @@ pub async fn execute(args: &Value, config: &Config, router: &ModelRouter) -> Res
     let mut last_error = String::new();
 
     for attempt in 1..=MAX_PATCH_ATTEMPTS {
-        let (ops, mut output) =
-            match request_patch(path_str, task, &content, router, feedback.as_deref()).await {
-                Ok(r) => r,
-                Err(e) => {
-                    last_error = e.to_string();
-                    if attempt < MAX_PATCH_ATTEMPTS {
-                        feedback = Some(last_error.clone());
-                        continue;
-                    }
-                    break;
+        let (ops, mut output) = match request_patch(
+            path_str,
+            task,
+            &content,
+            router,
+            feedback.as_deref(),
+            lsp_validation,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = e.to_string();
+                if attempt < MAX_PATCH_ATTEMPTS {
+                    feedback = Some(last_error.clone());
+                    continue;
                 }
-            };
+                break;
+            }
+        };
 
         if ops.is_empty() {
             return Ok(ToolResult::ok(format!(
@@ -74,16 +95,33 @@ pub async fn execute(args: &Value, config: &Config, router: &ModelRouter) -> Res
             }
         };
 
-        if let Err(e) = validate_candidate(path_str, &content, &candidate) {
-            last_error = e.to_string();
-            if attempt < MAX_PATCH_ATTEMPTS {
-                feedback = Some(last_error.clone());
-                continue;
+        let validation_note = match validate_candidate_for_write(
+            path_str,
+            &path,
+            &content,
+            &candidate,
+            config,
+            lsp,
+            lsp_validation,
+        )
+        .await
+        {
+            Ok(note) => note,
+            Err(e) => {
+                last_error = e.to_string();
+                if attempt < MAX_PATCH_ATTEMPTS {
+                    feedback = Some(last_error.clone());
+                    continue;
+                }
+                break;
             }
-            break;
-        }
+        };
 
         std::fs::write(&path, &candidate)?;
+        if let Some(note) = validation_note {
+            output.push_str(&note);
+            output.push('\n');
+        }
         output.push_str(&format!(
             "✓ Applied {} operation(s) to {path_str} ({} lines)\n",
             ops.len(),
@@ -92,7 +130,19 @@ pub async fn execute(args: &Value, config: &Config, router: &ModelRouter) -> Res
         return Ok(ToolResult::ok(output));
     }
 
-    match execute_split_fallback(path_str, task, &content, router, &last_error).await {
+    match execute_split_fallback(
+        path_str,
+        task,
+        &path,
+        &content,
+        router,
+        &last_error,
+        config,
+        lsp,
+        lsp_validation,
+    )
+    .await
+    {
         Ok(Some(candidate_result)) => {
             std::fs::write(&path, &candidate_result.content)?;
             return Ok(ToolResult::ok(candidate_result.message));
@@ -115,12 +165,42 @@ struct SplitResult {
     message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LspValidationMode {
+    Auto,
+    Require,
+    Off,
+}
+
+impl LspValidationMode {
+    fn from_args(args: &Value) -> Result<Self> {
+        match args["lsp_validation"].as_str().unwrap_or("auto") {
+            "auto" => Ok(Self::Auto),
+            "require" => Ok(Self::Require),
+            "off" => Ok(Self::Off),
+            other => bail!("Invalid lsp_validation: {other}. Expected one of: auto, require, off"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Require => "require",
+            Self::Off => "off",
+        }
+    }
+}
+
 async fn execute_split_fallback(
     path_str: &str,
     task: &str,
+    path: &std::path::Path,
     original: &str,
     router: &ModelRouter,
     broad_error: &str,
+    config: &Config,
+    lsp: Option<&LspClient>,
+    lsp_validation: LspValidationMode,
 ) -> Result<Option<SplitResult>> {
     let regions = request_region_plan(path_str, task, original, router, broad_error).await?;
     if regions.is_empty() {
@@ -150,6 +230,7 @@ async fn execute_split_fallback(
                 router,
                 region,
                 feedback.as_deref(),
+                lsp_validation,
             )
             .await
             {
@@ -207,7 +288,20 @@ async fn execute_split_fallback(
         }
     }
 
-    validate_candidate(path_str, original, &current)?;
+    let validation_note = validate_candidate_for_write(
+        path_str,
+        path,
+        original,
+        &current,
+        config,
+        lsp,
+        lsp_validation,
+    )
+    .await?;
+    if let Some(note) = validation_note {
+        message.push_str(&note);
+        message.push('\n');
+    }
     message.push_str(&format!(
         "✓ Applied {total_ops} operation(s) to {path_str} via split fallback ({} lines)\n",
         current.lines().count()
@@ -219,12 +313,148 @@ async fn execute_split_fallback(
     }))
 }
 
+async fn validate_candidate_for_write(
+    path_str: &str,
+    path: &std::path::Path,
+    original: &str,
+    candidate: &str,
+    config: &Config,
+    lsp: Option<&LspClient>,
+    lsp_validation: LspValidationMode,
+) -> Result<Option<String>> {
+    validate_candidate(path_str, original, candidate)?;
+    validate_candidate_with_lsp(
+        path_str,
+        path,
+        original,
+        candidate,
+        config,
+        lsp,
+        lsp_validation,
+    )
+    .await
+}
+
+async fn validate_candidate_with_lsp(
+    path_str: &str,
+    path: &std::path::Path,
+    original: &str,
+    candidate: &str,
+    config: &Config,
+    lsp: Option<&LspClient>,
+    lsp_validation: LspValidationMode,
+) -> Result<Option<String>> {
+    if lsp_validation == LspValidationMode::Off {
+        return Ok(Some("[lsp] skipped (off)".into()));
+    }
+
+    let Some(lsp) = lsp else {
+        if lsp_validation == LspValidationMode::Require {
+            bail!("LSP validation required but no LSP client is available");
+        }
+        return Ok(None);
+    };
+
+    if !lsp.is_ready() || lsp.has_crashed() {
+        if lsp_validation == LspValidationMode::Require {
+            bail!("LSP validation required but LSP is not ready");
+        }
+        return Ok(None);
+    }
+
+    let timeout = Duration::from_millis(config.lsp.diagnostic_timeout_ms);
+    let baseline_errors = match diagnostics_for_current_file(lsp, path, timeout).await {
+        Ok(diags) => error_diagnostics(&diags),
+        Err(e) => {
+            if lsp_validation == LspValidationMode::Require {
+                bail!("LSP baseline diagnostics failed: {e}");
+            }
+            return Ok(None);
+        }
+    };
+
+    std::fs::write(path, candidate)?;
+
+    let candidate_diags = match diagnostics_for_current_file(lsp, path, timeout).await {
+        Ok(diags) => diags,
+        Err(e) => {
+            let _ = std::fs::write(path, original);
+            let _ = diagnostics_for_current_file(lsp, path, timeout).await;
+            if lsp_validation == LspValidationMode::Require {
+                bail!("LSP candidate diagnostics failed: {e}");
+            }
+            return Ok(None);
+        }
+    };
+
+    let candidate_errors = error_diagnostics(&candidate_diags);
+    if candidate_errors.len() > baseline_errors.len() {
+        let summary =
+            format_lsp_error_regression(path_str, baseline_errors.len(), &candidate_errors);
+        let _ = std::fs::write(path, original);
+        let _ = diagnostics_for_current_file(lsp, path, timeout).await;
+        bail!("{summary}");
+    }
+
+    Ok(Some(format!(
+        "[lsp] OK ({} -> {} error(s), mode={})",
+        baseline_errors.len(),
+        candidate_errors.len(),
+        lsp_validation.as_str()
+    )))
+}
+
+async fn diagnostics_for_current_file(
+    lsp: &LspClient,
+    path: &std::path::Path,
+    timeout: Duration,
+) -> Result<Vec<Diagnostic>> {
+    lsp.notify_file_changed(path)?;
+    Ok(lsp.get_diagnostics(path, timeout).await)
+}
+
+fn error_diagnostics(diagnostics: &[Diagnostic]) -> Vec<Diagnostic> {
+    diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        .cloned()
+        .collect()
+}
+
+fn format_lsp_error_regression(
+    path_str: &str,
+    baseline_error_count: usize,
+    candidate_errors: &[Diagnostic],
+) -> String {
+    let mut out = format!(
+        "LSP diagnostics worsened for {path_str}: {baseline_error_count} -> {} error(s)",
+        candidate_errors.len()
+    );
+    for diag in candidate_errors.iter().take(5) {
+        out.push_str(&format!(
+            "\n{}:{}:{}: error: {}",
+            path_str,
+            diag.range.start.line + 1,
+            diag.range.start.character + 1,
+            diag.message
+        ));
+    }
+    if candidate_errors.len() > 5 {
+        out.push_str(&format!(
+            "\n... and {} more error(s)",
+            candidate_errors.len() - 5
+        ));
+    }
+    out
+}
+
 async fn request_patch(
     path_str: &str,
     task: &str,
     content: &str,
     router: &ModelRouter,
     repair_feedback: Option<&str>,
+    lsp_validation: LspValidationMode,
 ) -> Result<(Vec<PatchOp>, String)> {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
@@ -266,6 +496,7 @@ async fn request_patch(
              Task: {task}\n\
              {repair}\n\
              Return a complete patch for all changes needed in this file/window.\n\
+             LSP validation mode: {}. Your patch may be rejected if file diagnostics get worse.\n\
              Use this patch DSL exactly:\n\n\
              INSERT_BEFORE <line>\n\
              CONTENT:\n\
@@ -295,7 +526,8 @@ async fn request_patch(
              - If two edits overlap, use the smallest enclosing REPLACE_AT block that covers the overlap; do not rewrite a much larger block.\n\
              - Preserve indentation and blank lines exactly inside CONTENT/OLD/NEW.\n\
              - Validation is atomic: if any operation fails, no changes are applied.\n\n\
-             File content:\n{window_content}"
+             File content:\n{window_content}",
+            lsp_validation.as_str()
         );
 
         let request = ChatRequest {
@@ -337,6 +569,7 @@ async fn request_patch_for_region(
     router: &ModelRouter,
     region: &EditRegion,
     repair_feedback: Option<&str>,
+    lsp_validation: LspValidationMode,
 ) -> Result<(Vec<PatchOp>, String)> {
     let lines: Vec<&str> = content.lines().collect();
     if region.start == 0 || region.end < region.start || region.end > lines.len() {
@@ -368,6 +601,7 @@ async fn request_patch_for_region(
          Task: {task}\n\
          {repair}\n\
          You may edit ONLY lines {}-{}. Do not target lines outside this region.\n\
+         LSP validation mode: {}. Your patch may be rejected if file diagnostics get worse.\n\
          Return a complete patch for this region using the patch DSL exactly:\n\n\
          INSERT_BEFORE <line>\n\
          CONTENT:\n\
@@ -394,12 +628,18 @@ async fn request_patch_for_region(
          - Preserve indentation and blank lines exactly inside CONTENT/OLD/NEW.\n\
          - Keep edits small and inside the allowed line region.\n\n\
          Region content:\n{region_content}",
-        region.start, region.end, region.start, region.end
+        region.start,
+        region.end,
+        region.start,
+        region.end,
+        lsp_validation.as_str()
     );
 
     let request = ChatRequest {
         messages: vec![
-            Message::system("You output only strict patch DSL blocks. No explanations, no markdown."),
+            Message::system(
+                "You output only strict patch DSL blocks. No explanations, no markdown.",
+            ),
             Message::user(&prompt),
         ],
         tools: None,
@@ -473,7 +713,9 @@ async fn request_region_plan(
 
         let request = ChatRequest {
             messages: vec![
-                Message::system("You output only strict REGION blocks. No explanations, no markdown."),
+                Message::system(
+                    "You output only strict REGION blocks. No explanations, no markdown.",
+                ),
                 Message::user(&prompt),
             ],
             tools: None,
@@ -865,7 +1107,10 @@ fn op_label(ordinal: usize, op: &PatchOp) -> String {
         PatchOp::InsertBefore { line, .. } => format!("op {ordinal} INSERT_BEFORE {line}"),
         PatchOp::InsertAfter { line, .. } => format!("op {ordinal} INSERT_AFTER {line}"),
         PatchOp::ReplaceAt { start, old, .. } => {
-            format!("op {ordinal} REPLACE_AT {start} ({} OLD line(s))", old.len())
+            format!(
+                "op {ordinal} REPLACE_AT {start} ({} OLD line(s))",
+                old.len()
+            )
         }
         PatchOp::DeleteAt { start, old } => {
             format!("op {ordinal} DELETE_AT {start} ({} OLD line(s))", old.len())
@@ -919,10 +1164,7 @@ fn find_exact_block_matches(haystack: &[String], needle: &[String]) -> Vec<usize
 }
 
 fn reject_overlapping_spans(ops: &[ResolvedOp]) -> Result<()> {
-    let mut spans: Vec<&ResolvedOp> = ops
-        .iter()
-        .filter(|op| op.start != op.end)
-        .collect();
+    let mut spans: Vec<&ResolvedOp> = ops.iter().filter(|op| op.start != op.end).collect();
     spans.sort_unstable_by(|a, b| a.start.cmp(&b.start).then_with(|| a.end.cmp(&b.end)));
 
     for pair in spans.windows(2) {
