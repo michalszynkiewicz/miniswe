@@ -1,16 +1,16 @@
 //! file(action='write') — Whole-file rewrite.
 //!
-//! For quantized small models, whole-file output is more reliable than
-//! search-and-replace diffs. The tradeoff is higher token cost, so files
-//! should be kept small (~200 lines / ~4K chars).
+//! This tool expects complete file contents. For semantic edits to existing
+//! code, prefer fix_file unless the model is deliberately rewriting the entire
+//! file.
 
 use anyhow::Result;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::config::Config;
 use super::ToolResult;
+use crate::config::Config;
 
 /// Soft warning threshold for file size (lines).
 const LARGE_FILE_WARNING: usize = 250;
@@ -21,12 +21,12 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 
     if path_str.is_empty() {
         return Ok(ToolResult::err(
-            "Missing required parameter: path. Expected JSON arguments: {\"action\":\"write\",\"path\":\"src/main.rs\",\"content\":\"complete file content\"}.".into()
+            "Missing required parameter: path. Expected JSON arguments: {\"action\":\"write\",\"path\":\"src/bin/hello.rs\",\"content\":\"fn main() {\\n    println!(\\\"hello\\\");\\n}\\n\"}. The content value must be the complete file text.".into()
         ));
     }
     if content.is_empty() {
         return Ok(ToolResult::err(
-            "Missing required parameter: content. Expected JSON arguments: {\"action\":\"write\",\"path\":\"src/main.rs\",\"content\":\"complete file content\"}. For multi-line or multi-location edits to an existing file, prefer fix_file.".into()
+            "Missing required parameter: content. Expected JSON arguments: {\"action\":\"write\",\"path\":\"src/bin/hello.rs\",\"content\":\"fn main() {\\n    println!(\\\"hello\\\");\\n}\\n\"}. The content value must be the complete file text. For edits to an existing file, prefer fix_file.".into()
         ));
     }
 
@@ -55,8 +55,8 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
              (losing {} lines). This is almost certainly accidental — you probably forgot to \
              include the complete file content.\n\
              Options:\n\
-             1. Use file(action='replace') to change only the specific lines you need\n\
-             2. Use file(action='replace', all=true) for find-and-replace across the file\n\
+             1. Use fix_file for semantic edits to existing files\n\
+             2. Use file(action='replace') only if you have exact old+new text\n\
              3. Use file(action='read') first, then file(action='write') with the COMPLETE content\n\
              4. If the file is already corrupted, use file(action='revert') to restore it",
             old_lines - new_lines

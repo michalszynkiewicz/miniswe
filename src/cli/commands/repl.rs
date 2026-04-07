@@ -803,8 +803,15 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                     format!("read {path}")
                 }
                 ("file", "search") => {
-                    let query = args["query"].as_str().unwrap_or("?");
-                    format!("search \"{query}\"")
+                    let query = args["query"]
+                        .as_str()
+                        .or_else(|| args["pattern"].as_str())
+                        .unwrap_or("?");
+                    let scope = args["scope"]
+                        .as_str()
+                        .or_else(|| args["path"].as_str())
+                        .unwrap_or("project");
+                    format!("search \"{query}\" in {scope}")
                 }
                 ("file", "replace" | "write") => {
                     let path = args["path"].as_str().unwrap_or("?");
@@ -835,6 +842,26 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
             }
         }
         _ => format!("{args}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn file_search_summary_uses_pattern_and_path() {
+        let args = json!({
+            "action": "search",
+            "path": "src/context/mod.rs",
+            "pattern": "pub fn assemble",
+        });
+
+        assert_eq!(
+            summarize_args("file", &args),
+            "search \"pub fn assemble\" in src/context/mod.rs"
+        );
     }
 }
 

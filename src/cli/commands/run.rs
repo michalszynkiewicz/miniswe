@@ -521,14 +521,14 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 calls_since_last_edit += 1;
             }
 
-            // Track replace failures per file — suggest write after 2 failures
+            // Track replace failures per file — steer semantic edits to fix_file.
             if tc.function.name == "file" && file_action == "replace" && !result.success {
                 let path = args["path"].as_str().unwrap_or("").to_string();
                 let count = edit_fail_count.entry(path.clone()).or_insert(0);
                 *count += 1;
                 if *count >= 2 {
                     result.content.push_str(&format!(
-                        "\nERROR: replace has failed {} times on {path}. STOP using replace. Use file(action='write') instead — read the file first, then write the complete new content.\n",
+                        "\nERROR: replace has failed {} times on {path}. STOP using replace. Use fix_file(path, task) for this semantic edit; use file(action='write') only if you provide the complete file content.\n",
                         count
                     ));
                 }
@@ -589,8 +589,14 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                 }
             }
             "search" => {
-                let query = args["query"].as_str().unwrap_or("?");
-                let scope = args["scope"].as_str().unwrap_or("project");
+                let query = args["query"]
+                    .as_str()
+                    .or_else(|| args["pattern"].as_str())
+                    .unwrap_or("?");
+                let scope = args["scope"]
+                    .as_str()
+                    .or_else(|| args["path"].as_str())
+                    .unwrap_or("project");
                 format!("search \"{query}\" in {scope}")
             }
             "replace" | "write" => {
@@ -643,5 +649,25 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
             format!("{server}/{tool}")
         }
         _ => format!("{args}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn file_search_summary_uses_pattern_and_path() {
+        let args = json!({
+            "action": "search",
+            "path": "tests",
+            "pattern": "system_prompt_override",
+        });
+
+        assert_eq!(
+            summarize_args("file", &args),
+            "search \"system_prompt_override\" in tests"
+        );
     }
 }
