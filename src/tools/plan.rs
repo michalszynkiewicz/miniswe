@@ -356,7 +356,7 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
                 return Ok(ToolResult::err("No plan exists. Use action='set' first.".into()));
             }
 
-            let mut steps = parse_steps(&content);
+            let steps = parse_steps(&content);
             if step_num > steps.len() {
                 return Ok(ToolResult::err(format!(
                     "Step {step_num} out of range (plan has {} steps).",

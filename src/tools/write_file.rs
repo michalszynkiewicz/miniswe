@@ -1,4 +1,4 @@
-//! write_file tool — Whole-file rewrite.
+//! file(action='write') — Whole-file rewrite.
 //!
 //! For quantized small models, whole-file output is more reliable than
 //! search-and-replace diffs. The tradeoff is higher token cost, so files
@@ -51,10 +51,10 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
              (losing {} lines). This is almost certainly accidental — you probably forgot to \
              include the complete file content.\n\
              Options:\n\
-             1. Use replace() to change only the specific lines you need\n\
-             2. Use replace(all=true) for find-and-replace across the file\n\
-             3. Use read_file() first, then write_file() with the COMPLETE content\n\
-             4. If the file is already corrupted, use revert() to restore it",
+             1. Use file(action='replace') to change only the specific lines you need\n\
+             2. Use file(action='replace', all=true) for find-and-replace across the file\n\
+             3. Use file(action='read') first, then file(action='write') with the COMPLETE content\n\
+             4. If the file is already corrupted, use file(action='revert') to restore it",
             old_lines - new_lines
         )));
     }

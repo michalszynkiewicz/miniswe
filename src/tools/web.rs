@@ -1,8 +1,8 @@
-//! Web tools — web_search, web_fetch, docs_lookup.
+//! Web tools — web(action='search'), web(action='fetch').
 
 use anyhow::Result;
 use serde_json::Value;
-use std::fs;
+
 
 use crate::config::Config;
 use super::ToolResult;

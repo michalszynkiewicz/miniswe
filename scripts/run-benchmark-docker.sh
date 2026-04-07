@@ -107,9 +107,6 @@ enabled = $(_dis lsp)
 diagnostic_timeout_ms = 2000
 
 [tools]
-context_tools = $(_dis context_tools)
-lsp_tools = $(_dis lsp_tools)
-transform = $(_dis transform)
 web_tools = $(_dis web_tools)
 plan = $(_dis plan)
 scratchpad = $(_dis scratchpad)
@@ -398,15 +395,11 @@ SCRIPT
 
 # ── Main ────────────────────────────────────────────────────────────────
 
-# Phase 1: baseline vs all_off
-echo "═══ Phase 1: baseline vs all_off ═══"
+# Run baseline with all tools enabled
+echo "═══ Baseline (all tools) ═══"
 echo ""
 
 run_variant "00_baseline" ""
-# Uncomment for full comparison:
-# run_variant "01_plan_only" "scratchpad"
-# run_variant "02_scratchpad_only" "plan"
-# run_variant "03_no_extra_tools" "context_tools,lsp_tools,transform,lsp,plan"
 
 # Summary
 echo ""
