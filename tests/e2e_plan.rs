@@ -2,8 +2,8 @@
 
 mod helpers;
 
-use std::fs;
 use miniswe::tools::plan;
+use std::fs;
 
 #[tokio::test]
 async fn plan_set_creates_file() {
@@ -16,6 +16,12 @@ async fn plan_set_creates_file() {
     let result = plan::execute(&args, &config, 1).await.unwrap();
 
     assert!(result.success);
+    assert!(result.content.contains("Architecture check before editing"));
+    assert!(
+        result
+            .content
+            .contains("changes the right abstraction level")
+    );
     let plan = fs::read_to_string(config.miniswe_dir().join("plan.md")).unwrap();
     assert!(plan.contains("Step one"));
     assert!(plan.contains("- [ ]"));
@@ -39,7 +45,10 @@ async fn plan_check_marks_step() {
 
     let plan = fs::read_to_string(config.miniswe_dir().join("plan.md")).unwrap();
     assert!(plan.contains("- [ ] First"), "step 1 should be unchecked");
-    assert!(plan.contains("- [x] (round 5) Second"), "step 2 should be checked with round");
+    assert!(
+        plan.contains("- [x] (round 5) Second"),
+        "step 2 should be checked with round"
+    );
     assert!(plan.contains("- [ ] Third"), "step 3 should be unchecked");
 }
 
@@ -54,7 +63,11 @@ async fn plan_check_already_done() {
     let args = serde_json::json!({"action": "check", "step": 1});
     let result = plan::execute(&args, &config, 5).await.unwrap();
 
-    assert!(!result.success, "should fail on already checked: {}", result.content);
+    assert!(
+        !result.success,
+        "should fail on already checked: {}",
+        result.content
+    );
 }
 
 #[tokio::test]
@@ -69,7 +82,10 @@ async fn plan_show_includes_round() {
     let result = plan::execute(&args, &config, 10).await.unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("[round 10]"), "should show current round");
+    assert!(
+        result.content.contains("[round 10]"),
+        "should show current round"
+    );
     assert!(result.content.contains("Pending"));
 }
 
@@ -93,7 +109,11 @@ async fn plan_load_for_context() {
 
     // Create plan
     fs::create_dir_all(config.miniswe_dir()).ok();
-    fs::write(config.miniswe_dir().join("plan.md"), "## Plan\n- [ ] Do things\n").unwrap();
+    fs::write(
+        config.miniswe_dir().join("plan.md"),
+        "## Plan\n- [ ] Do things\n",
+    )
+    .unwrap();
 
     let loaded = plan::load_plan(&config);
     assert!(loaded.is_some());

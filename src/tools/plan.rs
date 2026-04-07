@@ -13,8 +13,8 @@ use anyhow::Result;
 use serde_json::Value;
 use std::fs;
 
-use crate::config::Config;
 use super::ToolResult;
+use crate::config::Config;
 
 /// A single plan step with compile gate metadata.
 #[derive(Debug, Clone)]
@@ -91,16 +91,33 @@ impl Step {
 
 /// Parse all steps from plan markdown.
 fn parse_steps(content: &str) -> Vec<Step> {
-    content
-        .lines()
-        .filter_map(Step::from_markdown)
-        .collect()
+    content.lines().filter_map(Step::from_markdown).collect()
 }
 
 /// Serialize steps back to markdown.
 fn steps_to_markdown(steps: &[Step]) -> String {
-    steps.iter().map(|s| s.to_markdown()).collect::<Vec<_>>().join("\n")
+    steps
+        .iter()
+        .map(|s| s.to_markdown())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
+
+fn plan_preview(steps: &[Step]) -> String {
+    steps
+        .iter()
+        .take(4)
+        .enumerate()
+        .map(|(idx, step)| format!("{}. {}", idx + 1, step.description))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+const ARCHITECTURE_REVIEW_HINT: &str = "\
+Architecture check before editing:
+- Check whether the plan changes the right abstraction level.
+- If a change affects a function/API, plan the call-site and test updates too.
+- If the plan edits many similar components, consider plan(action='refine') before editing.";
 
 /// Validate plan invariants:
 /// - Last step must be compile: true
@@ -113,7 +130,9 @@ fn validate_steps(steps: &[Step]) -> Result<(), String> {
 
     // Last step must compile
     if !steps.last().unwrap().compile {
-        return Err("Last step must have compile: true. The plan cannot end with a broken tree.".into());
+        return Err(
+            "Last step must have compile: true. The plan cannot end with a broken tree.".into(),
+        );
     }
 
     // Check compile: false steps
@@ -149,22 +168,42 @@ async fn run_compile_check(config: &Config) -> (bool, String) {
     let project_root = config.project_root.clone();
 
     // Detect language from project markers
-    let (cmd, args): (&str, Vec<String>) =
-        if project_root.join("Cargo.toml").exists() {
-            ("cargo", vec!["check".into(), "--tests".into(), "--message-format=short".into()])
-        } else if project_root.join("tsconfig.json").exists() || project_root.join("package.json").exists() {
-            ("npx", vec!["tsc".into(), "--noEmit".into(), "--pretty".into(), "false".into()])
-        } else if project_root.join("go.mod").exists() {
-            ("go", vec!["build".into(), "./...".into()])
-        } else if project_root.join("pyproject.toml").exists() || project_root.join("setup.py").exists() {
-            ("python3", vec!["-m".into(), "py_compile".into()])
-        } else if project_root.join("pom.xml").exists() {
-            ("mvn", vec!["compile".into(), "-q".into()])
-        } else if project_root.join("build.gradle").exists() {
-            ("gradle", vec!["compileJava".into(), "-q".into()])
-        } else {
-            return (true, "No recognized build system — skipping compile check.".into());
-        };
+    let (cmd, args): (&str, Vec<String>) = if project_root.join("Cargo.toml").exists() {
+        (
+            "cargo",
+            vec![
+                "check".into(),
+                "--tests".into(),
+                "--message-format=short".into(),
+            ],
+        )
+    } else if project_root.join("tsconfig.json").exists()
+        || project_root.join("package.json").exists()
+    {
+        (
+            "npx",
+            vec![
+                "tsc".into(),
+                "--noEmit".into(),
+                "--pretty".into(),
+                "false".into(),
+            ],
+        )
+    } else if project_root.join("go.mod").exists() {
+        ("go", vec!["build".into(), "./...".into()])
+    } else if project_root.join("pyproject.toml").exists() || project_root.join("setup.py").exists()
+    {
+        ("python3", vec!["-m".into(), "py_compile".into()])
+    } else if project_root.join("pom.xml").exists() {
+        ("mvn", vec!["compile".into(), "-q".into()])
+    } else if project_root.join("build.gradle").exists() {
+        ("gradle", vec!["compileJava".into(), "-q".into()])
+    } else {
+        return (
+            true,
+            "No recognized build system — skipping compile check.".into(),
+        );
+    };
 
     let cmd = cmd.to_string();
     let result = tokio::task::spawn_blocking(move || {
@@ -197,7 +236,10 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
                         .unwrap_or("")
                         .to_string();
                     if desc.is_empty() {
-                        return Ok(ToolResult::err(format!("Step {} has empty description.", i + 1)));
+                        return Ok(ToolResult::err(format!(
+                            "Step {} has empty description.",
+                            i + 1
+                        )));
                     }
                     let compile = step_val["compile"].as_bool().unwrap_or(true);
                     let reason = step_val["reason"].as_str().map(|s| s.to_string());
@@ -212,14 +254,18 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
                 parsed
             } else if let Some(content) = args["content"].as_str() {
                 if content.is_empty() {
-                    return Ok(ToolResult::err("Missing 'content' or 'steps' for plan set.".into()));
+                    return Ok(ToolResult::err(
+                        "Missing 'content' or 'steps' for plan set.".into(),
+                    ));
                 }
                 // Parse markdown content — add [compile] tag if not present
                 let mut steps = Vec::new();
                 for line in content.lines() {
                     if let Some(step) = Step::from_markdown(line) {
                         steps.push(step);
-                    } else if line.trim_start().starts_with("- [ ]") || line.trim_start().starts_with("- [x]") {
+                    } else if line.trim_start().starts_with("- [ ]")
+                        || line.trim_start().starts_with("- [x]")
+                    {
                         // Bare checkbox without compile tag — parse as compile: true
                         let trimmed = line.trim_start();
                         let desc = if trimmed.starts_with("- [ ]") {
@@ -253,7 +299,9 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
                 }
                 steps
             } else {
-                return Ok(ToolResult::err("Missing 'content' or 'steps' for plan set.".into()));
+                return Ok(ToolResult::err(
+                    "Missing 'content' or 'steps' for plan set.".into(),
+                ));
             };
 
             // Validate
@@ -274,8 +322,9 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
 
             let compile_count = steps.iter().filter(|s| s.compile).count();
             let nocompile_count = steps.len() - compile_count;
+            let preview = crate::truncate_chars(&plan_preview(&steps), 180);
             Ok(ToolResult::ok(format!(
-                "✓ Plan saved ({} steps, {} compile-gated, {} deferred)",
+                "✓ Plan saved ({} steps, {} compile-gated, {} deferred): {preview}\n{ARCHITECTURE_REVIEW_HINT}\n\n{md}",
                 steps.len(),
                 compile_count,
                 nocompile_count
@@ -285,12 +334,16 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
         "check" => {
             let step_num = args["step"].as_u64().unwrap_or(0) as usize;
             if step_num == 0 {
-                return Ok(ToolResult::err("Missing 'step' number to check off.".into()));
+                return Ok(ToolResult::err(
+                    "Missing 'step' number to check off.".into(),
+                ));
             }
 
             let content = fs::read_to_string(&plan_path).unwrap_or_default();
             if content.is_empty() {
-                return Ok(ToolResult::err("No plan exists. Use action='set' first.".into()));
+                return Ok(ToolResult::err(
+                    "No plan exists. Use action='set' first.".into(),
+                ));
             }
 
             let mut steps = parse_steps(&content);
@@ -305,7 +358,9 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
             let needs_compile = steps[step_num - 1].compile;
 
             if is_checked {
-                return Ok(ToolResult::err(format!("Step {step_num} is already checked.")));
+                return Ok(ToolResult::err(format!(
+                    "Step {step_num} is already checked."
+                )));
             }
 
             // If this step has compile: true, run the compile gate
@@ -353,7 +408,9 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
 
             let content = fs::read_to_string(&plan_path).unwrap_or_default();
             if content.is_empty() {
-                return Ok(ToolResult::err("No plan exists. Use action='set' first.".into()));
+                return Ok(ToolResult::err(
+                    "No plan exists. Use action='set' first.".into(),
+                ));
             }
 
             let steps = parse_steps(&content);
@@ -388,7 +445,10 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
                     .unwrap_or("")
                     .to_string();
                 if desc.is_empty() {
-                    return Ok(ToolResult::err(format!("Substep {} has empty description.", i + 1)));
+                    return Ok(ToolResult::err(format!(
+                        "Substep {} has empty description.",
+                        i + 1
+                    )));
                 }
                 let compile = sv["compile"].as_bool().unwrap_or(parent_compile);
                 let reason = sv["reason"].as_str().map(|s| s.to_string());
@@ -434,17 +494,15 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
             if content.is_empty() {
                 Ok(ToolResult::ok("No plan exists yet.".into()))
             } else {
-                Ok(ToolResult::ok(format!("[round {current_round}]\n{content}")))
+                Ok(ToolResult::ok(format!(
+                    "[round {current_round}]\n{content}"
+                )))
             }
         }
 
-        "scratchpad" => {
-            super::task_update::execute(args, config).await
-        }
+        "scratchpad" => super::task_update::execute(args, config).await,
 
-        "help" => {
-            Ok(ToolResult::ok(super::definitions::plan_help().into()))
-        }
+        "help" => Ok(ToolResult::ok(super::definitions::plan_help().into())),
 
         _ => Ok(ToolResult::err(format!(
             "Unknown action: {action}. Use 'set', 'check', 'refine', 'show', or 'scratchpad'."

@@ -618,7 +618,18 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
             "check" => format!("check step {}", args["step"].as_u64().unwrap_or(0)),
             _ => action.to_string(),
         },
-        "fix_file" => args["path"].as_str().unwrap_or("?").to_string(),
+        "fix_file" => {
+            let path = args["path"].as_str().unwrap_or("?");
+            let task = args["task"].as_str().unwrap_or("");
+            let lsp = args["lsp_validation"].as_str().unwrap_or("auto");
+            if task.is_empty() {
+                path.to_string()
+            } else if lsp == "auto" {
+                format!("{path}: {}", crate::truncate_chars(task, 70))
+            } else {
+                format!("{path}: {} [lsp={lsp}]", crate::truncate_chars(task, 58))
+            }
+        }
         "mcp_use" => {
             let server = args["server"].as_str().unwrap_or("?");
             let tool = args["tool"].as_str().unwrap_or("?");
