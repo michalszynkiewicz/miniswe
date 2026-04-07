@@ -106,6 +106,35 @@ fn parse_no_changes() {
 }
 
 #[test]
+fn parse_region_plan() {
+    let plan = "\
+REGION 10 20
+TASK: update one logical block
+END
+
+REGION 30 35
+TASK: update another logical block
+END
+";
+
+    let regions = fix_file::parse_region_plan(plan).unwrap();
+    assert_eq!(regions.len(), 2);
+    assert_eq!(regions[0].start, 10);
+    assert_eq!(regions[0].end, 20);
+    assert_eq!(regions[0].task, "update one logical block");
+    assert_eq!(regions[1].start, 30);
+    assert_eq!(regions[1].end, 35);
+    assert_eq!(regions[1].task, "update another logical block");
+}
+
+#[test]
+fn parse_region_plan_rejects_overlap_and_preamble() {
+    assert!(fix_file::parse_region_plan("NO_REGIONS").unwrap().is_empty());
+    assert!(fix_file::parse_region_plan("Here are regions:\nREGION 1 2\nTASK: x\nEND").is_err());
+    assert!(fix_file::parse_region_plan("REGION 1 3\nTASK: x\nEND\nREGION 3 5\nTASK: y\nEND").is_err());
+}
+
+#[test]
 fn parse_rejects_preamble_and_malformed_blocks() {
     assert!(fix_file::parse_patch("Here is the patch:\nINSERT_AFTER 1\nCONTENT:\nx\nEND").is_err());
     assert!(fix_file::parse_patch("INSERT_AFTER 1\nCONTENT:\nx\n").is_err());
@@ -370,6 +399,47 @@ async fn execute_repairs_until_third_patch() {
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "fixed\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_split_fallback_after_broad_overlap_failure() {
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0..=2 => helpers::mock_text_response(
+                    "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n\nREPLACE_AT 2\nOLD:\nb\nEND_OLD\nNEW:\ny\nEND_NEW\n",
+                ),
+                3 => helpers::mock_text_response(
+                    "REGION 1 2\nTASK: replace the first two-line block\nEND\n",
+                ),
+                _ => helpers::mock_text_response(
+                    "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n",
+                ),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "a\nb\nc\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({"path": "main.rs", "task": "change first block"});
+    let result = fix_file::execute(&args, &config, &router).await.unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("Split fallback"));
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "x\nc\n"
     );
 }
 
