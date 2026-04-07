@@ -1,7 +1,8 @@
 //! Tool system for miniswe.
 //!
-//! 12 built-in tools + MCP bridge. All file access is jailed to the project
-//! root. Destructive actions (shell, web, MCP) require user permission.
+//! 6 top-level tools (file, code, web, plan, fix_file, mcp_use) with
+//! action-based dispatch for grouped tools. All file access is jailed
+//! to the project root. Destructive actions require user permission.
 //! After file edits, the index is incrementally updated.
 
 pub mod edit;
@@ -55,8 +56,7 @@ impl ToolResult {
 }
 
 /// Execute a tool by name with the given arguments.
-/// All file paths are jail-checked. Destructive actions require permission.
-/// After successful file mutations (edit, write_file), the index is updated.
+/// Grouped tools (file, code, web) are dispatched by their `action` parameter.
 pub async fn execute_tool(
     name: &str,
     args: &Value,
@@ -65,14 +65,58 @@ pub async fn execute_tool(
     lsp: Option<&LspClient>,
 ) -> Result<ToolResult> {
     match name {
-        "read_file" => {
+        "file" => execute_file_tool(args, config, perms, lsp).await,
+        "code" => execute_code_tool(args, config, lsp).await,
+        "web" => execute_web_tool(args, config, perms).await,
+        "plan" => {
+            let action = args["action"].as_str().unwrap_or("");
+            if action == "help" {
+                return Ok(ToolResult::ok(definitions::plan_help().into()));
+            }
+            if action == "scratchpad" {
+                return task_update::execute(args, config).await;
+            }
+            // plan tool needs round number — caller (run.rs) handles this
+            bail!("plan tool must be dispatched by caller with round context");
+        }
+        _ => bail!("Unknown tool: {name}"),
+    }
+}
+
+// ── file tool group ──────────────────────────────────────────────────
+
+async fn execute_file_tool(
+    args: &Value,
+    config: &Config,
+    perms: &PermissionManager,
+    lsp: Option<&LspClient>,
+) -> Result<ToolResult> {
+    let action = args["action"].as_str().unwrap_or("");
+
+    match action {
+        "help" => Ok(ToolResult::ok(definitions::file_help().into())),
+
+        "read" => {
             let path = args["path"].as_str().unwrap_or("");
             if let Err(e) = perms.resolve_and_check_path(path) {
                 return Ok(ToolResult::err(e));
             }
             read_file::execute(args, config).await
         }
-        "search" => search::execute(args, config).await,
+
+        "write" => {
+            let path = args["path"].as_str().unwrap_or("");
+            if let Err(e) = perms.resolve_and_check_path(path) {
+                return Ok(ToolResult::err(e));
+            }
+            let mut result = write_file::execute(args, config).await?;
+            if result.success {
+                reindex_changed_file(path, config);
+                auto_check(path, config, &mut result, lsp).await;
+            }
+            Ok(result)
+        }
+
         "replace" => {
             let path = args["path"].as_str().unwrap_or("");
             if let Err(e) = perms.resolve_and_check_path(path) {
@@ -85,18 +129,9 @@ pub async fn execute_tool(
             }
             Ok(result)
         }
-        "write_file" => {
-            let path = args["path"].as_str().unwrap_or("");
-            if let Err(e) = perms.resolve_and_check_path(path) {
-                return Ok(ToolResult::err(e));
-            }
-            let mut result = write_file::execute(args, config).await?;
-            if result.success {
-                reindex_changed_file(path, config);
-                auto_check(path, config, &mut result, lsp).await;
-            }
-            Ok(result)
-        }
+
+        "search" => search::execute(args, config).await,
+
         "shell" => {
             let cmd = args["command"].as_str().unwrap_or("");
             if let Err(e) = perms.check(&Action::Shell(cmd.into())) {
@@ -104,9 +139,46 @@ pub async fn execute_tool(
             }
             shell::execute(args, config).await
         }
-        "task_update" => task_update::execute(args, config).await,
+
+        "revert" => {
+            // Revert is handled specially in run.rs (needs snapshot manager).
+            // If called through execute_tool, it means snapshot system isn't available.
+            Ok(ToolResult::err("Revert must be called through the run loop (needs snapshot manager).".into()))
+        }
+
+        _ => Ok(ToolResult::err(format!(
+            "Unknown file action: '{action}'. Use 'help' to see available actions."
+        ))),
+    }
+}
+
+// ── code tool group ──────────────────────────────────────────────────
+
+async fn execute_code_tool(
+    args: &Value,
+    config: &Config,
+    lsp: Option<&LspClient>,
+) -> Result<ToolResult> {
+    let action = args["action"].as_str().unwrap_or("");
+
+    match action {
+        "help" => Ok(ToolResult::ok(definitions::code_help().into())),
+
+        "goto_definition" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let line = args["line"].as_u64().unwrap_or(1).saturating_sub(1) as u32;
+            let column = args["column"].as_u64().unwrap_or(1).saturating_sub(1) as u32;
+            lsp_goto_definition(path, line, column, config, lsp).await
+        }
+
+        "find_references" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let line = args["line"].as_u64().unwrap_or(1).saturating_sub(1) as u32;
+            let column = args["column"].as_u64().unwrap_or(1).saturating_sub(1) as u32;
+            lsp_find_references(path, line, column, config, lsp).await
+        }
+
         "diagnostics" => {
-            // Try LSP diagnostics first for Rust projects
             if let Some(lsp) = lsp {
                 if lsp.is_ready() && !lsp.has_crashed() {
                     if let Some(result) = lsp_project_diagnostics(config, lsp).await {
@@ -122,39 +194,53 @@ pub async fn execute_tool(
             });
             shell::execute(&shell_args, config).await
         }
-        "goto_definition" => {
-            let path = args["path"].as_str().unwrap_or("");
-            let line = args["line"].as_u64().unwrap_or(1).saturating_sub(1) as u32;
-            let column = args["column"].as_u64().unwrap_or(1).saturating_sub(1) as u32;
-            lsp_goto_definition(path, line, column, config, lsp).await
+
+        "repo_map" => {
+            let keywords_str = args["keywords"].as_str().unwrap_or("");
+            context_tool_repo_map(keywords_str, config)
         }
-        "find_references" => {
-            let path = args["path"].as_str().unwrap_or("");
-            let line = args["line"].as_u64().unwrap_or(1).saturating_sub(1) as u32;
-            let column = args["column"].as_u64().unwrap_or(1).saturating_sub(1) as u32;
-            lsp_find_references(path, line, column, config, lsp).await
-        }
-        "web_search" => {
+
+        "project_info" => context_tool_project_info(config),
+
+        "architecture_notes" => context_tool_architecture_notes(config),
+
+        _ => Ok(ToolResult::err(format!(
+            "Unknown code action: '{action}'. Use 'help' to see available actions."
+        ))),
+    }
+}
+
+// ── web tool group ───────────────────────────────────────────────────
+
+async fn execute_web_tool(
+    args: &Value,
+    config: &Config,
+    perms: &PermissionManager,
+) -> Result<ToolResult> {
+    let action = args["action"].as_str().unwrap_or("");
+
+    match action {
+        "help" => Ok(ToolResult::ok(definitions::web_help().into())),
+
+        "search" => {
             let query = args["query"].as_str().unwrap_or("");
             if let Err(e) = perms.check(&Action::WebSearch(query.into())) {
                 return Ok(ToolResult::err(e));
             }
             web::search(args, config).await
         }
-        "web_fetch" => {
+
+        "fetch" => {
             let url = args["url"].as_str().unwrap_or("");
             if let Err(e) = perms.check(&Action::WebFetch(url.into())) {
                 return Ok(ToolResult::err(e));
             }
             web::fetch(args, config).await
         }
-"get_repo_map" => {
-            let keywords_str = args["keywords"].as_str().unwrap_or("");
-            context_tool_repo_map(keywords_str, config)
-        }
-        "get_project_info" => context_tool_project_info(config),
-        "get_architecture_notes" => context_tool_architecture_notes(config),
-        _ => bail!("Unknown tool: {name}"),
+
+        _ => Ok(ToolResult::err(format!(
+            "Unknown web action: '{action}'. Use 'help' to see available actions."
+        ))),
     }
 }
 
@@ -311,13 +397,13 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
     let joined = relevant.join("\n");
     let mut hints = Vec::new();
     if joined.contains("expected") && joined.contains("argument") && joined.contains("found") {
-        hints.push("ACTION: Function signature changed but call sites not updated. Use search(\"function_name\") to find ALL callers and update them.");
+        hints.push("ACTION: Function signature changed but call sites not updated. Use file(action='search', query='function_name') to find ALL callers and update them.");
     }
     if joined.contains("cannot find") {
         hints.push("ACTION: A symbol was renamed/removed but references remain. Search for the old name and update.");
     }
     if joined.contains("unclosed delimiter") || joined.contains("unexpected closing") {
-        hints.push("ACTION: Broken syntax (missing/extra bracket). Use write_file to rewrite the file — edit is unreliable for structural fixes.");
+        hints.push("ACTION: Broken syntax (missing/extra bracket). Use file(action='write') to rewrite the file — replace is unreliable for structural fixes.");
     }
     if joined.contains("mismatched types") {
         hints.push("ACTION: Type mismatch. Check the function signature and update the caller to pass the correct type.");
@@ -526,7 +612,7 @@ async fn lsp_goto_definition(
 ) -> Result<ToolResult> {
     let lsp = match lsp {
         Some(l) if l.is_ready() && !l.has_crashed() => l,
-        _ => return Ok(ToolResult::err("LSP not available. Use search or read_file instead.".into())),
+        _ => return Ok(ToolResult::err("LSP not available. Use file(action='search') instead.".into())),
     };
 
     let abs_path = config.project_root.join(path);
@@ -578,7 +664,7 @@ async fn lsp_find_references(
 ) -> Result<ToolResult> {
     let lsp = match lsp {
         Some(l) if l.is_ready() && !l.has_crashed() => l,
-        _ => return Ok(ToolResult::err("LSP not available. Use search instead.".into())),
+        _ => return Ok(ToolResult::err("LSP not available. Use file(action='search') instead.".into())),
     };
 
     let abs_path = config.project_root.join(path);

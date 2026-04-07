@@ -392,137 +392,137 @@ pub fn compress_profile(profile: &str) -> String {
 ///
 /// This replaces full tool outputs in older conversation turns with dense summaries.
 pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content: &str) -> String {
+    let action = args["action"].as_str().unwrap_or("");
+
     match tool_name {
-        "read_file" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            let line_count = content.lines().count();
-            // Extract function/struct signatures for a useful summary
-            let mut sigs = Vec::new();
-            for line in content.lines() {
-                // Strip line-number prefixes like "   5│" or "+  10│"
-                let stripped = if let Some(pos) = line.find('│') {
-                    &line[pos + '│'.len_utf8()..]
-                } else {
-                    line
-                };
-                let trimmed = stripped.trim();
-                // Capture function/method signatures
-                if (trimmed.starts_with("pub fn ")
-                    || trimmed.starts_with("pub async fn ")
-                    || trimmed.starts_with("fn ")
-                    || trimmed.starts_with("async fn "))
-                    && trimmed.contains('(')
-                {
-                    let sig = trimmed.split('{').next().unwrap_or(trimmed).trim();
-                    if sig.len() < 80 {
-                        sigs.push(sig.to_string());
+        "file" => {
+            match action {
+                "read" => {
+                    let path = args["path"].as_str().unwrap_or("?");
+                    let line_count = content.lines().count();
+                    let mut sigs = Vec::new();
+                    for line in content.lines() {
+                        let stripped = if let Some(pos) = line.find('│') {
+                            &line[pos + '│'.len_utf8()..]
+                        } else {
+                            line
+                        };
+                        let trimmed = stripped.trim();
+                        if (trimmed.starts_with("pub fn ")
+                            || trimmed.starts_with("pub async fn ")
+                            || trimmed.starts_with("fn ")
+                            || trimmed.starts_with("async fn "))
+                            && trimmed.contains('(')
+                        {
+                            let sig = trimmed.split('{').next().unwrap_or(trimmed).trim();
+                            if sig.len() < 80 { sigs.push(sig.to_string()); }
+                        }
+                        if (trimmed.starts_with("pub struct ")
+                            || trimmed.starts_with("pub enum ")
+                            || trimmed.starts_with("pub trait ")
+                            || trimmed.starts_with("struct ")
+                            || trimmed.starts_with("enum ")
+                            || trimmed.starts_with("trait "))
+                            && !trimmed.contains(';')
+                        {
+                            let def = trimmed.split('{').next().unwrap_or(trimmed).trim();
+                            if def.len() < 80 { sigs.push(def.to_string()); }
+                        }
+                        if sigs.len() >= 10 { break; }
+                    }
+                    if sigs.is_empty() {
+                        format!("[read:{path} ({line_count}L) — use file(action='read', path='{path}') to re-read]")
+                    } else {
+                        format!(
+                            "[read:{path} ({line_count}L) — use file(action='read', path='{path}') to re-read]\n{}",
+                            sigs.join("\n")
+                        )
                     }
                 }
-                // Capture struct/enum/trait definitions
-                if (trimmed.starts_with("pub struct ")
-                    || trimmed.starts_with("pub enum ")
-                    || trimmed.starts_with("pub trait ")
-                    || trimmed.starts_with("struct ")
-                    || trimmed.starts_with("enum ")
-                    || trimmed.starts_with("trait "))
-                    && !trimmed.contains(';')
-                {
-                    let def = trimmed.split('{').next().unwrap_or(trimmed).trim();
-                    if def.len() < 80 {
-                        sigs.push(def.to_string());
+                "search" => {
+                    let query = args["query"].as_str().unwrap_or("?");
+                    let match_count = content.lines().filter(|l| !l.starts_with('[')).count();
+                    format!("[search:\"{query}\"→{match_count} matches]")
+                }
+                "replace" => {
+                    let path = args["path"].as_str().unwrap_or("?");
+                    if content.contains('✓') {
+                        if content.contains("error") && (content.contains("[cargo check]") || content.contains("[lsp]")) {
+                            let errors: Vec<&str> = content.lines()
+                                .filter(|l| l.contains("error")).take(2).collect();
+                            format!("[replace:{path}→ok but errors: {}]", errors.join("; "))
+                        } else {
+                            format!("[replace:{path}→ok]")
+                        }
+                    } else {
+                        let reason = content.lines()
+                            .find(|l| l.contains("not found") || l.contains("matches"))
+                            .map(|l| crate::truncate_chars(l.trim(), 60))
+                            .unwrap_or_else(|| "unknown".into());
+                        format!("[replace:{path}→FAILED: {reason}]")
                     }
                 }
-                if sigs.len() >= 10 {
-                    break;
+                "write" => {
+                    let path = args["path"].as_str().unwrap_or("?");
+                    if content.contains('✓') {
+                        let lines = content.lines().next().unwrap_or("");
+                        format!("[write:{path}→{lines}]")
+                    } else {
+                        format!("[write:{path}→failed]")
+                    }
                 }
-            }
-            if sigs.is_empty() {
-                format!("[read:{path} ({line_count}L) — use read_file(\"{path}\") to re-read]")
-            } else {
-                format!(
-                    "[read:{path} ({line_count}L) — use read_file(\"{path}\") to re-read]\n{}",
-                    sigs.join("\n")
-                )
+                "shell" => {
+                    let cmd = args["command"].as_str().unwrap_or("?");
+                    let short_cmd = crate::truncate_chars(cmd, 30);
+                    let exit_code = if content.contains("exit 0") { "ok" } else { "err" };
+                    format!("[shell:\"{short_cmd}\"→{exit_code}]")
+                }
+                _ => format!("[file.{action}→done]"),
             }
         }
-        "search" => {
-            let query = args["query"].as_str().unwrap_or("?");
-            let match_count = content
-                .lines()
-                .filter(|l| !l.starts_with('['))
-                .count();
-            format!("[search:\"{query}\"→{match_count} matches]")
+        "code" => {
+            match action {
+                "diagnostics" => {
+                    let errors = content.lines().filter(|l| l.contains("error")).count();
+                    let warnings = content.lines().filter(|l| l.contains("warning")).count();
+                    format!("[diag:{errors}E,{warnings}W]")
+                }
+                _ => format!("[code.{action}→done]"),
+            }
         }
-        "replace" => {
+        "web" => {
+            match action {
+                "search" => {
+                    let query = args["query"].as_str().unwrap_or("?");
+                    let result_count = content.lines()
+                        .filter(|l| l.starts_with(|c: char| c.is_ascii_digit())).count();
+                    format!("[web_search:\"{query}\"→{result_count} results]")
+                }
+                "fetch" => {
+                    let url = args["url"].as_str().unwrap_or("?");
+                    format!("[web_fetch:{url}→{}chars]", content.len())
+                }
+                _ => format!("[web.{action}→done]"),
+            }
+        }
+        "plan" => {
+            match action {
+                "scratchpad" => "[scratchpad→ok]".to_string(),
+                _ => format!("[plan.{action}→done]"),
+            }
+        }
+        "fix_file" => {
             let path = args["path"].as_str().unwrap_or("?");
             if content.contains('✓') {
-                // Check if diagnostics found errors after the edit
-                if content.contains("error") && (content.contains("[cargo check]") || content.contains("[lsp]")) {
-                    let errors: Vec<&str> = content.lines()
-                        .filter(|l| l.contains("error"))
-                        .take(2)
-                        .collect();
-                    format!("[replace:{path}→ok but errors: {}]", errors.join("; "))
-                } else {
-                    format!("[replace:{path}→ok]")
-                }
+                format!("[fix_file:{path}→ok]")
             } else {
-                let reason = content.lines()
-                    .find(|l| l.contains("not found") || l.contains("matches"))
-                    .map(|l| crate::truncate_chars(l.trim(), 60))
-                    .unwrap_or_else(|| "unknown".into());
-                format!("[replace:{path}→FAILED: {reason}]")
+                format!("[fix_file:{path}→failed]")
             }
         }
-        "write_file" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            if content.contains('✓') {
-                let lines = content.lines().next().unwrap_or("");
-                format!("[write:{path}→{lines}]")
-            } else {
-                format!("[write:{path}→failed]")
-            }
-        }
-        "shell" => {
-            let cmd = args["command"].as_str().unwrap_or("?");
-            let short_cmd = crate::truncate_chars(cmd, 30);
-            let exit_code = if content.contains("exit 0") {
-                "ok"
-            } else {
-                "err"
-            };
-            format!("[shell:\"{short_cmd}\"→{exit_code}]")
-        }
-        "task_update" => "[task_update→ok]".to_string(),
-        "diagnostics" => {
-            let errors = content
-                .lines()
-                .filter(|l| l.contains("error"))
-                .count();
-            let warnings = content
-                .lines()
-                .filter(|l| l.contains("warning"))
-                .count();
-            format!("[diag:{errors}E,{warnings}W]")
-        }
-        "web_search" => {
-            let query = args["query"].as_str().unwrap_or("?");
-            let result_count = content
-                .lines()
-                .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
-                .count();
-            format!("[web_search:\"{query}\"→{result_count} results]")
-        }
-        "web_fetch" => {
-            let url = args["url"].as_str().unwrap_or("?");
-            let char_count = content.len();
-            format!("[web_fetch:{url}→{char_count}chars]")
-        }
-"mcp_use" => {
+        "mcp_use" => {
             let server = args["server"].as_str().unwrap_or("?");
             let tool = args["tool"].as_str().unwrap_or("?");
-            let chars = content.len();
-            format!("[mcp:{server}/{tool}→{chars}chars]")
+            format!("[mcp:{server}/{tool}→{}chars]", content.len())
         }
         _ => format!("[{tool_name}→done]"),
     }
@@ -599,11 +599,11 @@ def hello():
 
     #[test]
     fn test_tool_result_summary() {
-        let args = serde_json::json!({"path": "src/main.rs"});
+        let args = serde_json::json!({"action": "read", "path": "src/main.rs"});
         let content = "pub fn main() {\n    println!(\"hello\");\n}\n";
-        let summary = summarize_tool_result("read_file", &args, content);
+        let summary = summarize_tool_result("file", &args, content);
         assert!(summary.contains("src/main.rs"), "should have path: {summary}");
-        assert!(summary.contains("read_file"), "should hint at re-read: {summary}");
+        assert!(summary.contains("read"), "should hint at re-read: {summary}");
     }
 
     #[test]

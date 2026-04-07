@@ -40,16 +40,9 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
     // Filter tools based on config
     {
         let mut disabled = Vec::new();
-        if !config.tools.context_tools {
-            disabled.extend_from_slice(&["get_repo_map", "get_project_info", "get_architecture_notes"]);
-        }
-if !config.tools.web_tools { disabled.extend_from_slice(&["web_search", "web_fetch"]); }
+        if !config.tools.web_tools { disabled.push("web"); }
         if !config.tools.plan { disabled.push("plan"); }
-        if !config.tools.scratchpad { disabled.push("task_update"); }
         tool_defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
-    }
-    if config.tools.context_tools {
-        tool_defs.extend(tools::definitions::context_tool_definitions());
     }
 
     // Spawn LSP client (non-blocking)
@@ -61,11 +54,6 @@ if !config.tools.web_tools { disabled.extend_from_slice(&["web_search", "web_fet
     } else {
         None
     };
-    if lsp_client.is_some() {
-        if config.tools.lsp_tools {
-            tool_defs.extend(tools::definitions::lsp_tool_definitions());
-        }
-    }
 
     // Clear stale scratchpad/plan
     let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
@@ -610,10 +598,11 @@ async fn run_agent_loop(
             app.push_output(&format!("  {icon} {}: {first_line}", tc.function.name), style);
             app.store_tool_result(&tc.function.name, &result.content);
 
-            // Successful edit/write = code changed, reset loop detector
-            if result.success
-                && (tc.function.name == "replace" || tc.function.name == "write_file")
-            {
+            // Successful file write = code changed, reset loop detector
+            let file_action = args["action"].as_str().unwrap_or("");
+            let is_file_write = (tc.function.name == "file" && matches!(file_action, "replace" | "write"))
+                || tc.function.name == "fix_file";
+            if result.success && is_file_write {
                 recent_calls.clear();
             }
 
@@ -713,33 +702,34 @@ fn mask_old_tool_results(
 /// Create a brief summary of tool arguments for display.
 fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
     match tool_name {
-        "read_file" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            let start = args["start_line"].as_u64();
-            let end = args["end_line"].as_u64();
-            match (start, end) {
-                (Some(s), Some(e)) => format!("{path}:{s}-{e}"),
-                (Some(s), None) => format!("{path}:{s}-"),
-                _ => path.to_string(),
+        "file" | "code" | "web" | "plan" | "fix_file" | "mcp_use" => {
+            // Delegate to run.rs summarize_args pattern
+            let action = args["action"].as_str().unwrap_or("");
+            match (tool_name, action) {
+                ("file", "read") => {
+                    let path = args["path"].as_str().unwrap_or("?");
+                    format!("read {path}")
+                }
+                ("file", "search") => {
+                    let query = args["query"].as_str().unwrap_or("?");
+                    format!("search \"{query}\"")
+                }
+                ("file", "replace" | "write") => {
+                    let path = args["path"].as_str().unwrap_or("?");
+                    format!("{action} {path}")
+                }
+                ("file", "shell") => {
+                    let cmd = args["command"].as_str().unwrap_or("?");
+                    format!("shell {}", crate::truncate_chars(cmd, 40))
+                }
+                ("fix_file", _) => args["path"].as_str().unwrap_or("?").to_string(),
+                ("mcp_use", _) => {
+                    let server = args["server"].as_str().unwrap_or("?");
+                    let tool = args["tool"].as_str().unwrap_or("?");
+                    format!("{server}/{tool}")
+                }
+                _ => action.to_string(),
             }
-        }
-        "search" => {
-            let query = args["query"].as_str().unwrap_or("?");
-            let scope = args["scope"].as_str().unwrap_or("project");
-            format!("\"{query}\" in {scope}")
-        }
-        "replace" | "write_file" => args["path"].as_str().unwrap_or("?").to_string(),
-        "shell" => {
-            let cmd = args["command"].as_str().unwrap_or("?");
-            crate::truncate_chars(cmd, 47)
-        }
-        "task_update" => "scratchpad".to_string(),
-        "web_search" => args["query"].as_str().unwrap_or("?").to_string(),
-        "web_fetch" => args["url"].as_str().unwrap_or("?").to_string(),
-        "mcp_use" => {
-            let server = args["server"].as_str().unwrap_or("?");
-            let tool = args["tool"].as_str().unwrap_or("?");
-            format!("{server}/{tool}")
         }
         _ => format!("{args}"),
     }

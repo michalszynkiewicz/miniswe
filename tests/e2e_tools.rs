@@ -26,8 +26,8 @@ async fn read_file_returns_content_with_line_numbers() {
     let content = "line one\nline two\nline three\n";
     fs::write(helpers::project_path(&config, "test.txt"), content).unwrap();
 
-    let args = json!({"path": "test.txt"});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
+    let args = json!({"action": "read", "path": "test.txt"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -50,8 +50,8 @@ async fn read_file_with_line_range() {
         .join("\n");
     fs::write(helpers::project_path(&config, "range.txt"), &content).unwrap();
 
-    let args = json!({"path": "range.txt", "start_line": 3, "end_line": 5});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
+    let args = json!({"action": "read", "path": "range.txt", "start_line": 3, "end_line": 5});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -70,8 +70,8 @@ async fn read_file_compresses_rust_stdlib_imports() {
     let content = "use std::io;\nuse std::fs;\nuse crate::config::Config;\n\nfn main() {\n    println!(\"hello\");\n}\n";
     fs::write(helpers::project_path(&config, "test.rs"), content).unwrap();
 
-    let args = json!({"path": "test.rs"});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
+    let args = json!({"action": "read", "path": "test.rs"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -93,8 +93,8 @@ async fn read_file_compresses_rust_stdlib_imports() {
 async fn read_file_not_found() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({"path": "nonexistent.txt"});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
+    let args = json!({"action": "read", "path": "nonexistent.txt"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -110,8 +110,8 @@ async fn read_file_rejects_large_file() {
     let large = "x".repeat(11 * 1024 * 1024);
     fs::write(helpers::project_path(&config, "huge.txt"), &large).unwrap();
 
-    let args = json!({"path": "huge.txt"});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
+    let args = json!({"action": "read", "path": "huge.txt"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -125,11 +125,11 @@ async fn read_file_rejects_large_file() {
 async fn write_file_creates_new_file() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({
+    let args = json!({"action": "write",
         "path": "new_file.txt",
         "content": "hello world\nsecond line\n"
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -145,11 +145,11 @@ async fn write_file_creates_new_file() {
 async fn write_file_creates_parent_dirs() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({
+    let args = json!({"action": "write",
         "path": "deeply/nested/dir/file.txt",
         "content": "nested content"
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -165,11 +165,11 @@ async fn write_file_overwrites_existing() {
 
     fs::write(helpers::project_path(&config, "existing.txt"), "old content").unwrap();
 
-    let args = json!({
+    let args = json!({"action": "write",
         "path": "existing.txt",
         "content": "new content"
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -188,12 +188,12 @@ async fn edit_performs_replacement() {
     let content = "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x + y);\n}\n";
     fs::write(helpers::project_path(&config, "edit_test.txt"), content).unwrap();
 
-    let args = json!({
+    let args = json!({"action": "replace",
         "path": "edit_test.txt",
         "old": "    let x = 1;",
         "new": "    let x = 42;"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -212,12 +212,12 @@ async fn edit_rejects_ambiguous_match() {
     let content = "foo\nbar\nfoo\nbaz\n";
     fs::write(helpers::project_path(&config, "dupe.txt"), content).unwrap();
 
-    let args = json!({
+    let args = json!({"action": "replace",
         "path": "dupe.txt",
         "old": "foo",
         "new": "qux"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -236,12 +236,12 @@ async fn edit_rejects_ambiguous_match() {
 async fn edit_file_not_found() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({
+    let args = json!({"action": "replace",
         "path": "no_such_file.txt",
         "old": "foo",
         "new": "bar"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -255,12 +255,12 @@ async fn edit_old_not_found_in_file() {
 
     fs::write(helpers::project_path(&config, "miss.txt"), "actual content\n").unwrap();
 
-    let args = json!({
+    let args = json!({"action": "replace",
         "path": "miss.txt",
         "old": "nonexistent text",
         "new": "replacement"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -287,8 +287,8 @@ async fn search_finds_matches() {
     )
     .unwrap();
 
-    let args = json!({"query": "hello world"});
-    let result = tools::execute_tool("search", &args, &config, &perms(&config), None)
+    let args = json!({"action": "search", "query": "hello world"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -308,8 +308,8 @@ async fn search_no_matches() {
     fs::create_dir_all(helpers::project_path(&config, "src")).unwrap();
     fs::write(helpers::project_path(&config, "src/main.rs"), "fn main() {}\n").unwrap();
 
-    let args = json!({"query": "ZZZZUNIQUENOMATCH"});
-    let result = tools::execute_tool("search", &args, &config, &perms(&config), None)
+    let args = json!({"action": "search", "query": "ZZZZUNIQUENOMATCH"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -323,8 +323,8 @@ async fn search_no_matches() {
 async fn shell_runs_command_and_captures_output() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({"command": "echo hello"});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
+    let args = json!({"action": "shell", "command": "echo hello"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -337,8 +337,8 @@ async fn shell_runs_command_and_captures_output() {
 async fn shell_captures_exit_code() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({"command": "exit 42"});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
+    let args = json!({"action": "shell", "command": "exit 42"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -350,8 +350,8 @@ async fn shell_captures_exit_code() {
 async fn shell_timeout() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({"command": "sleep 60", "timeout": 1});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
+    let args = json!({"action": "shell", "command": "sleep 60", "timeout": 1});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -366,8 +366,8 @@ async fn shell_runs_in_project_root() {
     // Create a marker file in project root
     fs::write(helpers::project_path(&config, "marker.txt"), "found").unwrap();
 
-    let args = json!({"command": "cat marker.txt"});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
+    let args = json!({"action": "shell", "command": "cat marker.txt"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -383,8 +383,8 @@ async fn shell_truncates_very_long_lines() {
 
     // Generate a single line with 200K characters (no newlines)
     // Use printf with brace expansion — avoids pipes which can cause issues with shell tool's try_wait
-    let args = json!({"command": "printf 'x%.0s' $(seq 1 200000)"});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
+    let args = json!({"action": "shell", "command": "printf 'x%.0s' $(seq 1 200000)"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -402,8 +402,8 @@ async fn shell_truncates_many_lines() {
     let (_tmp, config) = helpers::create_test_project();
 
     // Generate 500 lines of output
-    let args = json!({"command": "seq 1 500"});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
+    let args = json!({"action": "shell", "command": "seq 1 500"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -425,8 +425,8 @@ async fn task_update_creates_scratchpad() {
     let (_tmp, config) = helpers::create_test_project();
 
     let scratchpad = "## Current Task\nImplement feature X\n\n## Plan\n1. Step one\n2. Step two\n";
-    let args = json!({"content": scratchpad});
-    let result = tools::execute_tool("task_update", &args, &config, &perms(&config), None)
+    let args = json!({"action": "scratchpad", "content": scratchpad});
+    let result = tools::execute_tool("plan", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -443,8 +443,8 @@ async fn task_update_rejects_missing_sections() {
     let (_tmp, config) = helpers::create_test_project();
 
     // Missing ## Plan section
-    let args = json!({"content": "## Current Task\nDo something\n"});
-    let result = tools::execute_tool("task_update", &args, &config, &perms(&config), None)
+    let args = json!({"action": "scratchpad", "content": "## Current Task\nDo something\n"});
+    let result = tools::execute_tool("plan", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -452,8 +452,8 @@ async fn task_update_rejects_missing_sections() {
     assert!(result.content.contains("Plan"));
 
     // Missing ## Current Task section
-    let args = json!({"content": "## Plan\n1. Step\n"});
-    let result = tools::execute_tool("task_update", &args, &config, &perms(&config), None)
+    let args = json!({"action": "scratchpad", "content": "## Plan\n1. Step\n"});
+    let result = tools::execute_tool("plan", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -480,8 +480,8 @@ async fn unknown_tool_returns_error() {
 async fn read_file_missing_path() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({});
-    let result = tools::execute_tool("read_file", &args, &config, &perms(&config), None)
+    let args = json!({"action": "read"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -493,8 +493,8 @@ async fn read_file_missing_path() {
 async fn write_file_missing_content() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({"path": "file.txt"});
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
+    let args = json!({"action": "write", "path": "file.txt"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -506,8 +506,8 @@ async fn write_file_missing_content() {
 async fn shell_missing_command() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
+    let args = json!({"action": "shell"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -526,18 +526,18 @@ async fn edit_whitespace_normalized_fallback() {
     fs::write(helpers::project_path(&config, "ws_test.rs"), content).unwrap();
 
     // old has 2-space indent (wrong whitespace, but same content)
-    let args = json!({
+    let args = json!({"action": "replace",
         "path": "ws_test.rs",
         "old": "  let x = 1;\n  let y = 2;",
         "new": "    let x = 42;\n    let y = 99;"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
     assert!(result.success, "whitespace-normalized edit should succeed: {}", result.content);
-    assert!(result.content.contains("normalized whitespace"),
-        "should mention normalized whitespace: {}", result.content);
+    assert!(result.content.contains("fuzzy/normalized matching"),
+        "should mention fuzzy/normalized matching: {}", result.content);
 
     let disk = fs::read_to_string(helpers::project_path(&config, "ws_test.rs")).unwrap();
     assert!(disk.contains("let x = 42;"), "replacement should be applied");
@@ -552,64 +552,18 @@ async fn edit_whitespace_normalized_single_line() {
     fs::write(helpers::project_path(&config, "ws_single.rs"), content).unwrap();
 
     // Wrong indentation in old
-    let args = json!({
+    let args = json!({"action": "replace",
         "path": "ws_single.rs",
         "old": "let value = 10;",
         "new": "    let value = 20;"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
     assert!(result.success, "single-line normalized edit should succeed: {}", result.content);
     let disk = fs::read_to_string(helpers::project_path(&config, "ws_single.rs")).unwrap();
     assert!(disk.contains("let value = 20;"));
-}
-
-// ── function signature change detection ───────────────────────────
-
-#[tokio::test]
-async fn edit_detects_function_signature_change() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    let content = "pub fn run(config: Config) -> Result<()> {\n    todo!()\n}\n";
-    fs::write(helpers::project_path(&config, "sig_test.rs"), content).unwrap();
-
-    let args = json!({
-        "path": "sig_test.rs",
-        "old": "pub fn run(config: Config) -> Result<()> {",
-        "new": "pub fn run(config: Config, headless: bool) -> Result<()> {"
-    });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    assert!(result.success);
-    assert!(result.content.contains("IMPORTANT"),
-        "should warn about call sites: {}", result.content);
-    assert!(result.content.contains("search(\"run\")") || result.content.contains("search"),
-        "should suggest searching for callers: {}", result.content);
-}
-
-#[tokio::test]
-async fn edit_no_signature_warning_for_non_fn_changes() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    let content = "let x = 1;\nlet y = 2;\n";
-    fs::write(helpers::project_path(&config, "no_sig.rs"), content).unwrap();
-
-    let args = json!({
-        "path": "no_sig.rs",
-        "old": "let x = 1;",
-        "new": "let x = 42;"
-    });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    assert!(result.success);
-    assert!(!result.content.contains("IMPORTANT"),
-        "should NOT warn about call sites for non-fn edits: {}", result.content);
 }
 
 // ── edit failure hints ────────────────────────────────────────────
@@ -620,18 +574,18 @@ async fn edit_not_found_suggests_write_file() {
 
     fs::write(helpers::project_path(&config, "hint_test.txt"), "actual content\n").unwrap();
 
-    let args = json!({
+    let args = json!({"action": "replace",
         "path": "hint_test.txt",
         "old": "nonexistent content",
         "new": "replacement"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
     assert!(!result.success);
-    assert!(result.content.contains("write_file"),
-        "should suggest write_file: {}", result.content);
+    assert!(result.content.contains("file(action='write')"),
+        "should suggest file(action='write'): {}", result.content);
 }
 
 // ── context pull-based tools ──────────────────────────────────────
@@ -645,8 +599,8 @@ async fn get_project_info_returns_profile() {
         "# Test\n## Overview\n- Name: test-proj\n- Language: Rust\n",
     ).unwrap();
 
-    let args = json!({});
-    let result = tools::execute_tool("get_project_info", &args, &config, &perms(&config), None)
+    let args = json!({"action": "project_info"});
+    let result = tools::execute_tool("code", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -659,8 +613,8 @@ async fn get_project_info_returns_profile() {
 async fn get_architecture_notes_missing_file() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({});
-    let result = tools::execute_tool("get_architecture_notes", &args, &config, &perms(&config), None)
+    let args = json!({"action": "architecture_notes"});
+    let result = tools::execute_tool("code", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -677,8 +631,8 @@ async fn get_architecture_notes_returns_content() {
     fs::create_dir_all(&ai_dir).unwrap();
     fs::write(ai_dir.join("README.md"), "# Architecture\nLayered design.\n").unwrap();
 
-    let args = json!({});
-    let result = tools::execute_tool("get_architecture_notes", &args, &config, &perms(&config), None)
+    let args = json!({"action": "architecture_notes"});
+    let result = tools::execute_tool("code", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -700,7 +654,7 @@ async fn replace_all_missing_params() {
     fs::write(helpers::project_path(&config, "test.rs"), "fn main() {}\n").unwrap();
 
     // Missing old
-    let args = json!({"path": "test.rs", "new": "replacement", "all": true});
+    let args = json!({"action": "replace", "path": "test.rs", "new": "replacement", "all": true});
     let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
     assert!(!result.success);
     assert!(result.content.contains("old"));
@@ -712,7 +666,7 @@ async fn replace_all_not_found() {
 
     fs::write(helpers::project_path(&config, "target.rs"), "fn main() {}\n").unwrap();
 
-    let args = json!({"path": "target.rs", "old": "nonexistent", "new": "replacement", "all": true});
+    let args = json!({"action": "replace", "path": "target.rs", "old": "nonexistent", "new": "replacement", "all": true});
     let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
     assert!(!result.success);
     assert!(result.content.contains("not found"));
@@ -725,7 +679,7 @@ async fn replace_all_replaces_every_occurrence() {
     let content = "foo(1);\nfoo(2);\nbar();\nfoo(3);\n";
     fs::write(helpers::project_path(&config, "multi.rs"), content).unwrap();
 
-    let args = json!({"path": "multi.rs", "old": "foo(", "new": "baz(", "all": true});
+    let args = json!({"action": "replace", "path": "multi.rs", "old": "foo(", "new": "baz(", "all": true});
     let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
 
     assert!(result.success);
@@ -744,7 +698,7 @@ async fn replace_all_for_adding_argument() {
     let content = "assemble(&config, \"test\", &[], false, None);\nassemble(&config, \"hello\", &[], true, None);\n";
     fs::write(helpers::project_path(&config, "calls.rs"), content).unwrap();
 
-    let args = json!({"path": "calls.rs", "old": "assemble(&config,", "new": "assemble(&config, override_prompt,", "all": true});
+    let args = json!({"action": "replace", "path": "calls.rs", "old": "assemble(&config,", "new": "assemble(&config, override_prompt,", "all": true});
     let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
 
     assert!(result.success);
@@ -757,37 +711,39 @@ async fn replace_all_for_adding_argument() {
 // ── tool enabling/disabling ───────────────────────────────────────
 
 #[test]
-fn tools_config_disables_context_tools() {
-    let mut config = miniswe::config::Config::default();
-    config.tools.context_tools = false;
-
+fn tools_config_disables_web() {
     let mut defs = miniswe::tools::tool_definitions();
     // Filter like run.rs does
-    let disabled = vec!["get_repo_map", "get_project_info", "get_architecture_notes"];
-    defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
+    defs.retain(|t| t.function.name != "web");
 
     let names: Vec<&str> = defs.iter().map(|t| t.function.name.as_str()).collect();
-    assert!(!names.contains(&"get_repo_map"), "should not have get_repo_map");
-    assert!(!names.contains(&"get_project_info"), "should not have get_project_info");
-    assert!(names.contains(&"read_file"), "should still have read_file");
-    assert!(names.contains(&"edit"), "should still have edit");
+    assert!(!names.contains(&"web"), "should not have web");
+    assert!(names.contains(&"file"), "should still have file");
+    assert!(names.contains(&"code"), "should still have code");
 }
 
 #[test]
 fn tools_config_all_enabled_by_default() {
     let config = miniswe::config::Config::default();
     assert!(config.tools.context_tools);
-    assert!(config.tools.lsp_tools);
     assert!(config.tools.web_tools);
 }
 
 #[test]
-fn tools_has_replace_not_replace_all() {
+fn tools_has_grouped_tools() {
     let defs = miniswe::tools::tool_definitions();
     let names: Vec<&str> = defs.iter().map(|t| t.function.name.as_str()).collect();
-    assert!(names.contains(&"replace"), "should have replace");
-    assert!(!names.contains(&"replace_all"), "replace_all should be gone");
-    assert!(!names.contains(&"edit"), "edit should be renamed to replace");
+    assert!(names.contains(&"file"), "should have file");
+    assert!(names.contains(&"code"), "should have code");
+    assert!(names.contains(&"web"), "should have web");
+    assert!(names.contains(&"plan"), "should have plan");
+    assert!(names.contains(&"fix_file"), "should have fix_file");
+    // Old flat tools should be gone
+    assert!(!names.contains(&"read_file"), "read_file should be gone");
+    assert!(!names.contains(&"write_file"), "write_file should be gone");
+    assert!(!names.contains(&"replace"), "flat replace should be gone");
+    assert!(!names.contains(&"search"), "flat search should be gone");
+    assert!(!names.contains(&"shell"), "flat shell should be gone");
 }
 
 // ── dynamic tool output budget ────────────────────────────────────
@@ -819,8 +775,8 @@ async fn search_query_mode_is_literal() {
     ).unwrap();
 
     // query mode: "Result<()>" should match literally (no regex interpretation)
-    let args = json!({"query": "Result<()>"});
-    let result = tools::execute_tool("search", &args, &config, &perms(&config), None)
+    let args = json!({"action": "search", "query": "Result<()>"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -839,8 +795,8 @@ async fn search_pattern_mode_is_regex() {
     ).unwrap();
 
     // pattern mode: regex to find functions starting with 'b'
-    let args = json!({"pattern": "fn b\\w+"});
-    let result = tools::execute_tool("search", &args, &config, &perms(&config), None)
+    let args = json!({"action": "search", "pattern": "fn b\\w+"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -855,8 +811,8 @@ async fn search_pattern_mode_is_regex() {
 async fn search_needs_query_or_pattern() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({});
-    let result = tools::execute_tool("search", &args, &config, &perms(&config), None)
+    let args = json!({"action": "search"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -874,8 +830,8 @@ async fn shell_large_output_saved_to_file() {
     // Generate output larger than budget
     let budget_lines = config.tool_output_budget_chars() / 80;
     let line_count = budget_lines + 100;
-    let args = json!({"command": format!("seq 1 {line_count}")});
-    let result = tools::execute_tool("shell", &args, &config, &perms(&config), None)
+    let args = json!({"action": "shell", "command": format!("seq 1 {line_count}")});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -929,12 +885,12 @@ async fn edit_whitespace_tabs_vs_spaces() {
     fs::write(helpers::project_path(&config, "tabs.rs"), content).unwrap();
 
     // Old uses spaces (common model mistake)
-    let args = json!({
+    let args = json!({"action": "replace",
         "path": "tabs.rs",
         "old": "    let x = 1;",
         "new": "\tlet x = 42;"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -952,70 +908,20 @@ async fn edit_whitespace_empty_lines() {
     fs::write(helpers::project_path(&config, "blanks.rs"), content).unwrap();
 
     // Old omits blank lines
-    let args = json!({
+    let args = json!({"action": "replace",
         "path": "blanks.rs",
         "old": "fn foo() {}\nfn bar() {}",
         "new": "fn foo() {}\n\n\nfn baz() {}"
     });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
     // This should fail — blank line differences aren't whitespace normalization
     // (trimming doesn't help with missing lines)
     // The model should get a helpful error
-    assert!(result.content.contains("write_file") || result.content.contains("HINT"),
+    assert!(result.content.contains("file(action='write')") || result.content.contains("HINT"),
         "should suggest alternatives: {}", result.content);
-}
-
-// ── docs_lookup ───────────────────────────────────────────────────
-
-#[tokio::test]
-async fn docs_lookup_finds_cached_doc() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    // Create a cached doc file
-    let docs_dir = config.miniswe_path("docs");
-    fs::create_dir_all(&docs_dir).unwrap();
-    fs::write(docs_dir.join("tokio.txt"), "# Tokio\n\n## Runtime\nUse tokio::main macro.\n\n## Spawn\ntokio::spawn for async tasks.\n").unwrap();
-
-    let args = json!({"library": "tokio"});
-    let result = tools::execute_tool("docs_lookup", &args, &config, &perms(&config), None)
-        .await.unwrap();
-
-    assert!(result.success);
-    assert!(result.content.contains("Runtime") || result.content.contains("Spawn"),
-        "should return doc content: {}", result.content);
-}
-
-#[tokio::test]
-async fn docs_lookup_with_topic_filters() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    let docs_dir = config.miniswe_path("docs");
-    fs::create_dir_all(&docs_dir).unwrap();
-    fs::write(docs_dir.join("serde.txt"), "# Serde\n\n## Derive\nUse #[derive(Serialize)].\n\n## Custom\nImpl Serialize trait manually.\n").unwrap();
-
-    let args = json!({"library": "serde", "topic": "Derive"});
-    let result = tools::execute_tool("docs_lookup", &args, &config, &perms(&config), None)
-        .await.unwrap();
-
-    assert!(result.success);
-    assert!(result.content.contains("Derive"),
-        "should contain the matching section: {}", result.content);
-}
-
-#[tokio::test]
-async fn docs_lookup_no_docs_cached() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    let args = json!({"library": "nonexistent_lib"});
-    let result = tools::execute_tool("docs_lookup", &args, &config, &perms(&config), None)
-        .await.unwrap();
-
-    assert!(result.success); // returns ok with "no docs found"
-    assert!(result.content.contains("No docs") || result.content.contains("No local docs"),
-        "should say no docs: {}", result.content);
 }
 
 // ── tool response content tests ───────────────────────────────────
@@ -1028,8 +934,8 @@ async fn edit_response_contains_context_lines() {
     let content = "line1\nline2\nlet x = 1;\nline4\nline5\n";
     fs::write(helpers::project_path(&config, "ctx.rs"), content).unwrap();
 
-    let args = json!({"path": "ctx.rs", "old": "let x = 1;", "new": "let x = 42;"});
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
+    let args = json!({"action": "replace", "path": "ctx.rs", "old": "let x = 1;", "new": "let x = 42;"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await.unwrap();
 
     assert!(result.success);
@@ -1039,35 +945,14 @@ async fn edit_response_contains_context_lines() {
     assert!(result.content.contains("let x = 42;"), "should show the new content: {}", result.content);
 }
 
-#[tokio::test]
-async fn edit_fn_signature_change_warns_about_callers() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    let content = "pub fn process(data: &str) -> Result<()> {\n    Ok(())\n}\n";
-    fs::write(helpers::project_path(&config, "sig.rs"), content).unwrap();
-
-    let args = json!({
-        "path": "sig.rs",
-        "old": "pub fn process(data: &str) -> Result<()> {",
-        "new": "pub fn process(data: &str, verbose: bool) -> Result<()> {"
-    });
-    let result = tools::execute_tool("edit", &args, &config, &perms(&config), None)
-        .await.unwrap();
-
-    assert!(result.success);
-    assert!(result.content.contains("IMPORTANT"),
-        "should warn about call sites: {}", result.content);
-    assert!(result.content.contains("search"),
-        "should suggest searching for callers: {}", result.content);
-}
 
 #[tokio::test]
 async fn write_file_response_shows_tail() {
     let (_tmp, config) = helpers::create_test_project();
 
     let content = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
-    let args = json!({"path": "new.txt", "content": content});
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
+    let args = json!({"action": "write", "path": "new.txt", "content": content});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await.unwrap();
 
     assert!(result.success);
@@ -1082,8 +967,8 @@ async fn search_response_shows_file_and_line() {
 
     fs::write(helpers::project_path(&config, "findme.rs"), "pub fn hello() {}\nfn world() {}\n").unwrap();
 
-    let args = json!({"query": "pub fn hello"});
-    let result = tools::execute_tool("search", &args, &config, &perms(&config), None)
+    let args = json!({"action": "search", "query": "pub fn hello"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await.unwrap();
 
     assert!(result.success);
@@ -1116,8 +1001,8 @@ async fn get_repo_map_response_shows_symbols() {
     let graph = miniswe::knowledge::graph::DependencyGraph::build(&index);
     graph.save(&miniswe_dir).unwrap();
 
-    let args = json!({});
-    let result = tools::execute_tool("get_repo_map", &args, &config, &perms(&config), None)
+    let args = json!({"action": "repo_map"});
+    let result = tools::execute_tool("code", &args, &config, &perms(&config), None)
         .await.unwrap();
 
     assert!(result.success);
@@ -1160,8 +1045,8 @@ async fn diagnostics_response_is_actionable() {
         "fn main() {\n    let x: u32 = \"not a number\";\n    println!(\"{x}\");\n}\n"
     ).unwrap();
 
-    let args = json!({});
-    let result = tools::execute_tool("diagnostics", &args, &config, &perms(&config), None)
+    let args = json!({"action": "diagnostics"});
+    let result = tools::execute_tool("code", &args, &config, &perms(&config), None)
         .await.unwrap();
 
     // diagnostics runs cargo check — should report errors
