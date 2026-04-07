@@ -68,9 +68,9 @@ generate_config() {
 provider = "llama-cpp"
 endpoint = "http://localhost:8464"
 model = "devstral-small-2"
-context_window = 32000
+context_window = 60000
 temperature = ${TEMPERATURE}
-max_output_tokens = 16384
+max_output_tokens = 4096
 
 [context]
 repo_map_budget = 5000
