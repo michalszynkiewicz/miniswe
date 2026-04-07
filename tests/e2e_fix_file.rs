@@ -213,6 +213,34 @@ fn replace_at_rejects_ambiguous_old_block() {
     assert!(fix_file::apply_patch_dry_run(content, &ops).is_err());
 }
 
+#[test]
+fn overlapping_replacements_report_conflicting_spans() {
+    let content = "a\nb\nc\nd\n";
+    let ops = vec![
+        PatchOp::ReplaceAt {
+            start: 2,
+            old: vec!["b".into(), "c".into()],
+            new: vec!["x".into()],
+        },
+        PatchOp::ReplaceAt {
+            start: 3,
+            old: vec!["c".into()],
+            new: vec!["y".into()],
+        },
+    ];
+
+    let err = fix_file::apply_patch_dry_run(content, &ops)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("overlapping replacement/delete spans"));
+    assert!(err.contains("op 1 REPLACE_AT 2"));
+    assert!(err.contains("op 2 REPLACE_AT 3"));
+    assert!(err.contains("L2-L3"));
+    assert!(err.contains("L3"));
+    assert!(err.contains("smallest enclosing REPLACE_AT"));
+    assert!(err.contains("narrower fix_file task"));
+}
+
 // ── Execute/atomicity with mocked LLM ──────────────────────────────
 
 #[tokio::test]
