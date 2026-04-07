@@ -31,12 +31,12 @@ async fn edit_shows_10_lines_context() {
     fs::write(helpers::project_path(&config, "ctx.txt"), &content).unwrap();
 
     // Edit line 15
-    let args = json!({
+    let args = json!({"action": "replace",
         "path": "ctx.txt",
         "old": "line 15",
         "new": "EDITED LINE 15"
     });
-    let result = tools::execute_tool("replace", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -59,12 +59,12 @@ async fn edit_not_found_shows_near_match() {
 
     // Try to match with wrong indentation — first line of `old` trimmed
     // will match a line in the file, triggering the near-match display
-    let args = json!({
+    let args = json!({"action": "replace",
         "path": "near.txt",
         "old": "let x = 42;\n    println!(\"wrong\");",
         "new": "let x = 99;"
     });
-    let result = tools::execute_tool("replace", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -93,12 +93,12 @@ async fn edit_not_found_no_near_match() {
 
     fs::write(helpers::project_path(&config, "nomatch.txt"), "hello world\n").unwrap();
 
-    let args = json!({
+    let args = json!({"action": "replace",
         "path": "nomatch.txt",
         "old": "completely different text that does not appear",
         "new": "replacement"
     });
-    let result = tools::execute_tool("replace", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -119,11 +119,11 @@ async fn write_file_includes_tail() {
         .collect();
     let content = lines.join("\n") + "\n";
 
-    let args = json!({
+    let args = json!({"action": "write",
         "path": "tail_test.txt",
         "content": content
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -143,11 +143,11 @@ async fn write_file_includes_tail() {
 async fn write_file_short_file_shows_all_in_tail() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({
+    let args = json!({"action": "write",
         "path": "short.txt",
         "content": "line 1\nline 2\nline 3\n"
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -177,11 +177,11 @@ async fn auto_check_includes_source_context_on_error() {
     .unwrap();
 
     // Use write_file to trigger auto_check
-    let args = json!({
+    let args = json!({"action": "write",
         "path": "src/main.rs",
         "content": "fn main() {\n    let x: u32 = \"hello\";\n    println!(\"{x}\");\n}\n"
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -215,11 +215,11 @@ async fn auto_check_ok_on_valid_code() {
     .unwrap();
     fs::create_dir_all(helpers::project_path(&config, "src")).unwrap();
 
-    let args = json!({
+    let args = json!({"action": "write",
         "path": "src/main.rs",
         "content": "fn main() {\n    println!(\"hello\");\n}\n"
     });
-    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -249,10 +249,10 @@ fn token_budget_masking_keeps_newest() {
     let small = "y".repeat(40); // ~10 tokens
 
     let log: Vec<(String, serde_json::Value, String)> = vec![
-        ("read_file".into(), json!({"path": "a.rs"}), big.clone()),    // oldest
-        ("read_file".into(), json!({"path": "b.rs"}), big.clone()),
-        ("write_file".into(), json!({"path": "c.rs"}), small.clone()),
-        ("read_file".into(), json!({"path": "d.rs"}), big.clone()),    // newest
+        ("file".into(), json!({"action": "read", "path": "a.rs"}), big.clone()),    // oldest
+        ("file".into(), json!({"action": "read", "path": "b.rs"}), big.clone()),
+        ("file".into(), json!({"action": "write", "path": "c.rs"}), small.clone()),
+        ("file".into(), json!({"action": "read", "path": "d.rs"}), big.clone()),    // newest
     ];
 
     // Budget of 100 tokens: newest two (big=50 + small=10 = 60) fit,
@@ -269,7 +269,7 @@ fn token_budget_masking_keeps_newest() {
 
     assert!(should_mask[0], "oldest should be masked (over budget)");
     assert!(should_mask[1], "second oldest should be masked (over budget)");
-    assert!(!should_mask[2], "write_file fits in budget");
+    assert!(!should_mask[2], "file(write) fits in budget");
     assert!(!should_mask[3], "newest read fits in budget");
 }
 
@@ -280,9 +280,9 @@ fn token_budget_masking_nothing_when_under_budget() {
     let small = "content".to_string(); // ~2 tokens
 
     let log: Vec<(String, serde_json::Value, String)> = vec![
-        ("read_file".into(), json!({"path": "a.rs"}), small.clone()),
-        ("write_file".into(), json!({"path": "b.rs"}), small.clone()),
-        ("read_file".into(), json!({"path": "c.rs"}), small.clone()),
+        ("file".into(), json!({"action": "read", "path": "a.rs"}), small.clone()),
+        ("file".into(), json!({"action": "write", "path": "b.rs"}), small.clone()),
+        ("file".into(), json!({"action": "read", "path": "c.rs"}), small.clone()),
     ];
 
     // Budget of 1000 tokens: total is ~6 tokens, well under budget
@@ -318,8 +318,8 @@ fn rich_summary_includes_function_signatures() {
 "#;
 
     let summary = summarize_tool_result(
-        "read_file",
-        &json!({"path": "src/cli/mod.rs"}),
+        "file",
+        &json!({"action": "read", "path": "src/cli/mod.rs"}),
         content,
     );
 
@@ -349,15 +349,15 @@ fn rich_summary_includes_impl_blocks() {
 "#;
 
     let summary = summarize_tool_result(
-        "read_file",
-        &json!({"path": "src/config.rs"}),
+        "file",
+        &json!({"action": "read", "path": "src/config.rs"}),
         content,
     );
 
     assert!(summary.contains("pub struct Config"), "should have struct: {summary}");
     assert!(summary.contains("pub fn new"), "should have method: {summary}");
     assert!(summary.contains("pub trait Loadable"), "should have trait: {summary}");
-    assert!(summary.contains("read_file"), "should hint at read_file for re-reading: {summary}");
+    assert!(summary.contains("file(action='read'"), "should hint at file(action='read') for re-reading: {summary}");
 }
 
 #[test]
@@ -367,8 +367,8 @@ fn rich_summary_edit_with_errors() {
     let content = "✓ Edited src/main.rs (1 replacement)\n[cargo check]\nerror[E0061]: expected 4 arguments\n";
 
     let summary = summarize_tool_result(
-        "replace",
-        &json!({"path": "src/main.rs"}),
+        "file",
+        &json!({"action": "replace", "path": "src/main.rs"}),
         content,
     );
 
@@ -384,8 +384,8 @@ fn rich_summary_edit_success() {
     let content = "✓ Edited src/main.rs (1 replacement)\n[cargo check] OK\n";
 
     let summary = summarize_tool_result(
-        "replace",
-        &json!({"path": "src/main.rs"}),
+        "file",
+        &json!({"action": "replace", "path": "src/main.rs"}),
         content,
     );
 

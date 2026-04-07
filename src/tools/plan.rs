@@ -438,8 +438,16 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
             }
         }
 
+        "scratchpad" => {
+            super::task_update::execute(args, config).await
+        }
+
+        "help" => {
+            Ok(ToolResult::ok(super::definitions::plan_help().into()))
+        }
+
         _ => Ok(ToolResult::err(format!(
-            "Unknown action: {action}. Use 'set', 'check', 'refine', or 'show'."
+            "Unknown action: {action}. Use 'set', 'check', 'refine', 'show', or 'scratchpad'."
         ))),
     }
 }

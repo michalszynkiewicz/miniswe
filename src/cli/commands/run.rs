@@ -38,27 +38,11 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     };
     let mut tool_defs = tools::tool_definitions();
     // Filter tools based on config
-    let disabled_tools: Vec<&str> = {
-        let mut d = Vec::new();
-        if !config.tools.context_tools {
-            d.extend_from_slice(&["get_repo_map", "get_project_info", "get_architecture_notes"]);
-        }
-if !config.tools.web_tools {
-            d.extend_from_slice(&["web_search", "web_fetch"]);
-        }
-        if !config.tools.plan {
-            d.push("plan");
-        }
-        if !config.tools.scratchpad {
-            d.push("task_update");
-        }
-        d
-    };
-    tool_defs.retain(|t| !disabled_tools.contains(&t.function.name.as_str()));
-
-    // Conditional: context tools
-    if config.tools.context_tools {
-        tool_defs.extend(tools::definitions::context_tool_definitions());
+    {
+        let mut disabled = Vec::new();
+        if !config.tools.web_tools { disabled.push("web"); }
+        if !config.tools.plan { disabled.push("plan"); }
+        tool_defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
     }
 
     // Clear stale scratchpad/plan from previous sessions
@@ -100,10 +84,6 @@ if !config.tools.web_tools {
         None
     };
 
-    // Add LSP tool definitions if available and enabled
-    if lsp_client.is_some() && config.tools.lsp_tools {
-        tool_defs.extend(tools::definitions::lsp_tool_definitions());
-    }
 
     // Initialize MCP servers
     let mcp_config = McpConfig::load(&config.project_root)?;
@@ -396,11 +376,11 @@ if !config.tools.web_tools {
             log.tool_call_detail(&tc.function.name, &args);
             tui::print_tool_call(&tc.function.name, &args_summary);
 
-            // Block edit tools in plan-only mode
+            // Block write tools in plan-only mode
+            let file_action = args["action"].as_str().unwrap_or("");
             if plan_only
-                && (tc.function.name == "replace"
-                    || tc.function.name == "write_file"
-                    || tc.function.name == "shell")
+                && ((tc.function.name == "file" && matches!(file_action, "write" | "replace" | "shell"))
+                    || tc.function.name == "fix_file")
             {
                 let result_msg = Message::tool_result(
                     &tc.id,
@@ -413,9 +393,11 @@ if !config.tools.web_tools {
             }
 
             // Write gating: require plan before write tools
+            let is_write_action = (tc.function.name == "file" && matches!(file_action, "write" | "replace"))
+                || tc.function.name == "fix_file";
             if config.tools.plan
                 && !tools::plan::plan_exists(&config)
-                && matches!(tc.function.name.as_str(), "replace" | "write_file" | "fix_file")
+                && is_write_action
             {
                 let result_msg = Message::tool_result(
                     &tc.id,
@@ -427,8 +409,9 @@ if !config.tools.web_tools {
                 continue;
             }
 
-            // Handle special tool calls that need extra context
-            let mut result = if tc.function.name == "revert" {
+            // Handle tool dispatch
+            let mut result = if tc.function.name == "file" && file_action == "revert" {
+                // Revert needs snapshot manager
                 let to_round = args["to_round"].as_u64().unwrap_or(0) as usize;
                 let path = args["path"].as_str().unwrap_or("");
                 match &snapshots {
@@ -484,24 +467,24 @@ if !config.tools.web_tools {
             log.tool_result_detail(&tc.function.name, result.success, &result.content);
             tui::print_tool_result(&tc.function.name, result.success, first_line);
 
-            // A successful edit/write means code changed — reset trackers.
-            if result.success
-                && (tc.function.name == "replace" || tc.function.name == "write_file")
-            {
+            // A successful file write means code changed — reset trackers.
+            let is_file_write = (tc.function.name == "file" && matches!(file_action, "replace" | "write"))
+                || tc.function.name == "fix_file";
+            if result.success && is_file_write {
                 recent_calls.clear();
                 calls_since_last_edit = 0;
             } else {
                 calls_since_last_edit += 1;
             }
 
-            // Track edit failures per file — suggest write_file after 2 failures
-            if tc.function.name == "replace" && !result.success {
+            // Track replace failures per file — suggest write after 2 failures
+            if tc.function.name == "file" && file_action == "replace" && !result.success {
                 let path = args["path"].as_str().unwrap_or("").to_string();
                 let count = edit_fail_count.entry(path.clone()).or_insert(0);
                 *count += 1;
                 if *count >= 2 {
                     result.content.push_str(&format!(
-                        "\nERROR: edit has failed {} times on {path}. STOP using edit. Use write_file instead — read the file first, then write the complete new content.\n",
+                        "\nERROR: replace has failed {} times on {path}. STOP using replace. Use file(action='write') instead — read the file first, then write the complete new content.\n",
                         count
                     ));
                 }
@@ -548,33 +531,65 @@ if !config.tools.web_tools {
 
 /// Create a brief summary of tool arguments for display.
 fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
+    let action = args["action"].as_str().unwrap_or("");
     match tool_name {
-        "read_file" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            let start = args["start_line"].as_u64();
-            let end = args["end_line"].as_u64();
-            match (start, end) {
-                (Some(s), Some(e)) => format!("{path}:{s}-{e}"),
-                (Some(s), None) => format!("{path}:{s}-"),
-                _ => path.to_string(),
+        "file" => {
+            match action {
+                "read" => {
+                    let path = args["path"].as_str().unwrap_or("?");
+                    let start = args["start_line"].as_u64();
+                    let end = args["end_line"].as_u64();
+                    match (start, end) {
+                        (Some(s), Some(e)) => format!("read {path}:{s}-{e}"),
+                        (Some(s), None) => format!("read {path}:{s}-"),
+                        _ => format!("read {path}"),
+                    }
+                }
+                "search" => {
+                    let query = args["query"].as_str().unwrap_or("?");
+                    let scope = args["scope"].as_str().unwrap_or("project");
+                    format!("search \"{query}\" in {scope}")
+                }
+                "replace" | "write" => {
+                    let path = args["path"].as_str().unwrap_or("?");
+                    format!("{action} {path}")
+                }
+                "shell" => {
+                    let cmd = args["command"].as_str().unwrap_or("?");
+                    format!("shell {}", crate::truncate_chars(cmd, 40))
+                }
+                "revert" => "revert".to_string(),
+                _ => format!("{action}"),
             }
         }
-        "search" => {
-            let query = args["query"].as_str().unwrap_or("?");
-            let scope = args["scope"].as_str().unwrap_or("project");
-            format!("\"{query}\" in {scope}")
+        "code" => {
+            match action {
+                "goto_definition" | "find_references" => {
+                    let path = args["path"].as_str().unwrap_or("?");
+                    let line = args["line"].as_u64().unwrap_or(0);
+                    format!("{action} {path}:{line}")
+                }
+                _ => action.to_string(),
+            }
         }
-        "replace" | "write_file" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            format!("{path}")
+        "web" => {
+            match action {
+                "search" => {
+                    let query = args["query"].as_str().unwrap_or("?");
+                    format!("search \"{query}\"")
+                }
+                "fetch" => args["url"].as_str().unwrap_or("?").to_string(),
+                _ => action.to_string(),
+            }
         }
-        "shell" => {
-            let cmd = args["command"].as_str().unwrap_or("?");
-            crate::truncate_chars(cmd, 47)
+        "plan" => {
+            match action {
+                "scratchpad" => "scratchpad".to_string(),
+                "check" => format!("check step {}", args["step"].as_u64().unwrap_or(0)),
+                _ => action.to_string(),
+            }
         }
-        "task_update" => "scratchpad".to_string(),
-        "web_search" => args["query"].as_str().unwrap_or("?").to_string(),
-        "web_fetch" => args["url"].as_str().unwrap_or("?").to_string(),
+        "fix_file" => args["path"].as_str().unwrap_or("?").to_string(),
         "mcp_use" => {
             let server = args["server"].as_str().unwrap_or("?");
             let tool = args["tool"].as_str().unwrap_or("?");

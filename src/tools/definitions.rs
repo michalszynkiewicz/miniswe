@@ -1,4 +1,8 @@
 //! Tool definitions in OpenAI function-calling format.
+//!
+//! Tools are grouped into 6 top-level tools to reduce the function list
+//! size for small models. Each grouped tool uses an `action` parameter
+//! to dispatch to sub-tools. Use `action="help"` to list available actions.
 
 use crate::llm::{FunctionDefinition, ToolDefinition};
 use serde_json::json;
@@ -6,183 +10,116 @@ use serde_json::json;
 /// Return all tool definitions for the LLM.
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
+        // ── file: core file I/O and shell ─────────────────────────────
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
-                name: "read_file".into(),
-                description: "Read a file or line range with line numbers.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path relative to project root"
-                        },
-                        "start_line": {
-                            "type": "integer",
-                            "description": "Start line number (1-indexed, optional)"
-                        },
-                        "end_line": {
-                            "type": "integer",
-                            "description": "End line number (inclusive, optional)"
-                        }
-                    },
-                    "required": ["path"]
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "search".into(),
-                description: "Search the codebase for text or patterns. Returns matching lines with file:line context.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Plain text to search for (e.g. 'assemble' or 'max_rounds'). No escaping needed."
-                        },
-                        "pattern": {
-                            "type": "string",
-                            "description": "Regex pattern for advanced searches (e.g. 'fn\\s+run\\b'). Use query for simple text searches."
-                        },
-                        "scope": {
-                            "type": "string",
-                            "description": "Search scope: 'project' (default), a directory path, or 'symbols'"
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": "Maximum results to return (default: 20)"
-                        }
-                    }
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "replace".into(),
-                description: "Replace text in a file. Default: replaces one unique occurrence with fuzzy fallback. Set all=true to replace every occurrence (rename, find-and-replace).".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path relative to project root"
-                        },
-                        "old": {
-                            "type": "string",
-                            "description": "Exact text to find (include 3+ lines of context for unique match)"
-                        },
-                        "new": {
-                            "type": "string",
-                            "description": "Replacement text"
-                        },
-                        "all": {
-                            "type": "boolean",
-                            "description": "If true, replace every occurrence instead of requiring a unique match"
-                        }
-                    },
-                    "required": ["path", "old", "new"]
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "write_file".into(),
-                description: "Create or overwrite a file with complete content.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path relative to project root"
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Complete file content to write"
-                        }
-                    },
-                    "required": ["path", "content"]
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "shell".into(),
-                description: "Execute a shell command and return stdout/stderr.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "Shell command to execute"
-                        },
-                        "timeout": {
-                            "type": "integer",
-                            "description": "Timeout in seconds (default: 60)"
-                        }
-                    },
-                    "required": ["command"]
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "task_update".into(),
-                description: "Save notes and progress to the scratchpad. Persists across rounds.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": "Full scratchpad content in markdown format"
-                        }
-                    },
-                    "required": ["content"]
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "plan".into(),
-                description: "Manage a structured plan with compile gates. Actions: 'set' (create plan), 'check' (mark step done — runs the project's type checker/compiler if compile-gated), 'refine' (split a step into substeps), 'show' (view plan). Each step has compile: true (default) meaning the compiler must pass to check it off, or compile: false with a reason if the step intentionally leaves the tree broken.".into(),
+                name: "file".into(),
+                description: "File operations: read, write, replace, search, shell, revert. Use action='help' for details.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "description": "One of: 'set', 'check', 'refine', 'show'"
+                            "description": "One of: read, write, replace, search, shell, revert, help"
+                        },
+                        "path": { "type": "string", "description": "File path (for read/write/replace/revert)" },
+                        "content": { "type": "string", "description": "File content (for write)" },
+                        "old": { "type": "string", "description": "Text to find (for replace)" },
+                        "new": { "type": "string", "description": "Replacement text (for replace)" },
+                        "all": { "type": "boolean", "description": "Replace all occurrences (for replace)" },
+                        "start_line": { "type": "integer", "description": "Start line for read" },
+                        "end_line": { "type": "integer", "description": "End line for read" },
+                        "query": { "type": "string", "description": "Search text (for search)" },
+                        "pattern": { "type": "string", "description": "Regex pattern (for search)" },
+                        "scope": { "type": "string", "description": "Search scope (for search)" },
+                        "max_results": { "type": "integer", "description": "Max results (for search)" },
+                        "command": { "type": "string", "description": "Shell command (for shell)" },
+                        "timeout": { "type": "integer", "description": "Timeout in seconds (for shell)" },
+                        "to_round": { "type": "integer", "description": "Round to revert to (for revert)" }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
+        // ── code: LSP + project intelligence ──────────────────────────
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "code".into(),
+                description: "Code intelligence: goto_definition, find_references, diagnostics, repo_map, project_info, architecture_notes. Use action='help' for details.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "One of: goto_definition, find_references, diagnostics, repo_map, project_info, architecture_notes, help"
+                        },
+                        "path": { "type": "string", "description": "File path (for goto_definition, find_references, diagnostics)" },
+                        "line": { "type": "integer", "description": "Line number (for goto_definition, find_references)" },
+                        "column": { "type": "integer", "description": "Column number (for goto_definition, find_references)" },
+                        "keywords": { "type": "string", "description": "Keywords to focus repo map on (for repo_map)" }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
+        // ── web: search + fetch ───────────────────────────────────────
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "web".into(),
+                description: "Web access: search the web or fetch a URL. Use action='help' for details.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "One of: search, fetch, help"
+                        },
+                        "query": { "type": "string", "description": "Search query (for search)" },
+                        "url": { "type": "string", "description": "URL to fetch (for fetch)" },
+                        "max_results": { "type": "integer", "description": "Max results (for search)" },
+                        "selector": { "type": "string", "description": "CSS selector (for fetch)" }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
+        // ── plan: structured planning + scratchpad ────────────────────
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "plan".into(),
+                description: "Plan and track work. Actions: set (create plan), check (mark step done with compile gate), refine (split step), show (view plan), scratchpad (save notes). Use action='help' for details.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "One of: set, check, refine, show, scratchpad, help"
                         },
                         "content": {
                             "type": "string",
-                            "description": "For action='set': the plan in markdown with '- [ ] step [compile]' or '- [ ] step [no-compile: reason]' tags"
+                            "description": "For set: plan in markdown. For scratchpad: notes content."
                         },
                         "steps": {
                             "type": "array",
-                            "description": "For action='set': structured step list (alternative to content)",
+                            "description": "For set: structured step list",
                             "items": {
                                 "type": "object",
                                 "properties": {
                                     "description": { "type": "string" },
-                                    "compile": { "type": "boolean", "description": "true (default) = compiler/type checker must pass to complete this step. false = step intentionally leaves tree broken." },
-                                    "reason": { "type": "string", "description": "Required when compile=false: why the tree will be broken" }
+                                    "compile": { "type": "boolean" },
+                                    "reason": { "type": "string" }
                                 },
                                 "required": ["description"]
                             }
                         },
-                        "step": {
-                            "type": "integer",
-                            "description": "For action='check' or 'refine': which step number (1-indexed)"
-                        },
+                        "step": { "type": "integer", "description": "Step number (for check/refine)" },
                         "substeps": {
                             "type": "array",
-                            "description": "For action='refine': substeps to replace the target step",
+                            "description": "For refine: substeps to replace target step",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -198,64 +135,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 }),
             },
         },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "diagnostics".into(),
-                description: "Get compiler errors and warnings for the project.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path (optional, defaults to project-wide)"
-                        }
-                    }
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "web_search".into(),
-                description: "Search the web for documentation or solutions.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query"
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": "Maximum results (default: 5)"
-                        }
-                    },
-                    "required": ["query"]
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "web_fetch".into(),
-                description: "Fetch a URL and extract content as markdown.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "URL to fetch"
-                        },
-                        "selector": {
-                            "type": "string",
-                            "description": "CSS selector to narrow extraction (optional)"
-                        }
-                    },
-                    "required": ["url"]
-                }),
-            },
-        },
+        // ── fix_file: LLM-powered code transformation ─────────────────
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
@@ -270,130 +150,10 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         },
                         "task": {
                             "type": "string",
-                            "description": "What to change and why. Be specific: include types, parameter names, values. E.g. 'Add a timeout_ms parameter with default value 5000 to every call to send_request(), passing 5000 for now.'"
+                            "description": "What to change and why. Be specific: include types, parameter names, values."
                         }
                     },
                     "required": ["path", "task"]
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "revert".into(),
-                description: "Revert files to a previous round's state. Each round is automatically snapshotted.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "to_round": {
-                            "type": "integer",
-                            "description": "Round number to revert to (0 = session start). Omit to revert everything to session start."
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "Revert only this file (optional — omit to revert all files)"
-                        }
-                    }
-                }),
-            },
-        },
-    ]
-}
-
-/// Return LSP tool definitions (only added when LSP is available).
-pub fn lsp_tool_definitions() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "goto_definition".into(),
-                description: "Jump to a symbol's definition. Returns file, line, and source context.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path relative to project root"
-                        },
-                        "line": {
-                            "type": "integer",
-                            "description": "Line number (1-indexed)"
-                        },
-                        "column": {
-                            "type": "integer",
-                            "description": "Column number (1-indexed)"
-                        }
-                    },
-                    "required": ["path", "line", "column"]
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "find_references".into(),
-                description: "Find all references to a symbol. Returns file:line locations.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path relative to project root"
-                        },
-                        "line": {
-                            "type": "integer",
-                            "description": "Line number (1-indexed)"
-                        },
-                        "column": {
-                            "type": "integer",
-                            "description": "Column number (1-indexed)"
-                        }
-                    },
-                    "required": ["path", "line", "column"]
-                }),
-            },
-        },
-    ]
-}
-
-/// Context tools — pull-based access to project knowledge.
-pub fn context_tool_definitions() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "get_repo_map".into(),
-                description: "Get the project's code structure: files ranked by importance with function/type signatures.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "keywords": {
-                            "type": "string",
-                            "description": "Space-separated keywords to focus the map on (e.g. 'config cli run'). Optional — omit for full overview."
-                        }
-                    }
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "get_project_info".into(),
-                description: "Get project metadata: language, build system, entry points, guidelines.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {}
-                }),
-            },
-        },
-        ToolDefinition {
-            r#type: "function".into(),
-            function: FunctionDefinition {
-                name: "get_architecture_notes".into(),
-                description: "Get architecture overview and key decisions from .ai/README.md.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {}
                 }),
             },
         },
@@ -427,4 +187,53 @@ pub fn mcp_tool_definition() -> ToolDefinition {
             }),
         },
     }
+}
+
+/// Help text for the `file` tool group.
+pub fn file_help() -> &'static str {
+    "\
+Available actions for `file`:
+
+- read: Read a file. Params: path (required), start_line, end_line
+- write: Create or overwrite a file. Params: path (required), content (required)
+- replace: Replace text. Params: path (required), old (required), new (required), all (optional bool)
+  Default replaces one unique match. Set all=true for every occurrence.
+- search: Search codebase. Params: query or pattern (one required), scope, max_results
+- shell: Run a command. Params: command (required), timeout
+- revert: Revert files to a previous round. Params: to_round, path (both optional)"
+}
+
+/// Help text for the `code` tool group.
+pub fn code_help() -> &'static str {
+    "\
+Available actions for `code`:
+
+- goto_definition: Jump to definition. Params: path, line, column (all required)
+- find_references: Find all references. Params: path, line, column (all required)
+- diagnostics: Get compiler errors/warnings. Params: path (optional)
+- repo_map: Get project structure with signatures. Params: keywords (optional)
+- project_info: Get project metadata, guidelines, lessons. No params.
+- architecture_notes: Get architecture overview from .ai/README.md. No params."
+}
+
+/// Help text for the `web` tool group.
+pub fn web_help() -> &'static str {
+    "\
+Available actions for `web`:
+
+- search: Search the web. Params: query (required), max_results
+- fetch: Fetch a URL as markdown. Params: url (required), selector"
+}
+
+/// Help text for the `plan` tool.
+pub fn plan_help() -> &'static str {
+    "\
+Available actions for `plan`:
+
+- set: Create a plan. Params: steps (array) or content (markdown)
+  Each step has: description, compile (bool, default true), reason (if compile=false)
+- check: Mark step done. Params: step (number). Runs compile gate if compile=true.
+- refine: Split a step into substeps. Params: step (number), substeps (array)
+- show: View current plan. No params.
+- scratchpad: Save working notes. Params: content (required, must have ## Current Task and ## Plan sections)"
 }
