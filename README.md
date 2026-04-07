@@ -39,13 +39,14 @@ miniswe operates on one principle: **give the model the right tools and let it d
 
 ### Core Components
 
-- **Pull-based Context** — Context tools (`get_repo_map`, `get_project_info`, `get_architecture_notes`) let the model fetch project knowledge on demand instead of injecting everything into the system prompt.
+- **Grouped Tools** — 5 top-level tools (`file`, `code`, `web`, `plan`, `fix_file`) with action-based dispatch. Reduces function list size for small models while keeping full functionality via `action='help'`.
+- **Pull-based Context** — Context actions (`code(action='repo_map')`, `code(action='project_info')`, `code(action='architecture_notes')`) let the model fetch project knowledge on demand instead of injecting everything into the system prompt.
 - **Unified Compression** — Single-pass timeline compression. When conversation exceeds the token budget, older messages are LLM-summarized into a narrative and archived to `.miniswe/session_archive.md`.
 - **Knowledge Engine** — Tree-sitter AST parsing (19 languages), PageRank-based dependency graph, doc-header extraction for file summaries, incremental re-indexing after edits.
-- **LSP Integration** — Auto-downloads rust-analyzer (or other language servers). Provides ~200ms diagnostics after edits (vs 2-5s cargo check) plus `goto_definition` and `find_references` tools.
-- **Transform Tool** — LLM-powered multi-site code transformation. Pattern mode (same change to every occurrence) and block mode (structural change on a line range). Auto-reverts on compile failure.
-- **Smart Edit** — Whitespace-normalized fallback, function signature change detection (warns to update call sites), edit failure tracking (forces write_file after 2 failures).
-- **Tool System** — 18+ built-in tools + unlimited MCP tools. Path jailing, shell approval, per-query web access control.
+- **LSP Integration** — Auto-downloads rust-analyzer (or other language servers). Provides ~200ms diagnostics after edits (vs 2-5s cargo check) plus `code(action='goto_definition')` and `code(action='find_references')`.
+- **fix_file Tool** — LLM-powered whole-file code transformation. Describe a change and it gets applied across the file.
+- **Smart Edit** — 3-layer fuzzy matching (exact trim, indentation-preserving, line-similarity), bracket balance detection, edit failure tracking (forces write after 2 failures).
+- **Tool System** — 5 grouped tools + `fix_file` + unlimited MCP tools. Path jailing, shell approval, per-query web access control.
 - **LLM Interface** — OpenAI-compatible API with streaming, tool call parsing, multi-model routing (plan/code/fast roles).
 
 ### Context Budget (dynamic, based on context_window)
@@ -57,7 +58,7 @@ miniswe operates on one principle: **give the model the right tools and let it d
 | Compressed summary | 1/6 (17%) | LLM narrative of older rounds |
 | Output headroom | 1/6 (17%) | Reserved for model response |
 
-Per-result budget: `context_window / 10` (~3200 chars at 32K). Large results (web_fetch, shell) saved to file with preview + pointer.
+Per-result budget: `context_window / 10` (~3200 chars at 32K). Large results (web fetch, shell) saved to file with preview + pointer.
 
 ## Commands
 
@@ -70,8 +71,6 @@ Per-result budget: `context_window / 10` (~3200 chars at 32K). Large results (we
 | `miniswe info` | Show project info and index stats |
 | `miniswe config` | Show current configuration |
 | `miniswe plan "question"` | Plan-only mode (no edits) |
-| `miniswe docs add <url>` | Cache documentation for offline use |
-| `miniswe docs list` | List cached docs |
 
 ### REPL Commands
 
@@ -86,42 +85,52 @@ Per-result budget: `context_window / 10` (~3200 chars at 32K). Large results (we
 
 ## Tools
 
-### Core (always available)
+Tools are grouped to reduce the function list for small models. Each group uses `action='help'` to list available sub-actions.
 
-| Tool | Purpose |
-|------|---------|
-| `read_file` | Read file contents with line numbers (auto-truncated to budget) |
-| `read_symbol` | Look up a function/class/type by name via tree-sitter index |
+### `file` — File I/O and shell
+
+| Action | Purpose |
+|--------|---------|
+| `read` | Read file contents with line numbers (auto-truncated to budget) |
+| `write` | Create or rewrite files (preferred for files under 200 lines) |
+| `replace` | Replace text in a file (fuzzy matching fallback, `all=true` for every occurrence) |
 | `search` | ripgrep search — `query` (plain text) or `pattern` (regex) |
-| `edit` | Replace text in a file (whitespace-normalized fallback, signature change detection) |
-| `write_file` | Create or rewrite files (preferred for files under 200 lines) |
-| `transform` | LLM-powered multi-site transformation — pattern mode or block mode |
 | `shell` | Execute shell commands (output saved to file if large) |
-| `task_update` | Update the task scratchpad (agent's memory) |
-| `diagnostics` | Get compiler/linter errors (LSP-accelerated if available) |
+| `revert` | Revert files to a previous round via shadow git snapshots |
 
-### Context (pull-based, toggleable via `[tools]` config)
+### `code` — LSP and project intelligence
 
-| Tool | Purpose |
-|------|---------|
-| `get_repo_map` | PageRank-scored code structure overview |
-| `get_project_info` | Project profile, guide, lessons |
-| `get_architecture_notes` | Architecture decisions from `.ai/README.md` |
-
-### LSP (when language server is available)
-
-| Tool | Purpose |
-|------|---------|
+| Action | Purpose |
+|--------|---------|
 | `goto_definition` | Jump to symbol definition with source context |
 | `find_references` | Find all references to a symbol |
+| `diagnostics` | Get compiler/linter errors (LSP-accelerated if available) |
+| `repo_map` | PageRank-scored code structure overview |
+| `project_info` | Project profile, guide, lessons |
+| `architecture_notes` | Architecture decisions from `.ai/README.md` |
 
-### Web (toggleable via `[tools]` config)
+### `web` — Search and fetch
+
+| Action | Purpose |
+|--------|---------|
+| `search` | Web search via Serper (shows query, asks permission) |
+| `fetch` | Fetch URL as markdown (large pages saved to file with preview) |
+
+### `plan` — Structured planning
+
+| Action | Purpose |
+|--------|---------|
+| `set` | Create a plan with compile-gated steps |
+| `check` | Mark step done (runs compile gate if enabled) |
+| `refine` | Split a step into substeps |
+| `show` | View current plan |
+| `scratchpad` | Save working notes (agent's memory) |
+
+### Top-level tools
 
 | Tool | Purpose |
 |------|---------|
-| `web_search` | Web search via Serper (shows query, asks permission) |
-| `web_fetch` | Fetch URL as markdown (large pages saved to file with preview) |
-| `docs_lookup` | Search local documentation cache |
+| `fix_file` | LLM-powered code transformation — describe a change, it gets applied |
 | `mcp_use` | Call any tool on a connected MCP server |
 
 ## LSP Support
@@ -162,10 +171,8 @@ enabled = true
 diagnostic_timeout_ms = 2000
 
 [tools]
-context_tools = true    # get_repo_map, get_project_info, get_architecture_notes
-lsp_tools = true        # goto_definition, find_references
-transform = true        # LLM-powered multi-site transformation
-web_tools = true        # web_search, web_fetch, docs_lookup
+web_tools = true        # web(action='search'), web(action='fetch')
+plan = true             # plan tool group
 
 [web]
 search_backend = "serper"
@@ -174,17 +181,12 @@ fetch_backend = "jina"
 
 ## Benchmarking
 
-Provider/tool benchmarks with Docker isolation:
+Docker-isolated benchmark against a reference task:
 
 ```bash
-# Compare baseline (all tools) vs core-only
+# Run benchmark (needs LLM at localhost:8464)
 ./scripts/run-benchmark-docker.sh --timeout 2400 --max-rounds 80
-
-# Local (faster, less isolated)
-./scripts/bench-task-B-max-rounds-flag.sh --timeout 1800
 ```
-
-See [docs/errors.md](docs/errors.md) for benchmark analysis and tool effectiveness data.
 
 ## Tree-sitter Language Support
 
@@ -201,7 +203,7 @@ cargo build --release --features all-languages
 
 ```bash
 cargo build                     # debug build
-cargo test                      # run 160+ tests
+cargo test                      # run 140+ tests
 cargo clippy                    # lint
 cargo test --test e2e_lsp       # LSP integration tests (needs rust-analyzer)
 cargo test --test e2e_snapshots # Snapshot/revert tests
@@ -209,11 +211,11 @@ cargo test --test e2e_snapshots # Snapshot/revert tests
 
 ### Test coverage
 
-16/19 tools have e2e tests. Not tested (require network/external services):
-- `web_search`, `web_fetch` — need Serper API key or network
+All tool actions have e2e tests except those requiring external services:
+- `web(action='search')`, `web(action='fetch')` — need Serper API key or network
 - `mcp_use` — needs a running MCP server
 
-LSP tools (`goto_definition`, `find_references`) are tested in `e2e_lsp.rs`.
+LSP actions (`goto_definition`, `find_references`) are tested in `e2e_lsp.rs`.
 Revert is tested in `e2e_snapshots.rs`.
 
 ## License

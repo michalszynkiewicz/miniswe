@@ -61,7 +61,7 @@ pub async fn run() -> Result<()> {
     // Create lessons.md if it doesn't exist, seeded with language-specific tips
     let lessons_path = miniswe_dir.join("lessons.md");
     if !lessons_path.exists() {
-        let mut lessons = String::from("# Lessons\n\n");
+        let lessons = String::from("# Lessons\n\n");
 
         fs::write(&lessons_path, &lessons)?;
         tui::print_status("  Created lessons.md");

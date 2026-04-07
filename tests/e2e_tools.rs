@@ -461,7 +461,7 @@ async fn task_update_rejects_missing_sections() {
     assert!(result.content.contains("Current Task"));
 }
 
-// ── unknown tool ────────────────────────────────────────────────────
+// ── unknown tool / action ───────────────────────────────────────────
 
 #[tokio::test]
 async fn unknown_tool_returns_error() {
@@ -472,6 +472,61 @@ async fn unknown_tool_returns_error() {
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("Unknown tool"));
+}
+
+#[tokio::test]
+async fn unknown_action_returns_error() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let args = json!({"action": "bogus_action"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(!result.success, "unknown action should fail: {}", result.content);
+}
+
+#[tokio::test]
+async fn file_help_returns_action_list() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let args = json!({"action": "help"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("read"), "help should list read action: {}", result.content);
+    assert!(result.content.contains("write"), "help should list write action: {}", result.content);
+    assert!(result.content.contains("replace"), "help should list replace action: {}", result.content);
+}
+
+#[tokio::test]
+async fn code_help_returns_action_list() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let args = json!({"action": "help"});
+    let result = tools::execute_tool("code", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("goto_definition"), "help should list goto_definition: {}", result.content);
+    assert!(result.content.contains("repo_map"), "help should list repo_map: {}", result.content);
+}
+
+#[tokio::test]
+async fn web_help_returns_action_list() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let args = json!({"action": "help"});
+    let result = tools::execute_tool("web", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(result.content.contains("search"), "help should list search: {}", result.content);
+    assert!(result.content.contains("fetch"), "help should list fetch: {}", result.content);
 }
 
 // ── missing required params ─────────────────────────────────────────
