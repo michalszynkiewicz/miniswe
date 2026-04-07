@@ -730,6 +730,95 @@ async fn execute_preplan_uses_literal_replacements_before_smart_edits() {
 }
 
 #[tokio::test]
+async fn execute_preplan_literal_step_falls_back_to_smart_edit() {
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
+                ),
+                _ => helpers::mock_text_response(
+                    "REPLACE_AT 1\nOLD:\ncall( None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\n",
+                ),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "call( None)\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "update all calls",
+        "lsp_validation": "off"
+    });
+    let result = fix_file::execute(&args, &config, &router, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("literal fallback L1-L1"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "call(None, None)\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_preplan_repairs_whole_plan_after_step_retries_fail() {
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nmissing(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
+                ),
+                1 | 2 => helpers::mock_text_response("NO_CHANGES"),
+                _ => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
+                ),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "call(None)\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "update all calls",
+        "lsp_validation": "off"
+    });
+    let result = fix_file::execute(&args, &config, &router, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("Pre-plan repair attempt 2"));
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "call(None, None)\n"
+    );
+}
+
+#[tokio::test]
 async fn execute_preplan_parse_failure_falls_back_to_broad_patch() {
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));

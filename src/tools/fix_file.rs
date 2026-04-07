@@ -21,6 +21,8 @@ const WINDOW_SIZE: usize = 800;
 /// Overlap between windows to catch edits at boundaries.
 const WINDOW_OVERLAP: usize = 100;
 const MAX_PATCH_ATTEMPTS: usize = 3;
+const MAX_PLAN_ATTEMPTS: usize = 2;
+const MAX_LITERAL_FALLBACK_ATTEMPTS: usize = 2;
 const MAX_PLANNED_REGIONS: usize = 100;
 const MAX_PREPLAN_STEPS: usize = 100;
 const LARGE_TRUNCATION_MIN_LINES: usize = 50;
@@ -244,26 +246,59 @@ async fn execute_preplanned_steps(
     lsp: Option<&LspClient>,
     lsp_validation: LspValidationMode,
 ) -> Result<Option<SplitResult>> {
-    let steps = request_preplan_steps(path_str, task, original, router).await?;
+    let mut steps = request_preplan_steps(path_str, task, original, router, None, None).await?;
     if steps.is_empty() {
         return Ok(None);
     }
 
-    let step_count = steps.len();
-    execute_planned_steps(
-        path_str,
-        path,
-        original,
-        router,
-        config,
-        lsp,
-        lsp_validation,
-        steps,
-        format!("Pre-plan: {step_count} step(s) planned"),
-        "via pre-plan",
-    )
-    .await
-    .map(Some)
+    let mut last_error: Option<String> = None;
+    for attempt in 1..=MAX_PLAN_ATTEMPTS {
+        let step_count = steps.len();
+        let message = if let Some(error) = &last_error {
+            format!(
+                "Pre-plan repair attempt {attempt}: {step_count} step(s) planned\nPrevious plan failed: {error}"
+            )
+        } else {
+            format!("Pre-plan: {step_count} step(s) planned")
+        };
+
+        match execute_planned_steps(
+            path_str,
+            path,
+            original,
+            router,
+            config,
+            lsp,
+            lsp_validation,
+            steps.clone(),
+            message,
+            "via pre-plan",
+        )
+        .await
+        {
+            Ok(result) => return Ok(Some(result)),
+            Err(e) if attempt < MAX_PLAN_ATTEMPTS => {
+                let error = e.to_string();
+                let previous_plan = format_edit_plan_steps(&steps);
+                steps = request_preplan_steps(
+                    path_str,
+                    task,
+                    original,
+                    router,
+                    Some(&error),
+                    Some(&previous_plan),
+                )
+                .await?;
+                if steps.is_empty() {
+                    return Ok(None);
+                }
+                last_error = Some(error);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    unreachable!("plan attempts loop must return")
 }
 
 async fn execute_split_fallback(
@@ -448,97 +483,90 @@ async fn execute_planned_steps(
                 old,
                 new,
             } => {
-                let (candidate, count) = apply_literal_replace_in_scope(
+                match apply_literal_replace_in_scope(
                     &current,
                     *scope_start,
                     *scope_end,
                     old,
                     new,
                     *all,
-                )
-                .map_err(|e| anyhow::anyhow!("step {} literal replace failed: {e}", idx + 1))?;
-                current = candidate;
-                total_ops += count;
-                message.push_str(&format!(
-                    "Pre-plan step {} literal L{}-L{}: replaced {count} occurrence(s)\n",
-                    idx + 1,
-                    scope_start,
-                    scope_end
-                ));
+                ) {
+                    Ok((candidate, count)) => {
+                        current = candidate;
+                        total_ops += count;
+                        message.push_str(&format!(
+                            "Pre-plan step {} literal L{}-L{}: replaced {count} occurrence(s)\n",
+                            idx + 1,
+                            scope_start,
+                            scope_end
+                        ));
+                    }
+                    Err(literal_error) => {
+                        let fallback_task = format!(
+                            "The planned exact literal replacement failed: {literal_error}\n\
+                             Apply the same intended change manually within this region only.\n\n\
+                             Intended OLD:\n{}\n\n\
+                             Intended NEW:\n{}",
+                            old.join("\n"),
+                            new.join("\n")
+                        );
+                        let region = EditRegion {
+                            start: *scope_start,
+                            end: *scope_end,
+                            task: fallback_task,
+                        };
+                        let (candidate, count) = execute_smart_step(
+                            path_str,
+                            &region.task,
+                            &current,
+                            router,
+                            lsp_validation,
+                            &region,
+                            MAX_LITERAL_FALLBACK_ATTEMPTS,
+                            false,
+                        )
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "step {} literal replace failed: {literal_error}; smart fallback failed: {e}",
+                                idx + 1
+                            )
+                        })?;
+                        current = candidate;
+                        total_ops += count;
+                        message.push_str(&format!(
+                            "Pre-plan step {} literal fallback L{}-L{}: applied {count} operation(s)\n",
+                            idx + 1,
+                            scope_start,
+                            scope_end
+                        ));
+                    }
+                }
             }
             EditPlanStep::SmartEdit(region) => {
-                let mut feedback: Option<String> = None;
-                let mut last_region_error = String::new();
                 let region_label =
                     format!("step {} smart L{}-L{}", idx + 1, region.start, region.end);
+                let (candidate, count) = execute_smart_step(
+                    path_str,
+                    &region.task,
+                    &current,
+                    router,
+                    lsp_validation,
+                    region,
+                    MAX_PATCH_ATTEMPTS,
+                    true,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{region_label} failed: {e}"))?;
 
-                for attempt in 1..=MAX_PATCH_ATTEMPTS {
-                    let (ops, _) = match request_patch_for_region(
-                        path_str,
-                        &region.task,
-                        &current,
-                        router,
-                        region,
-                        feedback.as_deref(),
-                        lsp_validation,
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(e) => {
-                            last_region_error = e.to_string();
-                            if attempt < MAX_PATCH_ATTEMPTS {
-                                feedback = Some(last_region_error.clone());
-                                continue;
-                            }
-                            break;
-                        }
-                    };
-
-                    if ops.is_empty() {
-                        message.push_str(&format!("Pre-plan {region_label}: no changes\n"));
-                        last_region_error.clear();
-                        break;
-                    }
-
-                    let candidate = match apply_patch_dry_run_in_region(
-                        &current,
-                        &ops,
-                        region.start,
-                        region.end,
-                    ) {
-                        Ok(candidate) => candidate,
-                        Err(e) => {
-                            last_region_error = e.to_string();
-                            if attempt < MAX_PATCH_ATTEMPTS {
-                                feedback = Some(last_region_error.clone());
-                                continue;
-                            }
-                            break;
-                        }
-                    };
-
-                    if let Err(e) = validate_candidate(path_str, &current, &candidate) {
-                        last_region_error = e.to_string();
-                        if attempt < MAX_PATCH_ATTEMPTS {
-                            feedback = Some(last_region_error.clone());
-                            continue;
-                        }
-                        break;
-                    }
-
-                    total_ops += ops.len();
+                if count == 0 {
+                    message.push_str(&format!("Pre-plan {region_label}: no changes\n"));
+                } else {
+                    total_ops += count;
                     current = candidate;
                     message.push_str(&format!(
-                        "Pre-plan {region_label}: applied {} operation(s)\n",
-                        ops.len()
+                        "Pre-plan {region_label}: applied {count} operation(s)\n"
                     ));
-                    last_region_error.clear();
-                    break;
-                }
-
-                if !last_region_error.is_empty() {
-                    bail!("{region_label} failed: {last_region_error}");
                 }
             }
         }
@@ -567,6 +595,82 @@ async fn execute_planned_steps(
         content: current,
         message,
     })
+}
+
+async fn execute_smart_step(
+    path_str: &str,
+    task: &str,
+    current: &str,
+    router: &ModelRouter,
+    lsp_validation: LspValidationMode,
+    region: &EditRegion,
+    max_attempts: usize,
+    allow_no_changes: bool,
+) -> Result<(String, usize)> {
+    let mut feedback: Option<String> = None;
+    let mut last_error = String::new();
+
+    for attempt in 1..=max_attempts {
+        let (ops, _) = match request_patch_for_region(
+            path_str,
+            task,
+            current,
+            router,
+            region,
+            feedback.as_deref(),
+            lsp_validation,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                last_error = e.to_string();
+                if attempt < max_attempts {
+                    feedback = Some(last_error.clone());
+                    continue;
+                }
+                break;
+            }
+        };
+
+        if ops.is_empty() {
+            if allow_no_changes {
+                return Ok((current.to_string(), 0));
+            }
+            last_error = "smart fallback returned NO_CHANGES".into();
+            if attempt < max_attempts {
+                feedback = Some(last_error.clone());
+                continue;
+            }
+            break;
+        }
+
+        let candidate = match apply_patch_dry_run_in_region(current, &ops, region.start, region.end)
+        {
+            Ok(candidate) => candidate,
+            Err(e) => {
+                last_error = e.to_string();
+                if attempt < max_attempts {
+                    feedback = Some(last_error.clone());
+                    continue;
+                }
+                break;
+            }
+        };
+
+        if let Err(e) = validate_candidate(path_str, current, &candidate) {
+            last_error = e.to_string();
+            if attempt < max_attempts {
+                feedback = Some(last_error.clone());
+                continue;
+            }
+            break;
+        }
+
+        return Ok((candidate, ops.len()));
+    }
+
+    bail!("{last_error}")
 }
 
 async fn validate_candidate_for_write(
@@ -927,6 +1031,8 @@ async fn request_preplan_steps(
     task: &str,
     content: &str,
     router: &ModelRouter,
+    feedback: Option<&str>,
+    previous_plan: Option<&str>,
 ) -> Result<Vec<EditPlanStep>> {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
@@ -946,10 +1052,22 @@ async fn request_preplan_steps(
             .join("\n");
         let remaining = MAX_PREPLAN_STEPS - steps.len();
 
+        let feedback_block = feedback
+            .map(|failure| {
+                let previous = previous_plan
+                    .map(|plan| format!("Previous edit plan:\n{plan}\n\n"))
+                    .unwrap_or_default();
+                format!(
+                    "Previous edit plan was not applied.\nFailure: {failure}\n{previous}Return a corrected complete edit plan against the original file.\n\n"
+                )
+            })
+            .unwrap_or_default();
+
         let prompt = format!(
             "Plan small edit steps for one file.\n\n\
              File: {path_str}\n\
              Task: {task}\n\n\
+             {feedback_block}\
              Return up to {remaining} non-overlapping steps within this window.\n\
              Use LITERAL_REPLACE for obvious exact text replacements.\n\
              Use SMART_EDIT for ambiguous or structural edits.\n\
@@ -1188,6 +1306,37 @@ impl EditPlanStep {
             Self::LiteralReplace { scope_end, .. } => *scope_end,
         }
     }
+}
+
+fn format_edit_plan_steps(steps: &[EditPlanStep]) -> String {
+    let mut out = String::new();
+    for step in steps {
+        match step {
+            EditPlanStep::SmartEdit(region) => {
+                out.push_str("SMART_EDIT\n");
+                out.push_str(&format!("REGION {} {}\n", region.start, region.end));
+                out.push_str(&format!("TASK: {}\n", region.task));
+                out.push_str("END\n\n");
+            }
+            EditPlanStep::LiteralReplace {
+                scope_start,
+                scope_end,
+                all,
+                old,
+                new,
+            } => {
+                out.push_str("LITERAL_REPLACE\n");
+                out.push_str(&format!("SCOPE {scope_start} {scope_end}\n"));
+                out.push_str(&format!("ALL {all}\n"));
+                out.push_str("OLD:\n");
+                out.push_str(&old.join("\n"));
+                out.push_str("\nEND_OLD\nNEW:\n");
+                out.push_str(&new.join("\n"));
+                out.push_str("\nEND_NEW\nEND\n\n");
+            }
+        }
+    }
+    out
 }
 
 pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
