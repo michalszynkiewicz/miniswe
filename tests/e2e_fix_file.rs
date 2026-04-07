@@ -166,6 +166,12 @@ fn parse_region_plan_rejects_overlap_and_preamble() {
     assert!(
         fix_file::parse_region_plan("REGION 1 3\nTASK: x\nEND\nREGION 3 5\nTASK: y\nEND").is_err()
     );
+
+    let err = fix_file::parse_region_plan("REGION L1 3\nTASK: x\nEND")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("invalid region start 'L1'"));
+    assert!(err.contains("REGION L1 3"));
 }
 
 #[test]
@@ -229,7 +235,13 @@ fn apply_rejects_mismatch_and_out_of_range() {
         old: vec!["not a".into()],
         new: vec!["z".into()],
     }];
-    assert!(fix_file::apply_patch_dry_run("a\n", &mismatch).is_err());
+    let err = fix_file::apply_patch_dry_run("a\n", &mismatch)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("OLD mismatch for REPLACE_AT 1"));
+    assert!(err.contains("OLD1: \"not a\""));
+    assert!(err.contains("Actual text at anchor"));
+    assert!(err.contains("L1: \"a\""));
 
     let out_of_range = vec![PatchOp::InsertAfter {
         line: 3,
@@ -273,7 +285,29 @@ fn replace_at_rejects_ambiguous_old_block() {
         new: vec!["x".into()],
     }];
 
-    assert!(fix_file::apply_patch_dry_run(content, &ops).is_err());
+    let err = fix_file::apply_patch_dry_run(content, &ops)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("matched 2 locations"));
+    assert!(err.contains("L1"));
+    assert!(err.contains("L3"));
+    assert!(err.contains("Use a more specific OLD block"));
+}
+
+#[test]
+fn replace_at_reports_trimmed_match_hint() {
+    let content = "fn main() {\n        call();\n}\n";
+    let ops = vec![PatchOp::ReplaceAt {
+        start: 2,
+        old: vec!["call();".into()],
+        new: vec!["        other();".into()],
+    }];
+
+    let err = fix_file::apply_patch_dry_run(content, &ops)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Whitespace-trimmed OLD would match at L2"));
+    assert!(err.contains("preserve exact indentation"));
 }
 
 #[test]
