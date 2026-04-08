@@ -179,6 +179,79 @@ async fn write_file_overwrites_existing() {
     assert_eq!(disk, "new content");
 }
 
+#[tokio::test]
+async fn write_file_without_content_creates_empty_file() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let args = json!({"action": "write", "path": "empty.txt"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "write_file should create empty file: {}", result.content);
+    assert!(result.content.contains("Created empty file empty.txt"));
+    assert_eq!(
+        fs::read_to_string(helpers::project_path(&config, "empty.txt")).unwrap(),
+        ""
+    );
+    assert!(result.content.contains("[tail]"));
+    assert!(result.content.contains("(empty file)"));
+}
+
+#[tokio::test]
+async fn write_file_without_content_rejects_existing_file() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    fs::write(helpers::project_path(&config, "existing.txt"), "old content").unwrap();
+
+    let args = json!({"action": "write", "path": "existing.txt"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(!result.success);
+    assert!(result.content.contains("already exists"));
+}
+
+#[tokio::test]
+async fn delete_file_removes_existing_file() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    fs::write(
+        helpers::project_path(&config, "delete_me.txt"),
+        "remove this file\n",
+    )
+    .unwrap();
+
+    let args = json!({"action": "delete", "path": "delete_me.txt"});
+    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "delete should succeed: {}", result.content);
+    assert!(result.content.contains("Deleted delete_me.txt"));
+    assert!(!helpers::project_path(&config, "delete_me.txt").exists());
+}
+
+#[tokio::test]
+async fn delete_file_missing_path_or_file_fails() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let missing_path_args = json!({"action": "delete"});
+    let missing_path = tools::execute_tool("file", &missing_path_args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+    assert!(!missing_path.success);
+    assert!(missing_path.content.contains("Missing required parameter: path"));
+
+    let missing_file_args = json!({"action": "delete", "path": "nope.txt"});
+    let missing_file = tools::execute_tool("file", &missing_file_args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+    assert!(!missing_file.success);
+    assert!(missing_file.content.contains("File not found: nope.txt"));
+}
+
 // ── edit ────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -553,8 +626,8 @@ async fn write_file_missing_content() {
         .await
         .unwrap();
 
-    assert!(!result.success);
-    assert!(result.content.contains("content") || result.content.contains("Missing"));
+    assert!(result.success);
+    assert_eq!(fs::read_to_string(helpers::project_path(&config, "file.txt")).unwrap(), "");
 }
 
 #[tokio::test]
@@ -624,7 +697,7 @@ async fn edit_whitespace_normalized_single_line() {
 // ── edit failure hints ────────────────────────────────────────────
 
 #[tokio::test]
-async fn edit_not_found_suggests_fix_file() {
+async fn edit_not_found_suggests_edit_file() {
     let (_tmp, config) = helpers::create_test_project();
 
     fs::write(helpers::project_path(&config, "hint_test.txt"), "actual content\n").unwrap();
@@ -640,8 +713,8 @@ async fn edit_not_found_suggests_fix_file() {
 
     assert!(!result.success);
     assert!(
-        result.content.contains("fix_file"),
-        "should suggest fix_file: {}",
+        result.content.contains("edit_file"),
+        "should suggest edit_file: {}",
         result.content
     );
 }
@@ -795,7 +868,7 @@ fn tools_has_grouped_tools() {
     assert!(names.contains(&"code"), "should have code");
     assert!(names.contains(&"web"), "should have web");
     assert!(names.contains(&"plan"), "should have plan");
-    assert!(names.contains(&"fix_file"), "should have fix_file");
+    assert!(names.contains(&"edit_file"), "should have edit_file");
     // Old flat tools should be gone
     assert!(!names.contains(&"read_file"), "read_file should be gone");
     assert!(!names.contains(&"write_file"), "write_file should be gone");
@@ -979,7 +1052,7 @@ async fn edit_whitespace_empty_lines() {
     // (trimming doesn't help with missing lines)
     // The model should get a helpful error
     assert!(
-        result.content.contains("fix_file") || result.content.contains("HINT"),
+        result.content.contains("edit_file") || result.content.contains("HINT"),
         "should suggest alternatives: {}",
         result.content
     );
