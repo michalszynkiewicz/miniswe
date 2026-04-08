@@ -9,8 +9,8 @@
 //! 6. Feed results back and repeat
 
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
@@ -20,6 +20,9 @@ use crate::llm::{ChatRequest, Message, ModelRouter};
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
 use crate::mcp::{McpConfig, McpRegistry};
+use crate::runtime::{
+    LlmWorkerEvent, LlmWorkerHandle, ShellControl, ShellWorkerEvent, ToolWorkerPool,
+};
 use crate::tools;
 use crate::tools::permissions::{Action, PermissionManager};
 use crate::tui;
@@ -38,12 +41,14 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let log = SessionLog::new(&config);
     log.user_message(message);
 
-    let router = ModelRouter::new(&config);
-    let perms = if headless {
+    let router = Arc::new(ModelRouter::new(&config));
+    let llm_worker = LlmWorkerHandle::new(router.clone());
+    let perms = Arc::new(if headless {
         PermissionManager::headless(&config)
     } else {
         PermissionManager::new(&config)
-    };
+    });
+    let tool_pool = ToolWorkerPool::new(config.runtime.tool_worker_pool_size);
     let mut tool_defs = tools::tool_definitions();
     // Filter tools based on config
     {
@@ -102,7 +107,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
     // Initialize MCP servers
     let mcp_config = McpConfig::load(&config.project_root)?;
-    let mut mcp_registry = if mcp_config.has_servers() {
+    let mcp_registry = if mcp_config.has_servers() {
         let cache_dir = config.miniswe_path("mcp");
         match McpRegistry::connect(&mcp_config, &cache_dir) {
             Ok(registry) => {
@@ -115,7 +120,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     // Add mcp_use tool definition
                     tool_defs.push(tools::definitions::mcp_tool_definition());
                 }
-                Some(registry)
+                Some(Arc::new(Mutex::new(registry)))
             }
             Err(e) => {
                 tui::print_status(&format!("MCP: failed to connect ({e})"));
@@ -126,7 +131,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         None
     };
 
-    let mcp_summary = mcp_registry.as_ref().and_then(|r| r.context_summary());
+    let mcp_summary = mcp_registry
+        .as_ref()
+        .and_then(|r| r.lock().ok().and_then(|g| g.context_summary()));
 
     // Estimate tool definition overhead for context budgeting
     let tool_def_tokens =
@@ -163,7 +170,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     });
 
     // Initialize snapshot manager for revert support
-    let mut snapshots = tools::snapshots::SnapshotManager::init(&config.project_root).ok();
+    let snapshots = tools::snapshots::SnapshotManager::init(&config.project_root)
+        .ok()
+        .map(|s| Arc::new(Mutex::new(s)));
 
     // Initial context assembly
     let assembled = context::assemble(
@@ -200,8 +209,10 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         log.round_start(round);
 
         // Snapshot at start of each round for revert support
-        if let Some(ref mut snap) = snapshots {
-            let _ = snap.begin_round(round);
+        if let Some(ref snap) = snapshots {
+            if let Ok(mut guard) = snap.lock() {
+                let _ = guard.begin_round(round);
+            }
         }
         if round > max_rounds {
             tui::print_error("Maximum tool rounds reached. Stopping.");
@@ -236,6 +247,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             &mut messages,
             &config,
             &router,
+            &llm_worker,
             tool_def_tokens,
             &mut plan_update_requested,
         )
@@ -262,22 +274,22 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         std::io::stderr().flush().ok();
         let thinking = Arc::new(AtomicBool::new(true));
 
-        let response = match router
-            .chat_stream(
-                model_role,
-                &request,
-                |token| {
+        let mut llm_events = llm_worker.submit(model_role, request.clone(), cancelled.clone());
+        let response = match loop {
+            match llm_events.recv().await {
+                Some(LlmWorkerEvent::Token(token)) => {
                     if thinking.load(Ordering::Relaxed) {
                         thinking.store(false, Ordering::Relaxed);
                         eprint!("\r\x1b[2K");
                         std::io::stderr().flush().ok();
                     }
-                    tui::print_token(token);
-                },
-                &cancelled,
-            )
-            .await
-        {
+                    tui::print_token(&token);
+                }
+                Some(LlmWorkerEvent::Completed(Ok(r))) => break Ok(r),
+                Some(LlmWorkerEvent::Completed(Err(e))) => break Err(e),
+                None => break Err("LLM worker stopped unexpectedly".to_string()),
+            }
+        } {
             Ok(r) => {
                 if thinking.load(Ordering::Relaxed) {
                     eprint!("\r\x1b[2K");
@@ -285,10 +297,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 }
                 r
             }
-            Err(e) => {
+            Err(err_str) => {
                 eprint!("\r\x1b[2K");
                 std::io::stderr().flush().ok();
-                let err_str = e.to_string();
                 if err_str.contains("Interrupted") {
                     tui::print_status("Generation interrupted.");
                     break;
@@ -452,71 +463,161 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
             // Handle tool dispatch
             let mut result = if tc.function.name == "file" && file_action == "revert" {
-                // Revert needs snapshot manager
-                let to_round = args["to_round"].as_u64().unwrap_or(0) as usize;
-                let path = args["path"].as_str().unwrap_or("");
-                match &snapshots {
-                    Some(snap) => {
-                        let res = if !path.is_empty() {
-                            snap.revert_file(path, to_round)
-                        } else {
-                            snap.revert_to_round(to_round)
-                        };
-                        match res {
-                            Ok(msg) => crate::tools::ToolResult::ok(msg),
-                            Err(e) => crate::tools::ToolResult::err(format!("Revert failed: {e}")),
+                let snapshots = snapshots.clone();
+                let args = args.clone();
+                match tool_pool
+                    .submit(move || {
+                        let to_round = args["to_round"].as_u64().unwrap_or(0) as usize;
+                        let path = args["path"].as_str().unwrap_or("").to_string();
+                        match snapshots {
+                            Some(snap) => {
+                                let guard = snap
+                                    .lock()
+                                    .map_err(|_| "Snapshot manager poisoned".to_string())?;
+                                let res = if !path.is_empty() {
+                                    guard.revert_file(&path, to_round)
+                                } else {
+                                    guard.revert_to_round(to_round)
+                                };
+                                res.map(crate::tools::ToolResult::ok)
+                                    .map_err(|e| format!("Revert failed: {e}"))
+                            }
+                            None => Ok(crate::tools::ToolResult::err(
+                                "Snapshot system not available (git not found?)".into(),
+                            )),
                         }
+                    })
+                    .await
+                {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => crate::tools::ToolResult::err(e),
+                    Err(_) => {
+                        crate::tools::ToolResult::err("Tool worker dropped revert job".into())
                     }
-                    None => crate::tools::ToolResult::err(
-                        "Snapshot system not available (git not found?)".into(),
-                    ),
                 }
             } else if tc.function.name == "plan" {
-                match tools::plan::execute(&args, &config, round).await {
-                    Ok(r) => r,
-                    Err(e) => crate::tools::ToolResult::err(format!("plan error: {e}")),
+                let args = args.clone();
+                let config = config.clone();
+                match tool_pool
+                    .submit(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| e.to_string())?;
+                        runtime
+                            .block_on(
+                                async move { tools::plan::execute(&args, &config, round).await },
+                            )
+                            .map_err(|e| format!("plan error: {e}"))
+                    })
+                    .await
+                {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => crate::tools::ToolResult::err(e),
+                    Err(_) => crate::tools::ToolResult::err("Tool worker dropped plan job".into()),
                 }
             } else if tc.function.name == "edit_file" {
-                match tools::execute_edit_file_tool(
-                    &args,
-                    &config,
-                    &perms,
-                    &router,
-                    lsp_client.as_deref(),
-                )
-                .await
+                let args = args.clone();
+                let config = config.clone();
+                let perms = perms.clone();
+                let router = router.clone();
+                let lsp = lsp_client.clone();
+                match tool_pool
+                    .submit(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| e.to_string())?;
+                        runtime
+                            .block_on(async move {
+                                tools::execute_edit_file_tool(
+                                    &args,
+                                    &config,
+                                    perms.as_ref(),
+                                    router.as_ref(),
+                                    lsp.as_deref(),
+                                )
+                                .await
+                            })
+                            .map_err(|e| format!("edit_file error: {e}"))
+                    })
+                    .await
                 {
-                    Ok(r) => r,
-                    Err(e) => crate::tools::ToolResult::err(format!("edit_file error: {e}")),
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => crate::tools::ToolResult::err(e),
+                    Err(_) => {
+                        crate::tools::ToolResult::err("Tool worker dropped edit_file job".into())
+                    }
                 }
             } else if tc.function.name == "file" && file_action == "shell" {
-                handle_shell_tool_run(&args, &config, &cancelled)
-            } else if tc.function.name == "mcp_use" {
-                let server = args["server"].as_str().unwrap_or("");
-                let tool = args["tool"].as_str().unwrap_or("");
-                let tool_args = args.get("arguments").cloned().unwrap_or_default();
-                match perms.check(&Action::McpUse(server.into(), tool.into())) {
-                    Err(e) => crate::tools::ToolResult::err(e),
-                    Ok(()) => match &mut mcp_registry {
-                        Some(registry) => match registry.call_tool(server, tool, tool_args) {
-                            Ok(content) => crate::tools::ToolResult::ok(content),
-                            Err(e) => crate::tools::ToolResult::err(format!("MCP error: {e}")),
-                        },
-                        None => crate::tools::ToolResult::err("No MCP servers connected".into()),
-                    },
-                }
-            } else {
-                match tools::execute_tool(
-                    &tc.function.name,
-                    &args,
-                    &config,
-                    &perms,
-                    lsp_client.as_deref(),
+                await_shell_job_run(
+                    tool_pool.submit_shell(args.clone(), config.clone(), cancelled.clone()),
+                    cancelled.as_ref(),
                 )
                 .await
+            } else if tc.function.name == "mcp_use" {
+                let server = args["server"].as_str().unwrap_or("").to_string();
+                let tool = args["tool"].as_str().unwrap_or("").to_string();
+                let tool_args = args.get("arguments").cloned().unwrap_or_default();
+                match perms.check(&Action::McpUse(server.clone(), tool.clone())) {
+                    Err(e) => crate::tools::ToolResult::err(e),
+                    Ok(()) => {
+                        let registry = mcp_registry.clone();
+                        match tool_pool
+                            .submit(move || match registry {
+                                Some(registry) => {
+                                    let mut guard = registry
+                                        .lock()
+                                        .map_err(|_| "MCP registry poisoned".to_string())?;
+                                    guard
+                                        .call_tool(&server, &tool, tool_args)
+                                        .map(crate::tools::ToolResult::ok)
+                                        .map_err(|e| format!("MCP error: {e}"))
+                                }
+                                None => Ok(crate::tools::ToolResult::err(
+                                    "No MCP servers connected".into(),
+                                )),
+                            })
+                            .await
+                        {
+                            Ok(Ok(r)) => r,
+                            Ok(Err(e)) => crate::tools::ToolResult::err(e),
+                            Err(_) => {
+                                crate::tools::ToolResult::err("Tool worker dropped mcp job".into())
+                            }
+                        }
+                    }
+                }
+            } else {
+                let tool_name = tc.function.name.clone();
+                let args = args.clone();
+                let config = config.clone();
+                let perms = perms.clone();
+                let lsp = lsp_client.clone();
+                match tool_pool
+                    .submit(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| e.to_string())?;
+                        runtime
+                            .block_on(async move {
+                                tools::execute_tool(
+                                    &tool_name,
+                                    &args,
+                                    &config,
+                                    perms.as_ref(),
+                                    lsp.as_deref(),
+                                )
+                                .await
+                            })
+                            .map_err(|e| format!("Tool error: {e}"))
+                    })
+                    .await
                 {
-                    Ok(r) => r,
-                    Err(e) => crate::tools::ToolResult::err(format!("Tool error: {e}")),
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => crate::tools::ToolResult::err(e),
+                    Err(_) => crate::tools::ToolResult::err("Tool worker dropped job".into()),
                 }
             };
 
@@ -614,25 +715,16 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     Ok(())
 }
 
-fn handle_shell_tool_run(
-    args: &serde_json::Value,
-    config: &Config,
-    cancelled: &Arc<AtomicBool>,
+async fn await_shell_job_run(
+    mut shell_job: crate::runtime::ShellJobHandle,
+    cancelled: &AtomicBool,
 ) -> crate::tools::ToolResult {
-    let timeout_secs = args["timeout"]
-        .as_u64()
-        .unwrap_or(config.shell.default_timeout_secs);
-    let command = args["command"].as_str().unwrap_or("");
-    let mut running = match crate::tools::shell::start(args, config) {
-        Ok(r) => r,
-        Err(e) => return crate::tools::ToolResult::err(e.to_string()),
-    };
-
-    loop {
-        match crate::tools::shell::wait(running, timeout_secs, config, Some(cancelled.as_ref())) {
-            Ok(crate::tools::shell::ShellWaitOutcome::Completed(result)) => return result,
-            Ok(crate::tools::shell::ShellWaitOutcome::TimedOut(timed_out)) => {
-                running = timed_out;
+    while let Some(event) = shell_job.events_rx.recv().await {
+        match event {
+            ShellWorkerEvent::TimedOut {
+                command,
+                timeout_secs,
+            } => {
                 let prompt = format!(
                     "Shell command still running after {timeout_secs}s.\n  $ {command}\n[c]ontinue waiting / [k]ill: "
                 );
@@ -640,19 +732,33 @@ fn handle_shell_tool_run(
                     .unwrap_or_else(|| "k".into())
                     .trim()
                     .to_lowercase();
-                if response == "c" || response == "continue" {
+                let control = if response == "c" || response == "continue" {
                     crate::tui::print_status("continuing to wait for shell command...");
+                    ShellControl::Continue
                 } else {
-                    return crate::tools::shell::kill(running, timeout_secs);
+                    ShellControl::Kill
+                };
+                if shell_job.send_control(control).is_err() {
+                    return crate::tools::ToolResult::err(
+                        "Shell worker dropped control channel".into(),
+                    );
                 }
             }
-            Ok(crate::tools::shell::ShellWaitOutcome::Interrupted(timed_out)) => {
-                cancelled.store(false, Ordering::Relaxed);
-                return crate::tools::shell::kill(timed_out, timeout_secs);
+            ShellWorkerEvent::Completed(result) => {
+                if cancelled.load(Ordering::Relaxed) {
+                    cancelled.store(false, Ordering::Relaxed);
+                }
+                return match result {
+                    Ok(tool_result) => tool_result,
+                    Err(err) => crate::tools::ToolResult::err(err),
+                };
             }
-            Err(e) => return crate::tools::ToolResult::err(format!("Shell error: {e}")),
         }
     }
+    if cancelled.load(Ordering::Relaxed) {
+        cancelled.store(false, Ordering::Relaxed);
+    }
+    crate::tools::ToolResult::err("Shell worker dropped before reporting a result".into())
 }
 
 /// Replace old tool results with compressed summaries using per-type thresholds.
@@ -760,7 +866,11 @@ fn canonical_json(value: &serde_json::Value) -> String {
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into()),
         serde_json::Value::Array(items) => {
-            let inner = items.iter().map(canonical_json).collect::<Vec<_>>().join(",");
+            let inner = items
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",");
             format!("[{inner}]")
         }
         serde_json::Value::Object(map) => {
