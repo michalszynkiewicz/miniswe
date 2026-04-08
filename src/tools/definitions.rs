@@ -15,16 +15,16 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "file".into(),
-                description: "File operations: read, search, shell, replace, write, revert. Use action='help' for details. For code edits, prefer fix_file. Use replace only with exact old+new text. Use write only when providing the complete file contents.".into(),
+                description: "File operations: read, search, shell, write, delete, replace, revert. Use action='help' for details. For code edits, prefer edit_file. Use write with content for complete file contents, or omit content to create a new empty file. Use delete only for removing an existing file.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "description": "One of: read, write, replace, search, shell, revert, help"
+                            "description": "One of: read, write, delete, replace, search, shell, revert, help"
                         },
-                        "path": { "type": "string", "description": "File path (required for read/write/replace/revert)" },
-                        "content": { "type": "string", "description": "Complete file contents (required for action='write'); not a patch or snippet" },
+                        "path": { "type": "string", "description": "File path (required for read/write/delete/replace/revert)" },
+                        "content": { "type": "string", "description": "Complete file contents for action='write'; omit only to create a new empty file, not for partial edits" },
                         "old": { "type": "string", "description": "Exact text to find (required for action='replace')" },
                         "new": { "type": "string", "description": "Replacement text (required for action='replace')" },
                         "all": { "type": "boolean", "description": "Replace all occurrences (for replace)" },
@@ -135,12 +135,12 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 }),
             },
         },
-        // ── fix_file: LLM-powered code transformation ─────────────────
+        // ── edit_file: LLM-powered code transformation ────────────────
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
-                name: "fix_file".into(),
-                description: "Apply a semantic code change across one file using an atomic patch. Prefer this for multi-line edits, repeated call-site updates, or when file(action='replace') would need start_line/end_line. Supports optional LSP validation.".into(),
+                name: "edit_file".into(),
+                description: "Apply a semantic code change across one file using an atomic patch. Best for multi-line edits, repeated call-site updates, changed function callers, or 5+ similar edits that need per-site reasoning. Supports optional LSP validation.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -200,9 +200,11 @@ pub fn file_help() -> &'static str {
 Available actions for `file`:
 
 - read: Read a file. Params: path (required), start_line, end_line
-- write: Create or overwrite a file. Params: path (required), content (required, COMPLETE file text)
+- write: Create or overwrite a file. Params: path (required), content (optional, COMPLETE file text)
   Example: {\"action\":\"write\",\"path\":\"src/bin/hello.rs\",\"content\":\"fn main() {\\n    println!(\\\"hello\\\");\\n}\\n\"}
-  For edits to existing code, prefer fix_file unless you are providing the whole file.
+  Omit content only to create a new empty file. For edits to existing code, prefer edit_file unless you are providing the whole file.
+- delete: Delete an existing file. Params: path (required)
+  Example: {\"action\":\"delete\",\"path\":\"src/bin/old.rs\"}
 - replace: Replace text. Params: path (required), old (required), new (required), all (optional bool)
   Example: {\"action\":\"replace\",\"path\":\"src/main.rs\",\"old\":\"exact text\",\"new\":\"replacement\"}
   Default replaces one unique match. Set all=true for every occurrence.

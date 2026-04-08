@@ -1,8 +1,8 @@
-//! file(action='write') — Whole-file rewrite.
+//! file(action='write') — Create, overwrite, or touch a file.
 //!
-//! This tool expects complete file contents. For semantic edits to existing
-//! code, prefer fix_file unless the model is deliberately rewriting the entire
-//! file.
+//! If `content` is omitted, this creates a new empty file. For semantic edits
+//! to existing code, prefer edit_file unless the model is deliberately
+//! rewriting the entire file.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -18,15 +18,11 @@ const LARGE_FILE_WARNING: usize = 250;
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let path_str = args["path"].as_str().unwrap_or("");
     let content = args["content"].as_str().unwrap_or("");
+    let has_content = args.get("content").is_some();
 
     if path_str.is_empty() {
         return Ok(ToolResult::err(
-            "Missing required parameter: path. Expected JSON arguments: {\"action\":\"write\",\"path\":\"src/bin/hello.rs\",\"content\":\"fn main() {\\n    println!(\\\"hello\\\");\\n}\\n\"}. The content value must be the complete file text.".into()
-        ));
-    }
-    if content.is_empty() {
-        return Ok(ToolResult::err(
-            "Missing required parameter: content. Expected JSON arguments: {\"action\":\"write\",\"path\":\"src/bin/hello.rs\",\"content\":\"fn main() {\\n    println!(\\\"hello\\\");\\n}\\n\"}. The content value must be the complete file text. For edits to an existing file, prefer fix_file.".into()
+            "Missing required parameter: path. Expected JSON arguments: {\"action\":\"write\",\"path\":\"src/bin/hello.rs\",\"content\":\"fn main() {\\n    println!(\\\"hello\\\");\\n}\\n\"}. Omit content only to create a new empty file.".into()
         ));
     }
 
@@ -48,14 +44,20 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 
     // Block writes that would truncate >50% of an existing file.
     // This prevents catastrophic data loss when the model sends partial content.
+    if !is_new && !has_content {
+        return Ok(ToolResult::err(format!(
+            "{path_str} already exists. Omit content only when creating a new empty file. For edits to an existing file, use edit_file or provide the complete replacement content."
+        )));
+    }
+
     let new_lines = content.lines().count();
-    if !is_new && old_lines > 50 && new_lines < old_lines / 2 {
+    if has_content && !is_new && old_lines > 50 && new_lines < old_lines / 2 {
         return Ok(ToolResult::err(format!(
             "BLOCKED: This would truncate {path_str} from {old_lines} to {new_lines} lines \
              (losing {} lines). This is almost certainly accidental — you probably forgot to \
              include the complete file content.\n\
              Options:\n\
-             1. Use fix_file for semantic edits to existing files\n\
+             1. Use edit_file for semantic edits to existing files\n\
              2. Use file(action='replace') only if you have exact old+new text\n\
              3. Use file(action='read') first, then file(action='write') with the COMPLETE content\n\
              4. If the file is already corrupted, use file(action='revert') to restore it",
@@ -69,7 +71,11 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let new_chars = content.len();
 
     let mut output = if is_new {
-        format!("✓ Created {path_str} ({new_lines} lines, {new_chars} chars)\n")
+        if has_content {
+            format!("✓ Created {path_str} ({new_lines} lines, {new_chars} chars)\n")
+        } else {
+            format!("✓ Created empty file {path_str}\n")
+        }
     } else {
         let diff = if new_lines >= old_lines {
             format!("+{}", new_lines - old_lines)
@@ -80,7 +86,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     };
 
     // Warn if file is getting large
-    if new_lines > LARGE_FILE_WARNING {
+    if has_content && new_lines > LARGE_FILE_WARNING {
         output.push_str(&format!(
             "⚠ File is {new_lines} lines (>{LARGE_FILE_WARNING}). Consider splitting into smaller modules for better context efficiency.\n"
         ));
@@ -89,11 +95,15 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     // Include the tail of the written file so the model can verify correctness
     // and make follow-up edits without a separate read_file call.
     let lines: Vec<&str> = content.lines().collect();
-    let tail_start = lines.len().saturating_sub(30);
     output.push_str("[tail]\n");
-    for (i, line) in lines[tail_start..].iter().enumerate() {
-        let line_num = tail_start + i + 1;
-        output.push_str(&format!("{line_num:>4}│{line}\n"));
+    if lines.is_empty() {
+        output.push_str("(empty file)\n");
+    } else {
+        let tail_start = lines.len().saturating_sub(30);
+        for (i, line) in lines[tail_start..].iter().enumerate() {
+            let line_num = tail_start + i + 1;
+            output.push_str(&format!("{line_num:>4}│{line}\n"));
+        }
     }
 
     Ok(ToolResult::ok(output))
