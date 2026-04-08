@@ -69,11 +69,11 @@ fn build_system_prompt() -> String {
     String::from(
         "You are miniswe, a coding agent. Use your tools to complete the task.\n\
          Tool contract: grouped tools require action plus action-specific params.\n\
-         file read: {\"action\":\"read\",\"path\":\"src/main.rs\"}\n\
-         file replace: {\"action\":\"replace\",\"path\":\"src/main.rs\",\"old\":\"exact text\",\"new\":\"replacement text\"}\n\
-         file write with content replaces the whole file: {\"action\":\"write\",\"path\":\"src/bin/hello.rs\",\"content\":\"fn main() {\\n    println!(\\\"hello\\\");\\n}\\n\"}\n\
-         file write without content creates a new empty file: {\"action\":\"write\",\"path\":\"tmp/placeholder.txt\"}\n\
-         file shell: {\"action\":\"shell\",\"command\":\"cargo check\",\"timeout\":30}\n\
+         file read: {\"action\":\"read\",\"path\":\"README.md\"}\n\
+         file replace: {\"action\":\"replace\",\"path\":\"README.md\",\"old\":\"exact text\",\"new\":\"replacement text\"}\n\
+         write_file with content replaces the whole file: {\"path\":\"notes/todo.txt\",\"content\":\"first line\\nsecond line\\n\"}\n\
+         write_file without content creates a new empty file: {\"path\":\"tmp/placeholder.txt\"}\n\
+         file shell: {\"action\":\"shell\",\"command\":\"ls\",\"timeout\":60}\n\
          For multi-line or multi-location file edits, prefer edit_file with a semantic task.\n\
          If a tool says a parameter is missing, retry with the exact required parameter names.\n",
     )

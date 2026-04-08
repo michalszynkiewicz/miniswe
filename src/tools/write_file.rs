@@ -1,4 +1,4 @@
-//! file(action='write') — Create, overwrite, or touch a file.
+//! write_file — Create, overwrite, or touch a file.
 //!
 //! If `content` is omitted, this creates a new empty file. For semantic edits
 //! to existing code, prefer edit_file unless the model is deliberately
@@ -59,7 +59,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
              Options:\n\
              1. Use edit_file for semantic edits to existing files\n\
              2. Use file(action='replace') only if you have exact old+new text\n\
-             3. Use file(action='read') first, then file(action='write') with the COMPLETE content\n\
+             3. Use file(action='read') first, then write_file with the COMPLETE content\n\
              4. If the file is already corrupted, use file(action='revert') to restore it",
             old_lines - new_lines
         )));

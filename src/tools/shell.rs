@@ -3,14 +3,16 @@
 //! Permission checks (blocklist + user approval) are handled by the
 //! PermissionManager before this function is called.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
 use super::ToolResult;
+use crate::config::Config;
 
 /// Maximum characters per output line before truncation (display).
 const MAX_LINE_CHARS: usize = 1000;
@@ -18,18 +20,45 @@ const MAX_LINE_CHARS: usize = 1000;
 /// Maximum total bytes to read from stdout+stderr combined.
 const MAX_OUTPUT_BYTES: usize = 512 * 1024; // 512KB
 
-/// Default timeout in seconds.
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
+pub struct RunningShellCommand {
+    child: Child,
+    stdout_handle: JoinHandle<Vec<u8>>,
+    stderr_handle: JoinHandle<Vec<u8>>,
+}
+
+pub enum ShellWaitOutcome {
+    Completed(ToolResult),
+    TimedOut(RunningShellCommand),
+    Interrupted(RunningShellCommand),
+}
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
-    let command = args["command"].as_str().unwrap_or("");
     let timeout_secs = args["timeout"]
         .as_u64()
-        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        .unwrap_or(config.shell.default_timeout_secs);
+    let running = match start(args, config) {
+        Ok(r) => r,
+        Err(e) => return Ok(ToolResult::err(e.to_string())),
+    };
+    match wait(running, timeout_secs, config, None) {
+        Ok(ShellWaitOutcome::Completed(result)) => Ok(result),
+        Ok(ShellWaitOutcome::TimedOut(mut running)) => {
+            let _ = running.child.kill();
+            Ok(render_killed_result(running, timeout_secs))
+        }
+        Ok(ShellWaitOutcome::Interrupted(mut running)) => {
+            let _ = running.child.kill();
+            Ok(render_interrupted_result(running))
+        }
+        Err(e) => Err(e),
+    }
+}
 
+pub fn start(args: &Value, config: &Config) -> Result<RunningShellCommand> {
+    let command = args["command"].as_str().unwrap_or("");
     if command.is_empty() {
-        return Ok(ToolResult::err(
-            "Missing required parameter: command. Expected JSON arguments: {\"action\":\"shell\",\"command\":\"cargo check\",\"timeout\":30}.".into()
+        return Err(anyhow!(
+            "Missing required parameter: command. Expected JSON arguments: {{\"action\":\"shell\",\"command\":\"cargo check\",\"timeout\":60}}."
         ));
     }
 
@@ -43,7 +72,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => return Ok(ToolResult::err(format!("Failed to execute command: {e}"))),
+        Err(e) => return Err(anyhow!("Failed to execute command: {e}")),
     };
 
     // Drain stdout and stderr in background threads to prevent pipe deadlock.
@@ -68,37 +97,70 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         buf
     });
 
-    // Poll for completion with timeout
+    Ok(RunningShellCommand {
+        child,
+        stdout_handle,
+        stderr_handle,
+    })
+}
+
+pub fn wait(
+    mut running: RunningShellCommand,
+    timeout_secs: u64,
+    config: &Config,
+    cancel: Option<&AtomicBool>,
+) -> Result<ShellWaitOutcome> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break, // process exited
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Ok(ShellWaitOutcome::Interrupted(running));
+        }
+        match running.child.try_wait() {
+            Ok(Some(_)) => return Ok(ShellWaitOutcome::Completed(render_finished_result(
+                running, config,
+            ))),
             Ok(None) => {
                 if Instant::now() > deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Ok(ToolResult {
-                        content: format!(
-                            "Command timed out after {timeout_secs}s (killed).\n\
-                             Tip: use a higher timeout parameter, or don't run \
-                             long-lived servers with shell()."
-                        ),
-                        success: false,
-                    });
+                    return Ok(ShellWaitOutcome::TimedOut(running));
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
-                return Ok(ToolResult::err(format!("Failed to wait for command: {e}")));
+                return Ok(ShellWaitOutcome::Completed(ToolResult::err(format!(
+                    "Failed to wait for command: {e}"
+                ))));
             }
         }
     }
+}
 
-    let exit_code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+pub fn kill(mut running: RunningShellCommand, timeout_secs: u64) -> ToolResult {
+    let _ = running.child.kill();
+    render_killed_result(running, timeout_secs)
+}
+
+fn render_killed_result(mut running: RunningShellCommand, timeout_secs: u64) -> ToolResult {
+    let _ = running.child.wait();
+    ToolResult::err(format!(
+        "Command timed out after {timeout_secs}s and was killed by user."
+    ))
+}
+
+fn render_interrupted_result(mut running: RunningShellCommand) -> ToolResult {
+    let _ = running.child.wait();
+    ToolResult::err("Command interrupted by user.".into())
+}
+
+fn render_finished_result(mut running: RunningShellCommand, config: &Config) -> ToolResult {
+    let exit_code = running
+        .child
+        .wait()
+        .map(|s| s.code().unwrap_or(-1))
+        .unwrap_or(-1);
 
     // Collect output from drain threads
-    let stdout_bytes = stdout_handle.join().unwrap_or_default();
-    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+    let stdout_bytes = running.stdout_handle.join().unwrap_or_default();
+    let stderr_bytes = running.stderr_handle.join().unwrap_or_default();
 
     let stdout = String::from_utf8_lossy(&stdout_bytes);
     let stderr = String::from_utf8_lossy(&stderr_bytes);
@@ -135,13 +197,16 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 
         result.push_str(&format!(
             ", showing last {} of {} lines",
-            max_output_lines, lines.len()
+            max_output_lines,
+            lines.len()
         ));
         result.push_str("]\n");
 
         let skip = lines.len() - max_output_lines;
         for (i, line) in lines[skip..].iter().enumerate() {
-            if i > 0 { result.push('\n'); }
+            if i > 0 {
+                result.push('\n');
+            }
             if line.chars().count() > MAX_LINE_CHARS {
                 result.push_str(&crate::truncate_chars(line, MAX_LINE_CHARS));
             } else {
@@ -155,7 +220,9 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     } else {
         result.push_str("]\n");
         for (i, line) in lines.iter().enumerate() {
-            if i > 0 { result.push('\n'); }
+            if i > 0 {
+                result.push('\n');
+            }
             if line.chars().count() > MAX_LINE_CHARS {
                 result.push_str(&crate::truncate_chars(line, MAX_LINE_CHARS));
             } else {
@@ -165,8 +232,11 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     }
 
     if exit_code == 0 {
-        Ok(ToolResult::ok(result))
+        ToolResult::ok(result)
     } else {
-        Ok(ToolResult { content: result, success: false })
+        ToolResult {
+            content: result,
+            success: false,
+        }
     }
 }

@@ -195,11 +195,10 @@ async fn lsp_auto_check_integration() {
 
     // Write a file with a type error via the tool system
     let args = json!({
-        "action": "write",
         "path": "src/main.rs",
         "content": "fn main() {\n    let x: u32 = \"type error\";\n}\n"
     });
-    let result = miniswe::tools::execute_tool("file", &args, &config, &perms, Some(&client))
+    let result = miniswe::tools::execute_tool("write_file", &args, &config, &perms, Some(&client))
         .await
         .unwrap();
 

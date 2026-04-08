@@ -159,7 +159,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         // Show cursor only when input is active
         let cursor_x = area.x + 1 + prefix.chars().count() as u16 + cursor_col as u16;
         let cursor_y = area.y + 1;
-        if cursor_x < area.x + area.width - 1 {
+        if cursor_x < area.x + area.width.saturating_sub(1) {
             frame.set_cursor_position((cursor_x, cursor_y));
         }
     }
@@ -213,7 +213,7 @@ fn draw_permission_modal(frame: &mut Frame, app: &App, area: Rect) {
     // Show cursor
     let cursor_x = chunks[1].x + 1 + prefix.chars().count() as u16 + cursor_col as u16;
     let cursor_y = chunks[1].y + 1;
-    if cursor_x < chunks[1].x + chunks[1].width - 1 {
+    if cursor_x < chunks[1].x + chunks[1].width.saturating_sub(1) {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
@@ -256,9 +256,12 @@ fn visible_input_window(input: &str, cursor_byte: usize, max_chars: usize) -> (S
 
 #[cfg(test)]
 mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
 
-    use super::{centered_rect, visible_input_window};
+    use super::{centered_rect, draw, visible_input_window};
+    use crate::tui::app::App;
 
     #[test]
     fn visible_input_window_keeps_short_input_unchanged() {
@@ -289,6 +292,43 @@ mod tests {
     fn centered_rect_is_centered_and_bounded() {
         let modal = centered_rect(Rect::new(0, 0, 100, 30), 80, 7);
         assert_eq!(modal, Rect::new(10, 11, 80, 7));
+    }
+
+    #[test]
+    fn permission_modal_disappears_after_pending_permission_clears() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.pending_permission = Some("Allow shell command?\n  $ cargo check".into());
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let first = terminal.backend().buffer().clone();
+        let first_text = buffer_text(&first);
+        assert!(first_text.contains("Permission Required"));
+        assert!(first_text.contains("Allow shell command?"));
+
+        app.pending_permission = None;
+        app.input.clear();
+        app.cursor = 0;
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let second = terminal.backend().buffer().clone();
+        let second_text = buffer_text(&second);
+        assert!(!second_text.contains("Permission Required"));
+        assert!(!second_text.contains("Allow shell command?"));
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
     }
 }
 

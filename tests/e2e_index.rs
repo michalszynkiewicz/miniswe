@@ -438,13 +438,12 @@ async fn reindex_after_write_file_updates_symbols() {
     assert!(!index.lookup("original").is_empty());
     assert!(index.lookup("replacement").is_empty());
 
-    // Phase 2: use file(action='write') tool (which triggers reindex)
+    // Phase 2: use write_file (which triggers reindex)
     let args = json!({
-        "action": "write",
         "path": "src/lib.rs",
         "content": "pub fn replacement() {\n    println!(\"new\");\n}\n"
     });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
     assert!(result.success);

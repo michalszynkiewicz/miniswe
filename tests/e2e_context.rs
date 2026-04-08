@@ -32,6 +32,14 @@ fn basic_assembly_includes_system_prompt() {
         system.contains("relative paths only"),
         "should instruct model to use relative paths"
     );
+    assert!(
+        !system.contains("cargo check"),
+        "system prompt examples should not hardcode Rust build commands"
+    );
+    assert!(
+        !system.contains("src/bin/hello.rs"),
+        "system prompt examples should not hardcode Rust file paths"
+    );
 
     // Last message should be the user message
     let last = assembled.messages.last().unwrap();
