@@ -20,8 +20,14 @@ fn basic_assembly_includes_system_prompt() {
     // First message should be system
     assert_eq!(assembled.messages[0].role, "system");
     let system = assembled.messages[0].content.as_deref().unwrap();
-    assert!(system.contains("miniswe"), "system prompt should mention miniswe");
-    assert!(system.contains("miniswe"), "system prompt should identify the agent");
+    assert!(
+        system.contains("miniswe"),
+        "system prompt should mention miniswe"
+    );
+    assert!(
+        system.contains("miniswe"),
+        "system prompt should identify the agent"
+    );
 
     // Should include the project root path so the model knows where it's working
     assert!(
@@ -85,7 +91,10 @@ fn assembly_includes_guide() {
     let system = assembled.messages[0].content.as_deref().unwrap();
 
     assert!(system.contains("[GUIDE]"), "should have guide section");
-    assert!(system.contains("snake_case"), "guide content should be present");
+    assert!(
+        system.contains("snake_case"),
+        "guide content should be present"
+    );
 }
 
 #[test]
@@ -102,7 +111,10 @@ fn assembly_skips_template_guide() {
     let assembled = context::assemble(&config, "test", &[], false, None);
     let system = assembled.messages[0].content.as_deref().unwrap();
 
-    assert!(!system.contains("[GUIDE]"), "template guide should be skipped");
+    assert!(
+        !system.contains("[GUIDE]"),
+        "template guide should be skipped"
+    );
 }
 
 // ── Scratchpad ──────────────────────────────────────────────────────
@@ -120,8 +132,14 @@ fn scratchpad_included_in_context() {
     let assembled = context::assemble(&config, "continue", &[], false, None);
     let system = assembled.messages[0].content.as_deref().unwrap();
 
-    assert!(system.contains("[SCRATCHPAD]"), "should have scratchpad section");
-    assert!(system.contains("Implement auth"), "scratchpad content should be present");
+    assert!(
+        system.contains("[SCRATCHPAD]"),
+        "should have scratchpad section"
+    );
+    assert!(
+        system.contains("Implement auth"),
+        "scratchpad content should be present"
+    );
 }
 
 // ── Plan mode ───────────────────────────────────────────────────────
@@ -157,7 +175,10 @@ fn ai_readme_included_in_context() {
     let assembled = context::assemble(&config, "test", &[], false, None);
     let system = assembled.messages[0].content.as_deref().unwrap();
 
-    assert!(system.contains("[PROJECT NOTES]"), "should have project notes");
+    assert!(
+        system.contains("[PROJECT NOTES]"),
+        "should have project notes"
+    );
     assert!(system.contains("layered architecture"));
 }
 
@@ -214,7 +235,11 @@ fn compress_history_keeps_recent() {
     let compressed = context::compress_history(&history, 4);
 
     // Should have: summary user + summary assistant + last 4 raw messages
-    assert!(compressed.len() >= 4, "should keep at least 4 raw messages, got {}", compressed.len());
+    assert!(
+        compressed.len() >= 4,
+        "should keep at least 4 raw messages, got {}",
+        compressed.len()
+    );
 
     // Last message should be the third response
     let last = compressed.last().unwrap();
@@ -322,6 +347,35 @@ fn sanitize_inserts_assistant_bridge_between_tool_and_user() {
 }
 
 #[test]
+fn sanitize_drops_dangling_assistant_tool_calls_before_user() {
+    use miniswe::llm::{FunctionCall, ToolCall};
+
+    let mut messages = vec![
+        Message::system("sys"),
+        Message::user("start server"),
+        Message::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "file".into(),
+                arguments: r#"{"action":"shell","command":"go run main.go"}"#.into(),
+            },
+        }]),
+        Message::user("that port is taken; use another one"),
+    ];
+
+    context::sanitize_messages(&mut messages);
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "system");
+    assert_eq!(messages[1].role, "user");
+    let content = messages[1].content.as_deref().unwrap();
+    assert!(content.contains("start server"));
+    assert!(content.contains("another one"));
+    assert!(!messages.iter().any(|m| m.tool_calls.is_some()));
+}
+
+#[test]
 fn sanitize_removes_duplicate_system() {
     let mut messages = vec![
         Message::system("first system"),
@@ -342,7 +396,10 @@ fn sanitize_removes_duplicate_system() {
 fn token_estimate_roughly_correct() {
     // ~4 chars per token
     let tokens = context::estimate_tokens("hello world"); // 11 chars
-    assert!(tokens >= 2 && tokens <= 4, "should be ~2-3 tokens, got {tokens}");
+    assert!(
+        tokens >= 2 && tokens <= 4,
+        "should be ~2-3 tokens, got {tokens}"
+    );
 
     let tokens = context::estimate_tokens(&"x".repeat(400)); // 400 chars
     assert_eq!(tokens, 100);

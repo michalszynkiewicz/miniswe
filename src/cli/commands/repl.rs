@@ -1,8 +1,8 @@
 //! Interactive REPL mode with ratatui TUI.
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use crossterm::ExecutableCommand;
@@ -20,6 +20,9 @@ use crate::llm::{ChatRequest, Message, ModelRouter};
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
 use crate::mcp::{McpConfig, McpRegistry};
+use crate::runtime::{
+    LlmWorkerEvent, LlmWorkerHandle, ShellControl, ShellWorkerEvent, ToolWorkerPool,
+};
 use crate::tools;
 use crate::tools::permissions::{Action, PermissionManager};
 use crate::tui::app::{App, AppMode, LineStyle};
@@ -56,12 +59,14 @@ impl Drop for ReplTerminalGuard {
 pub async fn run(config: Config, headless: bool) -> Result<()> {
     let log = SessionLog::new(&config);
 
-    let router = ModelRouter::new(&config);
-    let perms = if headless {
+    let router = Arc::new(ModelRouter::new(&config));
+    let llm_worker = LlmWorkerHandle::new(router.clone());
+    let perms = Arc::new(if headless {
         PermissionManager::headless(&config)
     } else {
         PermissionManager::new(&config)
-    };
+    });
+    let tool_pool = ToolWorkerPool::new(config.runtime.tool_worker_pool_size);
     let mut tool_defs = tools::tool_definitions();
     // Filter tools based on config
     {
@@ -91,14 +96,14 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
 
     // Initialize MCP
     let mcp_config = McpConfig::load(&config.project_root)?;
-    let mut mcp_registry = if mcp_config.has_servers() {
+    let mcp_registry = if mcp_config.has_servers() {
         let cache_dir = config.miniswe_path("mcp");
         match McpRegistry::connect(&mcp_config, &cache_dir) {
             Ok(registry) => {
                 if registry.has_servers() {
                     tool_defs.push(tools::definitions::mcp_tool_definition());
                 }
-                Some(registry)
+                Some(Arc::new(Mutex::new(registry)))
             }
             Err(_) => None,
         }
@@ -106,7 +111,9 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         None
     };
 
-    let mcp_summary = mcp_registry.as_ref().and_then(|r| r.context_summary());
+    let mcp_summary = mcp_registry
+        .as_ref()
+        .and_then(|r| r.lock().ok().and_then(|g| g.context_summary()));
 
     // Set up terminal
     let _terminal_guard = ReplTerminalGuard::enter()?;
@@ -129,15 +136,17 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         );
     }
     if let Some(ref mcp) = mcp_registry {
-        if mcp.has_servers() {
-            app.push_output(
-                &format!(
-                    "MCP: {} servers, {} tools",
-                    mcp.servers.len(),
-                    mcp.tool_count()
-                ),
-                LineStyle::Status,
-            );
+        if let Ok(guard) = mcp.lock() {
+            if guard.has_servers() {
+                app.push_output(
+                    &format!(
+                        "MCP: {} servers, {} tools",
+                        guard.servers.len(),
+                        guard.tool_count()
+                    ),
+                    LineStyle::Status,
+                );
+            }
         }
     }
     app.push_output(
@@ -280,7 +289,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                 let mut messages = assembled.messages;
                                 let max_rounds = config.context.max_rounds;
                                 let perms_ref = &perms;
-                                let mcp_ref = &mut mcp_registry;
+                                let mcp_ref = &mcp_registry;
                                 let conv_ref = &mut conversation_history;
 
                                 log.user_message(&input);
@@ -291,6 +300,8 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                     &mut rx,
                                     &mut terminal,
                                     &router,
+                                    &llm_worker,
+                                    &tool_pool,
                                     &tool_defs,
                                     &config,
                                     perms_ref,
@@ -321,8 +332,20 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                             KeyCode::Backspace => app.delete_char(),
                             KeyCode::Left => app.cursor_left(),
                             KeyCode::Right => app.cursor_right(),
-                            KeyCode::Up => app.history_up(),
-                            KeyCode::Down => app.history_down(),
+                            KeyCode::Up => {
+                                if app.input.is_empty() {
+                                    app.scroll_up(1);
+                                } else {
+                                    app.history_up();
+                                }
+                            }
+                            KeyCode::Down => {
+                                if app.input.is_empty() {
+                                    app.scroll_down(1);
+                                } else {
+                                    app.history_down();
+                                }
+                            }
                             KeyCode::PageUp => app.scroll_up(10),
                             KeyCode::PageDown => app.scroll_down(10),
                             KeyCode::Home => {
@@ -398,11 +421,13 @@ async fn run_agent_loop(
     app: &mut App,
     rx: &mut mpsc::UnboundedReceiver<AppEvent>,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    router: &ModelRouter,
+    router: &Arc<ModelRouter>,
+    llm_worker: &LlmWorkerHandle,
+    tool_pool: &ToolWorkerPool,
     tool_defs: &[crate::llm::ToolDefinition],
     config: &Config,
-    perms: &PermissionManager,
-    mcp_registry: &mut Option<McpRegistry>,
+    perms: &Arc<PermissionManager>,
+    mcp_registry: &Option<Arc<Mutex<McpRegistry>>>,
     cancelled: &Arc<AtomicBool>,
     messages: &mut Vec<Message>,
     conversation_history: &mut Vec<Message>,
@@ -456,6 +481,7 @@ async fn run_agent_loop(
 
         cancelled.store(false, Ordering::Relaxed);
         app.is_thinking = true;
+        app.set_active_job("llm");
 
         // Render before LLM call so spinner is visible immediately
         let _ = terminal.draw(|frame| ui::draw(frame, app));
@@ -463,48 +489,81 @@ async fn run_agent_loop(
         // Call LLM with streaming — render on each token
         let response = {
             let mut token_count = 0u32;
-            match router
-                .chat_stream(
-                    ModelRole::Default,
-                    &request,
-                    |token| {
-                        app.push_token(token);
-                        // Re-render every few tokens (not every token — too expensive)
-                        token_count += 1;
-                        if token_count % 3 == 0 {
-                            let _ = terminal.draw(|frame| ui::draw(frame, app));
+            let mut llm_events =
+                llm_worker.submit(ModelRole::Default, request.clone(), cancelled.clone());
+            loop {
+                tokio::select! {
+                    evt = llm_events.recv() => {
+                        match evt {
+                            Some(LlmWorkerEvent::Token(token)) => {
+                                app.push_token(&token);
+                                token_count += 1;
+                                if token_count % 3 == 0 {
+                                    let _ = terminal.draw(|frame| ui::draw(frame, app));
+                                }
+                            }
+                            Some(LlmWorkerEvent::Completed(Ok(r))) => break Some(r),
+                            Some(LlmWorkerEvent::Completed(Err(err_str))) => {
+                                if err_str.contains("Interrupted") {
+                                    app.push_output("Generation interrupted.", LineStyle::Status);
+                                } else {
+                                    let clean = if err_str.contains('<') {
+                                        err_str
+                                            .split('<')
+                                            .next()
+                                            .unwrap_or(&err_str)
+                                            .trim()
+                                            .to_string()
+                                    } else {
+                                        err_str
+                                    };
+                                    log.llm_error(&clean);
+                                    app.push_output(&format!("LLM error: {clean}"), LineStyle::Error);
+                                }
+                                app.clear_active_job();
+                                break None;
+                            }
+                            None => {
+                                app.push_output("LLM worker stopped unexpectedly.", LineStyle::Error);
+                                app.clear_active_job();
+                                break None;
+                            }
                         }
-                    },
-                    cancelled,
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("Interrupted") {
-                        app.push_output("Generation interrupted.", LineStyle::Status);
-                    } else {
-                        let clean = if err_str.contains('<') {
-                            err_str
-                                .split('<')
-                                .next()
-                                .unwrap_or(&err_str)
-                                .trim()
-                                .to_string()
-                        } else {
-                            err_str
-                        };
-                        log.llm_error(&clean);
-                        app.push_output(&format!("LLM error: {clean}"), LineStyle::Error);
                     }
-                    break;
+                    app_evt = rx.recv() => {
+                        match app_evt {
+                            Some(AppEvent::Tick) => {
+                                let _ = terminal.draw(|frame| ui::draw(frame, app));
+                            }
+                            Some(AppEvent::Key(key)) if handle_background_key(app, &key) => {
+                                let _ = terminal.draw(|frame| ui::draw(frame, app));
+                            }
+                            Some(AppEvent::Key(key)) if event::is_ctrl_c(&key) => {
+                                cancelled.store(true, Ordering::Relaxed);
+                                app.push_output("(interrupted)", LineStyle::Status);
+                                let _ = terminal.draw(|frame| ui::draw(frame, app));
+                            }
+                            Some(AppEvent::Mouse(_)) => {}
+                            Some(_) => {}
+                            None => {
+                                app.push_output("Event stream closed.", LineStyle::Error);
+                                app.clear_active_job();
+                                break None;
+                            }
+                        }
+                    }
                 }
             }
         };
 
+        app.clear_active_job();
+
         // Re-render after LLM response
         let _ = terminal.draw(|frame| ui::draw(frame, app));
+
+        let Some(response) = response else {
+            break;
+        };
 
         let choice = match response.choices.first() {
             Some(c) => c,
@@ -636,10 +695,7 @@ async fn run_agent_loop(
                             }
                             _ => {
                                 perm_denied = true;
-                                app.push_output(
-                                    "  · Permission denied.",
-                                    LineStyle::Status,
-                                );
+                                app.push_output("  · Permission denied.", LineStyle::Status);
                             }
                         }
 
@@ -679,43 +735,105 @@ async fn run_agent_loop(
 
             // Execute tool (permissions already checked above for shell/web/mcp)
             let mut result = if tc.function.name == "mcp_use" {
-                let server = args["server"].as_str().unwrap_or("");
-                let tool = args["tool"].as_str().unwrap_or("");
+                let server = args["server"].as_str().unwrap_or("").to_string();
+                let tool = args["tool"].as_str().unwrap_or("").to_string();
                 let tool_args = args.get("arguments").cloned().unwrap_or_default();
-                match mcp_registry {
-                    Some(registry) => match registry.call_tool(server, tool, tool_args) {
-                        Ok(content) => crate::tools::ToolResult::ok(content),
-                        Err(e) => crate::tools::ToolResult::err(format!("MCP error: {e}")),
-                    },
-                    None => crate::tools::ToolResult::err("No MCP servers connected".into()),
-                }
+                let registry = mcp_registry.clone();
+                let mut result_rx = tool_pool.submit(move || match registry {
+                    Some(registry) => {
+                        let mut guard = registry
+                            .lock()
+                            .map_err(|_| "MCP registry poisoned".to_string())?;
+                        guard
+                            .call_tool(&server, &tool, tool_args)
+                            .map(crate::tools::ToolResult::ok)
+                            .map_err(|e| format!("MCP error: {e}"))
+                    }
+                    None => Ok(crate::tools::ToolResult::err(
+                        "No MCP servers connected".into(),
+                    )),
+                });
+                await_tool_job_ui(rx, terminal, app, "mcp_use", &mut result_rx, cancelled).await
             } else if tc.function.name == "edit_file" {
-                match crate::tools::execute_edit_file_tool(
-                    &args,
-                    config,
-                    perms,
-                    router,
-                    lsp.as_deref(),
+                let args = args.clone();
+                let config = config.clone();
+                let perms = perms.clone();
+                let router = router.clone();
+                let lsp = lsp.clone();
+                let mut result_rx = tool_pool.submit(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    runtime
+                        .block_on(async move {
+                            crate::tools::execute_edit_file_tool(
+                                &args,
+                                &config,
+                                perms.as_ref(),
+                                router.as_ref(),
+                                lsp.as_deref(),
+                            )
+                            .await
+                        })
+                        .map_err(|e| format!("edit_file error: {e}"))
+                });
+                await_tool_job_ui(rx, terminal, app, "edit_file", &mut result_rx, cancelled).await
+            } else if tc.function.name == "plan" {
+                let args = args.clone();
+                let config = config.clone();
+                let mut result_rx = tool_pool.submit(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    runtime
+                        .block_on(async move { tools::plan::execute(&args, &config, round).await })
+                        .map_err(|e| format!("plan error: {e}"))
+                });
+                await_tool_job_ui(rx, terminal, app, "plan", &mut result_rx, cancelled).await
+            } else if tc.function.name == "file" && file_action == "shell" {
+                await_shell_job_repl(
+                    tool_pool.submit_shell(args.clone(), config.clone(), cancelled.clone()),
+                    app,
+                    rx,
+                    terminal,
+                    cancelled,
                 )
                 .await
-                {
-                    Ok(r) => r,
-                    Err(e) => crate::tools::ToolResult::err(format!("edit_file error: {e}")),
-                }
-            } else if tc.function.name == "plan" {
-                match tools::plan::execute(&args, config, round).await {
-                    Ok(r) => r,
-                    Err(e) => crate::tools::ToolResult::err(format!("plan error: {e}")),
-                }
-            } else if tc.function.name == "file" && file_action == "shell" {
-                handle_shell_tool_repl(&args, config, app, rx, terminal, cancelled).await
             } else {
-                match tools::execute_tool(&tc.function.name, &args, config, perms, lsp.as_deref())
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => crate::tools::ToolResult::err(format!("Tool error: {e}")),
-                }
+                let tool_name = tc.function.name.clone();
+                let args = args.clone();
+                let config = config.clone();
+                let perms = perms.clone();
+                let lsp = lsp.clone();
+                let mut result_rx = tool_pool.submit(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    runtime
+                        .block_on(async move {
+                            tools::execute_tool(
+                                &tool_name,
+                                &args,
+                                &config,
+                                perms.as_ref(),
+                                lsp.as_deref(),
+                            )
+                            .await
+                        })
+                        .map_err(|e| format!("Tool error: {e}"))
+                });
+                await_tool_job_ui(
+                    rx,
+                    terminal,
+                    app,
+                    &tc.function.name,
+                    &mut result_rx,
+                    cancelled,
+                )
+                .await
             };
 
             if !result.success {
@@ -908,7 +1026,9 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                     let cmd = args["command"].as_str().unwrap_or("?");
                     let timeout = args["timeout"].as_u64();
                     match timeout {
-                        Some(t) => format!("shell {} [timeout={t}]", crate::truncate_chars(cmd, 40)),
+                        Some(t) => {
+                            format!("shell {} [timeout={t}]", crate::truncate_chars(cmd, 40))
+                        }
                         None => format!("shell {}", crate::truncate_chars(cmd, 40)),
                     }
                 }
@@ -969,6 +1089,36 @@ fn permission_action(tool_name: &str, args: &serde_json::Value) -> Option<Action
     }
 }
 
+fn handle_background_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
+    match key.code {
+        KeyCode::PageUp => {
+            app.scroll_up(10);
+            true
+        }
+        KeyCode::PageDown => {
+            app.scroll_down(10);
+            true
+        }
+        KeyCode::Up if app.input.is_empty() => {
+            app.scroll_up(1);
+            true
+        }
+        KeyCode::Down if app.input.is_empty() => {
+            app.scroll_down(1);
+            true
+        }
+        KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.scroll_offset = app.output.len().saturating_sub(1) as u16;
+            true
+        }
+        KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.scroll_offset = 0;
+            true
+        }
+        _ => false,
+    }
+}
+
 fn canonical_json(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => "null".to_string(),
@@ -976,7 +1126,11 @@ fn canonical_json(value: &serde_json::Value) -> String {
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into()),
         serde_json::Value::Array(items) => {
-            let inner = items.iter().map(canonical_json).collect::<Vec<_>>().join(",");
+            let inner = items
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",");
             format!("[{inner}]")
         }
         serde_json::Value::Object(map) => {
@@ -991,6 +1145,50 @@ fn canonical_json(value: &serde_json::Value) -> String {
                 .collect::<Vec<_>>()
                 .join(",");
             format!("{{{inner}}}")
+        }
+    }
+}
+
+async fn await_tool_job_ui(
+    rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    job_label: &str,
+    result_rx: &mut tokio::sync::oneshot::Receiver<Result<crate::tools::ToolResult, String>>,
+    cancelled: &Arc<AtomicBool>,
+) -> crate::tools::ToolResult {
+    app.set_active_job(job_label);
+    loop {
+        tokio::select! {
+            result = &mut *result_rx => {
+                app.clear_active_job();
+                return match result {
+                    Ok(Ok(tool_result)) => tool_result,
+                    Ok(Err(err)) => crate::tools::ToolResult::err(err),
+                    Err(_) => crate::tools::ToolResult::err("Tool worker dropped job".into()),
+                };
+            }
+            evt = rx.recv() => {
+                match evt {
+                    Some(AppEvent::Tick) => {
+                        let _ = terminal.draw(|frame| ui::draw(frame, app));
+                    }
+                    Some(AppEvent::Key(key)) if handle_background_key(app, &key) => {
+                        let _ = terminal.draw(|frame| ui::draw(frame, app));
+                    }
+                    Some(AppEvent::Key(key)) if event::is_ctrl_c(&key) => {
+                        cancelled.store(true, Ordering::Relaxed);
+                        app.push_output("(interrupted)", LineStyle::Status);
+                        let _ = terminal.draw(|frame| ui::draw(frame, app));
+                    }
+                    Some(AppEvent::Mouse(_)) => {}
+                    Some(_) => {}
+                    None => {
+                        app.clear_active_job();
+                        return crate::tools::ToolResult::err("Event stream closed.".into())
+                    },
+                }
+            }
         }
     }
 }
@@ -1151,53 +1349,89 @@ async fn wait_for_permission_input(
     wait_for_modal_input(app, rx, terminal, &['y', 'n', 'a']).await
 }
 
-async fn handle_shell_tool_repl(
-    args: &serde_json::Value,
-    config: &Config,
+async fn await_shell_job_repl(
+    mut shell_job: crate::runtime::ShellJobHandle,
     app: &mut App,
     rx: &mut mpsc::UnboundedReceiver<AppEvent>,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cancelled: &Arc<AtomicBool>,
 ) -> crate::tools::ToolResult {
-    let timeout_secs = args["timeout"]
-        .as_u64()
-        .unwrap_or(config.shell.default_timeout_secs);
-    let command = args["command"].as_str().unwrap_or("");
-    let mut running = match crate::tools::shell::start(args, config) {
-        Ok(r) => r,
-        Err(e) => return crate::tools::ToolResult::err(e.to_string()),
-    };
-
+    app.set_active_job("shell");
     loop {
-        match crate::tools::shell::wait(running, timeout_secs, config, Some(cancelled.as_ref())) {
-            Ok(crate::tools::shell::ShellWaitOutcome::Completed(result)) => return result,
-            Ok(crate::tools::shell::ShellWaitOutcome::TimedOut(timed_out)) => {
-                running = timed_out;
-                app.pending_permission = Some(format!(
-                    "Shell command has been running for {timeout_secs}s:\n  $ {command}\nChoose: [c]ontinue waiting or [k]ill the command."
-                ));
-                app.input.clear();
-                app.cursor = 0;
-                let _ = terminal.draw(|frame| ui::draw(frame, app));
-                let response = wait_for_modal_input(app, rx, terminal, &['c', 'k']).await;
-                app.pending_permission = None;
-                match response.as_str() {
-                    "c" => {
-                        app.push_output("  · Continuing to wait for shell command...", LineStyle::Status);
+        tokio::select! {
+            event = shell_job.events_rx.recv() => {
+                match event {
+                    Some(ShellWorkerEvent::TimedOut { command, timeout_secs }) => {
+                        app.pending_permission = Some(format!(
+                            "Shell command has been running for {timeout_secs}s:\n  $ {command}\nChoose: [c]ontinue waiting or [k]ill the command."
+                        ));
+                        app.input.clear();
+                        app.cursor = 0;
+                        let _ = terminal.draw(|frame| ui::draw(frame, app));
+                        let response = wait_for_modal_input(app, rx, terminal, &['c', 'k']).await;
+                        app.pending_permission = None;
+                        let control = match response.as_str() {
+                            "c" => {
+                                app.push_output("  · Continuing to wait for shell command...", LineStyle::Status);
+                                ShellControl::Continue
+                            }
+                            _ => {
+                                app.push_output("  · Shell command killed.", LineStyle::Status);
+                                ShellControl::Kill
+                            }
+                        };
+                        if shell_job.send_control(control).is_err() {
+                            app.clear_active_job();
+                            return crate::tools::ToolResult::err("Shell worker dropped control channel".into());
+                        }
+                        let _ = terminal.draw(|frame| ui::draw(frame, app));
                     }
-                    _ => {
-                        app.push_output("  · Shell command killed.", LineStyle::Status);
-                        return crate::tools::shell::kill(running, timeout_secs);
+                    Some(ShellWorkerEvent::Completed(result)) => {
+                        app.clear_active_job();
+                        if cancelled.load(Ordering::Relaxed) {
+                            cancelled.store(false, Ordering::Relaxed);
+                        }
+                        if matches!(&result, Ok(tool_result) if !tool_result.success && tool_result.content == "Command interrupted by user.") {
+                            app.push_output("  · Shell command interrupted.", LineStyle::Status);
+                        }
+                        return match result {
+                            Ok(tool_result) => tool_result,
+                            Err(err) => crate::tools::ToolResult::err(err),
+                        };
+                    }
+                    None => {
+                        app.clear_active_job();
+                        if cancelled.load(Ordering::Relaxed) {
+                            cancelled.store(false, Ordering::Relaxed);
+                        }
+                        return crate::tools::ToolResult::err("Shell worker dropped before reporting a result".into());
                     }
                 }
-                let _ = terminal.draw(|frame| ui::draw(frame, app));
             }
-            Ok(crate::tools::shell::ShellWaitOutcome::Interrupted(timed_out)) => {
-                app.push_output("  · Shell command interrupted.", LineStyle::Status);
-                cancelled.store(false, Ordering::Relaxed);
-                return crate::tools::shell::kill(timed_out, timeout_secs);
+            evt = rx.recv() => {
+                match evt {
+                    Some(AppEvent::Tick) => {
+                        let _ = terminal.draw(|frame| ui::draw(frame, app));
+                    }
+                    Some(AppEvent::Key(key)) if handle_background_key(app, &key) => {
+                        let _ = terminal.draw(|frame| ui::draw(frame, app));
+                    }
+                    Some(AppEvent::Key(key)) if event::is_ctrl_c(&key) => {
+                        cancelled.store(true, Ordering::Relaxed);
+                        app.push_output("(interrupted)", LineStyle::Status);
+                        let _ = terminal.draw(|frame| ui::draw(frame, app));
+                    }
+                    Some(AppEvent::Mouse(_)) => {}
+                    Some(_) => {}
+                    None => {
+                        app.clear_active_job();
+                        if cancelled.load(Ordering::Relaxed) {
+                            cancelled.store(false, Ordering::Relaxed);
+                        }
+                        return crate::tools::ToolResult::err("Event stream closed.".into());
+                    }
+                }
             }
-            Err(e) => return crate::tools::ToolResult::err(format!("Shell error: {e}")),
         }
     }
 }
