@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 
 use super::app::{App, AppMode, LineStyle};
 
@@ -21,33 +21,19 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// Normal mode: output pane + input line + optional permission prompt.
 fn draw_normal(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(5),    // output
+            Constraint::Length(3), // input
+        ])
+        .split(area);
+
+    draw_output(frame, app, chunks[0]);
+    draw_input(frame, app, chunks[1]);
 
     if app.pending_permission.is_some() {
-        // Three-way split: output, permission prompt, input
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(5),    // output
-                Constraint::Length(4), // permission prompt
-                Constraint::Length(3), // input (y/n/a)
-            ])
-            .split(area);
-
-        draw_output(frame, app, chunks[0]);
-        draw_permission(frame, app, chunks[1]);
-        draw_permission_input(frame, app, chunks[2]);
-    } else {
-        // Normal two-way split: output + input
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(5),    // output
-                Constraint::Length(3), // input
-            ])
-            .split(area);
-
-        draw_output(frame, app, chunks[0]);
-        draw_input(frame, app, chunks[1]);
+        draw_permission_modal(frame, app, area);
     }
 }
 
@@ -156,7 +142,12 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(input_widget, area);
         // Hide cursor while working
     } else {
-        let input_text = format!("you> {}", app.input);
+        let input_width = area.width.saturating_sub(2) as usize;
+        let prefix = "you> ";
+        let visible_width = input_width.saturating_sub(prefix.chars().count());
+        let (visible_input, cursor_col) =
+            visible_input_window(&app.input, app.cursor, visible_width);
+        let input_text = format!("{prefix}{visible_input}");
         let input_widget = Paragraph::new(input_text)
             .block(Block::default()
                 .borders(Borders::ALL)
@@ -166,7 +157,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(input_widget, area);
 
         // Show cursor only when input is active
-        let cursor_x = area.x + 1 + "you> ".len() as u16 + app.cursor as u16;
+        let cursor_x = area.x + 1 + prefix.chars().count() as u16 + cursor_col as u16;
         let cursor_y = area.y + 1;
         if cursor_x < area.x + area.width - 1 {
             frame.set_cursor_position((cursor_x, cursor_y));
@@ -174,27 +165,42 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Draw the permission prompt bar.
-fn draw_permission(frame: &mut Frame, app: &App, area: Rect) {
-    let text = app.pending_permission.as_deref().unwrap_or("");
-    // Show the prompt text (e.g. "Allow shell command?\n  $ rm src/tests.rs")
-    let lines: Vec<Line> = text.lines()
-        .take(3)
-        .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::Yellow))))
-        .collect();
-
-    let widget = Paragraph::new(lines)
-        .block(Block::default()
+/// Draw the permission prompt as a centered modal.
+fn draw_permission_modal(frame: &mut Frame, app: &App, area: Rect) {
+    let modal = centered_rect(area, 80, 7);
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Block::default()
             .borders(Borders::ALL)
             .title(" Permission Required ")
-            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        modal,
+    );
 
-    frame.render_widget(widget, area);
-}
+    let inner = Rect {
+        x: modal.x + 1,
+        y: modal.y + 1,
+        width: modal.width.saturating_sub(2),
+        height: modal.height.saturating_sub(2),
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(2), Constraint::Length(3)])
+        .split(inner);
 
-/// Draw the permission response input.
-fn draw_permission_input(frame: &mut Frame, app: &App, area: Rect) {
-    let input_text = format!("  {}", app.input);
+    let text = app.pending_permission.as_deref().unwrap_or("");
+    let widget = Paragraph::new(text.to_string())
+        .style(Style::default().fg(Color::Yellow))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(widget, chunks[0]);
+
+    let input_width = chunks[1].width.saturating_sub(2) as usize;
+    let prefix = "  ";
+    let visible_width = input_width.saturating_sub(prefix.chars().count());
+    let (visible_input, cursor_col) =
+        visible_input_window(&app.input, app.cursor, visible_width);
+    let input_text = format!("{prefix}{visible_input}");
     let widget = Paragraph::new(input_text)
         .block(Block::default()
             .borders(Borders::ALL)
@@ -202,13 +208,87 @@ fn draw_permission_input(frame: &mut Frame, app: &App, area: Rect) {
             .title(" [y]es / [n]o / [a]lways "))
         .style(Style::default().fg(Color::White));
 
-    frame.render_widget(widget, area);
+    frame.render_widget(widget, chunks[1]);
 
     // Show cursor
-    let cursor_x = area.x + 1 + "  ".len() as u16 + app.cursor as u16;
-    let cursor_y = area.y + 1;
-    if cursor_x < area.x + area.width - 1 {
+    let cursor_x = chunks[1].x + 1 + prefix.chars().count() as u16 + cursor_col as u16;
+    let cursor_y = chunks[1].y + 1;
+    if cursor_x < chunks[1].x + chunks[1].width - 1 {
         frame.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+fn centered_rect(area: Rect, width_percent: u16, height: u16) -> Rect {
+    let requested_width = area.width.saturating_mul(width_percent).saturating_div(100);
+    let width = requested_width.clamp(20, area.width.saturating_sub(2).max(1));
+    let height = height.min(area.height.saturating_sub(2).max(1));
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn visible_input_window(input: &str, cursor_byte: usize, max_chars: usize) -> (String, usize) {
+    if max_chars == 0 {
+        return (String::new(), 0);
+    }
+
+    let chars: Vec<char> = input.chars().collect();
+    let total_chars = chars.len();
+    let cursor_char = input[..cursor_byte.min(input.len())].chars().count();
+
+    if total_chars <= max_chars {
+        return (input.to_string(), cursor_char);
+    }
+
+    let mut start = cursor_char.saturating_add(1).saturating_sub(max_chars);
+    if start + max_chars > total_chars {
+        start = total_chars.saturating_sub(max_chars);
+    }
+    let end = (start + max_chars).min(total_chars);
+
+    let visible: String = chars[start..end].iter().collect();
+    let cursor_col = cursor_char.saturating_sub(start).min(max_chars.saturating_sub(1));
+    (visible, cursor_col)
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::layout::Rect;
+
+    use super::{centered_rect, visible_input_window};
+
+    #[test]
+    fn visible_input_window_keeps_short_input_unchanged() {
+        let (visible, cursor) = visible_input_window("hello", 5, 10);
+        assert_eq!(visible, "hello");
+        assert_eq!(cursor, 5);
+    }
+
+    #[test]
+    fn visible_input_window_scrolls_to_keep_cursor_visible() {
+        let input = "abcdefghijklmnopqrstuvwxyz";
+        let cursor_byte = input.len();
+        let (visible, cursor) = visible_input_window(input, cursor_byte, 8);
+        assert_eq!(visible, "stuvwxyz");
+        assert_eq!(cursor, 7);
+    }
+
+    #[test]
+    fn visible_input_window_handles_mid_string_cursor() {
+        let input = "abcdefghijklmnopqrstuvwxyz";
+        let cursor_byte = input.char_indices().nth(10).map(|(i, _)| i).unwrap();
+        let (visible, cursor) = visible_input_window(input, cursor_byte, 8);
+        assert_eq!(visible, "defghijk");
+        assert_eq!(cursor, 7);
+    }
+
+    #[test]
+    fn centered_rect_is_centered_and_bounded() {
+        let modal = centered_rect(Rect::new(0, 0, 100, 30), 80, 7);
+        assert_eq!(modal, Rect::new(10, 11, 80, 7));
     }
 }
 
