@@ -73,8 +73,8 @@ async fn path_jail_allows_relative_path() {
 async fn path_jail_blocks_write_absolute() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({"action": "write", "path": "/tmp/evil.txt", "content": "pwned"});
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let args = json!({"path": "/tmp/evil.txt", "content": "pwned"});
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 

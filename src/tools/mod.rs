@@ -1,16 +1,17 @@
 //! Tool system for miniswe.
 //!
-//! 6 top-level tools (file, code, web, plan, fix_file, mcp_use) with
+//! Top-level tools for grouped file/code/web operations plus focused editors.
 //! action-based dispatch for grouped tools. All file access is jailed
 //! to the project root. Destructive actions require user permission.
 //! After file edits, the index is incrementally updated.
 
+mod delete_file;
 pub mod edit;
-pub mod fix_file;
+pub mod edit_file;
 pub mod plan;
 mod read_file;
 mod search;
-mod shell;
+pub(crate) mod shell;
 pub mod snapshots;
 mod task_update;
 mod web;
@@ -69,6 +70,7 @@ pub async fn execute_tool(
         "file" => execute_file_tool(args, config, perms, lsp).await,
         "code" => execute_code_tool(args, config, lsp).await,
         "web" => execute_web_tool(args, config, perms).await,
+        "write_file" => execute_write_file_tool(args, config, perms, lsp).await,
         "plan" => {
             let action = args["action"].as_str().unwrap_or("");
             if action == "help" {
@@ -105,16 +107,16 @@ async fn execute_file_tool(
             read_file::execute(args, config).await
         }
 
-        "write" => {
+        "write" => Ok(ToolResult::err(
+            "file(action='write') is no longer supported. Use write_file(path, content) to create or overwrite a file, or write_file(path) to create a new empty file.".into(),
+        )),
+
+        "delete" => {
             let path = args["path"].as_str().unwrap_or("");
             if let Err(e) = perms.resolve_and_check_path(path) {
                 return Ok(ToolResult::err(e));
             }
-            let mut result = write_file::execute(args, config).await?;
-            if result.success {
-                finalize_file_edit(path, config, &mut result, lsp).await;
-            }
-            Ok(result)
+            delete_file::execute(args, config).await
         }
 
         "replace" => {
@@ -151,6 +153,23 @@ async fn execute_file_tool(
             "Unknown file action: '{action}'. Use 'help' to see available actions."
         ))),
     }
+}
+
+async fn execute_write_file_tool(
+    args: &Value,
+    config: &Config,
+    perms: &PermissionManager,
+    lsp: Option<&LspClient>,
+) -> Result<ToolResult> {
+    let path = args["path"].as_str().unwrap_or("");
+    if let Err(e) = perms.resolve_and_check_path(path) {
+        return Ok(ToolResult::err(e));
+    }
+    let mut result = write_file::execute(args, config).await?;
+    if result.success {
+        finalize_file_edit(path, config, &mut result, lsp).await;
+    }
+    Ok(result)
 }
 
 // ── code tool group ──────────────────────────────────────────────────
@@ -245,10 +264,10 @@ async fn execute_web_tool(
     }
 }
 
-/// Execute `fix_file` through the same permission and post-edit path used by
+/// Execute `edit_file` through the same permission and post-edit path used by
 /// file(write/replace). The inner fixer still owns patch generation and
 /// candidate validation.
-pub async fn execute_fix_file_tool(
+pub async fn execute_edit_file_tool(
     args: &Value,
     config: &Config,
     perms: &PermissionManager,
@@ -260,7 +279,7 @@ pub async fn execute_fix_file_tool(
         return Ok(ToolResult::err(e));
     }
 
-    let mut result = fix_file::execute(args, config, router, lsp).await?;
+    let mut result = edit_file::execute(args, config, router, lsp).await?;
     if result.success {
         finalize_file_edit(path, config, &mut result, lsp).await;
     }
@@ -442,7 +461,7 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
         hints.push("ACTION: A symbol was renamed/removed but references remain. Search for the old name and update.");
     }
     if joined.contains("unclosed delimiter") || joined.contains("unexpected closing") {
-        hints.push("ACTION: Broken syntax (missing/extra bracket). Use fix_file for the structural repair; replace is unreliable for structural fixes.");
+        hints.push("ACTION: Broken syntax (missing/extra bracket). Use edit_file for the structural repair; replace is unreliable for structural fixes.");
     }
     if joined.contains("mismatched types") {
         hints.push("ACTION: Type mismatch. Check the function signature and update the caller to pass the correct type.");

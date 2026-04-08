@@ -27,6 +27,7 @@ pub struct Config {
     pub context: ContextConfig,
     pub hardware: HardwareConfig,
     pub web: WebConfig,
+    pub shell: ShellConfig,
     pub logging: LogConfig,
     pub lsp: LspConfig,
     pub tools: ToolsConfig,
@@ -208,6 +209,14 @@ pub struct WebConfig {
     pub fetch_backend: String,
 }
 
+/// Shell tool configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShellConfig {
+    /// Default timeout in seconds for shell commands.
+    pub default_timeout_secs: u64,
+}
+
 /// LSP integration configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -266,6 +275,7 @@ impl Default for Config {
             context: ContextConfig::default(),
             hardware: HardwareConfig::default(),
             web: WebConfig::default(),
+            shell: ShellConfig::default(),
             logging: LogConfig::default(),
             lsp: LspConfig::default(),
             tools: ToolsConfig::default(),
@@ -328,6 +338,14 @@ impl Default for WebConfig {
             search_api_key: None,
             searxng_url: None,
             fetch_backend: "jina".into(),
+        }
+    }
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            default_timeout_secs: 60,
         }
     }
 }

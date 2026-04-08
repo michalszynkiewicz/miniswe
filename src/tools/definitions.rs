@@ -15,16 +15,15 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "file".into(),
-                description: "File operations: read, search, shell, write, delete, replace, revert. Use action='help' for details. For code edits, prefer edit_file. Use write with content for complete file contents, or omit content to create a new empty file. Use delete only for removing an existing file.".into(),
+                description: "File operations: read, search, shell, delete, replace, revert. Use action='help' for details. For code edits, prefer edit_file. Use delete only for removing an existing file.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "description": "One of: read, write, delete, replace, search, shell, revert, help"
+                            "description": "One of: read, delete, replace, search, shell, revert, help"
                         },
-                        "path": { "type": "string", "description": "File path (required for read/write/delete/replace/revert)" },
-                        "content": { "type": "string", "description": "Complete file contents for action='write'; omit only to create a new empty file, not for partial edits" },
+                        "path": { "type": "string", "description": "File path (required for read/delete/replace/revert)" },
                         "old": { "type": "string", "description": "Exact text to find (required for action='replace')" },
                         "new": { "type": "string", "description": "Replacement text (required for action='replace')" },
                         "all": { "type": "boolean", "description": "Replace all occurrences (for replace)" },
@@ -162,6 +161,27 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 }),
             },
         },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "write_file".into(),
+                description: "Create or overwrite a file. Provide complete file contents in `content`, or omit `content` to create a new empty file. Do not use for partial edits to existing code; use edit_file instead.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path relative to project root"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Complete replacement file contents. Omit only to create a new empty file."
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        },
     ]
 }
 
@@ -200,9 +220,6 @@ pub fn file_help() -> &'static str {
 Available actions for `file`:
 
 - read: Read a file. Params: path (required), start_line, end_line
-- write: Create or overwrite a file. Params: path (required), content (optional, COMPLETE file text)
-  Example: {\"action\":\"write\",\"path\":\"src/bin/hello.rs\",\"content\":\"fn main() {\\n    println!(\\\"hello\\\");\\n}\\n\"}
-  Omit content only to create a new empty file. For edits to existing code, prefer edit_file unless you are providing the whole file.
 - delete: Delete an existing file. Params: path (required)
   Example: {\"action\":\"delete\",\"path\":\"src/bin/old.rs\"}
 - replace: Replace text. Params: path (required), old (required), new (required), all (optional bool)

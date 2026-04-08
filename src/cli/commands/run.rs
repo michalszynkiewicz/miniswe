@@ -25,8 +25,13 @@ use crate::tools::permissions::{Action, PermissionManager};
 use crate::tui;
 
 const PLAN_CHECKPOINT_AFTER_EDITS: u32 = 5;
-const PLAN_CHECKPOINT_MESSAGE: &str = "\
-Plan checkpoint pending. Review the plan before more edits: use plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet.";
+const PLAN_HARD_BLOCK_AFTER_EDITS: u32 = 8;
+const PLAN_PROGRESS_NUDGE: &str = "\
+PLAN STATUS: If this edit completed one of your current plan steps, mark it now with plan(action='check', step=N). If the work split changed, use plan(action='refine') or plan(action='set').";
+const PLAN_CHECKPOINT_WARNING: &str = "\
+PLAN CHECKPOINT: You have made 5 edits since the last successful plan action. Before making many more edits, review the plan: use plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet. Further edits may be blocked if you continue without any plan action.";
+const PLAN_CHECKPOINT_BLOCK_MESSAGE: &str = "\
+Plan checkpoint required before more edits. You have continued editing after the checkpoint warning. Use any successful plan action now: plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet.";
 
 /// Run the agent for a single message.
 pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()> {
@@ -135,8 +140,9 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let mut had_error = false;
     let mut user_continued = false;
 
-    // Track tool calls for loop detection
-    let mut recent_calls: Vec<String> = Vec::new();
+    // Track consecutive identical tool calls for loop detection
+    let mut last_call_key: Option<String> = None;
+    let mut same_call_streak = 0u32;
     let mut consecutive_loops = 0u32;
     let mut calls_since_last_edit = 0u32;
     let mut edit_fail_count: std::collections::HashMap<String, u32> =
@@ -245,6 +251,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             tools: Some(tool_defs.clone()),
             tool_choice: None,
         };
+        log.llm_request(&request);
 
         tui::print_separator();
 
@@ -365,23 +372,24 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
             let args_summary = summarize_args(&tc.function.name, &args);
 
-            // Detect tool call loops
-            let call_key = format!("{}:{}", tc.function.name, args_summary);
-            recent_calls.push(call_key.clone());
-            if recent_calls.len() > 6 {
-                recent_calls.remove(0);
+            // Detect tool call loops: only identical calls repeated consecutively.
+            let call_key = loop_call_key(&tc.function.name, &args);
+            if last_call_key.as_ref() == Some(&call_key) {
+                same_call_streak += 1;
+            } else {
+                last_call_key = Some(call_key.clone());
+                same_call_streak = 1;
             }
-            let repeat_count = recent_calls.iter().filter(|c| *c == &call_key).count();
-            if repeat_count >= 3 {
-                log.loop_detected(&tc.function.name, &args_summary, repeat_count);
+            if same_call_streak >= 3 {
+                log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
                 tui::print_error(&format!(
                     "Loop detected: {}({}) called {} times — stopping",
-                    tc.function.name, args_summary, repeat_count
+                    tc.function.name, args_summary, same_call_streak
                 ));
                 consecutive_loops += 1;
                 let result_msg = Message::tool_result(
                     &tc.id,
-                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or fix_file for semantic edits.",
+                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits.",
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
@@ -404,7 +412,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             if plan_only
                 && ((tc.function.name == "file"
                     && matches!(file_action, "write" | "replace" | "shell"))
-                    || tc.function.name == "fix_file")
+                    || matches!(tc.function.name.as_str(), "edit_file" | "write_file"))
             {
                 let result_msg = Message::tool_result(
                     &tc.id,
@@ -419,7 +427,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             // Write gating: require plan before write tools
             let is_write_action = (tc.function.name == "file"
                 && matches!(file_action, "write" | "replace"))
-                || tc.function.name == "fix_file";
+                || matches!(tc.function.name.as_str(), "edit_file" | "write_file");
             if config.tools.plan && !tools::plan::plan_exists(&config) && is_write_action {
                 let result_msg = Message::tool_result(
                     &tc.id,
@@ -430,8 +438,12 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 tui::print_tool_result(&tc.function.name, false, "blocked: no plan");
                 continue;
             }
-            if config.tools.plan && plan_checkpoint_pending && is_write_action {
-                let result_msg = Message::tool_result(&tc.id, PLAN_CHECKPOINT_MESSAGE);
+            if config.tools.plan
+                && plan_checkpoint_pending
+                && successful_edits_since_plan_update >= PLAN_HARD_BLOCK_AFTER_EDITS
+                && is_write_action
+            {
+                let result_msg = Message::tool_result(&tc.id, PLAN_CHECKPOINT_BLOCK_MESSAGE);
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
                 tui::print_tool_result(&tc.function.name, false, "blocked: plan checkpoint");
@@ -464,8 +476,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("plan error: {e}")),
                 }
-            } else if tc.function.name == "fix_file" {
-                match tools::execute_fix_file_tool(
+            } else if tc.function.name == "edit_file" {
+                match tools::execute_edit_file_tool(
                     &args,
                     &config,
                     &perms,
@@ -475,8 +487,10 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 .await
                 {
                     Ok(r) => r,
-                    Err(e) => crate::tools::ToolResult::err(format!("fix_file error: {e}")),
+                    Err(e) => crate::tools::ToolResult::err(format!("edit_file error: {e}")),
                 }
+            } else if tc.function.name == "file" && file_action == "shell" {
+                handle_shell_tool_run(&args, &config, &cancelled)
             } else if tc.function.name == "mcp_use" {
                 let server = args["server"].as_str().unwrap_or("");
                 let tool = args["tool"].as_str().unwrap_or("");
@@ -531,28 +545,37 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             // A successful file write means code changed — reset trackers.
             let is_file_write = (tc.function.name == "file"
                 && matches!(file_action, "replace" | "write"))
-                || tc.function.name == "fix_file";
+                || matches!(tc.function.name.as_str(), "edit_file" | "write_file");
             if result.success && is_file_write {
-                recent_calls.clear();
+                last_call_key = None;
+                same_call_streak = 0;
                 calls_since_last_edit = 0;
                 if config.tools.plan {
+                    if tools::plan::plan_exists(&config) {
+                        result.content.push_str("\n");
+                        result.content.push_str(PLAN_PROGRESS_NUDGE);
+                    }
                     successful_edits_since_plan_update += 1;
                     if successful_edits_since_plan_update >= PLAN_CHECKPOINT_AFTER_EDITS {
                         plan_checkpoint_pending = true;
+                    }
+                    if successful_edits_since_plan_update == PLAN_CHECKPOINT_AFTER_EDITS {
+                        result.content.push_str("\n");
+                        result.content.push_str(PLAN_CHECKPOINT_WARNING);
                     }
                 }
             } else {
                 calls_since_last_edit += 1;
             }
 
-            // Track replace failures per file — steer semantic edits to fix_file.
+            // Track replace failures per file — steer semantic edits to edit_file.
             if tc.function.name == "file" && file_action == "replace" && !result.success {
                 let path = args["path"].as_str().unwrap_or("").to_string();
                 let count = edit_fail_count.entry(path.clone()).or_insert(0);
                 *count += 1;
                 if *count >= 2 {
                     result.content.push_str(&format!(
-                        "\nERROR: replace has failed {} times on {path}. STOP using replace. Use fix_file(path, task) for this semantic edit; use file(action='write') only if you provide the complete file content.\n",
+                        "\nERROR: replace has failed {} times on {path}. STOP using replace. Use edit_file(path, task) for this semantic edit; use write_file(path, content) only when providing the complete replacement file content.\n",
                         count
                     ));
                 }
@@ -568,7 +591,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             messages.push(Message::user(
                 "[WARNING: You have used 20+ tool calls without making any edits. \
                  You likely have enough information. Start making changes now. \
-                 Use fix_file for semantic file edits. \
+                 Use edit_file for semantic file edits. \
                  If you're stuck, explain what's blocking you.]",
             ));
         }
@@ -589,6 +612,47 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     }
 
     Ok(())
+}
+
+fn handle_shell_tool_run(
+    args: &serde_json::Value,
+    config: &Config,
+    cancelled: &Arc<AtomicBool>,
+) -> crate::tools::ToolResult {
+    let timeout_secs = args["timeout"]
+        .as_u64()
+        .unwrap_or(config.shell.default_timeout_secs);
+    let command = args["command"].as_str().unwrap_or("");
+    let mut running = match crate::tools::shell::start(args, config) {
+        Ok(r) => r,
+        Err(e) => return crate::tools::ToolResult::err(e.to_string()),
+    };
+
+    loop {
+        match crate::tools::shell::wait(running, timeout_secs, config, Some(cancelled.as_ref())) {
+            Ok(crate::tools::shell::ShellWaitOutcome::Completed(result)) => return result,
+            Ok(crate::tools::shell::ShellWaitOutcome::TimedOut(timed_out)) => {
+                running = timed_out;
+                let prompt = format!(
+                    "Shell command still running after {timeout_secs}s.\n  $ {command}\n[c]ontinue waiting / [k]ill: "
+                );
+                let response = crate::tui::read_input(&prompt)
+                    .unwrap_or_else(|| "k".into())
+                    .trim()
+                    .to_lowercase();
+                if response == "c" || response == "continue" {
+                    crate::tui::print_status("continuing to wait for shell command...");
+                } else {
+                    return crate::tools::shell::kill(running, timeout_secs);
+                }
+            }
+            Ok(crate::tools::shell::ShellWaitOutcome::Interrupted(timed_out)) => {
+                cancelled.store(false, Ordering::Relaxed);
+                return crate::tools::shell::kill(timed_out, timeout_secs);
+            }
+            Err(e) => return crate::tools::ToolResult::err(format!("Shell error: {e}")),
+        }
+    }
 }
 
 /// Replace old tool results with compressed summaries using per-type thresholds.
@@ -629,7 +693,11 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
             }
             "shell" => {
                 let cmd = args["command"].as_str().unwrap_or("?");
-                format!("shell {}", crate::truncate_chars(cmd, 40))
+                let timeout = args["timeout"].as_u64();
+                match timeout {
+                    Some(t) => format!("shell {} [timeout={t}]", crate::truncate_chars(cmd, 40)),
+                    None => format!("shell {}", crate::truncate_chars(cmd, 40)),
+                }
             }
             "revert" => "revert".to_string(),
             _ => format!("{action}"),
@@ -656,7 +724,7 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
             "refine" => format!("refine step {}", args["step"].as_u64().unwrap_or(0)),
             _ => action.to_string(),
         },
-        "fix_file" => {
+        "edit_file" => {
             let path = args["path"].as_str().unwrap_or("?");
             let task = args["task"].as_str().unwrap_or("");
             let lsp = args["lsp_validation"].as_str().unwrap_or("auto");
@@ -668,12 +736,46 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                 format!("{path}: {} [lsp={lsp}]", crate::truncate_chars(task, 58))
             }
         }
+        "write_file" => {
+            let path = args["path"].as_str().unwrap_or("?");
+            format!("write {path}")
+        }
         "mcp_use" => {
             let server = args["server"].as_str().unwrap_or("?");
             let tool = args["tool"].as_str().unwrap_or("?");
             format!("{server}/{tool}")
         }
         _ => format!("{args}"),
+    }
+}
+
+fn loop_call_key(tool_name: &str, args: &serde_json::Value) -> String {
+    format!("{tool_name}:{}", canonical_json(args))
+}
+
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::Value::Array(items) => {
+            let inner = items.iter().map(canonical_json).collect::<Vec<_>>().join(",");
+            format!("[{inner}]")
+        }
+        serde_json::Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let inner = entries
+                .into_iter()
+                .map(|(k, v)| {
+                    let key = serde_json::to_string(k).unwrap_or_else(|_| "\"\"".into());
+                    format!("{key}:{}", canonical_json(v))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
     }
 }
 

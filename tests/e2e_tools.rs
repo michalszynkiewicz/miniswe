@@ -125,11 +125,11 @@ async fn read_file_rejects_large_file() {
 async fn write_file_creates_new_file() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({"action": "write",
+    let args = json!({
         "path": "new_file.txt",
         "content": "hello world\nsecond line\n"
     });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -145,11 +145,11 @@ async fn write_file_creates_new_file() {
 async fn write_file_creates_parent_dirs() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({"action": "write",
+    let args = json!({
         "path": "deeply/nested/dir/file.txt",
         "content": "nested content"
     });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -165,11 +165,11 @@ async fn write_file_overwrites_existing() {
 
     fs::write(helpers::project_path(&config, "existing.txt"), "old content").unwrap();
 
-    let args = json!({"action": "write",
+    let args = json!({
         "path": "existing.txt",
         "content": "new content"
     });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -183,8 +183,8 @@ async fn write_file_overwrites_existing() {
 async fn write_file_without_content_creates_empty_file() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({"action": "write", "path": "empty.txt"});
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let args = json!({"path": "empty.txt"});
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -204,8 +204,8 @@ async fn write_file_without_content_rejects_existing_file() {
 
     fs::write(helpers::project_path(&config, "existing.txt"), "old content").unwrap();
 
-    let args = json!({"action": "write", "path": "existing.txt"});
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let args = json!({"path": "existing.txt"});
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -570,7 +570,7 @@ async fn file_help_returns_action_list() {
 
     assert!(result.success);
     assert!(result.content.contains("read"), "help should list read action: {}", result.content);
-    assert!(result.content.contains("write"), "help should list write action: {}", result.content);
+    assert!(!result.content.contains("\n- write:"), "file help should no longer advertise write: {}", result.content);
     assert!(result.content.contains("replace"), "help should list replace action: {}", result.content);
 }
 
@@ -621,8 +621,8 @@ async fn read_file_missing_path() {
 async fn write_file_missing_content() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({"action": "write", "path": "file.txt"});
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let args = json!({"path": "file.txt"});
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -869,9 +869,9 @@ fn tools_has_grouped_tools() {
     assert!(names.contains(&"web"), "should have web");
     assert!(names.contains(&"plan"), "should have plan");
     assert!(names.contains(&"edit_file"), "should have edit_file");
+    assert!(names.contains(&"write_file"), "should have write_file");
     // Old flat tools should be gone
     assert!(!names.contains(&"read_file"), "read_file should be gone");
-    assert!(!names.contains(&"write_file"), "write_file should be gone");
     assert!(!names.contains(&"replace"), "flat replace should be gone");
     assert!(!names.contains(&"search"), "flat search should be gone");
     assert!(!names.contains(&"shell"), "flat shell should be gone");
@@ -1085,8 +1085,8 @@ async fn write_file_response_shows_tail() {
     let (_tmp, config) = helpers::create_test_project();
 
     let content = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
-    let args = json!({"action": "write", "path": "new.txt", "content": content});
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let args = json!({"path": "new.txt", "content": content});
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await.unwrap();
 
     assert!(result.success);

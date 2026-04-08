@@ -9,6 +9,7 @@ use crossterm::ExecutableCommand;
 use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
+use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
@@ -26,8 +27,30 @@ use crate::tui::event::{self, AppEvent};
 use crate::tui::ui;
 
 const PLAN_CHECKPOINT_AFTER_EDITS: u32 = 5;
-const PLAN_CHECKPOINT_MESSAGE: &str = "\
-Plan checkpoint pending. Review the plan before more edits: use plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet.";
+const PLAN_HARD_BLOCK_AFTER_EDITS: u32 = 8;
+const PLAN_PROGRESS_NUDGE: &str = "\
+PLAN STATUS: If this edit completed one of your current plan steps, mark it now with plan(action='check', step=N). If the work split changed, use plan(action='refine') or plan(action='set').";
+const PLAN_CHECKPOINT_WARNING: &str = "\
+PLAN CHECKPOINT: You have made 5 edits since the last successful plan action. Before making many more edits, review the plan: use plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet. Further edits may be blocked if you continue without any plan action.";
+const PLAN_CHECKPOINT_BLOCK_MESSAGE: &str = "\
+Plan checkpoint required before more edits. You have continued editing after the checkpoint warning. Use any successful plan action now: plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet.";
+
+struct ReplTerminalGuard;
+
+impl ReplTerminalGuard {
+    fn enter() -> Result<Self> {
+        terminal::enable_raw_mode()?;
+        io::stdout().execute(EnterAlternateScreen)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ReplTerminalGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+    }
+}
 
 /// Run the interactive REPL with TUI.
 pub async fn run(config: Config, headless: bool) -> Result<()> {
@@ -86,8 +109,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
     let mcp_summary = mcp_registry.as_ref().and_then(|r| r.context_summary());
 
     // Set up terminal
-    terminal::enable_raw_mode()?;
-    io::stdout().execute(EnterAlternateScreen)?;
+    let _terminal_guard = ReplTerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
@@ -190,7 +212,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                         }
 
                         match key.code {
-                            KeyCode::Enter => {
+                            KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
                                 let input = app.submit_input();
                                 if input.is_empty() {
                                     continue;
@@ -324,6 +346,8 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                 }
             }
 
+            AppEvent::Mouse(_) => {}
+
             // Events from agent loop
             AppEvent::Token(token) => {
                 app.push_token(&token);
@@ -365,9 +389,6 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         }
     }
 
-    terminal::disable_raw_mode()?;
-    io::stdout().execute(LeaveAlternateScreen)?;
-
     Ok(())
 }
 
@@ -391,8 +412,9 @@ async fn run_agent_loop(
 ) {
     let mut round = 0;
     let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
-    // Track recent tool calls to detect loops
-    let mut recent_calls: Vec<String> = Vec::new();
+    // Track consecutive identical tool calls to detect loops
+    let mut last_call_key: Option<String> = None;
+    let mut same_call_streak = 0u32;
     let mut edit_fail_count: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
     let mut successful_edits_since_plan_update = 0u32;
@@ -430,6 +452,7 @@ async fn run_agent_loop(
             tools: Some(tool_defs.to_vec()),
             tool_choice: None,
         };
+        log.llm_request(&request);
 
         cancelled.store(false, Ordering::Relaxed);
         app.is_thinking = true;
@@ -531,25 +554,26 @@ async fn run_agent_loop(
 
             let args_summary = summarize_args(&tc.function.name, &args);
 
-            // Detect tool call loops (same call repeated 3+ times in last 6 calls)
-            let call_key = format!("{}:{}", tc.function.name, args_summary);
-            recent_calls.push(call_key.clone());
-            if recent_calls.len() > 6 {
-                recent_calls.remove(0);
+            // Detect tool call loops: only identical calls repeated consecutively.
+            let call_key = loop_call_key(&tc.function.name, &args);
+            if last_call_key.as_ref() == Some(&call_key) {
+                same_call_streak += 1;
+            } else {
+                last_call_key = Some(call_key.clone());
+                same_call_streak = 1;
             }
-            let repeat_count = recent_calls.iter().filter(|c| *c == &call_key).count();
-            if repeat_count >= 3 {
-                log.loop_detected(&tc.function.name, &args_summary, repeat_count);
+            if same_call_streak >= 3 {
+                log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
                 app.push_output(
                     &format!(
                         "  ✗ Loop detected: {}({}) called {} times — stopping",
-                        tc.function.name, args_summary, repeat_count
+                        tc.function.name, args_summary, same_call_streak
                     ),
                     LineStyle::Error,
                 );
                 let result_msg = Message::tool_result(
                     &tc.id,
-                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times with no edits in between. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or fix_file for semantic edits.",
+                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits.",
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
@@ -567,18 +591,7 @@ async fn run_agent_loop(
             let _ = terminal.draw(|frame| ui::draw(frame, app));
 
             // Determine if this tool call needs a permission prompt
-            let perm_action = match tc.function.name.as_str() {
-                "shell" => Some(Action::Shell(args["command"].as_str().unwrap_or("").into())),
-                "web_search" => Some(Action::WebSearch(
-                    args["query"].as_str().unwrap_or("").into(),
-                )),
-                "web_fetch" => Some(Action::WebFetch(args["url"].as_str().unwrap_or("").into())),
-                "mcp_use" => Some(Action::McpUse(
-                    args["server"].as_str().unwrap_or("").into(),
-                    args["tool"].as_str().unwrap_or("").into(),
-                )),
-                _ => None,
-            };
+            let perm_action = permission_action(&tc.function.name, &args);
 
             // Check permission via TUI prompt (not raw stderr)
             let mut perm_denied = false;
@@ -609,12 +622,24 @@ async fn run_agent_loop(
                         match response.as_str() {
                             "y" | "yes" => {
                                 perms.approve(action, false);
+                                app.push_output(
+                                    "  · Permission granted, running tool...",
+                                    LineStyle::Status,
+                                );
                             }
                             "a" | "always" => {
                                 perms.approve(action, true);
+                                app.push_output(
+                                    "  · Permission granted and saved, running tool...",
+                                    LineStyle::Status,
+                                );
                             }
                             _ => {
                                 perm_denied = true;
+                                app.push_output(
+                                    "  · Permission denied.",
+                                    LineStyle::Status,
+                                );
                             }
                         }
 
@@ -639,9 +664,13 @@ async fn run_agent_loop(
             let file_action = args["action"].as_str().unwrap_or("");
             let is_write_action = (tc.function.name == "file"
                 && matches!(file_action, "write" | "replace"))
-                || tc.function.name == "fix_file";
-            if config.tools.plan && plan_checkpoint_pending && is_write_action {
-                let result_msg = Message::tool_result(&tc.id, PLAN_CHECKPOINT_MESSAGE);
+                || matches!(tc.function.name.as_str(), "edit_file" | "write_file");
+            if config.tools.plan
+                && plan_checkpoint_pending
+                && successful_edits_since_plan_update >= PLAN_HARD_BLOCK_AFTER_EDITS
+                && is_write_action
+            {
+                let result_msg = Message::tool_result(&tc.id, PLAN_CHECKPOINT_BLOCK_MESSAGE);
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
                 app.push_output("  ✗ blocked: plan checkpoint", LineStyle::ToolErr);
@@ -660,8 +689,8 @@ async fn run_agent_loop(
                     },
                     None => crate::tools::ToolResult::err("No MCP servers connected".into()),
                 }
-            } else if tc.function.name == "fix_file" {
-                match crate::tools::execute_fix_file_tool(
+            } else if tc.function.name == "edit_file" {
+                match crate::tools::execute_edit_file_tool(
                     &args,
                     config,
                     perms,
@@ -671,13 +700,15 @@ async fn run_agent_loop(
                 .await
                 {
                     Ok(r) => r,
-                    Err(e) => crate::tools::ToolResult::err(format!("fix_file error: {e}")),
+                    Err(e) => crate::tools::ToolResult::err(format!("edit_file error: {e}")),
                 }
             } else if tc.function.name == "plan" {
                 match tools::plan::execute(&args, config, round).await {
                     Ok(r) => r,
                     Err(e) => crate::tools::ToolResult::err(format!("plan error: {e}")),
                 }
+            } else if tc.function.name == "file" && file_action == "shell" {
+                handle_shell_tool_repl(&args, config, app, rx, terminal, cancelled).await
             } else {
                 match tools::execute_tool(&tc.function.name, &args, config, perms, lsp.as_deref())
                     .await
@@ -717,13 +748,22 @@ async fn run_agent_loop(
             // Successful file write = code changed, reset loop detector
             let is_file_write = (tc.function.name == "file"
                 && matches!(file_action, "replace" | "write"))
-                || tc.function.name == "fix_file";
+                || matches!(tc.function.name.as_str(), "edit_file" | "write_file");
             if result.success && is_file_write {
-                recent_calls.clear();
+                last_call_key = None;
+                same_call_streak = 0;
                 if config.tools.plan {
+                    if tools::plan::plan_exists(config) {
+                        result.content.push_str("\n");
+                        result.content.push_str(PLAN_PROGRESS_NUDGE);
+                    }
                     successful_edits_since_plan_update += 1;
                     if successful_edits_since_plan_update >= PLAN_CHECKPOINT_AFTER_EDITS {
                         plan_checkpoint_pending = true;
+                    }
+                    if successful_edits_since_plan_update == PLAN_CHECKPOINT_AFTER_EDITS {
+                        result.content.push_str("\n");
+                        result.content.push_str(PLAN_CHECKPOINT_WARNING);
                     }
                 }
             }
@@ -734,7 +774,7 @@ async fn run_agent_loop(
                 *count += 1;
                 if *count >= 2 {
                     result.content.push_str(&format!(
-                        "\nERROR: replace has failed {} times on {path}. STOP using replace. Use fix_file(path, task) for this semantic edit; use file(action='write') only if you provide the complete file content.\n",
+                        "\nERROR: replace has failed {} times on {path}. STOP using replace. Use edit_file(path, task) for this semantic edit; use write_file(path, content) only when providing the complete replacement file content.\n",
                         count
                     ));
                 }
@@ -841,7 +881,7 @@ fn mask_old_tool_results(
 /// Create a brief summary of tool arguments for display.
 fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
     match tool_name {
-        "file" | "code" | "web" | "plan" | "fix_file" | "mcp_use" => {
+        "file" | "code" | "web" | "plan" | "edit_file" | "write_file" | "mcp_use" => {
             // Delegate to run.rs summarize_args pattern
             let action = args["action"].as_str().unwrap_or("");
             match (tool_name, action) {
@@ -866,7 +906,11 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                 }
                 ("file", "shell") => {
                     let cmd = args["command"].as_str().unwrap_or("?");
-                    format!("shell {}", crate::truncate_chars(cmd, 40))
+                    let timeout = args["timeout"].as_u64();
+                    match timeout {
+                        Some(t) => format!("shell {} [timeout={t}]", crate::truncate_chars(cmd, 40)),
+                        None => format!("shell {}", crate::truncate_chars(cmd, 40)),
+                    }
                 }
                 ("plan", "check") => {
                     format!("check step {}", args["step"].as_u64().unwrap_or(0))
@@ -875,7 +919,7 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                     format!("refine step {}", args["step"].as_u64().unwrap_or(0))
                 }
                 ("plan", "scratchpad") => "scratchpad".to_string(),
-                ("fix_file", _) => {
+                ("edit_file", _) => {
                     let path = args["path"].as_str().unwrap_or("?");
                     let task = args["task"].as_str().unwrap_or("");
                     let lsp = args["lsp_validation"].as_str().unwrap_or("auto");
@@ -886,6 +930,10 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                     } else {
                         format!("{path}: {} [lsp={lsp}]", crate::truncate_chars(task, 58))
                     }
+                }
+                ("write_file", _) => {
+                    let path = args["path"].as_str().unwrap_or("?");
+                    format!("write {path}")
                 }
                 ("mcp_use", _) => {
                     let server = args["server"].as_str().unwrap_or("?");
@@ -899,10 +947,62 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
     }
 }
 
+fn loop_call_key(tool_name: &str, args: &serde_json::Value) -> String {
+    format!("{tool_name}:{}", canonical_json(args))
+}
+
+fn permission_action(tool_name: &str, args: &serde_json::Value) -> Option<Action> {
+    match tool_name {
+        "shell" => Some(Action::Shell(args["command"].as_str().unwrap_or("").into())),
+        "file" if args["action"].as_str().unwrap_or("") == "shell" => {
+            Some(Action::Shell(args["command"].as_str().unwrap_or("").into()))
+        }
+        "web_search" => Some(Action::WebSearch(
+            args["query"].as_str().unwrap_or("").into(),
+        )),
+        "web_fetch" => Some(Action::WebFetch(args["url"].as_str().unwrap_or("").into())),
+        "mcp_use" => Some(Action::McpUse(
+            args["server"].as_str().unwrap_or("").into(),
+            args["tool"].as_str().unwrap_or("").into(),
+        )),
+        _ => None,
+    }
+}
+
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::Value::Array(items) => {
+            let inner = items.iter().map(canonical_json).collect::<Vec<_>>().join(",");
+            format!("[{inner}]")
+        }
+        serde_json::Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let inner = entries
+                .into_iter()
+                .map(|(k, v)| {
+                    let key = serde_json::to_string(k).unwrap_or_else(|_| "\"\"".into());
+                    format!("{key}:{}", canonical_json(v))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use serde_json::json;
+    use tokio::sync::mpsc;
 
     #[test]
     fn file_search_summary_uses_pattern_and_path() {
@@ -927,14 +1027,74 @@ mod tests {
 
         assert_eq!(summarize_args("plan", &args), "refine step 2");
     }
+
+    #[test]
+    fn grouped_file_shell_maps_to_shell_permission_action() {
+        let args = json!({
+            "action": "shell",
+            "command": "python -m http.server",
+        });
+
+        match permission_action("file", &args) {
+            Some(Action::Shell(cmd)) => assert_eq!(cmd, "python -m http.server"),
+            _ => panic!("expected grouped file shell to require shell permission"),
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_prompt_accepts_single_key_without_enter() {
+        let mut app = App::new();
+        app.pending_permission = Some("Allow shell command?".into());
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        tx.send(AppEvent::Key(KeyEvent {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }))
+        .unwrap();
+
+        let response = wait_for_permission_input(&mut app, &mut rx, &mut terminal).await;
+        assert_eq!(response, "y");
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn permission_prompt_accepts_raw_carriage_return_as_enter() {
+        let mut app = App::new();
+        app.pending_permission = Some("Allow shell command?".into());
+        app.input = "yes".into();
+        app.cursor = app.input.len();
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        tx.send(AppEvent::Key(KeyEvent {
+            code: KeyCode::Char('\r'),
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }))
+        .unwrap();
+
+        let response = wait_for_permission_input(&mut app, &mut rx, &mut terminal).await;
+        assert_eq!(response, "yes");
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
+    }
 }
 
 /// Wait for the user to respond to a permission prompt in the TUI.
 /// Blocks until Enter is pressed, returns the trimmed input (e.g., "y", "n", "a").
-async fn wait_for_permission_input(
+async fn wait_for_modal_input(
     app: &mut App,
     rx: &mut mpsc::UnboundedReceiver<AppEvent>,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<impl Backend>,
+    instant_keys: &[char],
 ) -> String {
     loop {
         let _ = terminal.draw(|frame| ui::draw(frame, app));
@@ -952,7 +1112,23 @@ async fn wait_for_permission_input(
                     app.cursor = 0;
                     return response;
                 }
-                KeyCode::Char(c) => app.insert_char(c),
+                KeyCode::Char('\n') | KeyCode::Char('\r') => {
+                    let response = app.input.trim().to_lowercase();
+                    app.input.clear();
+                    app.cursor = 0;
+                    return response;
+                }
+                KeyCode::Char(c) => {
+                    if key.modifiers.is_empty() {
+                        let lower = c.to_ascii_lowercase();
+                        if app.input.is_empty() && instant_keys.contains(&lower) {
+                            app.input.clear();
+                            app.cursor = 0;
+                            return lower.to_string();
+                        }
+                    }
+                    app.insert_char(c);
+                }
                 KeyCode::Backspace => app.delete_char(),
                 KeyCode::Esc => {
                     app.input.clear();
@@ -963,6 +1139,65 @@ async fn wait_for_permission_input(
             },
             AppEvent::Tick => {} // re-render
             _ => {}
+        }
+    }
+}
+
+async fn wait_for_permission_input(
+    app: &mut App,
+    rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+    terminal: &mut Terminal<impl Backend>,
+) -> String {
+    wait_for_modal_input(app, rx, terminal, &['y', 'n', 'a']).await
+}
+
+async fn handle_shell_tool_repl(
+    args: &serde_json::Value,
+    config: &Config,
+    app: &mut App,
+    rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    cancelled: &Arc<AtomicBool>,
+) -> crate::tools::ToolResult {
+    let timeout_secs = args["timeout"]
+        .as_u64()
+        .unwrap_or(config.shell.default_timeout_secs);
+    let command = args["command"].as_str().unwrap_or("");
+    let mut running = match crate::tools::shell::start(args, config) {
+        Ok(r) => r,
+        Err(e) => return crate::tools::ToolResult::err(e.to_string()),
+    };
+
+    loop {
+        match crate::tools::shell::wait(running, timeout_secs, config, Some(cancelled.as_ref())) {
+            Ok(crate::tools::shell::ShellWaitOutcome::Completed(result)) => return result,
+            Ok(crate::tools::shell::ShellWaitOutcome::TimedOut(timed_out)) => {
+                running = timed_out;
+                app.pending_permission = Some(format!(
+                    "Shell command has been running for {timeout_secs}s:\n  $ {command}\nChoose: [c]ontinue waiting or [k]ill the command."
+                ));
+                app.input.clear();
+                app.cursor = 0;
+                let _ = terminal.draw(|frame| ui::draw(frame, app));
+                let response = wait_for_modal_input(app, rx, terminal, &['c', 'k']).await;
+                app.pending_permission = None;
+                match response.as_str() {
+                    "c" => {
+                        app.push_output("  · Continuing to wait for shell command...", LineStyle::Status);
+                    }
+                    _ => {
+                        app.push_output("  · Shell command killed.", LineStyle::Status);
+                        return crate::tools::shell::kill(running, timeout_secs);
+                    }
+                }
+                let _ = terminal.draw(|frame| ui::draw(frame, app));
+            }
+            Ok(crate::tools::shell::ShellWaitOutcome::Interrupted(timed_out)) => {
+                app.push_output("  · Shell command interrupted.", LineStyle::Status);
+                cancelled.store(false, Ordering::Relaxed);
+                return crate::tools::shell::kill(timed_out, timeout_secs);
+            }
+            Err(e) => return crate::tools::ToolResult::err(format!("Shell error: {e}")),
         }
     }
 }

@@ -194,6 +194,15 @@ impl SessionLog {
         self.write(&format!("[trace] {msg}"));
     }
 
+    /// Log the full LLM request payload (trace level).
+    pub fn llm_request(&self, request: &crate::llm::ChatRequest) {
+        if self.level < LogLevel::Trace {
+            return;
+        }
+        let body = serde_json::to_string(request).unwrap_or_else(|_| "{}".into());
+        self.write(&format!("[llm:request] {}", truncate(&body, 6000)));
+    }
+
     // ── Internal ────────────────────────────────────────────────────
 
     fn write(&self, line: &str) {

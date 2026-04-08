@@ -119,11 +119,11 @@ async fn write_file_includes_tail() {
         .collect();
     let content = lines.join("\n") + "\n";
 
-    let args = json!({"action": "write",
+    let args = json!({
         "path": "tail_test.txt",
         "content": content
     });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -143,11 +143,11 @@ async fn write_file_includes_tail() {
 async fn write_file_short_file_shows_all_in_tail() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({"action": "write",
+    let args = json!({
         "path": "short.txt",
         "content": "line 1\nline 2\nline 3\n"
     });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -177,11 +177,11 @@ async fn auto_check_includes_source_context_on_error() {
     .unwrap();
 
     // Use write_file to trigger auto_check
-    let args = json!({"action": "write",
+    let args = json!({
         "path": "src/main.rs",
         "content": "fn main() {\n    let x: u32 = \"hello\";\n    println!(\"{x}\");\n}\n"
     });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -215,11 +215,11 @@ async fn auto_check_ok_on_valid_code() {
     .unwrap();
     fs::create_dir_all(helpers::project_path(&config, "src")).unwrap();
 
-    let args = json!({"action": "write",
+    let args = json!({
         "path": "src/main.rs",
         "content": "fn main() {\n    println!(\"hello\");\n}\n"
     });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -251,7 +251,7 @@ fn token_budget_masking_keeps_newest() {
     let log: Vec<(String, serde_json::Value, String)> = vec![
         ("file".into(), json!({"action": "read", "path": "a.rs"}), big.clone()),    // oldest
         ("file".into(), json!({"action": "read", "path": "b.rs"}), big.clone()),
-        ("file".into(), json!({"action": "write", "path": "c.rs"}), small.clone()),
+        ("write_file".into(), json!({"path": "c.rs"}), small.clone()),
         ("file".into(), json!({"action": "read", "path": "d.rs"}), big.clone()),    // newest
     ];
 
@@ -269,7 +269,7 @@ fn token_budget_masking_keeps_newest() {
 
     assert!(should_mask[0], "oldest should be masked (over budget)");
     assert!(should_mask[1], "second oldest should be masked (over budget)");
-    assert!(!should_mask[2], "file(write) fits in budget");
+    assert!(!should_mask[2], "write_file fits in budget");
     assert!(!should_mask[3], "newest read fits in budget");
 }
 
@@ -281,7 +281,7 @@ fn token_budget_masking_nothing_when_under_budget() {
 
     let log: Vec<(String, serde_json::Value, String)> = vec![
         ("file".into(), json!({"action": "read", "path": "a.rs"}), small.clone()),
-        ("file".into(), json!({"action": "write", "path": "b.rs"}), small.clone()),
+        ("write_file".into(), json!({"path": "b.rs"}), small.clone()),
         ("file".into(), json!({"action": "read", "path": "c.rs"}), small.clone()),
     ];
 

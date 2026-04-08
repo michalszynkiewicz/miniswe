@@ -129,8 +129,8 @@ async fn llm_client_stream_tool_call() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(helpers::mock_sse_tool_call(
-            "file",
-            r#"{"action":"write","path":"test.txt","content":"hello"}"#,
+            "write_file",
+            r#"{"path":"test.txt","content":"hello"}"#,
         ))
         .mount(&mock_server)
         .await;
@@ -153,7 +153,7 @@ async fn llm_client_stream_tool_call() {
 
     let msg = &response.choices[0].message;
     let tc = msg.tool_calls.as_ref().expect("should have tool calls");
-    assert_eq!(tc[0].function.name, "file");
+    assert_eq!(tc[0].function.name, "write_file");
 
     let args: serde_json::Value = serde_json::from_str(&tc[0].function.arguments).unwrap();
     assert_eq!(args["path"], "test.txt");
@@ -232,8 +232,8 @@ async fn write_file_flow_creates_file_on_disk() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(helpers::mock_tool_call_response(
-            "file",
-            json!({"action": "write", "path": "output.txt", "content": "Generated content\nLine 2\n"}),
+            "write_file",
+            json!({"path": "output.txt", "content": "Generated content\nLine 2\n"}),
         ))
         .up_to_n_times(1)
         .mount(&mock_server)
@@ -263,7 +263,7 @@ async fn write_file_flow_creates_file_on_disk() {
         .await
         .unwrap();
 
-    assert!(result.success, "file(action='write') should succeed: {}", result.content);
+    assert!(result.success, "write_file should succeed: {}", result.content);
 
     // Verify file on disk
     let disk = fs::read_to_string(helpers::project_path(&config, "output.txt")).unwrap();
@@ -466,11 +466,11 @@ fn tool_definitions_are_valid() {
     assert!(names.contains(&"code"), "should have 'code' tool");
     assert!(names.contains(&"web"), "should have 'web' tool");
     assert!(names.contains(&"plan"), "should have 'plan' tool");
-    assert!(names.contains(&"fix_file"), "should have 'fix_file' tool");
+    assert!(names.contains(&"edit_file"), "should have 'edit_file' tool");
 
-    // Old flat tools should be gone
+    // Current top-level tools
     assert!(!names.contains(&"read_file"), "flat read_file should be gone");
-    assert!(!names.contains(&"write_file"), "flat write_file should be gone");
+    assert!(names.contains(&"write_file"), "should have top-level write_file");
     assert!(!names.contains(&"replace"), "flat replace should be gone");
     assert!(!names.contains(&"search"), "flat search should be gone");
     assert!(!names.contains(&"shell"), "flat shell should be gone");
