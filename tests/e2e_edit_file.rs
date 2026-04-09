@@ -458,6 +458,10 @@ async fn execute_valid_patch_writes_file() {
                 0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1-2\nTASK: add setup call\nEND\n",
                 ),
+                1 => helpers::mock_text_response("DONE_EXPLORING"),
+                2 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1-2\nTASK: add setup call\nEND\n",
+                ),
                 _ => helpers::mock_text_response(
                     "INSERT_AFTER 1\nCONTENT:\n    added();\nEND\n",
                 ),
@@ -478,7 +482,7 @@ async fn execute_valid_patch_writes_file() {
 
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("via pre-plan"));
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "fn main() {\n    added();\n}\n"
@@ -494,14 +498,14 @@ async fn execute_failed_patch_writes_nothing() {
         .and(path("/v1/chat/completions"))
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
-            if n % 4 == 0 {
-                helpers::mock_text_response(
+            match n % 6 {
+                0 | 2 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
-                )
-            } else {
-                helpers::mock_text_response(
+                ),
+                1 => helpers::mock_text_response("DONE_EXPLORING"),
+                _ => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\nwrong\nEND_OLD\nNEW:\nnew\nEND_NEW\n",
-                )
+                ),
             }
         })
         .mount(&mock_server)
@@ -520,7 +524,7 @@ async fn execute_failed_patch_writes_nothing() {
     assert!(!result.success);
     assert!(result.content.contains("patch was not applied"));
     assert!(result.content.contains("Pre-plan exhausted after 4 attempt(s)"));
-    assert_eq!(calls.load(Ordering::SeqCst), 16);
+    assert_eq!(calls.load(Ordering::SeqCst), 24);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "original\n"
@@ -540,10 +544,18 @@ async fn execute_repairs_failed_first_patch() {
                 0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
                 ),
-                1..=3 => helpers::mock_text_response(
+                1 => helpers::mock_text_response("DONE_EXPLORING"),
+                2 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
+                ),
+                3..=5 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\nwrong\nEND_OLD\nNEW:\nfixed\nEND_NEW\n",
                 ),
-                4 => helpers::mock_text_response(
+                6 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
+                ),
+                7 => helpers::mock_text_response("DONE_EXPLORING"),
+                8 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -566,7 +578,7 @@ async fn execute_repairs_failed_first_patch() {
 
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("Pre-plan repair attempt 2"));
-    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "fixed\n"
@@ -583,10 +595,14 @@ async fn execute_repairs_until_third_patch() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                0 | 4 | 8 => helpers::mock_text_response(
+                0 | 6 | 12 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
                 ),
-                1..=3 | 5..=7 => helpers::mock_text_response(
+                1 | 7 | 13 => helpers::mock_text_response("DONE_EXPLORING"),
+                2 | 8 | 14 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
+                ),
+                3..=5 | 9..=11 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\nwrong\nEND_OLD\nNEW:\nfixed\nEND_NEW\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -609,7 +625,7 @@ async fn execute_repairs_until_third_patch() {
 
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("Pre-plan repair attempt 3"));
-    assert_eq!(calls.load(Ordering::SeqCst), 10);
+    assert_eq!(calls.load(Ordering::SeqCst), 16);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "fixed\n"
@@ -629,10 +645,18 @@ async fn execute_preplan_repair_after_failed_plan() {
                 0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1-2\nTASK: replace the first two-line block\nEND\n",
                 ),
-                1..=3 => helpers::mock_text_response(
+                1 => helpers::mock_text_response("DONE_EXPLORING"),
+                2 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1-2\nTASK: replace the first two-line block\nEND\n",
+                ),
+                3..=5 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n\nREPLACE_AT 2\nOLD:\nb\nEND_OLD\nNEW:\ny\nEND_NEW\n",
                 ),
-                4 => helpers::mock_text_response(
+                6 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1-2\nTASK: replace the first two-line block\nEND\n",
+                ),
+                7 => helpers::mock_text_response("DONE_EXPLORING"),
+                8 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1-2\nTASK: replace the first two-line block\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -655,7 +679,7 @@ async fn execute_preplan_repair_after_failed_plan() {
 
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("Pre-plan repair attempt 2"));
-    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "x\nc\n"
@@ -675,12 +699,18 @@ async fn execute_preplan_repair_can_inspect_with_search_and_read() {
                 0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1-2\nTASK: change first block\nEND\n",
                 ),
-                1..=3 => helpers::mock_text_response(
+                1 => helpers::mock_text_response("DONE_EXPLORING"),
+                2 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1-2\nTASK: change first block\nEND\n",
+                ),
+                3..=5 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n\nREPLACE_AT 2\nOLD:\nb\nEND_OLD\nNEW:\ny\nEND_NEW\n",
                 ),
-                4 => helpers::mock_text_response("SEARCH: a"),
-                5 => helpers::mock_text_response("READ: 1-2"),
-                6 => helpers::mock_text_response(
+                6 => helpers::mock_text_response("NOTE revisit first block"),
+                7 => helpers::mock_text_response("SEARCH: a"),
+                8 => helpers::mock_text_response("READ: 1-2"),
+                9 => helpers::mock_text_response("DONE_EXPLORING"),
+                10 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1-2\nTASK: change first block\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -703,7 +733,7 @@ async fn execute_preplan_repair_can_inspect_with_search_and_read() {
 
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("Pre-plan repair attempt 2"));
-    assert_eq!(calls.load(Ordering::SeqCst), 8);
+    assert_eq!(calls.load(Ordering::SeqCst), 12);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "x\nc\n"
@@ -721,9 +751,13 @@ async fn execute_preplans_bulk_edit_into_regions() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 0 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1 1\nTASK: update first call\nEND\n\nSMART_EDIT\nREGION 3 3\nTASK: update last call\nEND\n",
+                ),
+                1 => helpers::mock_text_response("DONE_EXPLORING"),
+                2 => helpers::mock_text_response(
                     "REGION 1 1\nTASK: update first call\nEND\n\nREGION 3 3\nTASK: update last call\nEND\n",
                 ),
-                1 => helpers::mock_text_response(
+                3 => helpers::mock_text_response(
                     "REPLACE_AT 3\nOLD:\ncall_c();\nEND_OLD\nNEW:\ncall_c(None);\nEND_NEW\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -761,7 +795,7 @@ async fn execute_preplans_bulk_edit_into_regions() {
     assert!(result.content.contains("Pre-plan attempt 1"));
     assert!(result.content.contains("Raw Pre-plan attempt 1"));
     assert!(result.content.contains("SMART_EDIT"));
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call_a(None);\nkeep();\ncall_c(None);\n"
@@ -778,12 +812,17 @@ async fn execute_preplan_can_inspect_with_search_and_read() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                0 => helpers::mock_text_response("SEARCH: call_a"),
-                1 => helpers::mock_text_response("READ: 1-3"),
-                2 => helpers::mock_text_response(
+                0 => helpers::mock_text_response("NOTE update first and last call"),
+                1 => helpers::mock_text_response("SEARCH: call_a"),
+                2 => helpers::mock_text_response("READ: 1-3"),
+                3 => helpers::mock_text_response("DONE_EXPLORING"),
+                4 => helpers::mock_text_response(
                     "REGION 1\nTASK: update first call\nEND\n\nREGION 3\nTASK: update last call\nEND\n",
                 ),
-                3 => helpers::mock_text_response(
+                5 => helpers::mock_text_response(
+                    "REGION 1\nTASK: update first call\nEND\n\nREGION 3\nTASK: update last call\nEND\n",
+                ),
+                6 => helpers::mock_text_response(
                     "REPLACE_AT 3\nOLD:\ncall_c();\nEND_OLD\nNEW:\ncall_c(None);\nEND_NEW\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -814,7 +853,7 @@ async fn execute_preplan_can_inspect_with_search_and_read() {
 
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("✓ via pre-plan: 2/2 step(s) completed"));
-    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    assert_eq!(calls.load(Ordering::SeqCst), 8);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call_a(None);\nkeep();\ncall_c(None);\n"
@@ -831,13 +870,18 @@ async fn execute_preplan_can_handle_multiple_inspection_commands_in_one_response
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                0 => helpers::mock_text_response(
-                    "SEARCH: call_a();\nSEARCH: call_c();\nREAD: 1-3\nNO_REGIONS",
-                ),
+                0 => helpers::mock_text_response("NOTE update both call sites"),
                 1 => helpers::mock_text_response(
+                    "SEARCH: call_a();\nSEARCH: call_c();\nREAD: 1-3",
+                ),
+                2 => helpers::mock_text_response("DONE_EXPLORING"),
+                3 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1 1\nTASK: update first call\nEND\n\nSMART_EDIT\nREGION 3 3\nTASK: update last call\nEND\n",
                 ),
-                2 => helpers::mock_text_response(
+                4 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1 1\nTASK: update first call\nEND\n\nSMART_EDIT\nREGION 3 3\nTASK: update last call\nEND\n",
+                ),
+                5 => helpers::mock_text_response(
                     "REPLACE_AT 3\nOLD:\ncall_c();\nEND_OLD\nNEW:\ncall_c(None);\nEND_NEW\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -867,7 +911,7 @@ async fn execute_preplan_can_handle_multiple_inspection_commands_in_one_response
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(calls.load(Ordering::SeqCst), 7);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call_a(None);\nkeep();\ncall_c(None);\n"
@@ -885,6 +929,10 @@ async fn execute_preplan_uses_literal_replacements_before_smart_edits() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 0 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 3\nALL true\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n\nSMART_EDIT\nREGION 4 6\nTASK: update multi-line call\nEND\n",
+                ),
+                1 => helpers::mock_text_response("DONE_EXPLORING"),
+                2 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 3\nALL true\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n\nSMART_EDIT\nREGION 4 6\nTASK: update multi-line call\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -923,7 +971,7 @@ async fn execute_preplan_uses_literal_replacements_before_smart_edits() {
             .contains("literal L1-L3: replaced 2 occurrence")
     );
     assert!(result.content.contains("smart L4-L6: applied 1 operation"));
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call(None, None)\nkeep();\ncall(None, None)\ncall(\n    None,\n    None,\n)\n"
@@ -941,6 +989,10 @@ async fn execute_preplan_literal_step_falls_back_to_smart_edit() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 0 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
+                ),
+                1 => helpers::mock_text_response("DONE_EXPLORING"),
+                2 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -967,7 +1019,7 @@ async fn execute_preplan_literal_step_falls_back_to_smart_edit() {
 
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("literal fallback L1-L1"));
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call(None, None)\n"
@@ -987,10 +1039,19 @@ async fn execute_preplan_repairs_whole_plan_after_step_retries_fail() {
                 0 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nmissing(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
-                1 | 2 => helpers::mock_text_response("NO_CHANGES"),
-                _ => helpers::mock_text_response(
+                1 => helpers::mock_text_response("DONE_EXPLORING"),
+                2 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nmissing(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
+                ),
+                3 | 4 => helpers::mock_text_response("NO_CHANGES"),
+                5 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
+                6 => helpers::mock_text_response("DONE_EXPLORING"),
+                7 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
+                ),
+                _ => unreachable!("unexpected extra LLM call"),
             }
         })
         .mount(&mock_server)
@@ -1014,7 +1075,7 @@ async fn execute_preplan_repairs_whole_plan_after_step_retries_fail() {
     assert!(result.content.contains("Pre-plan repair attempt 2"));
     assert!(result.content.contains("Raw Pre-plan repair attempt 2"));
     assert!(result.content.contains("OLD:\ncall(None)"));
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(calls.load(Ordering::SeqCst), 8);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call(None, None)\n"
@@ -1055,14 +1116,23 @@ async fn execute_preplan_parse_failure_returns_error() {
 #[tokio::test]
 async fn execute_no_changes_leaves_file_unchanged() {
     let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "choices": [{
-                "message": {"role": "assistant", "content": "NO_REGIONS"},
-                "finish_reason": "stop"
-            }]
-        })))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => helpers::mock_text_response("NOTE file appears unchanged"),
+                1 => helpers::mock_text_response("DONE_EXPLORING"),
+                _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "NO_CHANGES"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+            }
+        })
         .mount(&mock_server)
         .await;
 
@@ -1096,6 +1166,10 @@ async fn execute_lsp_off_succeeds_without_lsp_client() {
                 0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
                 ),
+                1 => helpers::mock_text_response("DONE_EXPLORING"),
+                2 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
+                ),
                 _ => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\noriginal\nEND_OLD\nNEW:\nfixed\nEND_NEW\n",
                 ),
@@ -1120,7 +1194,7 @@ async fn execute_lsp_off_succeeds_without_lsp_client() {
 
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("[lsp] skipped (off)"));
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "fixed\n"
@@ -1165,6 +1239,10 @@ async fn execute_edit_file_tool_reindexes_successful_edit() {
                 0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: rename original to replacement\nEND\n",
                 ),
+                1 => helpers::mock_text_response("DONE_EXPLORING"),
+                2 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1\nTASK: rename original to replacement\nEND\n",
+                ),
                 _ => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\npub fn original() {}\nEND_OLD\nNEW:\npub fn replacement() {}\nEND_NEW\n",
                 ),
@@ -1200,7 +1278,7 @@ async fn execute_edit_file_tool_reindexes_successful_edit() {
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     let updated_index = ProjectIndex::load(&config.miniswe_dir()).unwrap();
     assert!(
         !updated_index.lookup("replacement").is_empty(),

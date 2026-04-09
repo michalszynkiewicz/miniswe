@@ -8,7 +8,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use std::{collections::BTreeSet, path::Path};
 
 use anyhow::{Result, bail};
 use lsp_types::{Diagnostic, DiagnosticSeverity};
@@ -24,6 +23,7 @@ use crate::lsp::LspClient;
 const WINDOW_SIZE: usize = 800;
 /// Overlap between windows to catch edits at boundaries.
 const WINDOW_OVERLAP: usize = 100;
+const PREPLAN_READ_OVERLAP: usize = 60;
 const MAX_PATCH_ATTEMPTS: usize = 3;
 const MAX_PLAN_ATTEMPTS: usize = 4;
 const MAX_LITERAL_FALLBACK_ATTEMPTS: usize = 2;
@@ -31,6 +31,7 @@ const MAX_PLANNED_REGIONS: usize = 100;
 const MAX_PREPLAN_STEPS: usize = 100;
 const MAX_PREPLAN_LOG_CHARS: usize = 20000;
 const LARGE_TRUNCATION_MIN_LINES: usize = 50;
+const MAX_PREPLAN_EXPLORE_ATTEMPTS: usize = 4;
 
 fn ensure_not_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
     if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -170,8 +171,6 @@ async fn execute_preplanned_steps(
     log: Option<&SessionLog>,
 ) -> Result<Option<SplitResult>> {
     let max_literal_lines = max_literal_replace_lines(config.model.context_window);
-    let signature_grounding =
-        build_signature_grounding_note(path_str, task, original, &config.project_root);
     let mut current = original.to_string();
     let mut last_error: Option<String> = None;
     let mut previous_plan: Option<String> = None;
@@ -193,7 +192,6 @@ async fn execute_preplanned_steps(
             last_error.as_deref(),
             previous_plan.as_deref(),
             max_literal_lines,
-            signature_grounding.as_deref(),
             cancelled,
             log,
         )
@@ -887,18 +885,12 @@ const MAX_PREPLAN_SEARCHES: usize = 20;
 const MAX_PREPLAN_READS_INITIAL: usize = 6;
 const MAX_PREPLAN_READS_REPAIR: usize = 10;
 
-fn build_retry_feedback(last_error: &str, signature_grounding: Option<&str>) -> String {
+fn build_retry_feedback(last_error: &str, _signature_grounding: Option<&str>) -> String {
     let mut feedback = last_error.to_string();
     if is_signature_mismatch_error(last_error) {
         feedback.push_str(
-            "\nDo not repeat the same patch shape on the same lines. Re-check the current callee signatures and only edit call sites whose current argument count and types match the intended change.",
+            "\nDo not repeat the same patch shape on the same lines. Re-check the current code before retrying and narrow the edit to only the lines that clearly need to change.",
         );
-    }
-    if let Some(grounding) = signature_grounding {
-        if !grounding.is_empty() {
-            feedback.push_str("\n\n");
-            feedback.push_str(grounding);
-        }
     }
     feedback
 }
@@ -908,64 +900,22 @@ fn is_signature_mismatch_error(error: &str) -> bool {
         && (error.contains("arguments, found") || error.contains("mismatched types"))
 }
 
-fn build_signature_grounding_note(
-    path_str: &str,
-    task: &str,
-    content: &str,
-    project_root: &Path,
-) -> Option<String> {
-    if !path_str.ends_with(".rs") {
-        return None;
-    }
-    let lower = task.to_ascii_lowercase();
-    if !(lower.contains("call")
-        || lower.contains("argument")
-        || lower.contains("parameter")
-        || lower.contains("pass ")
-        || lower.contains("as_deref"))
-    {
-        return None;
-    }
-
-    let mut seen = BTreeSet::new();
-    let mut signatures = Vec::new();
-    for line in content.lines() {
-        for (module_path, fn_name) in extract_qualified_rust_calls(line) {
-            let key = format!("{module_path}::{fn_name}");
-            if !seen.insert(key) {
-                continue;
-            }
-            if let Some(signature) =
-                resolve_rust_signature_hint(project_root, &module_path, &fn_name)
-            {
-                signatures.push(signature);
-            }
-            if signatures.len() >= 6 {
-                break;
-            }
-        }
-        if signatures.len() >= 6 {
-            break;
-        }
-    }
-
-    if signatures.is_empty() {
-        return None;
-    }
-
-    let mut note =
-        String::from("Current known callee signatures from the repo; use these before editing call sites:\n");
-    for signature in signatures {
-        note.push_str("- ");
-        note.push_str(&signature);
-        note.push('\n');
-    }
-    Some(note.trim_end().to_string())
-}
-
 enum PreplanAssistantResponse {
     Plan(String),
     Inspect(Vec<InspectionCommand>),
+    NoChanges,
+}
+
+struct PreplanReadResponse {
+    notes: Vec<String>,
+    tentative_steps: Vec<EditPlanStep>,
+}
+
+struct PreplanExploreResponse {
+    notes: Vec<String>,
+    commands: Vec<InspectionCommand>,
+    tentative_steps: Vec<EditPlanStep>,
+    done_exploring: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -978,11 +928,17 @@ fn parse_preplan_assistant_response(text: &str) -> Result<PreplanAssistantRespon
     let trimmed = text.trim();
     let nonempty: Vec<&str> = trimmed.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
     if nonempty.iter().all(|line| {
-        line.starts_with("SEARCH:") || line.starts_with("READ:") || *line == "NO_REGIONS"
+        has_case_insensitive_prefix(line, "SEARCH:")
+            || has_case_insensitive_prefix(line, "READ:")
+            || line.eq_ignore_ascii_case("NO_REGIONS")
+            || line.eq_ignore_ascii_case("NO_CHANGES")
     }) {
         let mut commands = Vec::new();
         for line in nonempty {
-            if let Some(rest) = line.strip_prefix("SEARCH:") {
+            if line.eq_ignore_ascii_case("NO_REGIONS") || line.eq_ignore_ascii_case("NO_CHANGES") {
+                continue;
+            }
+            if let Some(rest) = strip_case_insensitive_prefix(line, "SEARCH:") {
                 let query = rest.trim();
                 if query.is_empty() {
                     bail!("empty SEARCH query");
@@ -990,7 +946,7 @@ fn parse_preplan_assistant_response(text: &str) -> Result<PreplanAssistantRespon
                 commands.push(InspectionCommand::Search(query.to_string()));
                 continue;
             }
-            if let Some(rest) = line.strip_prefix("READ:") {
+            if let Some(rest) = strip_case_insensitive_prefix(line, "READ:") {
                 let rest = rest.trim();
                 let (start, end) = rest
                     .split_once('-')
@@ -1006,8 +962,165 @@ fn parse_preplan_assistant_response(text: &str) -> Result<PreplanAssistantRespon
         if !commands.is_empty() {
             return Ok(PreplanAssistantResponse::Inspect(commands));
         }
+        if trimmed.eq_ignore_ascii_case("NO_REGIONS") || trimmed.eq_ignore_ascii_case("NO_CHANGES")
+        {
+            return Ok(PreplanAssistantResponse::NoChanges);
+        }
     }
     Ok(PreplanAssistantResponse::Plan(trimmed.to_string()))
+}
+
+fn parse_preplan_read_response(text: &str) -> Result<PreplanReadResponse> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        bail!("empty preplan read response");
+    }
+
+    let mut notes = Vec::new();
+    let mut plan_lines = Vec::new();
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            if !plan_lines.is_empty() {
+                plan_lines.push(String::new());
+            }
+            continue;
+        }
+        if let Some(rest) = strip_case_insensitive_prefix(line, "NOTE ") {
+            let note = rest.trim();
+            if !note.is_empty() {
+                notes.push(note.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = strip_case_insensitive_prefix(line, "NOTE:") {
+            let note = rest.trim();
+            if !note.is_empty() {
+                notes.push(note.to_string());
+            }
+            continue;
+        }
+        if has_case_insensitive_prefix(line, "SEARCH:") || has_case_insensitive_prefix(line, "READ:")
+        {
+            bail!("read phase supports NOTE lines and tentative steps only");
+        }
+        if line.eq_ignore_ascii_case("NO_CHANGES")
+            || line.eq_ignore_ascii_case("NO_REGIONS")
+            || line.eq_ignore_ascii_case("DONE_EXPLORING")
+            || line.eq_ignore_ascii_case("FINALIZE")
+            || line.eq_ignore_ascii_case("PLAN")
+            || line.eq_ignore_ascii_case("EXPLORE")
+        {
+            bail!("unexpected control line in read phase: {line}");
+        }
+        plan_lines.push(raw_line.to_string());
+    }
+
+    let tentative_steps = if plan_lines.iter().any(|line| !line.trim().is_empty()) {
+        parse_edit_plan(&plan_lines.join("\n"))?
+    } else {
+        Vec::new()
+    };
+
+    Ok(PreplanReadResponse {
+        notes,
+        tentative_steps,
+    })
+}
+
+fn parse_preplan_explore_response(text: &str) -> Result<PreplanExploreResponse> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        bail!("empty preplan explore response");
+    }
+    if trimmed.eq_ignore_ascii_case("DONE_EXPLORING") || trimmed.eq_ignore_ascii_case("FINALIZE") {
+        return Ok(PreplanExploreResponse {
+            notes: Vec::new(),
+            commands: Vec::new(),
+            tentative_steps: Vec::new(),
+            done_exploring: true,
+        });
+    }
+
+    let mut notes = Vec::new();
+    let mut commands = Vec::new();
+    let mut plan_lines = Vec::new();
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            if !plan_lines.is_empty() {
+                plan_lines.push(String::new());
+            }
+            continue;
+        }
+        if let Some(rest) = strip_case_insensitive_prefix(line, "NOTE ") {
+            let note = rest.trim();
+            if !note.is_empty() {
+                notes.push(note.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = strip_case_insensitive_prefix(line, "NOTE:") {
+            let note = rest.trim();
+            if !note.is_empty() {
+                notes.push(note.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = strip_case_insensitive_prefix(line, "SEARCH:") {
+            let query = rest.trim();
+            if query.is_empty() {
+                bail!("empty SEARCH query");
+            }
+            commands.push(InspectionCommand::Search(query.to_string()));
+            continue;
+        }
+        if let Some(rest) = strip_case_insensitive_prefix(line, "READ:") {
+            let rest = rest.trim();
+            let (start, end) = rest
+                .split_once('-')
+                .ok_or_else(|| anyhow::anyhow!("READ must be in the form READ: <start>-<end>"))?;
+            let start = start.trim().parse::<usize>()?;
+            let end = end.trim().parse::<usize>()?;
+            if start == 0 || end < start {
+                bail!("invalid READ range {start}-{end}");
+            }
+            commands.push(InspectionCommand::Read { start, end });
+            continue;
+        }
+        if line.eq_ignore_ascii_case("DONE_EXPLORING") || line.eq_ignore_ascii_case("FINALIZE") {
+            continue;
+        }
+        if line.eq_ignore_ascii_case("NO_CHANGES") || line.eq_ignore_ascii_case("NO_REGIONS") {
+            bail!("explore phase must return DONE_EXPLORING before final NO_CHANGES");
+        }
+        plan_lines.push(raw_line.to_string());
+    }
+
+    let tentative_steps = if plan_lines.iter().any(|line| !line.trim().is_empty()) {
+        parse_edit_plan(&plan_lines.join("\n"))?
+    } else {
+        Vec::new()
+    };
+
+    Ok(PreplanExploreResponse {
+        notes,
+        commands,
+        tentative_steps,
+        done_exploring: false,
+    })
+}
+
+fn has_case_insensitive_prefix(text: &str, prefix: &str) -> bool {
+    text.get(..prefix.len())
+        .map(|head| head.eq_ignore_ascii_case(prefix))
+        .unwrap_or(false)
+}
+
+fn strip_case_insensitive_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    has_case_insensitive_prefix(text, prefix).then(|| &text[prefix.len()..])
 }
 
 fn search_in_file(content: &str, query: &str) -> String {
@@ -1043,75 +1156,13 @@ fn read_in_file(content: &str, start: usize, end: usize) -> Result<String> {
     Ok(out.trim_end().to_string())
 }
 
-fn extract_qualified_rust_calls(line: &str) -> Vec<(String, String)> {
-    let mut calls = Vec::new();
-    let bytes = line.as_bytes();
-    for (idx, ch) in line.char_indices() {
-        if ch != '(' {
-            continue;
-        }
-        let mut start = idx;
-        while start > 0 {
-            let prev = bytes[start - 1] as char;
-            if prev.is_ascii_alphanumeric() || prev == '_' || prev == ':' {
-                start -= 1;
-            } else {
-                break;
-            }
-        }
-        let token = line[start..idx].trim();
-        if !token.contains("::") {
-            continue;
-        }
-        let Some((module_path, fn_name)) = token.rsplit_once("::") else {
-            continue;
-        };
-        if module_path.is_empty() || fn_name.is_empty() {
-            continue;
-        }
-        calls.push((module_path.to_string(), fn_name.to_string()));
-    }
-    calls
-}
-
-fn resolve_rust_signature_hint(
-    project_root: &Path,
-    module_path: &str,
-    fn_name: &str,
-) -> Option<String> {
-    let module_path = module_path.strip_prefix("crate::").unwrap_or(module_path);
-    let module_path = module_path.strip_prefix("miniswe::").unwrap_or(module_path);
-    let segments: Vec<&str> = module_path.split("::").filter(|s| !s.is_empty()).collect();
-    if segments.is_empty() {
-        return None;
-    }
-
-    let mut candidates = Vec::new();
-    candidates.push(project_root.join(format!("{}.rs", segments.join("/"))));
-    candidates.push(project_root.join(segments.join("/")).join("mod.rs"));
-    candidates.push(project_root.join("src").join(format!("{}.rs", segments.join("/"))));
-    candidates.push(project_root.join("src").join(segments.join("/")).join("mod.rs"));
-
-    for path in candidates {
-        if !path.exists() {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        for (idx, line) in content.lines().enumerate() {
-            if line.contains(&format!("fn {fn_name}(")) {
-                let rel = path.strip_prefix(project_root).ok().unwrap_or(&path);
-                return Some(format!(
-                    "{}:{} `{}`",
-                    rel.display(),
-                    idx + 1,
-                    line.trim()
-                ));
-            }
-        }
-    }
-    None
+fn render_numbered_slice(lines: &[&str], start: usize, end: usize) -> String {
+    lines[start..end.min(lines.len())]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| format!("{:>4}│{}", start + offset + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn request_patch(
@@ -1415,7 +1466,6 @@ async fn request_preplan_steps(
     feedback: Option<&str>,
     previous_plan: Option<&str>,
     max_literal_lines: usize,
-    signature_grounding: Option<&str>,
     cancelled: Option<&AtomicBool>,
     log: Option<&SessionLog>,
 ) -> Result<Vec<EditPlanStep>> {
@@ -1445,36 +1495,52 @@ async fn request_preplan_steps(
             )
         })
         .unwrap_or_default();
-    let signature_block = signature_grounding
-        .map(|note| format!("{note}\n\n"))
-        .unwrap_or_default();
     let mut extra_context = String::new();
-    let text = loop {
+    let mut notes = Vec::<String>::new();
+    let mut tentative_steps = Vec::<EditPlanStep>::new();
+    let read_windows = if total_lines == 0 {
+        vec![(0, 0)]
+    } else {
+        build_windows(total_lines, WINDOW_SIZE, PREPLAN_READ_OVERLAP)
+    };
+
+    for (idx, (start, end)) in read_windows.iter().copied().enumerate() {
+        let slice = if total_lines == 0 {
+            String::from("(empty file)")
+        } else {
+            render_numbered_slice(&lines, start, end)
+        };
+        let notes_block = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Notes gathered so far:\n{}\n\n",
+                notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
+            )
+        };
+        let tentative_steps_block = if tentative_steps.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Tentative steps gathered so far:\n{}\n\n",
+                format_edit_plan_steps(&tentative_steps)
+            )
+        };
         let prompt = format!(
-            "Plan small edit steps for one file.\n\n\
+            "Read a file slice before planning edits.\n\n\
              File: {path_str}\n\
              Task: {task}\n\n\
-             {signature_block}\
              {feedback_block}\
-             {extra_context}\
-             You may first inspect the current file using these bounded commands:\n\
-             - SEARCH: <exact text>   (current file only, max {MAX_PREPLAN_SEARCHES} total)\n\
-             - READ: <start>-<end>    (current file only, max {max_reads} total in this planning phase)\n\
-             After any inspection, return the final plan or NO_REGIONS.\n\
-             Return up to {MAX_PREPLAN_STEPS} non-overlapping steps for the whole file.\n\
-             Use LITERAL_REPLACE for obvious exact text replacements.\n\
-             Use SMART_EDIT for ambiguous or structural edits.\n\
-             Do not use LITERAL_REPLACE when OLD or NEW spans more than {max_literal_lines} lines.\n\
-             Do not use LITERAL_REPLACE for whole functions, impl blocks, modules, test cases, or other large code blocks even if the text matches exactly.\n\
-             If the edit would require a larger span, split it into smaller LITERAL_REPLACE steps or use SMART_EDIT.\n\
-             Each step should cover at most 5 edit sites.\n\
-             For repeated call-site updates, group nearby exact calls with LITERAL_REPLACE when safe.\n\
-             For code, prefer functions/classes/import blocks.\n\
-             For config/text files, prefer logical sections.\n\
-             Line numbers refer to the full file shown below.\n\n\
-             Output only one of these formats:\n\n\
-             SEARCH: <exact text>\n\n\
-             READ: <start>-<end>\n\n\
+             {notes_block}\
+             {tentative_steps_block}\
+             This is slice {current_slice} of {total_slices}.\n\
+             It covers full-file lines {start_line}-{end_line}.\n\
+             Adjacent slices overlap by {PREPLAN_READ_OVERLAP} lines.\n\
+             You are still reading the file. Do not request SEARCH or READ yet. Do not finalize the plan yet.\n\
+             Output only any mix of these items, with no explanations and no markdown:\n\
+             - NOTE <short factual planning note>\n\
+             - tentative LITERAL_REPLACE and SMART_EDIT blocks using the exact step syntax below\n\n\
+             Tentative step format:\n\n\
              LITERAL_REPLACE\n\
              SCOPE <start> <end>\n\
              ALL true\n\
@@ -1489,15 +1555,17 @@ async fn request_preplan_steps(
              REGION <start> <end>\n\
              TASK: <specific edit for this region>\n\
              END\n\n\
-             Or exactly:\n\
-             NO_REGIONS\n\n\
-             Full file ({total_lines} lines):\n{numbered_content}"
+             Slice content:\n{slice}",
+            current_slice = idx + 1,
+            total_slices = read_windows.len(),
+            start_line = if total_lines == 0 { 0 } else { start + 1 },
+            end_line = end,
         );
 
         let request = ChatRequest {
             messages: vec![
                 Message::system(
-                    "You output only strict edit-plan blocks or one SEARCH/READ command. No explanations, no markdown.",
+                    "You are in the file-reading phase for one file edit. Output only NOTE lines and tentative LITERAL_REPLACE/SMART_EDIT blocks. No SEARCH, no READ, no final plan, no explanations, no markdown.",
                 ),
                 Message::user(&prompt),
             ],
@@ -1505,7 +1573,11 @@ async fn request_preplan_steps(
             tool_choice: None,
         };
 
-        log_stage(log, path_str, &format!("preplan:file:1-{total_lines}"));
+        log_stage(
+            log,
+            path_str,
+            &format!("preplan:read:{}/{}:{}-{}", idx + 1, read_windows.len(), start + 1, end),
+        );
         let response = router
             .chat_with_cancel(ModelRole::Fast, &request, cancelled)
             .await?;
@@ -1518,68 +1590,247 @@ async fn request_preplan_steps(
             log,
             path_str,
             &format!(
-                "preplan:file:1-{total_lines} raw_response:\n{}",
+                "preplan:read:{}/{}:{}-{} raw_response:\n{}",
+                idx + 1,
+                read_windows.len(),
+                start + 1,
+                end,
                 truncate_multiline(text, 12000)
             ),
         );
 
-        match parse_preplan_assistant_response(text)? {
-            PreplanAssistantResponse::Plan(plan) => break plan,
-            PreplanAssistantResponse::Inspect(commands) => {
-                for command in commands {
-                    match command {
-                        InspectionCommand::Search(query) => {
-                            if search_count >= MAX_PREPLAN_SEARCHES {
-                                bail!("preplan exceeded SEARCH limit of {MAX_PREPLAN_SEARCHES}");
-                            }
-                            search_count += 1;
-                            let result = search_in_file(content, &query);
-                            log_debug(
-                                log,
-                                path_str,
-                                &format!(
-                                    "preplan:search:{} {}",
-                                    search_count,
-                                    truncate_multiline(&result, 4000)
-                                ),
-                            );
-                            extra_context.push_str("\nInspection result:\n");
-                            extra_context.push_str(&result);
-                            extra_context.push_str("\n\n");
-                        }
-                        InspectionCommand::Read { start: read_start, end: read_end } => {
-                            if read_count >= max_reads {
-                                bail!("preplan exceeded READ limit of {max_reads}");
-                            }
-                            read_count += 1;
-                            let result = read_in_file(content, read_start, read_end)?;
-                            log_debug(
-                                log,
-                                path_str,
-                                &format!(
-                                    "preplan:read:{} {}",
-                                    read_count,
-                                    truncate_multiline(&result, 4000)
-                                ),
-                            );
-                            extra_context.push_str("\nInspection result:\n");
-                            extra_context.push_str(&result);
-                            extra_context.push_str("\n\n");
-                        }
+        let response = parse_preplan_read_response(text)?;
+        for note in response.notes {
+            if !notes.contains(&note) {
+                notes.push(note);
+            }
+        }
+        if !response.tentative_steps.is_empty() {
+            tentative_steps = response.tentative_steps;
+        }
+    }
+
+    for explore_attempt in 1..=MAX_PREPLAN_EXPLORE_ATTEMPTS {
+        let notes_block = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Planning notes:\n{}\n\n",
+                notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
+            )
+        };
+        let tentative_steps_block = if tentative_steps.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Tentative steps gathered so far:\n{}\n\n",
+                format_edit_plan_steps(&tentative_steps)
+            )
+        };
+        let prompt = format!(
+            "Explore one file before finalizing an edit plan.\n\n\
+             File: {path_str}\n\
+             Task: {task}\n\n\
+             {feedback_block}\
+             {notes_block}\
+             {tentative_steps_block}\
+             {extra_context}\
+             You have already read the full file.\n\
+             You may inspect the current file using these bounded commands:\n\
+             - SEARCH: <exact text>   (current file only, max {MAX_PREPLAN_SEARCHES} total)\n\
+             - READ: <start>-<end>    (current file only, max {max_reads} total in this exploration phase)\n\
+             In this exploration phase, output only one of these forms with no explanations and no markdown:\n\
+             - one or more NOTE lines\n\
+             - one or more SEARCH/READ commands\n\
+             - tentative LITERAL_REPLACE and SMART_EDIT blocks\n\
+             - or exactly DONE_EXPLORING when you are ready for final planning\n\
+             Do not output the final plan yet.\n\
+             Full file ({total_lines} lines):\n{numbered_content}"
+        );
+
+        let request = ChatRequest {
+            messages: vec![
+                Message::system(
+                    "You are in the exploration phase for one file edit. Output only NOTE lines, SEARCH/READ commands, tentative LITERAL_REPLACE/SMART_EDIT blocks, or exactly DONE_EXPLORING. No explanations, no markdown.",
+                ),
+                Message::user(&prompt),
+            ],
+            tools: None,
+            tool_choice: None,
+        };
+
+        log_stage(
+            log,
+            path_str,
+            &format!("preplan:explore:{explore_attempt}:file:1-{total_lines}"),
+        );
+        let response = router
+            .chat_with_cancel(ModelRole::Fast, &request, cancelled)
+            .await?;
+        let text = response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_deref())
+            .unwrap_or("");
+        log_debug(
+            log,
+            path_str,
+            &format!(
+                "preplan:explore:{explore_attempt}:file:1-{total_lines} raw_response:\n{}",
+                truncate_multiline(text, 12000)
+            ),
+        );
+
+        let response = parse_preplan_explore_response(text)?;
+        if response.done_exploring {
+            break;
+        }
+        for note in response.notes {
+            if !notes.contains(&note) {
+                notes.push(note);
+            }
+        }
+        if !response.tentative_steps.is_empty() {
+            tentative_steps = response.tentative_steps;
+        }
+        for command in response.commands {
+            match command {
+                InspectionCommand::Search(query) => {
+                    if search_count >= MAX_PREPLAN_SEARCHES {
+                        bail!("preplan exceeded SEARCH limit of {MAX_PREPLAN_SEARCHES}");
                     }
+                    search_count += 1;
+                    let result = search_in_file(content, &query);
+                    log_debug(
+                        log,
+                        path_str,
+                        &format!(
+                            "preplan:search:{} {}",
+                            search_count,
+                            truncate_multiline(&result, 4000)
+                        ),
+                    );
+                    extra_context.push_str("\nInspection result:\n");
+                    extra_context.push_str(&result);
+                    extra_context.push_str("\n\n");
+                }
+                InspectionCommand::Read { start: read_start, end: read_end } => {
+                    if read_count >= max_reads {
+                        bail!("preplan exceeded READ limit of {max_reads}");
+                    }
+                    read_count += 1;
+                    let result = read_in_file(content, read_start, read_end)?;
+                    log_debug(
+                        log,
+                        path_str,
+                        &format!(
+                            "preplan:read:{} {}",
+                            read_count,
+                            truncate_multiline(&result, 4000)
+                        ),
+                    );
+                    extra_context.push_str("\nInspection result:\n");
+                    extra_context.push_str(&result);
+                    extra_context.push_str("\n\n");
                 }
             }
         }
+    }
+
+    let notes_block = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Planning notes:\n{}\n\n",
+            notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
+        )
+    };
+    let tentative_steps_block = if tentative_steps.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Here are the tentative steps gathered so far. Revisit them and return the final plan only:\n{}\n",
+            format_edit_plan_steps(&tentative_steps)
+        )
+    };
+    let finalize_prompt = format!(
+        "Finalize the edit plan for one file.\n\n\
+         File: {path_str}\n\
+         Task: {task}\n\n\
+         {feedback_block}\
+         {notes_block}\
+         {tentative_steps_block}\
+         {extra_context}\
+         Return only the final edit plan blocks for the whole file, or exactly NO_CHANGES if no edits are needed.\n\
+         Do not include SEARCH, READ, or NOTE in this response.\n\
+         Return up to {MAX_PREPLAN_STEPS} non-overlapping steps for the whole file.\n\
+         Use LITERAL_REPLACE for obvious exact text replacements.\n\
+         Use SMART_EDIT for ambiguous or structural edits.\n\
+         Do not use LITERAL_REPLACE when OLD or NEW spans more than {max_literal_lines} lines.\n\
+         Do not use LITERAL_REPLACE for whole functions, impl blocks, modules, test cases, or other large code blocks even if the text matches exactly.\n\
+         If the edit would require a larger span, split it into smaller LITERAL_REPLACE steps or use SMART_EDIT.\n\
+         Each step should cover at most 5 edit sites.\n\
+         For repeated call-site updates, group nearby exact calls with LITERAL_REPLACE when safe.\n\
+         For code, prefer functions/classes/import blocks.\n\
+         For config/text files, prefer logical sections.\n\
+         Line numbers refer to the full file shown below.\n\n\
+         Output only these step formats:\n\n\
+         LITERAL_REPLACE\n\
+         SCOPE <start> <end>\n\
+         ALL true\n\
+         OLD:\n\
+         <exact text to replace>\n\
+         END_OLD\n\
+         NEW:\n\
+         <replacement text>\n\
+         END_NEW\n\
+         END\n\n\
+         SMART_EDIT\n\
+         REGION <start> <end>\n\
+         TASK: <specific edit for this region>\n\
+         END\n\n\
+         Or exactly:\n\
+         NO_CHANGES\n\n\
+         Full file ({total_lines} lines):\n{numbered_content}"
+    );
+
+    let request = ChatRequest {
+        messages: vec![
+            Message::system(
+                "You are in the final planning phase for one file edit. Output only strict edit-plan blocks or exactly NO_CHANGES. No explanations, no markdown.",
+            ),
+            Message::user(&finalize_prompt),
+        ],
+        tools: None,
+        tool_choice: None,
     };
 
-    let mut steps = match parse_edit_plan(&text) {
+    log_stage(log, path_str, &format!("preplan:finalize:file:1-{total_lines}"));
+    let response = router
+        .chat_with_cancel(ModelRole::Fast, &request, cancelled)
+        .await?;
+    let text = response
+        .choices
+        .first()
+        .and_then(|c| c.message.content.as_deref())
+        .unwrap_or("");
+    log_debug(
+        log,
+        path_str,
+        &format!(
+            "preplan:finalize:file:1-{total_lines} raw_response:\n{}",
+            truncate_multiline(text, 12000)
+        ),
+    );
+
+    let mut steps = match parse_edit_plan(text) {
         Ok(steps) => steps,
         Err(e) => {
             log_debug(
                 log,
                 path_str,
                 &format!(
-                    "preplan:file:1-{total_lines} parse_failed {}",
+                    "preplan:finalize:file:1-{total_lines} parse_failed {}",
                     truncate_multiline(&e.to_string(), 2000)
                 ),
             );
@@ -1590,7 +1841,7 @@ async fn request_preplan_steps(
         log,
         path_str,
         &format!(
-            "preplan:file:1-{total_lines} parsed_steps={}\n{}",
+            "preplan:finalize:file:1-{total_lines} parsed_steps={}\n{}",
             steps.len(),
             truncate_multiline(&format_edit_plan_steps(&steps), 12000)
         ),
@@ -1759,6 +2010,7 @@ async fn request_region_plan(
                         }
                     }
                 }
+                PreplanAssistantResponse::NoChanges => break "NO_REGIONS".to_string(),
             }
         };
 
@@ -1979,7 +2231,7 @@ fn truncate_multiline(text: &str, max_chars: usize) -> String {
 }
 
 pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
-    if text.trim() == "NO_REGIONS" {
+    if matches!(text.trim(), "NO_REGIONS" | "NO_CHANGES") {
         return Ok(Vec::new());
     }
     if text.trim().is_empty() {
@@ -2772,49 +3024,15 @@ pub fn build_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn signature_grounding_extracts_known_rust_callees() {
-        let tmp = tempdir().unwrap();
-        let project_root = tmp.path();
-        std::fs::create_dir_all(project_root.join("src/cli/commands")).unwrap();
-        std::fs::write(
-            project_root.join("src/cli/commands/run.rs"),
-            "pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()> {\n}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            project_root.join("src/cli/commands/repl.rs"),
-            "pub async fn run(config: Config, headless: bool) -> Result<()> {\n}\n",
-        )
-        .unwrap();
-
-        let content = "\
-miniswe::cli::commands::run::run(config, &message, true, cli.yes).await?;\n\
-miniswe::cli::commands::repl::run(config, cli.yes).await?;\n";
-        let note = build_signature_grounding_note(
-            "src/main.rs",
-            "Update main.rs to pass system_prompt_override to run and repl commands",
-            content,
-            project_root,
-        )
-        .unwrap();
-
-        assert!(note.contains("src/cli/commands/run.rs:1"));
-        assert!(note.contains("pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()>"));
-        assert!(note.contains("src/cli/commands/repl.rs:1"));
-    }
-
     #[test]
     fn retry_feedback_adds_signature_guidance_for_lsp_arity_errors() {
         let feedback = build_retry_feedback(
             "LSP diagnostics worsened for src/main.rs: 0 -> 3 error(s)\nsrc/main.rs:31:79: error: expected 4 arguments, found 5",
-            Some("Current known callee signatures from the repo:\n- src/cli/commands/run.rs:1 `pub async fn run(...)`"),
+            None,
         );
 
         assert!(feedback.contains("Do not repeat the same patch shape"));
-        assert!(feedback.contains("Current known callee signatures"));
+        assert!(!feedback.contains("Current known callee signatures"));
     }
 
     #[test]
@@ -2858,6 +3076,40 @@ miniswe::cli::commands::repl::run(config, cli.yes).await?;\n";
             }
             _ => panic!("expected inspection commands"),
         }
+    }
+
+    #[test]
+    fn parse_preplan_read_response_accepts_notes_and_tentative_steps_only() {
+        let response = parse_preplan_read_response(
+            "NOTE provider loop 10-20\n\nSMART_EDIT\nREGION 10 20\nTASK: update provider loop\nEND\n",
+        )
+        .unwrap();
+        assert_eq!(response.notes, vec!["provider loop 10-20".to_string()]);
+        assert_eq!(
+            response.tentative_steps,
+            vec![EditPlanStep::SmartEdit(EditRegion {
+                start: 10,
+                end: 20,
+                task: "update provider loop".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn parse_preplan_explore_response_accepts_done_and_commands() {
+        let done = parse_preplan_explore_response("DONE_EXPLORING").unwrap();
+        assert!(done.done_exploring);
+
+        let response =
+            parse_preplan_explore_response("NOTE slice reviewed\nSEARCH: foo\nREAD: 10-20").unwrap();
+        assert_eq!(response.notes, vec!["slice reviewed".to_string()]);
+        assert_eq!(
+            response.commands,
+            vec![
+                InspectionCommand::Search("foo".into()),
+                InspectionCommand::Read { start: 10, end: 20 },
+            ]
+        );
     }
 
     #[test]
