@@ -3,8 +3,9 @@
 //! Multiplexes keyboard input, LLM streaming events, and tool results
 //! into a single event stream that the main loop processes.
 
-use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// Events that the TUI main loop handles.
@@ -28,6 +29,8 @@ pub enum AppEvent {
     ToolResult(String, bool, String, String), // (name, success, summary, full_content)
     /// Status message
     Status(String),
+    /// Worker requests a permission decision from the UI thread
+    PermissionRequest(String, std_mpsc::Sender<String>), // (prompt, response_tx)
     /// Agent loop finished for this user message
     AgentDone,
 }

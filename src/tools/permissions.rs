@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::config::Config;
+use crate::tui::event::AppEvent;
+use tokio::sync::mpsc;
 
 /// Permission decisions cached for the current session.
 pub struct PermissionManager {
@@ -31,10 +33,12 @@ pub struct PermissionManager {
     shell_allowlist: Vec<String>,
     /// Whether to auto-approve all actions (--yes flag, dangerous)
     auto_approve: bool,
+    /// Optional REPL UI event channel for permission requests.
+    prompt_events: Mutex<Option<mpsc::UnboundedSender<AppEvent>>>,
 }
 
 /// Actions that require permission.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Action {
     /// Read a file (path is resolved and jail-checked)
     ReadFile(String),
@@ -103,7 +107,12 @@ impl PermissionManager {
             web_approved: Mutex::new(false),
             shell_allowlist,
             auto_approve,
+            prompt_events: Mutex::new(None),
         }
+    }
+
+    pub fn set_prompt_event_tx(&self, tx: mpsc::UnboundedSender<AppEvent>) {
+        *self.prompt_events.lock().unwrap() = Some(tx);
     }
 
     /// Resolve a file path and verify it's within the project root.
@@ -122,11 +131,11 @@ impl PermissionManager {
         // Canonicalize to resolve ../
         // For new files that don't exist yet, canonicalize the parent
         let canonical = if joined.exists() {
-            joined.canonicalize().map_err(|e| format!("Cannot resolve path: {e}"))?
+            joined
+                .canonicalize()
+                .map_err(|e| format!("Cannot resolve path: {e}"))?
         } else {
-            let parent = joined
-                .parent()
-                .ok_or_else(|| "Invalid path".to_string())?;
+            let parent = joined.parent().ok_or_else(|| "Invalid path".to_string())?;
             if !parent.exists() {
                 // Parent doesn't exist — will be created, check grandparent
                 let mut check = parent.to_path_buf();
@@ -154,9 +163,7 @@ impl PermissionManager {
         };
 
         if !canonical.starts_with(&self.project_root) {
-            return Err(format!(
-                "Path escapes project root: {path_str}"
-            ));
+            return Err(format!("Path escapes project root: {path_str}"));
         }
 
         Ok(canonical)
@@ -173,12 +180,12 @@ impl PermissionManager {
         match action {
             Action::ReadFile(_) | Action::WriteFile(_) => Ok(None),
             Action::Shell(cmd) => self.check_shell_needs_prompt(cmd),
-            Action::WebSearch(query) => self.check_web_needs_prompt(
-                &format!("Allow web search?\n  query: \"{query}\"\n  [y]es / [n]o / [a]llow all web: ")
-            ),
-            Action::WebFetch(url) => self.check_web_needs_prompt(
-                &format!("Allow web fetch?\n  url: {url}\n  [y]es / [n]o / [a]llow all web: ")
-            ),
+            Action::WebSearch(query) => self.check_web_needs_prompt(&format!(
+                "Allow web search?\n  query: \"{query}\"\n  [y]es / [n]o / [a]llow all web: "
+            )),
+            Action::WebFetch(url) => self.check_web_needs_prompt(&format!(
+                "Allow web fetch?\n  url: {url}\n  [y]es / [n]o / [a]llow all web: "
+            )),
             Action::McpUse(server, tool) => self.check_mcp_needs_prompt(server, tool),
         }
     }
@@ -188,7 +195,10 @@ impl PermissionManager {
         match action {
             Action::Shell(cmd) => {
                 if always {
-                    self.approved_shell.lock().unwrap().insert(cmd.trim().to_string());
+                    self.approved_shell
+                        .lock()
+                        .unwrap()
+                        .insert(cmd.trim().to_string());
                 }
             }
             Action::WebSearch(_) | Action::WebFetch(_) => {
@@ -296,7 +306,7 @@ impl PermissionManager {
         }
 
         // Prompt user
-        let approved = prompt_user(&format!(
+        let approved = self.request_user_decision(&format!(
             "Allow shell command?\n  $ {cmd_trimmed}\n  [y]es / [n]o / [a]lways for this command: "
         ));
 
@@ -323,7 +333,7 @@ impl PermissionManager {
             }
         }
 
-        let response = prompt_user(&format!(
+        let response = self.request_user_decision(&format!(
             "Allow web search?\n\
              \x1b[2m  query: \"{query}\"\n\
              \x1b[2m  sends to: web search API\x1b[0m\n\
@@ -356,7 +366,7 @@ impl PermissionManager {
             "direct HTTP request"
         };
 
-        let response = prompt_user(&format!(
+        let response = self.request_user_decision(&format!(
             "Allow web fetch?\n\
              \x1b[2m  url: {url}\n\
              \x1b[2m  via: {via}\x1b[0m\n\
@@ -382,21 +392,34 @@ impl PermissionManager {
             }
         }
 
-        let response = prompt_user(&format!(
+        let response = self.request_user_decision(&format!(
             "Allow MCP server '{server}' to run tool '{tool}'?\n  [y]es / [n]o / [a]lways for this server: "
         ));
 
         match response.as_str() {
             "y" | "yes" => Ok(()),
             "a" | "always" => {
-                self.approved_mcp
-                    .lock()
-                    .unwrap()
-                    .insert(server.to_string());
+                self.approved_mcp.lock().unwrap().insert(server.to_string());
                 Ok(())
             }
             _ => Err(format!("MCP tool '{server}/{tool}' denied by user")),
         }
+    }
+
+    fn request_user_decision(&self, prompt: &str) -> String {
+        if let Some(tx) = self.prompt_events.lock().unwrap().clone() {
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+            if tx
+                .send(AppEvent::PermissionRequest(
+                    prompt.to_string(),
+                    response_tx,
+                ))
+                .is_ok()
+            {
+                return response_rx.recv().unwrap_or_else(|_| "n".into());
+            }
+        }
+        prompt_user(prompt)
     }
 }
 
@@ -409,7 +432,7 @@ const BLOCKED_COMMANDS: &[&str] = &[
     "dd if=",
     ":(){:|:&};:",
     "chmod -R 777 /",
-    "wget http",   // downloading arbitrary executables
+    "wget http", // downloading arbitrary executables
     "curl | sh",
     "curl | bash",
 ];
@@ -433,4 +456,34 @@ fn prompt_user(message: &str) -> String {
 
     // Don't re-enable raw mode — reedline will do that on next read_line()
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn permission_checks_can_request_ui_decision_over_event_channel() {
+        let config = Config::default();
+        let perms = std::sync::Arc::new(PermissionManager::new(&config));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        perms.set_prompt_event_tx(tx);
+
+        let perms_for_thread = perms.clone();
+        let handle = std::thread::spawn(move || {
+            perms_for_thread.check(&Action::WebSearch("golang static file server".into()))
+        });
+
+        let event = rx.recv().await.expect("permission request event");
+        match event {
+            AppEvent::PermissionRequest(prompt, response_tx) => {
+                assert!(prompt.contains("Allow web search?"));
+                response_tx.send("y".into()).unwrap();
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        assert!(handle.join().unwrap().is_ok());
+    }
 }
