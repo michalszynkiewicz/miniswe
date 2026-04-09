@@ -3,9 +3,8 @@
 use anyhow::Result;
 use serde_json::Value;
 
-
-use crate::config::Config;
 use super::ToolResult;
+use crate::config::Config;
 
 /// web_search — Search the web via Serper (Google results) or SearXNG.
 ///
@@ -21,7 +20,7 @@ pub async fn search(args: &Value, config: &Config) -> Result<ToolResult> {
 
     match config.web.search_backend.as_str() {
         "searxng" => search_searxng(query, max_results, config).await,
-        "github" => search_github(query, max_results).await,
+        "github" => search_github(query, max_results, None).await,
         _ => {
             // Try Serper if key is available, fall back to GitHub search
             let has_key_file = dirs::home_dir()
@@ -34,7 +33,7 @@ pub async fn search(args: &Value, config: &Config) -> Result<ToolResult> {
             {
                 search_serper(query, max_results, config).await
             } else {
-                search_github(query, max_results).await
+                search_github(query, max_results, Some(&missing_serper_key_hint())).await
             }
         }
     }
@@ -51,22 +50,19 @@ async fn search_serper(query: &str, max_results: usize, config: &Config) -> Resu
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .map(|k| k.trim().to_string())
                 .filter(|k| !k.is_empty());
-            match home_key.ok_or(()).or_else(|_|
+            match home_key.ok_or(()).or_else(|_| {
                 std::env::var("SERPER_API_KEY").or_else(|_| std::env::var("SEARCH_API_KEY"))
-            ) {
+            }) {
                 Ok(key) if !key.is_empty() => {
                     // Use env var (can't store reference, so do the request inline)
                     return do_serper_request(query, max_results, &key).await;
                 }
                 _ => {
                     return Ok(ToolResult::err(
-                        "Web search requires an API key.\n\
+                        "General web search requires a Serper API key.\n\
                          Get a free key at https://serper.dev (2,500 queries/month).\n\
-                         Set it in .miniswe/config.toml:\n\
-                         [web]\n\
-                         search_api_key = \"your-key-here\"\n\
-                         \n\
-                         Or set SERPER_API_KEY environment variable."
+                         Recommended setup: put the raw key in ~/.miniswe/serper.key\n\
+                         Without this key, web(search) falls back to GitHub repository search only."
                             .into(),
                     ));
                 }
@@ -96,7 +92,9 @@ async fn do_serper_request(query: &str, max_results: usize, api_key: &str) -> Re
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                return Ok(ToolResult::err(format!("Search API error ({status}): {text}")));
+                return Ok(ToolResult::err(format!(
+                    "Search API error ({status}): {text}"
+                )));
             }
 
             let data: Value = resp.json().await.unwrap_or_default();
@@ -121,7 +119,9 @@ async fn do_serper_request(query: &str, max_results: usize, api_key: &str) -> Re
             }
 
             if count == 0 {
-                Ok(ToolResult::ok(format!("[search: \"{query}\" — no results]")))
+                Ok(ToolResult::ok(format!(
+                    "[search: \"{query}\" — no results]"
+                )))
             } else {
                 Ok(ToolResult::ok(output))
             }
@@ -167,7 +167,9 @@ async fn search_searxng(query: &str, max_results: usize, config: &Config) -> Res
             }
 
             if count == 0 {
-                Ok(ToolResult::ok(format!("[search: \"{query}\" — no results]")))
+                Ok(ToolResult::ok(format!(
+                    "[search: \"{query}\" — no results]"
+                )))
             } else {
                 Ok(ToolResult::ok(output))
             }
@@ -178,7 +180,11 @@ async fn search_searxng(query: &str, max_results: usize, config: &Config) -> Res
 
 /// Search via GitHub API (no auth needed, 10 req/min).
 /// Searches repos + README content. Good for code/library queries.
-async fn search_github(query: &str, max_results: usize) -> Result<ToolResult> {
+async fn search_github(
+    query: &str,
+    max_results: usize,
+    missing_key_hint: Option<&str>,
+) -> Result<ToolResult> {
     let encoded = urlencoded(query);
     let url = format!(
         "https://api.github.com/search/repositories?q={encoded}&per_page={max_results}&sort=stars"
@@ -196,13 +202,18 @@ async fn search_github(query: &str, max_results: usize) -> Result<ToolResult> {
         req = req.header("Authorization", format!("Bearer {token}"));
     }
 
-    match req.send().await
-    {
+    match req.send().await {
         Ok(resp) => {
             if resp.status() == 403 || resp.status() == 429 {
-                return Ok(ToolResult::err(
-                    "GitHub search rate limited (10/min unauthenticated). Wait a minute or set a Serper API key.".into()
-                ));
+                let mut msg =
+                    "GitHub search rate limited (10/min unauthenticated).".to_string();
+                if let Some(hint) = missing_key_hint {
+                    msg.push_str("\n");
+                    msg.push_str(hint);
+                } else {
+                    msg.push_str(" Wait a minute or configure another search backend.");
+                }
+                return Ok(ToolResult::err(msg));
             }
             let data: Value = resp.json().await.unwrap_or_default();
 
@@ -227,19 +238,39 @@ async fn search_github(query: &str, max_results: usize) -> Result<ToolResult> {
             }
 
             if count == 0 {
-                Ok(ToolResult::ok(format!(
+                let mut output = format!(
                     "[search: \"{query}\" — no GitHub repos found]\n\
-                     Tip: GitHub search only finds repositories, not web content.\n\
-                     For documentation, use web_fetch on the URL directly, e.g.:\n\
-                     web_fetch(\"https://docs.rs/CRATE\") or web_fetch(\"https://LIBRARY.dev\")"
-                )))
+                     GitHub search only finds repositories, not general web content."
+                );
+                if let Some(hint) = missing_key_hint {
+                    output.push_str("\n");
+                    output.push_str(hint);
+                }
+                output.push_str(
+                    "\nFor documentation, use web(fetch) on the URL directly, e.g.:\n\
+                     web(fetch \"https://docs.rs/CRATE\") or web(fetch \"https://LIBRARY.dev\")",
+                );
+                Ok(ToolResult::ok(output))
             } else {
-                output.push_str("\n(GitHub repo search — for broader web results, set SERPER_API_KEY)");
+                output.push_str("\n(GitHub repo search only");
+                if let Some(hint) = missing_key_hint {
+                    output.push_str(" — ");
+                    output.push_str(hint);
+                    output.push(')');
+                } else {
+                    output.push(')');
+                }
                 Ok(ToolResult::ok(output))
             }
         }
         Err(e) => Ok(ToolResult::err(format!("GitHub search failed: {e}"))),
     }
+}
+
+fn missing_serper_key_hint() -> String {
+    "General web search is not configured, so this used GitHub repo search fallback.\n\
+     To enable general web search, get a free key at https://serper.dev and put the raw key in ~/.miniswe/serper.key."
+        .into()
 }
 
 /// web_fetch — Fetch a URL and extract content as markdown.
@@ -268,14 +299,17 @@ pub async fn fetch(args: &Value, config: &Config) -> Result<ToolResult> {
 
             if total_chars <= budget {
                 // Fits in budget — return full content
-                Ok(ToolResult::ok(format!("[fetch: {url} — {total_chars} chars]\n{content}")))
+                Ok(ToolResult::ok(format!(
+                    "[fetch: {url} — {total_chars} chars]\n{content}"
+                )))
             } else {
                 // Too large — save full content to file, return preview + pointer
                 let cache_dir = config.miniswe_dir().join("web_cache");
                 let _ = std::fs::create_dir_all(&cache_dir);
 
                 // Sanitize URL to filename
-                let filename = url.replace("://", "_")
+                let filename = url
+                    .replace("://", "_")
                     .replace(['/', '?', '&', '#', '='], "_")
                     .chars()
                     .take(80)
@@ -319,4 +353,3 @@ fn urlencoded(s: &str) -> String {
         })
         .collect()
 }
-

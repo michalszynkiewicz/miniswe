@@ -68,7 +68,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "web".into(),
-                description: "Web access: search the web or fetch a URL. Use action='help' for details.".into(),
+                description: "Web access: search the web or fetch a URL. General web search uses Serper when configured. If no Serper key is configured, web(search) falls back to GitHub repository search only. Recommended setup: put your Serper key in ~/.miniswe/serper.key. Use action='help' for details.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -250,6 +250,9 @@ pub fn web_help() -> &'static str {
 Available actions for `web`:
 
 - search: Search the web. Params: query (required), max_results
+  General web search uses Serper when configured.
+  Recommended setup: put the raw key in `~/.miniswe/serper.key`.
+  Without a Serper key, `web(search)` falls back to GitHub repository search only.
 - fetch: Fetch a URL as markdown. Params: url (required), selector"
 }
 

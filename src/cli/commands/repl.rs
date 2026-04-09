@@ -316,12 +316,12 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                 )
                                 .await;
 
-                                app.is_thinking = false;
-                                app.flush_tokens();
-                                app.push_output(
-                                    "────────────────────────────────────────────────",
-                                    LineStyle::Separator,
-                                );
+                                finish_completed_turn(
+                                    &mut app,
+                                    &mut terminal,
+                                    None,
+                                    None,
+                                )?;
 
                                 // Trim history
                                 let max_history = config.context.history_turns * 6;
@@ -493,6 +493,7 @@ async fn run_agent_loop(
         let _ = terminal.draw(|frame| ui::draw(frame, app));
 
         // Call LLM with streaming — render on each token
+        let mut rendered_assistant_text = String::new();
         let response = {
             let mut token_count = 0u32;
             let mut llm_events =
@@ -503,6 +504,7 @@ async fn run_agent_loop(
                         match evt {
                             Some(LlmWorkerEvent::Token(token)) => {
                                 app.push_token(&token);
+                                rendered_assistant_text.push_str(&token);
                                 token_count += 1;
                                 if token_count % 3 == 0 {
                                     let _ = terminal.draw(|frame| ui::draw(frame, app));
@@ -589,6 +591,14 @@ async fn run_agent_loop(
 
         if let Some(content) = &assistant_msg.content {
             log.llm_response(content);
+            if let Some(missing) = reconcile_streamed_assistant_content(
+                &rendered_assistant_text,
+                content,
+            ) {
+                app.push_token(&missing);
+                app.flush_tokens();
+                let _ = terminal.draw(|frame| ui::draw(frame, app));
+            }
         }
         conversation_history.push(assistant_msg.clone());
 
@@ -1147,6 +1157,43 @@ fn consume_interrupt(cancelled: &AtomicBool) -> bool {
     cancelled.swap(false, Ordering::Relaxed)
 }
 
+fn reconcile_streamed_assistant_content(rendered: &str, final_content: &str) -> Option<String> {
+    if final_content.is_empty() || rendered == final_content {
+        return None;
+    }
+    if let Some(suffix) = final_content.strip_prefix(rendered) {
+        return (!suffix.is_empty()).then(|| suffix.to_string());
+    }
+    if rendered.is_empty() {
+        return Some(final_content.to_string());
+    }
+    Some(format!(
+        "\n[final response continuation]\n{}",
+        final_content
+    ))
+}
+
+fn finish_completed_turn(
+    app: &mut App,
+    terminal: &mut Terminal<impl Backend>,
+    final_content: Option<&str>,
+    rendered_assistant_text: Option<&str>,
+) -> io::Result<()> {
+    app.is_thinking = false;
+    if let (Some(final_content), Some(rendered)) = (final_content, rendered_assistant_text)
+        && let Some(missing) = reconcile_streamed_assistant_content(rendered, final_content)
+    {
+        app.push_token(&missing);
+    }
+    app.flush_tokens();
+    app.push_output(
+        "────────────────────────────────────────────────",
+        LineStyle::Separator,
+    );
+    terminal.draw(|frame| ui::draw(frame, app))?;
+    Ok(())
+}
+
 fn canonical_json(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => "null".to_string(),
@@ -1290,6 +1337,82 @@ mod tests {
         assert!(consume_interrupt(&cancelled));
         assert!(!consume_interrupt(&cancelled));
         assert!(!cancelled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn reconcile_streamed_assistant_content_appends_missing_suffix() {
+        assert_eq!(
+            reconcile_streamed_assistant_content("Hello", "Hello world"),
+            Some(" world".into())
+        );
+    }
+
+    #[test]
+    fn reconcile_streamed_assistant_content_returns_none_when_complete() {
+        assert_eq!(
+            reconcile_streamed_assistant_content("Hello world", "Hello world"),
+            None
+        );
+    }
+
+    #[test]
+    fn reconcile_streamed_assistant_content_uses_full_content_when_nothing_rendered() {
+        assert_eq!(
+            reconcile_streamed_assistant_content("", "Hello world"),
+            Some("Hello world".into())
+        );
+    }
+
+    #[test]
+    fn finish_completed_turn_draws_final_text_and_separator() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.push_token("Final answer");
+
+        finish_completed_turn(
+            &mut app,
+            &mut terminal,
+            Some("Final answer"),
+            Some(""),
+        )
+        .unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Final answer"));
+        assert!(text.contains("────────────────────────────────────────────────"));
+        assert!(!app.is_thinking);
+    }
+
+    #[test]
+    fn finish_completed_turn_appends_missing_suffix_before_separator() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.push_token("Hello");
+
+        finish_completed_turn(
+            &mut app,
+            &mut terminal,
+            Some("Hello world"),
+            Some("Hello"),
+        )
+        .unwrap();
+
+        let joined = app
+            .output
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Hello world"));
+        assert!(joined.ends_with("────────────────────────────────────────────────"));
     }
 
     #[tokio::test]
