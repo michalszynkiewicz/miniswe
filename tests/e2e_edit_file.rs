@@ -627,6 +627,50 @@ async fn execute_split_fallback_after_broad_overlap_failure() {
 }
 
 #[tokio::test]
+async fn execute_split_fallback_can_inspect_with_search_and_read() {
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 | 1 | 2 => helpers::mock_text_response(
+                    "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n\nREPLACE_AT 2\nOLD:\nb\nEND_OLD\nNEW:\ny\nEND_NEW\n",
+                ),
+                3 => helpers::mock_text_response("SEARCH: a"),
+                4 => helpers::mock_text_response("READ: 1-2"),
+                5 => helpers::mock_text_response(
+                    "REGION 1-2\nTASK: replace the first two-line block\nEND\n",
+                ),
+                _ => helpers::mock_text_response(
+                    "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n",
+                ),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "a\nb\nc\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({"path": "main.rs", "task": "change first block"});
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert_eq!(calls.load(Ordering::SeqCst), 7);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "x\nc\n"
+    );
+}
+
+#[tokio::test]
 async fn execute_preplans_bulk_edit_into_regions() {
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -678,6 +722,59 @@ async fn execute_preplans_bulk_edit_into_regions() {
     assert!(result.content.contains("Raw Pre-plan attempt 1"));
     assert!(result.content.contains("SMART_EDIT"));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "call_a(None);\nkeep();\ncall_c(None);\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_preplan_can_inspect_with_search_and_read() {
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => helpers::mock_text_response("SEARCH: call_a"),
+                1 => helpers::mock_text_response("READ: 1-3"),
+                2 => helpers::mock_text_response(
+                    "REGION 1\nTASK: update first call\nEND\n\nREGION 3\nTASK: update last call\nEND\n",
+                ),
+                3 => helpers::mock_text_response(
+                    "REPLACE_AT 3\nOLD:\ncall_c();\nEND_OLD\nNEW:\ncall_c(None);\nEND_NEW\n",
+                ),
+                _ => helpers::mock_text_response(
+                    "REPLACE_AT 1\nOLD:\ncall_a();\nEND_OLD\nNEW:\ncall_a(None);\nEND_NEW\n",
+                ),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(
+        config.project_root.join("main.rs"),
+        "call_a();\nkeep();\ncall_c();\n",
+    )
+    .unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "update all call sites",
+        "lsp_validation": "off"
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("✓ via pre-plan: 2/2 step(s) completed"));
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call_a(None);\nkeep();\ncall_c(None);\n"

@@ -30,6 +30,7 @@ model = "test-model"
 context_window = 50000
 temperature = 0.15
 max_output_tokens = 16384
+max_retries = 1
 
 [context]
 max_rounds = 10
@@ -56,6 +57,7 @@ fetch_backend = "jina"
 
     let mut config = Config::default();
     config.project_root = project_root;
+    config.model.max_retries = 1;
 
     (temp, config)
 }
@@ -85,10 +87,7 @@ pub fn mock_text_response(content: &str) -> ResponseTemplate {
 }
 
 /// Build a mock non-streaming LLM response with a single tool call.
-pub fn mock_tool_call_response(
-    tool_name: &str,
-    tool_args: serde_json::Value,
-) -> ResponseTemplate {
+pub fn mock_tool_call_response(tool_name: &str, tool_args: serde_json::Value) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(serde_json::json!({
         "choices": [{
             "message": {

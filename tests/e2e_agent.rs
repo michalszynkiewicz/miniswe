@@ -5,16 +5,16 @@
 
 mod helpers;
 
+use serde_json::json;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use miniswe::config::Config;
 use miniswe::llm::{ChatRequest, LlmClient, Message};
 use miniswe::tools::{self, PermissionManager};
-use miniswe::config::Config;
 
 fn perms(config: &Config) -> PermissionManager {
     PermissionManager::headless(config)
@@ -110,15 +110,14 @@ async fn llm_client_stream_plain_text() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let mut tokens = Vec::new();
     let response = client
-        .chat_stream(
-            &request,
-            |token| tokens.push(token.to_string()),
-            &cancelled,
-        )
+        .chat_stream(&request, |token| tokens.push(token.to_string()), &cancelled)
         .await
         .unwrap();
 
-    assert_eq!(response.choices[0].message.content.as_deref().unwrap(), "Streamed hello!");
+    assert_eq!(
+        response.choices[0].message.content.as_deref().unwrap(),
+        "Streamed hello!"
+    );
     assert!(!tokens.is_empty(), "should have received streaming tokens");
 }
 
@@ -194,7 +193,11 @@ async fn single_tool_call_flow_reads_file() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
 
     // Create the file the LLM will try to read
-    fs::write(helpers::project_path(&config, "hello.txt"), "Hello from test!").unwrap();
+    fs::write(
+        helpers::project_path(&config, "hello.txt"),
+        "Hello from test!",
+    )
+    .unwrap();
 
     let client = LlmClient::new(config.model.clone());
     let p = perms(&config);
@@ -252,18 +255,18 @@ async fn write_file_flow_creates_file_on_disk() {
     };
 
     let response = client.chat(&request).await.unwrap();
-    let tc = response.choices[0]
-        .message
-        .tool_calls
-        .as_ref()
-        .unwrap();
+    let tc = response.choices[0].message.tool_calls.as_ref().unwrap();
 
     let args: serde_json::Value = serde_json::from_str(&tc[0].function.arguments).unwrap();
     let result = tools::execute_tool(&tc[0].function.name, &args, &config, &p, None)
         .await
         .unwrap();
 
-    assert!(result.success, "write_file should succeed: {}", result.content);
+    assert!(
+        result.success,
+        "write_file should succeed: {}",
+        result.content
+    );
 
     // Verify file on disk
     let disk = fs::read_to_string(helpers::project_path(&config, "output.txt")).unwrap();
@@ -368,6 +371,40 @@ async fn llm_api_error_returns_error() {
 }
 
 #[tokio::test]
+async fn llm_chat_retries_transient_503_and_succeeds() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(helpers::mock_text_response("Recovered"))
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+
+    let client = LlmClient::new(config.model.clone());
+    let request = ChatRequest {
+        messages: vec![Message::user("hi")],
+        tools: None,
+        tool_choice: None,
+    };
+
+    let response = client.chat(&request).await.unwrap();
+    assert_eq!(
+        response.choices[0].message.content.as_deref().unwrap(),
+        "Recovered"
+    );
+}
+
+#[tokio::test]
 async fn llm_connection_refused() {
     let (_tmp, mut config) = helpers::create_test_project();
     config.model.endpoint = "http://127.0.0.1:1".into();
@@ -381,6 +418,45 @@ async fn llm_connection_refused() {
 
     let result = client.chat(&request).await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn llm_stream_retries_transient_503_and_succeeds() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(helpers::mock_sse_text_response("Stream recovered"))
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+
+    let client = LlmClient::new(config.model.clone());
+    let request = ChatRequest {
+        messages: vec![Message::user("hi")],
+        tools: None,
+        tool_choice: None,
+    };
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let response = client
+        .chat_stream(&request, |_| {}, &cancelled)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.choices[0].message.content.as_deref().unwrap(),
+        "Stream recovered"
+    );
 }
 
 // ── Stream cancellation ────────────────────────────────────────────
@@ -422,17 +498,17 @@ async fn stream_cancellation_via_flag() {
     let cancelled = Arc::new(AtomicBool::new(true)); // pre-cancelled
     let mut tokens = Vec::new();
     let result = client
-        .chat_stream(
-            &request,
-            |token| tokens.push(token.to_string()),
-            &cancelled,
-        )
+        .chat_stream(&request, |token| tokens.push(token.to_string()), &cancelled)
         .await;
 
     // Pre-cancelled stream may return Ok (partial) or Err (aborted) — both are fine.
     // The key is it finishes quickly without processing all 100 tokens.
     match result {
-        Ok(_) => assert!(tokens.len() < 10, "should stop early: got {} tokens", tokens.len()),
+        Ok(_) => assert!(
+            tokens.len() < 10,
+            "should stop early: got {} tokens",
+            tokens.len()
+        ),
         Err(_) => {} // Aborted — also acceptable
     }
 }
@@ -469,12 +545,21 @@ fn tool_definitions_are_valid() {
     assert!(names.contains(&"edit_file"), "should have 'edit_file' tool");
 
     // Current top-level tools
-    assert!(!names.contains(&"read_file"), "flat read_file should be gone");
-    assert!(names.contains(&"write_file"), "should have top-level write_file");
+    assert!(
+        !names.contains(&"read_file"),
+        "flat read_file should be gone"
+    );
+    assert!(
+        names.contains(&"write_file"),
+        "should have top-level write_file"
+    );
     assert!(!names.contains(&"replace"), "flat replace should be gone");
     assert!(!names.contains(&"search"), "flat search should be gone");
     assert!(!names.contains(&"shell"), "flat shell should be gone");
-    assert!(!names.contains(&"task_update"), "flat task_update should be gone");
+    assert!(
+        !names.contains(&"task_update"),
+        "flat task_update should be gone"
+    );
 
     // Each definition should have required fields
     for def in &defs {
