@@ -28,6 +28,7 @@ pub struct Config {
     pub hardware: HardwareConfig,
     pub web: WebConfig,
     pub shell: ShellConfig,
+    pub runtime: RuntimeConfig,
     pub logging: LogConfig,
     pub lsp: LspConfig,
     pub tools: ToolsConfig,
@@ -98,6 +99,10 @@ pub struct ModelConfig {
     pub temperature: f64,
     /// Maximum output tokens per response
     pub max_output_tokens: usize,
+    /// Timeout in seconds for non-streaming chat requests.
+    pub request_timeout_secs: u64,
+    /// Maximum number of transient retry attempts for LLM requests.
+    pub max_retries: usize,
 }
 
 /// Token budget allocation for context assembly.
@@ -150,12 +155,12 @@ pub struct ProvidersConfig {
 impl Default for ProvidersConfig {
     fn default() -> Self {
         Self {
-            profile: false,      // available via get_project_info() tool
+            profile: false,       // available via get_project_info() tool
             guide: false,         // available via get_project_info() tool
             project_notes: false, // available via get_architecture_notes() tool
             plan: true,
-            lessons: false,       // available via get_project_info() tool
-            repo_map: false,      // available via get_repo_map() tool
+            lessons: false,  // available via get_project_info() tool
+            repo_map: false, // available via get_repo_map() tool
             mcp: true,
             scratchpad: true,
             usage_guide: true,
@@ -217,6 +222,14 @@ pub struct ShellConfig {
     pub default_timeout_secs: u64,
 }
 
+/// Runtime execution configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    /// Size of the shared tool worker pool.
+    pub tool_worker_pool_size: usize,
+}
+
 /// LSP integration configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -276,6 +289,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             web: WebConfig::default(),
             shell: ShellConfig::default(),
+            runtime: RuntimeConfig::default(),
             logging: LogConfig::default(),
             lsp: LspConfig::default(),
             tools: ToolsConfig::default(),
@@ -302,6 +316,8 @@ impl Default for ModelConfig {
             context_window: 50000,
             temperature: 0.15,
             max_output_tokens: 16384,
+            request_timeout_secs: 60,
+            max_retries: 6,
         }
     }
 }
@@ -350,6 +366,14 @@ impl Default for ShellConfig {
     }
 }
 
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            tool_worker_pool_size: 10,
+        }
+    }
+}
+
 impl Config {
     /// Path to the global config directory (`~/.miniswe/`).
     pub fn global_dir() -> Option<PathBuf> {
@@ -363,8 +387,8 @@ impl Config {
     ///
     /// Project root is always the current working directory.
     pub fn load() -> Result<Self> {
-        let project_root = std::env::current_dir()
-            .context("Failed to determine current directory")?;
+        let project_root =
+            std::env::current_dir().context("Failed to determine current directory")?;
 
         // Layer 1: global config (~/.miniswe/config.toml), or defaults
         let mut config = if let Some(global_path) = Self::global_dir()
@@ -405,8 +429,7 @@ impl Config {
 
     /// Save configuration to `~/.miniswe/config.toml`.
     pub fn save(&self) -> Result<()> {
-        let config_dir = Self::global_dir()
-            .context("Cannot determine home directory")?;
+        let config_dir = Self::global_dir().context("Cannot determine home directory")?;
         std::fs::create_dir_all(&config_dir)?;
         let config_path = config_dir.join("config.toml");
         let contents = toml::to_string_pretty(self)?;
