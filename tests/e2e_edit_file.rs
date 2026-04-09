@@ -822,6 +822,59 @@ async fn execute_preplan_can_inspect_with_search_and_read() {
 }
 
 #[tokio::test]
+async fn execute_preplan_can_handle_multiple_inspection_commands_in_one_response() {
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => helpers::mock_text_response(
+                    "SEARCH: call_a();\nSEARCH: call_c();\nREAD: 1-3\nNO_REGIONS",
+                ),
+                1 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1 1\nTASK: update first call\nEND\n\nSMART_EDIT\nREGION 3 3\nTASK: update last call\nEND\n",
+                ),
+                2 => helpers::mock_text_response(
+                    "REPLACE_AT 3\nOLD:\ncall_c();\nEND_OLD\nNEW:\ncall_c(None);\nEND_NEW\n",
+                ),
+                _ => helpers::mock_text_response(
+                    "REPLACE_AT 1\nOLD:\ncall_a();\nEND_OLD\nNEW:\ncall_a(None);\nEND_NEW\n",
+                ),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(
+        config.project_root.join("main.rs"),
+        "call_a();\nkeep();\ncall_c();\n",
+    )
+    .unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "update all call sites",
+        "lsp_validation": "off"
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "call_a(None);\nkeep();\ncall_c(None);\n"
+    );
+}
+
+#[tokio::test]
 async fn execute_preplan_uses_literal_replacements_before_smart_edits() {
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));

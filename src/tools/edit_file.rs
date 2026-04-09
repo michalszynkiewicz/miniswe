@@ -883,9 +883,9 @@ struct PatchResponse {
     raw_text: String,
 }
 
-const MAX_PREPLAN_SEARCHES: usize = 10;
-const MAX_PREPLAN_READS_INITIAL: usize = 3;
-const MAX_PREPLAN_READS_REPAIR: usize = 5;
+const MAX_PREPLAN_SEARCHES: usize = 20;
+const MAX_PREPLAN_READS_INITIAL: usize = 6;
+const MAX_PREPLAN_READS_REPAIR: usize = 10;
 
 fn build_retry_feedback(last_error: &str, signature_grounding: Option<&str>) -> String {
     let mut feedback = last_error.to_string();
@@ -965,30 +965,47 @@ fn build_signature_grounding_note(
 
 enum PreplanAssistantResponse {
     Plan(String),
+    Inspect(Vec<InspectionCommand>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InspectionCommand {
     Search(String),
     Read { start: usize, end: usize },
 }
 
 fn parse_preplan_assistant_response(text: &str) -> Result<PreplanAssistantResponse> {
     let trimmed = text.trim();
-    if let Some(rest) = trimmed.strip_prefix("SEARCH:") {
-        let query = rest.trim();
-        if query.is_empty() {
-            bail!("empty SEARCH query");
+    let nonempty: Vec<&str> = trimmed.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    if nonempty.iter().all(|line| {
+        line.starts_with("SEARCH:") || line.starts_with("READ:") || *line == "NO_REGIONS"
+    }) {
+        let mut commands = Vec::new();
+        for line in nonempty {
+            if let Some(rest) = line.strip_prefix("SEARCH:") {
+                let query = rest.trim();
+                if query.is_empty() {
+                    bail!("empty SEARCH query");
+                }
+                commands.push(InspectionCommand::Search(query.to_string()));
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("READ:") {
+                let rest = rest.trim();
+                let (start, end) = rest
+                    .split_once('-')
+                    .ok_or_else(|| anyhow::anyhow!("READ must be in the form READ: <start>-<end>"))?;
+                let start = start.trim().parse::<usize>()?;
+                let end = end.trim().parse::<usize>()?;
+                if start == 0 || end < start {
+                    bail!("invalid READ range {start}-{end}");
+                }
+                commands.push(InspectionCommand::Read { start, end });
+            }
         }
-        return Ok(PreplanAssistantResponse::Search(query.to_string()));
-    }
-    if let Some(rest) = trimmed.strip_prefix("READ:") {
-        let rest = rest.trim();
-        let (start, end) = rest
-            .split_once('-')
-            .ok_or_else(|| anyhow::anyhow!("READ must be in the form READ: <start>-<end>"))?;
-        let start = start.trim().parse::<usize>()?;
-        let end = end.trim().parse::<usize>()?;
-        if start == 0 || end < start {
-            bail!("invalid READ range {start}-{end}");
+        if !commands.is_empty() {
+            return Ok(PreplanAssistantResponse::Inspect(commands));
         }
-        return Ok(PreplanAssistantResponse::Read { start, end });
     }
     Ok(PreplanAssistantResponse::Plan(trimmed.to_string()))
 }
@@ -1405,8 +1422,6 @@ async fn request_preplan_steps(
     ensure_not_cancelled(cancelled)?;
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
-    let windows = build_windows(total_lines, WINDOW_SIZE, WINDOW_OVERLAP);
-    let mut steps = Vec::new();
     let mut search_count = 0usize;
     let mut read_count = 0usize;
     let max_reads = if feedback.is_some() {
@@ -1414,202 +1429,174 @@ async fn request_preplan_steps(
     } else {
         MAX_PREPLAN_READS_INITIAL
     };
+    let numbered_content = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:>4}│{}", i + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let feedback_block = feedback
+        .map(|failure| {
+            let previous = previous_plan
+                .map(|plan| format!("Previous edit plan:\n{plan}\n\n"))
+                .unwrap_or_default();
+            format!(
+                "Previous edit plan was not applied.\nFailure: {failure}\n{previous}Return a corrected complete edit plan against the current file.\n\n"
+            )
+        })
+        .unwrap_or_default();
+    let signature_block = signature_grounding
+        .map(|note| format!("{note}\n\n"))
+        .unwrap_or_default();
+    let mut extra_context = String::new();
+    let text = loop {
+        let prompt = format!(
+            "Plan small edit steps for one file.\n\n\
+             File: {path_str}\n\
+             Task: {task}\n\n\
+             {signature_block}\
+             {feedback_block}\
+             {extra_context}\
+             You may first inspect the current file using these bounded commands:\n\
+             - SEARCH: <exact text>   (current file only, max {MAX_PREPLAN_SEARCHES} total)\n\
+             - READ: <start>-<end>    (current file only, max {max_reads} total in this planning phase)\n\
+             After any inspection, return the final plan or NO_REGIONS.\n\
+             Return up to {MAX_PREPLAN_STEPS} non-overlapping steps for the whole file.\n\
+             Use LITERAL_REPLACE for obvious exact text replacements.\n\
+             Use SMART_EDIT for ambiguous or structural edits.\n\
+             Do not use LITERAL_REPLACE when OLD or NEW spans more than {max_literal_lines} lines.\n\
+             Do not use LITERAL_REPLACE for whole functions, impl blocks, modules, test cases, or other large code blocks even if the text matches exactly.\n\
+             If the edit would require a larger span, split it into smaller LITERAL_REPLACE steps or use SMART_EDIT.\n\
+             Each step should cover at most 5 edit sites.\n\
+             For repeated call-site updates, group nearby exact calls with LITERAL_REPLACE when safe.\n\
+             For code, prefer functions/classes/import blocks.\n\
+             For config/text files, prefer logical sections.\n\
+             Line numbers refer to the full file shown below.\n\n\
+             Output only one of these formats:\n\n\
+             SEARCH: <exact text>\n\n\
+             READ: <start>-<end>\n\n\
+             LITERAL_REPLACE\n\
+             SCOPE <start> <end>\n\
+             ALL true\n\
+             OLD:\n\
+             <exact text to replace>\n\
+             END_OLD\n\
+             NEW:\n\
+             <replacement text>\n\
+             END_NEW\n\
+             END\n\n\
+             SMART_EDIT\n\
+             REGION <start> <end>\n\
+             TASK: <specific edit for this region>\n\
+             END\n\n\
+             Or exactly:\n\
+             NO_REGIONS\n\n\
+             Full file ({total_lines} lines):\n{numbered_content}"
+        );
 
-    for (win_idx, (start, end)) in windows.iter().enumerate() {
-        ensure_not_cancelled(cancelled)?;
-        if steps.len() >= MAX_PREPLAN_STEPS {
-            break;
-        }
-
-        let window_content = lines[*start..*end]
-            .iter()
-            .enumerate()
-            .map(|(i, line)| format!("{:>4}│{}", start + i + 1, line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let remaining = MAX_PREPLAN_STEPS - steps.len();
-
-        let feedback_block = feedback
-            .map(|failure| {
-                let previous = previous_plan
-                    .map(|plan| format!("Previous edit plan:\n{plan}\n\n"))
-                    .unwrap_or_default();
-                format!(
-                    "Previous edit plan was not applied.\nFailure: {failure}\n{previous}Return a corrected complete edit plan against the original file.\n\n"
-                )
-            })
-            .unwrap_or_default();
-        let signature_block = signature_grounding.map(|note| format!("{note}\n\n")).unwrap_or_default();
-        let mut extra_context = String::new();
-        let text = loop {
-            let prompt = format!(
-                "Plan small edit steps for one file.\n\n\
-                 File: {path_str}\n\
-                 Task: {task}\n\n\
-                 {signature_block}\
-                 {feedback_block}\
-                 {extra_context}\
-                 You may first inspect the current file using these bounded commands:\n\
-                 - SEARCH: <exact text>   (current file only, max {MAX_PREPLAN_SEARCHES} total)\n\
-                 - READ: <start>-<end>    (current file only, max {max_reads} total in this planning phase)\n\
-                 After any inspection, return the final plan or NO_REGIONS.\n\
-                 Return up to {remaining} non-overlapping steps within this window.\n\
-                 Use LITERAL_REPLACE for obvious exact text replacements.\n\
-                 Use SMART_EDIT for ambiguous or structural edits.\n\
-                 Do not use LITERAL_REPLACE when OLD or NEW spans more than {max_literal_lines} lines.\n\
-                 Do not use LITERAL_REPLACE for whole functions, impl blocks, modules, test cases, or other large code blocks even if the text matches exactly.\n\
-                 If the edit would require a larger span, split it into smaller LITERAL_REPLACE steps or use SMART_EDIT.\n\
-                 Each step should cover at most 5 edit sites.\n\
-                 For repeated call-site updates, group nearby exact calls with LITERAL_REPLACE when safe.\n\
-                 For code, prefer functions/classes/import blocks.\n\
-                 For config/text files, prefer logical sections.\n\
-                 Line numbers refer to the full file shown below.\n\n\
-                 Output only one of these formats:\n\n\
-                 SEARCH: <exact text>\n\n\
-                 READ: <start>-<end>\n\n\
-                 LITERAL_REPLACE\n\
-                 SCOPE <start> <end>\n\
-                 ALL true\n\
-                 OLD:\n\
-                 <exact text to replace>\n\
-                 END_OLD\n\
-                 NEW:\n\
-                 <replacement text>\n\
-                 END_NEW\n\
-                 END\n\n\
-                 SMART_EDIT\n\
-                 REGION <start> <end>\n\
-                 TASK: <specific edit for this region>\n\
-                 END\n\n\
-                 Or exactly:\n\
-                 NO_REGIONS\n\n\
-                 Window {}/{} lines {}-{} of {}:\n{window_content}",
-                win_idx + 1,
-                windows.len(),
-                start + 1,
-                end,
-                total_lines
-            );
-
-            let request = ChatRequest {
-                messages: vec![
-                    Message::system(
-                        "You output only strict edit-plan blocks or one SEARCH/READ command. No explanations, no markdown.",
-                    ),
-                    Message::user(&prompt),
-                ],
-                tools: None,
-                tool_choice: None,
-            };
-
-            log_stage(log, path_str, &format!("preplan:window:{}-{}", start + 1, end));
-            let response = router
-                .chat_with_cancel(ModelRole::Fast, &request, cancelled)
-                .await?;
-            let text = response
-                .choices
-                .first()
-                .and_then(|c| c.message.content.as_deref())
-                .unwrap_or("");
-            log_debug(
-                log,
-                path_str,
-                &format!(
-                    "preplan:window:{}-{} raw_response:\n{}",
-                    start + 1,
-                    end,
-                    truncate_multiline(text, 12000)
+        let request = ChatRequest {
+            messages: vec![
+                Message::system(
+                    "You output only strict edit-plan blocks or one SEARCH/READ command. No explanations, no markdown.",
                 ),
-            );
-
-            match parse_preplan_assistant_response(text)? {
-                PreplanAssistantResponse::Plan(plan) => break plan,
-                PreplanAssistantResponse::Search(query) => {
-                    if search_count >= MAX_PREPLAN_SEARCHES {
-                        bail!("preplan exceeded SEARCH limit of {MAX_PREPLAN_SEARCHES}");
-                    }
-                    search_count += 1;
-                    let result = search_in_file(content, &query);
-                    log_debug(
-                        log,
-                        path_str,
-                        &format!("preplan:search:{} {}", search_count, truncate_multiline(&result, 4000)),
-                    );
-                    extra_context.push_str("\nInspection result:\n");
-                    extra_context.push_str(&result);
-                    extra_context.push_str("\n\n");
-                }
-                PreplanAssistantResponse::Read { start: read_start, end: read_end } => {
-                    if read_count >= max_reads {
-                        bail!("preplan exceeded READ limit of {max_reads}");
-                    }
-                    read_count += 1;
-                    let result = read_in_file(content, read_start, read_end)?;
-                    log_debug(
-                        log,
-                        path_str,
-                        &format!("preplan:read:{} {}", read_count, truncate_multiline(&result, 4000)),
-                    );
-                    extra_context.push_str("\nInspection result:\n");
-                    extra_context.push_str(&result);
-                    extra_context.push_str("\n\n");
-                }
-            }
+                Message::user(&prompt),
+            ],
+            tools: None,
+            tool_choice: None,
         };
 
-        let mut planned = match parse_edit_plan(&text) {
-            Ok(steps) => steps,
-            Err(e) => {
-                log_debug(
-                    log,
-                    path_str,
-                    &format!(
-                        "preplan:window:{}-{} parse_failed {}",
-                        start + 1,
-                        end,
-                        truncate_multiline(&e.to_string(), 2000)
-                    ),
-                );
-                return Err(e);
-            }
-        };
+        log_stage(log, path_str, &format!("preplan:file:1-{total_lines}"));
+        let response = router
+            .chat_with_cancel(ModelRole::Fast, &request, cancelled)
+            .await?;
+        let text = response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_deref())
+            .unwrap_or("");
         log_debug(
             log,
             path_str,
             &format!(
-                "preplan:window:{}-{} parsed_steps={}\n{}",
-                start + 1,
-                end,
-                planned.len(),
-                truncate_multiline(&format_edit_plan_steps(&planned), 12000)
+                "preplan:file:1-{total_lines} raw_response:\n{}",
+                truncate_multiline(text, 12000)
             ),
         );
-        for step in &planned {
-            if step.start_line() < start + 1 || step.end_line() > *end {
-                log_debug(
-                    log,
-                    path_str,
-                    &format!(
-                        "preplan:window:{}-{} validation_failed planned step L{}-L{} outside window",
-                        start + 1,
-                        end,
-                        step.start_line(),
-                        step.end_line()
-                    ),
-                );
-                bail!(
-                    "planned step L{}-L{} falls outside window L{}-L{}",
-                    step.start_line(),
-                    step.end_line(),
-                    start + 1,
-                    end
-                );
+
+        match parse_preplan_assistant_response(text)? {
+            PreplanAssistantResponse::Plan(plan) => break plan,
+            PreplanAssistantResponse::Inspect(commands) => {
+                for command in commands {
+                    match command {
+                        InspectionCommand::Search(query) => {
+                            if search_count >= MAX_PREPLAN_SEARCHES {
+                                bail!("preplan exceeded SEARCH limit of {MAX_PREPLAN_SEARCHES}");
+                            }
+                            search_count += 1;
+                            let result = search_in_file(content, &query);
+                            log_debug(
+                                log,
+                                path_str,
+                                &format!(
+                                    "preplan:search:{} {}",
+                                    search_count,
+                                    truncate_multiline(&result, 4000)
+                                ),
+                            );
+                            extra_context.push_str("\nInspection result:\n");
+                            extra_context.push_str(&result);
+                            extra_context.push_str("\n\n");
+                        }
+                        InspectionCommand::Read { start: read_start, end: read_end } => {
+                            if read_count >= max_reads {
+                                bail!("preplan exceeded READ limit of {max_reads}");
+                            }
+                            read_count += 1;
+                            let result = read_in_file(content, read_start, read_end)?;
+                            log_debug(
+                                log,
+                                path_str,
+                                &format!(
+                                    "preplan:read:{} {}",
+                                    read_count,
+                                    truncate_multiline(&result, 4000)
+                                ),
+                            );
+                            extra_context.push_str("\nInspection result:\n");
+                            extra_context.push_str(&result);
+                            extra_context.push_str("\n\n");
+                        }
+                    }
+                }
             }
         }
-        steps.append(&mut planned);
-        if steps.len() > MAX_PREPLAN_STEPS {
-            steps.truncate(MAX_PREPLAN_STEPS);
+    };
+
+    let mut steps = match parse_edit_plan(&text) {
+        Ok(steps) => steps,
+        Err(e) => {
+            log_debug(
+                log,
+                path_str,
+                &format!(
+                    "preplan:file:1-{total_lines} parse_failed {}",
+                    truncate_multiline(&e.to_string(), 2000)
+                ),
+            );
+            return Err(e);
         }
+    };
+    log_debug(
+        log,
+        path_str,
+        &format!(
+            "preplan:file:1-{total_lines} parsed_steps={}\n{}",
+            steps.len(),
+            truncate_multiline(&format_edit_plan_steps(&steps), 12000)
+        ),
+    );
+    if steps.len() > MAX_PREPLAN_STEPS {
+        steps.truncate(MAX_PREPLAN_STEPS);
     }
 
     if let Err(e) = validate_steps_in_file(&steps, total_lines) {
@@ -1725,46 +1712,52 @@ async fn request_region_plan(
 
             match parse_preplan_assistant_response(text)? {
                 PreplanAssistantResponse::Plan(plan) => break plan,
-                PreplanAssistantResponse::Search(query) => {
-                    if search_count >= MAX_PREPLAN_SEARCHES {
-                        bail!("split fallback exceeded SEARCH limit of {MAX_PREPLAN_SEARCHES}");
+                PreplanAssistantResponse::Inspect(commands) => {
+                    for command in commands {
+                        match command {
+                            InspectionCommand::Search(query) => {
+                                if search_count >= MAX_PREPLAN_SEARCHES {
+                                    bail!("split fallback exceeded SEARCH limit of {MAX_PREPLAN_SEARCHES}");
+                                }
+                                search_count += 1;
+                                let result = search_in_file(content, &query);
+                                log_debug(
+                                    log,
+                                    path_str,
+                                    &format!(
+                                        "split_plan:search:{} {}",
+                                        search_count,
+                                        truncate_multiline(&result, 4000)
+                                    ),
+                                );
+                                extra_context.push_str("Inspection result:\n");
+                                extra_context.push_str(&result);
+                                extra_context.push_str("\n\n");
+                            }
+                            InspectionCommand::Read { start: read_start, end: read_end } => {
+                                if read_count >= MAX_PREPLAN_READS_REPAIR {
+                                    bail!(
+                                        "split fallback exceeded READ limit of {}",
+                                        MAX_PREPLAN_READS_REPAIR
+                                    );
+                                }
+                                read_count += 1;
+                                let result = read_in_file(content, read_start, read_end)?;
+                                log_debug(
+                                    log,
+                                    path_str,
+                                    &format!(
+                                        "split_plan:read:{} {}",
+                                        read_count,
+                                        truncate_multiline(&result, 4000)
+                                    ),
+                                );
+                                extra_context.push_str("Inspection result:\n");
+                                extra_context.push_str(&result);
+                                extra_context.push_str("\n\n");
+                            }
+                        }
                     }
-                    search_count += 1;
-                    let result = search_in_file(content, &query);
-                    log_debug(
-                        log,
-                        path_str,
-                        &format!(
-                            "split_plan:search:{} {}",
-                            search_count,
-                            truncate_multiline(&result, 4000)
-                        ),
-                    );
-                    extra_context.push_str("Inspection result:\n");
-                    extra_context.push_str(&result);
-                    extra_context.push_str("\n\n");
-                }
-                PreplanAssistantResponse::Read { start: read_start, end: read_end } => {
-                    if read_count >= MAX_PREPLAN_READS_REPAIR {
-                        bail!(
-                            "split fallback exceeded READ limit of {}",
-                            MAX_PREPLAN_READS_REPAIR
-                        );
-                    }
-                    read_count += 1;
-                    let result = read_in_file(content, read_start, read_end)?;
-                    log_debug(
-                        log,
-                        path_str,
-                        &format!(
-                            "split_plan:read:{} {}",
-                            read_count,
-                            truncate_multiline(&result, 4000)
-                        ),
-                    );
-                    extra_context.push_str("Inspection result:\n");
-                    extra_context.push_str(&result);
-                    extra_context.push_str("\n\n");
                 }
             }
         };
@@ -2827,15 +2820,43 @@ miniswe::cli::commands::repl::run(config, cli.yes).await?;\n";
     #[test]
     fn parse_preplan_assistant_response_supports_search_and_read() {
         match parse_preplan_assistant_response("SEARCH: context::assemble").unwrap() {
-            PreplanAssistantResponse::Search(query) => assert_eq!(query, "context::assemble"),
-            _ => panic!("expected SEARCH"),
+            PreplanAssistantResponse::Inspect(commands) => {
+                assert_eq!(
+                    commands,
+                    vec![InspectionCommand::Search("context::assemble".into())]
+                );
+            }
+            _ => panic!("expected inspection commands"),
         }
         match parse_preplan_assistant_response("READ: 10-20").unwrap() {
-            PreplanAssistantResponse::Read { start, end } => {
-                assert_eq!(start, 10);
-                assert_eq!(end, 20);
+            PreplanAssistantResponse::Inspect(commands) => {
+                assert_eq!(
+                    commands,
+                    vec![InspectionCommand::Read { start: 10, end: 20 }]
+                );
             }
-            _ => panic!("expected READ"),
+            _ => panic!("expected inspection commands"),
+        }
+    }
+
+    #[test]
+    fn parse_preplan_assistant_response_supports_multiple_inspection_commands() {
+        match parse_preplan_assistant_response(
+            "SEARCH: foo\nSEARCH: bar\nREAD: 10-20\nNO_REGIONS",
+        )
+        .unwrap()
+        {
+            PreplanAssistantResponse::Inspect(commands) => {
+                assert_eq!(
+                    commands,
+                    vec![
+                        InspectionCommand::Search("foo".into()),
+                        InspectionCommand::Search("bar".into()),
+                        InspectionCommand::Read { start: 10, end: 20 },
+                    ]
+                );
+            }
+            _ => panic!("expected inspection commands"),
         }
     }
 
