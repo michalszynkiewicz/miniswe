@@ -1,9 +1,10 @@
-//! edit_file tool — LLM generates a strict patch, miniswe applies it atomically.
+//! edit_file tool — LLM plans and applies bounded edits atomically.
 //!
-//! The model describes the task, miniswe sends file content to the LLM, and the
-//! inner LLM returns a small patch DSL. Patches are dry-run validated before any
-//! write. If the broad patch path fails, edit_file falls back to smaller,
-//! non-overlapping line regions and validates the combined result before writing.
+//! The model describes the task, miniswe asks the inner LLM for a structured
+//! edit plan, and then executes the planned steps against an in-memory working
+//! copy. If some steps succeed and later ones fail, the successful progress is
+//! preserved in memory and the tool asks for a repaired plan against the updated
+//! working copy. Only the final validated result is written to disk.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -24,7 +25,7 @@ const WINDOW_SIZE: usize = 800;
 /// Overlap between windows to catch edits at boundaries.
 const WINDOW_OVERLAP: usize = 100;
 const MAX_PATCH_ATTEMPTS: usize = 3;
-const MAX_PLAN_ATTEMPTS: usize = 2;
+const MAX_PLAN_ATTEMPTS: usize = 4;
 const MAX_LITERAL_FALLBACK_ATTEMPTS: usize = 2;
 const MAX_PLANNED_REGIONS: usize = 100;
 const MAX_PREPLAN_STEPS: usize = 100;
@@ -78,188 +79,15 @@ pub async fn execute(
     }
     ensure_not_cancelled(cancelled)?;
 
-    let content = std::fs::read_to_string(&path)
+    let original = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("Failed to read {path_str}: {e}"))?;
 
-    if should_preplan(task) {
-        log_stage(log, path_str, "preplan:start");
-        match execute_preplanned_steps(
-            path_str,
-            task,
-            &path,
-            &content,
-            router,
-            config,
-            lsp,
-            lsp_validation,
-            cancelled,
-            log,
-        )
-        .await
-        {
-            Ok(Some(candidate_result)) => {
-                std::fs::write(&path, &candidate_result.content)?;
-                return Ok(ToolResult::ok(candidate_result.message));
-            }
-            Ok(None) => {}
-            Err(e) => {
-                log_debug(
-                    log,
-                    path_str,
-                    &format!("preplan:failed {}", truncate_multiline(&e.to_string(), 2000)),
-                );
-                // Treat pre-planning as an optimization only. If the mixed plan
-                // is malformed or a scoped step fails, fall back to the
-                // established broad patch path and its repair loop.
-            }
-        }
-    }
-
-    let mut feedback: Option<String> = None;
-    let mut last_error = String::new();
-    let signature_grounding =
-        build_signature_grounding_note(path_str, task, &content, &config.project_root);
-    let mut last_raw_patch: Option<String> = None;
-
-    for attempt in 1..=MAX_PATCH_ATTEMPTS {
-        log_stage(log, path_str, &format!("broad_patch:attempt:{attempt}"));
-        let patch = match request_patch(
-            path_str,
-            task,
-            &content,
-            router,
-            feedback.as_deref(),
-            signature_grounding.as_deref(),
-            lsp_validation,
-            cancelled,
-            log,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                last_error = e.to_string();
-                log_debug(
-                    log,
-                    path_str,
-                    &format!(
-                        "broad_patch:request_failed:{attempt} {}",
-                        truncate_multiline(&last_error, 2000)
-                    ),
-                );
-                if attempt < MAX_PATCH_ATTEMPTS {
-                    feedback = Some(build_retry_feedback(
-                        &last_error,
-                        signature_grounding.as_deref(),
-                    ));
-                    continue;
-                }
-                break;
-            }
-        };
-        let PatchResponse {
-            ops,
-            mut output,
-            raw_text,
-        } = patch;
-
-        if last_raw_patch.as_deref() == Some(raw_text.trim())
-            && is_signature_mismatch_error(&last_error)
-        {
-            last_error = "model repeated the same invalid patch after LSP rejection".into();
-            log_debug(
-                log,
-                path_str,
-                &format!("broad_patch:duplicate_attempt:{attempt} {last_error}"),
-            );
-            break;
-        }
-        last_raw_patch = Some(raw_text.trim().to_string());
-
-        if ops.is_empty() {
-            return Ok(ToolResult::ok(format!(
-                "No changes needed in {path_str} for task: {task}"
-            )));
-        }
-
-        let candidate = match apply_patch_dry_run(&content, &ops) {
-            Ok(candidate) => candidate,
-            Err(e) => {
-                last_error = e.to_string();
-                log_debug(
-                    log,
-                    path_str,
-                    &format!(
-                        "broad_patch:apply_failed:{attempt} {}",
-                        truncate_multiline(&last_error, 2000)
-                    ),
-                );
-                if attempt < MAX_PATCH_ATTEMPTS {
-                    feedback = Some(build_retry_feedback(
-                        &last_error,
-                        signature_grounding.as_deref(),
-                    ));
-                    continue;
-                }
-                break;
-            }
-        };
-
-        let validation_note = match validate_candidate_for_write(
-            path_str,
-            &path,
-            &content,
-            &candidate,
-            config,
-            lsp,
-            lsp_validation,
-            cancelled,
-            log,
-        )
-        .await
-        {
-            Ok(note) => note,
-            Err(e) => {
-                last_error = e.to_string();
-                log_debug(
-                    log,
-                    path_str,
-                    &format!(
-                        "broad_patch:validate_failed:{attempt} {}",
-                        truncate_multiline(&last_error, 2000)
-                    ),
-                );
-                if attempt < MAX_PATCH_ATTEMPTS {
-                    feedback = Some(build_retry_feedback(
-                        &last_error,
-                        signature_grounding.as_deref(),
-                    ));
-                    continue;
-                }
-                break;
-            }
-        };
-
-        std::fs::write(&path, &candidate)?;
-        if let Some(note) = validation_note {
-            output.push_str(&note);
-            output.push('\n');
-        }
-        output.push_str(&format!(
-            "✓ Applied {} operation(s) to {path_str} ({} lines)\n",
-            ops.len(),
-            candidate.lines().count()
-        ));
-        return Ok(ToolResult::ok(output));
-    }
-
-    match execute_split_fallback(
+    match execute_preplanned_steps(
         path_str,
         task,
         &path,
-        &content,
+        &original,
         router,
-        &last_error,
         config,
         lsp,
         lsp_validation,
@@ -270,27 +98,16 @@ pub async fn execute(
     {
         Ok(Some(candidate_result)) => {
             std::fs::write(&path, &candidate_result.content)?;
-            return Ok(ToolResult::ok(candidate_result.message));
+            Ok(ToolResult::ok(candidate_result.message))
         }
-        Ok(None) => {}
-        Err(split_error) => {
-            log_debug(
-                log,
-                path_str,
-                &format!(
-                    "split_fallback:failed {}",
-                    truncate_multiline(&split_error.to_string(), 2000)
-                ),
-            );
-            return Ok(ToolResult::err(format!(
-                "edit_file failed: patch was not applied.\nReason: {last_error}\nSplit fallback failed: {split_error}\n"
-            )));
-        }
+        Ok(None) => Ok(ToolResult::ok(format!(
+            "No changes needed in {path_str} for task: {task}"
+        ))),
+        Err(e) => Ok(ToolResult::err(format!(
+            "edit_file failed: patch was not applied.\nReason: {}\n",
+            e
+        ))),
     }
-
-    Ok(ToolResult::err(format!(
-        "edit_file failed: patch was not applied.\nReason: {last_error}\n"
-    )))
 }
 
 struct SplitResult {
@@ -298,21 +115,10 @@ struct SplitResult {
     message: String,
 }
 
-fn should_preplan(task: &str) -> bool {
-    let lower = task.to_ascii_lowercase();
-    [
-        "all ",
-        "every ",
-        "call site",
-        "call sites",
-        "throughout",
-        "all calls",
-        "every call",
-        "all occurrences",
-        "every occurrence",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+struct PlannedExecutionFailure {
+    current_content: String,
+    message: String,
+    error: String,
 }
 
 fn max_literal_replace_lines(context_window: usize) -> usize {
@@ -366,44 +172,83 @@ async fn execute_preplanned_steps(
     let max_literal_lines = max_literal_replace_lines(config.model.context_window);
     let signature_grounding =
         build_signature_grounding_note(path_str, task, original, &config.project_root);
-    let mut steps = request_preplan_steps(
-        path_str,
-        task,
-        original,
-        router,
-        None,
-        None,
-        max_literal_lines,
-        signature_grounding.as_deref(),
-        cancelled,
-        log,
-    )
-    .await?;
-    if steps.is_empty() {
-        log_debug(log, path_str, "preplan:return_no_steps");
-        return Ok(None);
-    }
-
+    let mut current = original.to_string();
     let mut last_error: Option<String> = None;
+    let mut previous_plan: Option<String> = None;
+    let mut progress_log = String::new();
+
     for attempt in 1..=MAX_PLAN_ATTEMPTS {
-        let step_count = steps.len();
         let label = if last_error.is_some() {
             format!("Pre-plan repair attempt {attempt}")
         } else {
+            log_stage(log, path_str, "preplan:start");
             format!("Pre-plan attempt {attempt}")
         };
-        let mut message = if let Some(error) = &last_error {
+
+        let steps = request_preplan_steps(
+            path_str,
+            task,
+            &current,
+            router,
+            last_error.as_deref(),
+            previous_plan.as_deref(),
+            max_literal_lines,
+            signature_grounding.as_deref(),
+            cancelled,
+            log,
+        )
+        .await?;
+
+        if steps.is_empty() {
+            log_debug(log, path_str, "preplan:return_no_steps");
+            if current == original {
+                return Ok(None);
+            }
+
+            let mut message = String::new();
+            if !progress_log.is_empty() {
+                message.push_str(&progress_log);
+            }
+            message.push_str(&format!(
+                "✓ via pre-plan: converged after {attempt} planning attempt(s), applied edits to {path_str} ({} lines)\n",
+                current.lines().count()
+            ));
+            let validation_note = validate_candidate_for_write(
+                path_str,
+                path,
+                original,
+                &current,
+                config,
+                lsp,
+                lsp_validation,
+                cancelled,
+                log,
+            )
+            .await?;
+            if let Some(note) = validation_note {
+                message.push_str(&note);
+                message.push('\n');
+            }
+            return Ok(Some(SplitResult {
+                content: current,
+                message,
+            }));
+        }
+
+        let step_count = steps.len();
+        let mut attempt_message = if let Some(error) = &last_error {
             format!("{label}; previous plan failed: {error}")
         } else {
             label.clone()
         };
-        message.push('\n');
-        message.push_str(&format_preplan_log(&label, &steps));
+        attempt_message.push('\n');
+        attempt_message.push_str(&format_preplan_log(&label, &steps));
 
         match execute_planned_steps(
             path_str,
             path,
             original,
+            &current,
             router,
             config,
             lsp,
@@ -412,64 +257,47 @@ async fn execute_preplanned_steps(
             log,
             steps.clone(),
             step_count,
-            message,
+            attempt_message,
             "via pre-plan",
         )
         .await
         {
-            Ok(result) => return Ok(Some(result)),
-            Err(e) if attempt < MAX_PLAN_ATTEMPTS => {
-                let error = e.to_string();
-                log_debug(
-                    log,
-                    path_str,
-                    &format!(
-                        "preplan:apply_failed:{attempt} {}",
-                        truncate_multiline(&error, 2000)
-                    ),
-                );
-                let previous_plan = format_edit_plan_steps(&steps);
-                steps = request_preplan_steps(
-                    path_str,
-                    task,
-                    original,
-                    router,
-                    Some(&error),
-                    Some(&previous_plan),
-                    max_literal_lines,
-                    signature_grounding.as_deref(),
-                    cancelled,
-                    log,
-                )
-                .await?;
-                if steps.is_empty() {
-                    log_debug(
-                        log,
-                        path_str,
-                        &format!(
-                            "preplan:repair_returned_no_steps:{}",
-                            truncate_multiline(&error, 2000)
-                        ),
-                    );
-                    return Ok(None);
+            Ok(result) => {
+                if !progress_log.is_empty() {
+                    let mut message = progress_log;
+                    message.push_str(&result.message);
+                    return Ok(Some(SplitResult {
+                        content: result.content,
+                        message,
+                    }));
                 }
-                last_error = Some(error);
+                return Ok(Some(result));
             }
             Err(e) => {
                 log_debug(
                     log,
                     path_str,
                     &format!(
-                        "preplan:terminal_failure {}",
-                        truncate_multiline(&e.to_string(), 2000)
+                        "preplan:apply_failed:{attempt} {}",
+                        truncate_multiline(&e.error, 2000)
                     ),
                 );
-                return Err(e);
+                progress_log.push_str(&e.message);
+                previous_plan = Some(format_edit_plan_steps(&steps));
+                last_error = Some(e.error);
+                current = e.current_content;
             }
         }
     }
 
-    unreachable!("plan attempts loop must return")
+    let mut message = progress_log;
+    if let Some(error) = last_error {
+        message.push_str(&format!(
+            "Pre-plan exhausted after {MAX_PLAN_ATTEMPTS} attempt(s); last failure: {error}\n"
+        ));
+        bail!(message);
+    }
+    Ok(None)
 }
 
 async fn execute_split_fallback(
@@ -652,7 +480,8 @@ async fn execute_planned_regions(
 async fn execute_planned_steps(
     path_str: &str,
     path: &std::path::Path,
-    original: &str,
+    file_original: &str,
+    current_base: &str,
     router: &ModelRouter,
     config: &Config,
     lsp: Option<&LspClient>,
@@ -663,8 +492,8 @@ async fn execute_planned_steps(
     planned_count: usize,
     mut message: String,
     success_label: &str,
-) -> Result<SplitResult> {
-    let mut current = original.to_string();
+) -> std::result::Result<SplitResult, PlannedExecutionFailure> {
+    let mut current = current_base.to_string();
     let mut total_ops = 0usize;
     let mut completed_steps = 0usize;
     if !message.ends_with('\n') {
@@ -729,11 +558,19 @@ async fn execute_planned_steps(
                             log,
                         )
                         .await
-                        .map_err(|e| {
-                            anyhow::anyhow!(
+                        .map_err(|e| PlannedExecutionFailure {
+                            current_content: current.clone(),
+                            message: format!(
+                                "{message}Pre-plan step {} literal L{}-L{} failed after {} completed step(s): {literal_error}; smart fallback failed: {e}\n",
+                                idx + 1,
+                                scope_start,
+                                scope_end,
+                                completed_steps
+                            ),
+                            error: format!(
                                 "step {} literal replace failed: {literal_error}; smart fallback failed: {e}",
                                 idx + 1
-                            )
+                            ),
                         })?;
                         current = candidate;
                         total_ops += count;
@@ -763,7 +600,13 @@ async fn execute_planned_steps(
                     log,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("{region_label} failed: {e}"))?;
+                .map_err(|e| PlannedExecutionFailure {
+                    current_content: current.clone(),
+                    message: format!(
+                        "{message}Pre-plan {region_label} failed after {completed_steps} completed step(s): {e}\n",
+                    ),
+                    error: format!("{region_label} failed: {e}"),
+                })?;
 
                 if count == 0 {
                     message.push_str(&format!("Pre-plan {region_label}: no changes\n"));
@@ -783,7 +626,7 @@ async fn execute_planned_steps(
     let validation_note = validate_candidate_for_write(
         path_str,
         path,
-        original,
+        file_original,
         &current,
         config,
         lsp,
@@ -791,7 +634,14 @@ async fn execute_planned_steps(
         cancelled,
         log,
     )
-    .await?;
+    .await
+    .map_err(|e| PlannedExecutionFailure {
+        current_content: current.clone(),
+        message: format!(
+            "{message}Pre-plan validation failed after {completed_steps}/{planned_count} completed step(s): {e}\n"
+        ),
+        error: e.to_string(),
+    })?;
     if let Some(note) = validation_note {
         message.push_str(&note);
         message.push('\n');
@@ -2972,16 +2822,6 @@ miniswe::cli::commands::repl::run(config, cli.yes).await?;\n";
 
         assert!(feedback.contains("Do not repeat the same patch shape"));
         assert!(feedback.contains("Current known callee signatures"));
-    }
-
-    #[test]
-    fn should_preplan_requires_broad_scope_language() {
-        assert!(should_preplan(
-            "Update all context::assemble() calls to include the new parameter"
-        ));
-        assert!(!should_preplan(
-            "Update main.rs to pass system_prompt_override to run and repl commands"
-        ));
     }
 
     #[test]
