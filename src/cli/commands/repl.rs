@@ -57,7 +57,7 @@ impl Drop for ReplTerminalGuard {
 
 /// Run the interactive REPL with TUI.
 pub async fn run(config: Config, headless: bool) -> Result<()> {
-    let log = SessionLog::new(&config);
+    let log = Arc::new(SessionLog::new(&config));
 
     let router = Arc::new(ModelRouter::new(&config));
     let llm_worker = LlmWorkerHandle::new(router.clone());
@@ -160,6 +160,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
 
     // Event channel
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+    perms.set_prompt_event_tx(tx.clone());
 
     // Cancellation flag for LLM
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -310,7 +311,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                     &mut messages,
                                     conv_ref,
                                     max_rounds,
-                                    &log,
+                                    log.clone(),
                                     &lsp_client,
                                 )
                                 .await;
@@ -370,6 +371,11 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
             }
 
             AppEvent::Mouse(_) => {}
+            AppEvent::PermissionRequest(prompt, response_tx) => {
+                let response =
+                    fulfill_permission_request(&mut app, &mut rx, &mut terminal, prompt).await;
+                let _ = response_tx.send(response);
+            }
 
             // Events from agent loop
             AppEvent::Token(token) => {
@@ -432,7 +438,7 @@ async fn run_agent_loop(
     messages: &mut Vec<Message>,
     conversation_history: &mut Vec<Message>,
     max_rounds: usize,
-    log: &SessionLog,
+    log: Arc<SessionLog>,
     lsp: &Option<Arc<LspClient>>,
 ) {
     let mut round = 0;
@@ -447,7 +453,7 @@ async fn run_agent_loop(
 
     loop {
         // Check cancellation at the top of every round
-        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        if consume_interrupt(cancelled) {
             app.push_output("(interrupted)", LineStyle::Status);
             break;
         }
@@ -505,6 +511,7 @@ async fn run_agent_loop(
                             Some(LlmWorkerEvent::Completed(Ok(r))) => break Some(r),
                             Some(LlmWorkerEvent::Completed(Err(err_str))) => {
                                 if err_str.contains("Interrupted") {
+                                    cancelled.store(false, Ordering::Relaxed);
                                     app.push_output("Generation interrupted.", LineStyle::Status);
                                 } else {
                                     let clean = if err_str.contains('<') {
@@ -544,6 +551,11 @@ async fn run_agent_loop(
                                 let _ = terminal.draw(|frame| ui::draw(frame, app));
                             }
                             Some(AppEvent::Mouse(_)) => {}
+                            Some(AppEvent::PermissionRequest(prompt, response_tx)) => {
+                                let response =
+                                    fulfill_permission_request(app, rx, terminal, prompt).await;
+                                let _ = response_tx.send(response);
+                            }
                             Some(_) => {}
                             None => {
                                 app.push_output("Event stream closed.", LineStyle::Error);
@@ -590,7 +602,7 @@ async fn run_agent_loop(
         // Execute tool calls
         for tc in &tool_calls {
             // Check cancellation between tool calls
-            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            if consume_interrupt(cancelled) {
                 app.push_output("(interrupted)", LineStyle::Status);
                 return;
             }
@@ -622,22 +634,23 @@ async fn run_agent_loop(
                 same_call_streak = 1;
             }
             if same_call_streak >= 3 {
-                log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
-                app.push_output(
-                    &format!(
-                        "  ✗ Loop detected: {}({}) called {} times — stopping",
-                        tc.function.name, args_summary, same_call_streak
-                    ),
-                    LineStyle::Error,
-                );
+                if same_call_streak == 3 {
+                    log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
+                    app.push_output(
+                        &format!(
+                            "  ✗ Loop detected: {}({}) repeated 3 times in a row — stopping this turn",
+                            tc.function.name, args_summary
+                        ),
+                        LineStyle::Error,
+                    );
+                }
                 let result_msg = Message::tool_result(
                     &tc.id,
-                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits.",
+                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits.",
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
-                // Don't break — let the model see the error and hopefully stop
-                continue;
+                return;
             }
 
             log.tool_call_detail(&tc.function.name, &args);
@@ -654,7 +667,9 @@ async fn run_agent_loop(
 
             // Check permission via TUI prompt (not raw stderr)
             let mut perm_denied = false;
-            if let Some(ref action) = perm_action {
+            if let Some(ref action) = perm_action
+                && matches!(action, Action::Shell(_) | Action::McpUse(_, _))
+            {
                 match perms.check_needs_prompt(action) {
                     Err(e) => {
                         // Blocklisted — skip this tool call
@@ -760,6 +775,8 @@ async fn run_agent_loop(
                 let perms = perms.clone();
                 let router = router.clone();
                 let lsp = lsp.clone();
+                let cancelled_for_job = cancelled.clone();
+                let log_for_job = log.clone();
                 let mut result_rx = tool_pool.submit(move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -773,6 +790,8 @@ async fn run_agent_loop(
                                 perms.as_ref(),
                                 router.as_ref(),
                                 lsp.as_deref(),
+                                Some(cancelled_for_job.as_ref()),
+                                Some(log_for_job.as_ref()),
                             )
                             .await
                         })
@@ -1039,6 +1058,11 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                     format!("refine step {}", args["step"].as_u64().unwrap_or(0))
                 }
                 ("plan", "scratchpad") => "scratchpad".to_string(),
+                ("web", "search") => {
+                    let query = args["query"].as_str().unwrap_or("?");
+                    format!("search \"{query}\"")
+                }
+                ("web", "fetch") => args["url"].as_str().unwrap_or("?").to_string(),
                 ("edit_file", _) => {
                     let path = args["path"].as_str().unwrap_or("?");
                     let task = args["task"].as_str().unwrap_or("");
@@ -1119,6 +1143,10 @@ fn handle_background_key(app: &mut App, key: &crossterm::event::KeyEvent) -> boo
     }
 }
 
+fn consume_interrupt(cancelled: &AtomicBool) -> bool {
+    cancelled.swap(false, Ordering::Relaxed)
+}
+
 fn canonical_json(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => "null".to_string(),
@@ -1182,6 +1210,10 @@ async fn await_tool_job_ui(
                         let _ = terminal.draw(|frame| ui::draw(frame, app));
                     }
                     Some(AppEvent::Mouse(_)) => {}
+                    Some(AppEvent::PermissionRequest(prompt, response_tx)) => {
+                        let response = fulfill_permission_request(app, rx, terminal, prompt).await;
+                        let _ = response_tx.send(response);
+                    }
                     Some(_) => {}
                     None => {
                         app.clear_active_job();
@@ -1227,6 +1259,19 @@ mod tests {
     }
 
     #[test]
+    fn web_search_summary_includes_query() {
+        let args = json!({
+            "action": "search",
+            "query": "Michał Szynkiewicz",
+        });
+
+        assert_eq!(
+            summarize_args("web", &args),
+            "search \"Michał Szynkiewicz\""
+        );
+    }
+
+    #[test]
     fn grouped_file_shell_maps_to_shell_permission_action() {
         let args = json!({
             "action": "shell",
@@ -1237,6 +1282,14 @@ mod tests {
             Some(Action::Shell(cmd)) => assert_eq!(cmd, "python -m http.server"),
             _ => panic!("expected grouped file shell to require shell permission"),
         }
+    }
+
+    #[test]
+    fn consume_interrupt_clears_flag_after_first_read() {
+        let cancelled = AtomicBool::new(true);
+        assert!(consume_interrupt(&cancelled));
+        assert!(!consume_interrupt(&cancelled));
+        assert!(!cancelled.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -1349,6 +1402,21 @@ async fn wait_for_permission_input(
     wait_for_modal_input(app, rx, terminal, &['y', 'n', 'a']).await
 }
 
+async fn fulfill_permission_request(
+    app: &mut App,
+    rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+    terminal: &mut Terminal<impl Backend>,
+    prompt: String,
+) -> String {
+    app.pending_permission = Some(prompt);
+    app.input.clear();
+    app.cursor = 0;
+    let response = wait_for_permission_input(app, rx, terminal).await;
+    app.pending_permission = None;
+    let _ = terminal.draw(|frame| ui::draw(frame, app));
+    response
+}
+
 async fn await_shell_job_repl(
     mut shell_job: crate::runtime::ShellJobHandle,
     app: &mut App,
@@ -1422,6 +1490,10 @@ async fn await_shell_job_repl(
                         let _ = terminal.draw(|frame| ui::draw(frame, app));
                     }
                     Some(AppEvent::Mouse(_)) => {}
+                    Some(AppEvent::PermissionRequest(prompt, response_tx)) => {
+                        let response = fulfill_permission_request(app, rx, terminal, prompt).await;
+                        let _ = response_tx.send(response);
+                    }
                     Some(_) => {}
                     None => {
                         app.clear_active_job();

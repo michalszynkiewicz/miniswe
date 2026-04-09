@@ -38,7 +38,7 @@ Plan checkpoint required before more edits. You have continued editing after the
 
 /// Run the agent for a single message.
 pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()> {
-    let log = SessionLog::new(&config);
+    let log = Arc::new(SessionLog::new(&config));
     log.user_message(message);
 
     let router = Arc::new(ModelRouter::new(&config));
@@ -150,7 +150,6 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     // Track consecutive identical tool calls for loop detection
     let mut last_call_key: Option<String> = None;
     let mut same_call_streak = 0u32;
-    let mut consecutive_loops = 0u32;
     let mut calls_since_last_edit = 0u32;
     let mut edit_fail_count: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
@@ -392,27 +391,21 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 same_call_streak = 1;
             }
             if same_call_streak >= 3 {
-                log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
-                tui::print_error(&format!(
-                    "Loop detected: {}({}) called {} times — stopping",
-                    tc.function.name, args_summary, same_call_streak
-                ));
-                consecutive_loops += 1;
+                if same_call_streak == 3 {
+                    log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
+                    tui::print_error(&format!(
+                        "Loop detected: {}({}) repeated 3 times in a row — stopping this turn",
+                        tc.function.name, args_summary
+                    ));
+                }
                 let result_msg = Message::tool_result(
                     &tc.id,
-                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits.",
+                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits.",
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
-                if consecutive_loops >= 3 {
-                    tui::print_error("Too many consecutive loops — ending session");
-                    had_error = true;
-                    // Break inner tool loop; outer round loop checks had_error
-                    break;
-                }
-                continue;
-            } else {
-                consecutive_loops = 0;
+                had_error = true;
+                break;
             }
 
             log.tool_call_detail(&tc.function.name, &args);
@@ -522,6 +515,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 let perms = perms.clone();
                 let router = router.clone();
                 let lsp = lsp_client.clone();
+                let cancelled = cancelled.clone();
+                let log = log.clone();
                 match tool_pool
                     .submit(move || {
                         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -536,6 +531,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                                     perms.as_ref(),
                                     router.as_ref(),
                                     lsp.as_deref(),
+                                    Some(cancelled.as_ref()),
+                                    Some(log.as_ref()),
                                 )
                                 .await
                             })
@@ -916,5 +913,18 @@ mod tests {
         });
 
         assert_eq!(summarize_args("plan", &args), "refine step 2");
+    }
+
+    #[test]
+    fn web_search_summary_includes_query() {
+        let args = serde_json::json!({
+            "action": "search",
+            "query": "Michał Szynkiewicz",
+        });
+
+        assert_eq!(
+            summarize_args("web", &args),
+            "search \"Michał Szynkiewicz\""
+        );
     }
 }

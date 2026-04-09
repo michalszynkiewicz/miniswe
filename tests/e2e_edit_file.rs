@@ -242,7 +242,9 @@ END
 
 #[test]
 fn parse_rejects_preamble_and_malformed_blocks() {
-    assert!(edit_file::parse_patch("Here is the patch:\nINSERT_AFTER 1\nCONTENT:\nx\nEND").is_err());
+    assert!(
+        edit_file::parse_patch("Here is the patch:\nINSERT_AFTER 1\nCONTENT:\nx\nEND").is_err()
+    );
     assert!(edit_file::parse_patch("INSERT_AFTER 1\nCONTENT:\nx\n").is_err());
     assert!(edit_file::parse_patch("UNKNOWN 1\nCONTENT:\nx\nEND").is_err());
     assert!(edit_file::parse_patch("INSERT_AFTER 0\nCONTENT:\nx\nEND").is_err());
@@ -460,7 +462,7 @@ async fn execute_valid_patch_writes_file() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "add setup call"});
-    let result = edit_file::execute(&args, &config, &router, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
         .await
         .unwrap();
 
@@ -489,7 +491,7 @@ async fn execute_failed_patch_writes_nothing() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change line"});
-    let result = edit_file::execute(&args, &config, &router, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
         .await
         .unwrap();
 
@@ -529,7 +531,7 @@ async fn execute_repairs_failed_first_patch() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change line"});
-    let result = edit_file::execute(&args, &config, &router, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
         .await
         .unwrap();
 
@@ -569,7 +571,7 @@ async fn execute_repairs_until_third_patch() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change line"});
-    let result = edit_file::execute(&args, &config, &router, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
         .await
         .unwrap();
 
@@ -611,7 +613,7 @@ async fn execute_split_fallback_after_broad_overlap_failure() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change first block"});
-    let result = edit_file::execute(&args, &config, &router, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
         .await
         .unwrap();
 
@@ -662,7 +664,7 @@ async fn execute_preplans_bulk_edit_into_regions() {
         "task": "update all call sites",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
         .await
         .unwrap();
 
@@ -717,7 +719,7 @@ async fn execute_preplan_uses_literal_replacements_before_smart_edits() {
         "task": "update all call sites",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
         .await
         .unwrap();
 
@@ -769,7 +771,7 @@ async fn execute_preplan_literal_step_falls_back_to_smart_edit() {
         "task": "update all calls",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
         .await
         .unwrap();
 
@@ -814,7 +816,7 @@ async fn execute_preplan_repairs_whole_plan_after_step_retries_fail() {
         "task": "update all calls",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
         .await
         .unwrap();
 
@@ -859,7 +861,7 @@ async fn execute_preplan_parse_failure_falls_back_to_broad_patch() {
         "task": "update all calls",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
         .await
         .unwrap();
 
@@ -892,7 +894,7 @@ async fn execute_no_changes_leaves_file_unchanged() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "no op"});
-    let result = edit_file::execute(&args, &config, &router, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
         .await
         .unwrap();
 
@@ -924,7 +926,7 @@ async fn execute_lsp_off_succeeds_without_lsp_client() {
         "task": "change line",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
         .await
         .unwrap();
 
@@ -949,7 +951,7 @@ async fn execute_rejects_invalid_lsp_validation_mode() {
         "task": "change line",
         "lsp_validation": "sometimes"
     });
-    let result = edit_file::execute(&args, &config, &router, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
         .await
         .unwrap();
 
@@ -993,7 +995,8 @@ async fn execute_edit_file_tool_reindexes_successful_edit() {
         "task": "rename original to replacement",
         "lsp_validation": "off"
     });
-    let result = tools::execute_edit_file_tool(&args, &config, &perms, &router, None)
+    let result =
+        tools::execute_edit_file_tool(&args, &config, &perms, &router, None, None, None)
         .await
         .unwrap();
 
