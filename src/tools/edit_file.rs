@@ -1580,6 +1580,7 @@ async fn request_preplan_steps(
          {results_block}\
          Plan the edit. You only see the notes and inspection results above — line numbers in your plan must match the real file.\n\n\
          Up to {MAX_PREPLAN_STEPS} non-overlapping steps, each covering at most 5 edit sites.\n\
+         Every step must change something. Do not emit a LITERAL_REPLACE whose NEW is identical to its OLD, and do not emit a SMART_EDIT whose task is to verify a region is unchanged or to keep it as-is — just leave those regions out of the plan.\n\
          Use LITERAL_REPLACE when you have the OLD text verbatim from an inspection result and OLD/NEW each span ≤ {max_literal_lines} lines. Otherwise use SMART_EDIT — its execution phase will see the region content.\n\
          Never use LITERAL_REPLACE for whole functions, impl blocks, modules, or test cases.\n\n\
          Output only these blocks, nothing else:\n\n\
