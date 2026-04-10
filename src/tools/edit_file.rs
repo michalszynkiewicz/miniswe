@@ -23,9 +23,9 @@ use crate::lsp::LspClient;
 const WINDOW_SIZE: usize = 800;
 /// Overlap between windows to catch edits at boundaries.
 const PREPLAN_READ_OVERLAP: usize = 60;
-/// Files at or below this line count skip the windowed pre-plan pass entirely
-/// and go straight to finalize, since the whole file fits in a single prompt.
-const SMALL_FILE_THRESHOLD: usize = 200;
+/// Max iterations of the reconnaissance loop. Each iteration is one LLM call
+/// where the model decides what to SEARCH/READ next, or emits DONE.
+const MAX_RECON_ROUNDS: usize = 3;
 const MAX_PATCH_ATTEMPTS: usize = 3;
 const MAX_PLAN_ATTEMPTS: usize = 4;
 const MAX_PREPLAN_STEPS: usize = 100;
@@ -807,8 +807,15 @@ fn is_signature_mismatch_error(error: &str) -> bool {
 #[derive(Debug)]
 struct PreplanWindowResponse {
     notes: Vec<String>,
+}
+
+#[derive(Debug)]
+struct PreplanReconResponse {
     commands: Vec<InspectionCommand>,
-    tentative_steps: Vec<EditPlanStep>,
+    /// True if the model emitted DONE (or NO_CHANGES, or any other "stop"
+    /// signal). The recon loop also stops when commands are empty even
+    /// without an explicit DONE.
+    done: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -817,27 +824,17 @@ enum InspectionCommand {
     Read { start: usize, end: usize },
 }
 
-/// Parse the response from a single windowed pre-plan turn. Each window may
-/// emit any mix of NOTE lines, SEARCH/READ commands, and tentative
-/// LITERAL_REPLACE/SMART_EDIT blocks. SEARCH/READ commands are collected and
-/// batch-executed after the full pass; the model never sees results during
-/// the windowed pass itself.
-fn parse_preplan_window_response(text: &str) -> Result<PreplanWindowResponse> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        bail!("empty preplan window response");
-    }
-
+/// Parse the response from a single windowed pre-plan turn. Each window
+/// emits NOTE lines describing structural landmarks for later phases. The
+/// parser is liberal: anything that isn't a recognizable NOTE is silently
+/// ignored. Returning empty notes is fine — the model may have nothing
+/// useful to say about a particular slice.
+fn parse_preplan_window_response(text: &str) -> PreplanWindowResponse {
     let mut notes = Vec::new();
-    let mut commands = Vec::new();
-    let mut plan_lines = Vec::new();
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
         if line.is_empty() {
-            if !plan_lines.is_empty() {
-                plan_lines.push(String::new());
-            }
             continue;
         }
         if let Some(rest) = strip_case_insensitive_prefix(line, "NOTE ") {
@@ -854,52 +851,66 @@ fn parse_preplan_window_response(text: &str) -> Result<PreplanWindowResponse> {
             }
             continue;
         }
+        // Anything else is silently ignored. The window phase is observation
+        // only — stray control words, half-formed steps, or hallucinated
+        // SEARCH/READ commands all get dropped without erroring out.
+    }
+
+    PreplanWindowResponse { notes }
+}
+
+/// Parse the response from one reconnaissance round. Accepts SEARCH and
+/// READ commands and a DONE terminator. Liberal: unknown lines are ignored,
+/// and an empty/unparseable response is treated as DONE so that the loop
+/// terminates rather than hanging on a confused model.
+fn parse_preplan_recon_response(text: &str) -> PreplanReconResponse {
+    let mut commands = Vec::new();
+    let mut done = false;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.eq_ignore_ascii_case("DONE")
+            || line.eq_ignore_ascii_case("NONE")
+            || line.eq_ignore_ascii_case("NO_CHANGES")
+            || line.eq_ignore_ascii_case("FINALIZE")
+            || line.eq_ignore_ascii_case("PLAN")
+        {
+            done = true;
+            continue;
+        }
         if let Some(rest) = strip_case_insensitive_prefix(line, "SEARCH:") {
             let query = rest.trim();
-            if query.is_empty() {
-                bail!("empty SEARCH query");
+            if !query.is_empty() {
+                commands.push(InspectionCommand::Search(query.to_string()));
             }
-            commands.push(InspectionCommand::Search(query.to_string()));
             continue;
         }
         if let Some(rest) = strip_case_insensitive_prefix(line, "READ:") {
             let rest = rest.trim();
-            let (start, end) = rest
-                .split_once('-')
-                .ok_or_else(|| anyhow::anyhow!("READ must be in the form READ: <start>-<end>"))?;
-            let start = start.trim().parse::<usize>()?;
-            let end = end.trim().parse::<usize>()?;
-            if start == 0 || end < start {
-                bail!("invalid READ range {start}-{end}");
+            if let Some((start_s, end_s)) = rest.split_once('-') {
+                if let (Ok(start), Ok(end)) =
+                    (start_s.trim().parse::<usize>(), end_s.trim().parse::<usize>())
+                {
+                    if start > 0 && end >= start {
+                        commands.push(InspectionCommand::Read { start, end });
+                    }
+                }
             }
-            commands.push(InspectionCommand::Read { start, end });
             continue;
         }
-        if line.eq_ignore_ascii_case("DONE_EXPLORING")
-            || line.eq_ignore_ascii_case("FINALIZE")
-            || line.eq_ignore_ascii_case("PLAN")
-            || line.eq_ignore_ascii_case("EXPLORE")
-        {
-            // Tolerate stray control words; the windowed pass has no terminator.
-            continue;
-        }
-        if line.eq_ignore_ascii_case("NO_CHANGES") {
-            bail!("windowed pre-plan must not output NO_CHANGES; defer that to the finalize phase");
-        }
-        plan_lines.push(raw_line.to_string());
+        // Ignore everything else.
     }
 
-    let tentative_steps = if plan_lines.iter().any(|line| !line.trim().is_empty()) {
-        parse_edit_plan(&plan_lines.join("\n"))?
-    } else {
-        Vec::new()
-    };
+    if commands.is_empty() {
+        // An empty response or one with only unknown lines should terminate
+        // the loop, not silently hang waiting for the next round.
+        done = true;
+    }
 
-    Ok(PreplanWindowResponse {
-        notes,
-        commands,
-        tentative_steps,
-    })
+    PreplanReconResponse { commands, done }
 }
 
 fn has_case_insensitive_prefix(text: &str, prefix: &str) -> bool {
@@ -962,39 +973,6 @@ fn extend_unique_notes(existing: &mut Vec<String>, new_notes: Vec<String>) {
     }
 }
 
-fn extend_unique_tentative_steps(existing: &mut Vec<EditPlanStep>, new_steps: Vec<EditPlanStep>) {
-    for step in new_steps {
-        if !existing.contains(&step) {
-            existing.push(step);
-        }
-    }
-}
-
-fn extend_unique_commands(
-    existing: &mut Vec<InspectionCommand>,
-    new_commands: Vec<InspectionCommand>,
-) {
-    for command in new_commands {
-        if !existing.contains(&command) {
-            existing.push(command);
-        }
-    }
-}
-
-fn format_pending_commands(commands: &[InspectionCommand]) -> String {
-    let mut out = String::new();
-    for command in commands {
-        match command {
-            InspectionCommand::Search(query) => {
-                out.push_str(&format!("- SEARCH: {query}\n"));
-            }
-            InspectionCommand::Read { start, end } => {
-                out.push_str(&format!("- READ: {start}-{end}\n"));
-            }
-        }
-    }
-    out
-}
 
 fn append_inspection_result(extra_context: &mut String, label: &str, result: &str) {
     extra_context.push_str(label);
@@ -1003,80 +981,87 @@ fn append_inspection_result(extra_context: &mut String, label: &str, result: &st
     extra_context.push_str("\n\n");
 }
 
-/// Run all SEARCH/READ commands collected during the windowed pass and
-/// format their results for the finalize prompt. SEARCH and READ commands
-/// each have their own caps; commands beyond the cap are dropped with a
-/// note in the resulting context, not surfaced as errors, since they are
-/// hints from a planning pass and we'd rather still finalize.
-fn execute_pending_commands(
+/// Tracks running totals across all reconnaissance rounds so that the
+/// per-edit limits on SEARCH and READ apply globally, not per round.
+struct ReconCounters {
+    search_count: usize,
+    read_count: usize,
+    max_reads: usize,
+}
+
+/// Execute the SEARCH/READ commands emitted in one recon round, appending
+/// their formatted results to `extra_context`. Commands that exceed the
+/// per-edit caps are dropped with an inline note rather than erroring out.
+fn execute_recon_commands(
     content: &str,
     commands: &[InspectionCommand],
-    max_reads: usize,
+    counters: &mut ReconCounters,
+    extra_context: &mut String,
     path_str: &str,
     log: Option<&SessionLog>,
-) -> Result<String> {
-    let mut extra_context = String::new();
-    let mut search_count = 0usize;
-    let mut read_count = 0usize;
-    let mut dropped_searches = 0usize;
-    let mut dropped_reads = 0usize;
-
+) -> Result<()> {
     for command in commands {
         match command {
             InspectionCommand::Search(query) => {
-                if search_count >= MAX_PREPLAN_SEARCHES {
-                    dropped_searches += 1;
+                if counters.search_count >= MAX_PREPLAN_SEARCHES {
+                    extra_context.push_str(&format!(
+                        "(SEARCH `{query}` skipped: per-edit limit of {MAX_PREPLAN_SEARCHES} searches reached)\n\n",
+                    ));
                     continue;
                 }
-                search_count += 1;
+                counters.search_count += 1;
                 let result = search_in_file(content, query);
                 log_debug(
                     log,
                     path_str,
                     &format!(
                         "preplan:search:{} {}",
-                        search_count,
+                        counters.search_count,
                         truncate_multiline(&result, 4000)
                     ),
                 );
                 append_inspection_result(
-                    &mut extra_context,
+                    extra_context,
                     &format!("SEARCH_RESULT query=`{query}`"),
                     &result,
                 );
             }
             InspectionCommand::Read { start, end } => {
-                if read_count >= max_reads {
-                    dropped_reads += 1;
+                if counters.read_count >= counters.max_reads {
+                    extra_context.push_str(&format!(
+                        "(READ {start}-{end} skipped: per-edit limit of {} reads reached)\n\n",
+                        counters.max_reads,
+                    ));
                     continue;
                 }
-                read_count += 1;
-                let result = read_in_file(content, *start, *end)?;
+                counters.read_count += 1;
+                let result = match read_in_file(content, *start, *end) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        extra_context.push_str(&format!(
+                            "(READ {start}-{end} failed: {e})\n\n",
+                        ));
+                        continue;
+                    }
+                };
                 log_debug(
                     log,
                     path_str,
                     &format!(
                         "preplan:read:{} {}",
-                        read_count,
+                        counters.read_count,
                         truncate_multiline(&result, 4000)
                     ),
                 );
                 append_inspection_result(
-                    &mut extra_context,
+                    extra_context,
                     &format!("READ_RESULT range=L{start}-L{end}"),
                     &result,
                 );
             }
         }
     }
-
-    if dropped_searches > 0 || dropped_reads > 0 {
-        extra_context.push_str(&format!(
-            "(note: {dropped_searches} extra SEARCH and {dropped_reads} extra READ command(s) were dropped because the per-phase limits were reached)\n\n",
-        ));
-    }
-
-    Ok(extra_context)
+    Ok(())
 }
 
 async fn request_patch(
@@ -1390,197 +1375,229 @@ async fn request_preplan_steps(
     } else {
         MAX_PREPLAN_READS_INITIAL
     };
-    let numbered_content = lines
-        .iter()
-        .enumerate()
-        .map(|(i, line)| format!("{:>4}│{}", i + 1, line))
-        .collect::<Vec<_>>()
-        .join("\n");
     let feedback_block = repair
         .map(format_repair_context)
         .unwrap_or_default();
     let mut notes = Vec::<String>::new();
-    let mut tentative_steps = Vec::<EditPlanStep>::new();
-    let mut pending_commands = Vec::<InspectionCommand>::new();
 
-    // Small files fit in a single finalize prompt; skip the windowed pre-plan
-    // pass entirely. Empty files are also handled this way.
-    let run_windowed_pass = total_lines > SMALL_FILE_THRESHOLD;
-
-    if run_windowed_pass {
-        let windows = build_windows(total_lines, WINDOW_SIZE, PREPLAN_READ_OVERLAP);
-
-        for (idx, (start, end)) in windows.iter().copied().enumerate() {
-            let slice = render_numbered_slice(&lines, start, end);
-            let notes_block = if notes.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "Notes gathered so far:\n{}\n\n",
-                    notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
-                )
-            };
-            let tentative_steps_block = if tentative_steps.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "Tentative steps gathered so far:\n{}\n\n",
-                    format_edit_plan_steps(&tentative_steps)
-                )
-            };
-            let pending_block = if pending_commands.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "SEARCH/READ commands queued so far (results will be provided at finalize):\n{}\n\n",
-                    format_pending_commands(&pending_commands)
-                )
-            };
-            let prompt = format!(
-                "Walk through one file in slices to gather context for an edit plan.\n\n\
-                 File: {path_str}\n\
-                 Task: {task}\n\n\
-                 {feedback_block}\
-                 {notes_block}\
-                 {tentative_steps_block}\
-                 {pending_block}\
-                 This is slice {current_slice} of {total_slices}.\n\
-                 It covers full-file lines {start_line}-{end_line}.\n\
-                 Adjacent slices overlap by {PREPLAN_READ_OVERLAP} lines.\n\
-                 You are still gathering context. Do not finalize the plan yet.\n\
-                 Output only any mix of these items, with no explanations and no markdown:\n\
-                 - NOTE <short factual planning note>\n\
-                 - SEARCH: <exact text>   (queued; results delivered at finalize, max {MAX_PREPLAN_SEARCHES} total)\n\
-                 - READ: <start>-<end>    (queued; results delivered at finalize, max {max_reads} total)\n\
-                 - tentative LITERAL_REPLACE and SMART_EDIT blocks using the exact step syntax below\n\n\
-                 Tentative step format:\n\n\
-                 LITERAL_REPLACE\n\
-                 SCOPE <start> <end>\n\
-                 ALL true\n\
-                 OLD:\n\
-                 <exact text to replace>\n\
-                 END_OLD\n\
-                 NEW:\n\
-                 <replacement text>\n\
-                 END_NEW\n\
-                 END\n\n\
-                 SMART_EDIT\n\
-                 REGION <start> <end>\n\
-                 TASK: <specific edit for this region>\n\
-                 END\n\n\
-                 Slice content:\n{slice}",
-                current_slice = idx + 1,
-                total_slices = windows.len(),
-                start_line = start + 1,
-                end_line = end,
-            );
-
-            let request = ChatRequest {
-                messages: vec![
-                    Message::system(
-                        "You are walking through one file slice-by-slice to gather context for an edit plan. Output only NOTE lines, SEARCH/READ commands, and tentative LITERAL_REPLACE/SMART_EDIT blocks. SEARCH/READ results are delivered later at finalize. Do not finalize. No explanations, no markdown.",
-                    ),
-                    Message::user(&prompt),
-                ],
-                tools: None,
-                tool_choice: None,
-            };
-
-            log_stage(
-                log,
-                path_str,
-                &format!("preplan:window:{}/{}:{}-{}", idx + 1, windows.len(), start + 1, end),
-            );
-            let response = router
-                .chat_with_cancel(ModelRole::Fast, &request, cancelled)
-                .await?;
-            let text = response
-                .choices
-                .first()
-                .and_then(|c| c.message.content.as_deref())
-                .unwrap_or("");
-            log_debug(
-                log,
-                path_str,
-                &format!(
-                    "preplan:window:{}/{}:{}-{} raw_response:\n{}",
-                    idx + 1,
-                    windows.len(),
-                    start + 1,
-                    end,
-                    truncate_multiline(text, 12000)
-                ),
-            );
-
-            let response = parse_preplan_window_response(text)?;
-            extend_unique_notes(&mut notes, response.notes);
-            extend_unique_tentative_steps(&mut tentative_steps, response.tentative_steps);
-            extend_unique_commands(&mut pending_commands, response.commands);
-        }
+    // ── Phase 1: windowed observation ────────────────────────────────────
+    // Walk the file slice-by-slice. The model emits NOTE lines describing
+    // structural landmarks. No tentative steps, no SEARCH/READ here — those
+    // come in the recon phase.
+    //
+    // Empty files have nothing to observe and nothing to inspect; both
+    // Phase 1 and Phase 2 are skipped (zero windows / zero recon rounds)
+    // and we go straight to planning, which already knows how to handle
+    // a "0 lines" file from the task alone.
+    let windows = if total_lines == 0 {
+        Vec::new()
     } else {
+        build_windows(total_lines, WINDOW_SIZE, PREPLAN_READ_OVERLAP)
+    };
+
+    for (idx, (start, end)) in windows.iter().copied().enumerate() {
+        ensure_not_cancelled(cancelled)?;
+        let slice = render_numbered_slice(&lines, start, end);
+        let notes_block = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Notes gathered so far:\n{}\n\n",
+                notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
+            )
+        };
+        let prompt = format!(
+            "You are observing one file slice-by-slice to gather context for an edit plan.\n\n\
+             File: {path_str}\n\
+             Task: {task}\n\n\
+             {feedback_block}\
+             {notes_block}\
+             This is slice {current_slice} of {total_slices}, covering lines {start_line}-{end_line} of {total_lines}.\n\
+             Adjacent slices overlap by {PREPLAN_READ_OVERLAP} lines.\n\n\
+             Your only job in this phase is OBSERVATION. Output zero or more NOTE lines that future planning phases will rely on. You will not see this slice again — capture what matters now.\n\n\
+             Good notes are concrete and reusable: function/struct spans with line numbers, signatures verbatim (especially for anything the task touches), the exact line where a relevant block starts, places where the file structure differs from expectation. Reference line numbers from the slice content below.\n\n\
+             Bad notes are vague or restate the obvious: \"this file has 800 lines\", \"there is a function\", commentary, opinions, proposed changes.\n\n\
+             Output format (one per line, no other content):\n\
+             NOTE <concise factual observation referencing line numbers when relevant>\n\n\
+             Do NOT propose edits, do NOT request additional reads, do NOT plan. Other phases handle those.\n\n\
+             Slice content:\n{slice}",
+            current_slice = idx + 1,
+            total_slices = windows.len(),
+            start_line = start + 1,
+            end_line = end,
+        );
+
+        let request = ChatRequest {
+            messages: vec![
+                Message::system(
+                    "You are in the observation phase of edit planning. Walk through one file slice and emit NOTE lines for the planner to use later. No edits, no questions, no SEARCH/READ — only NOTE lines. No explanations, no markdown.",
+                ),
+                Message::user(&prompt),
+            ],
+            tools: None,
+            tool_choice: None,
+        };
+
         log_stage(
             log,
             path_str,
-            &format!("preplan:window:skipped_small_file:{total_lines}"),
+            &format!("preplan:window:{}/{}:{}-{}", idx + 1, windows.len(), start + 1, end),
         );
+        let response = router
+            .chat_with_cancel(ModelRole::Fast, &request, cancelled)
+            .await?;
+        let text = response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_deref())
+            .unwrap_or("");
+        log_debug(
+            log,
+            path_str,
+            &format!(
+                "preplan:window:{}/{}:{}-{} raw_response:\n{}",
+                idx + 1,
+                windows.len(),
+                start + 1,
+                end,
+                truncate_multiline(text, 12000)
+            ),
+        );
+
+        let parsed = parse_preplan_window_response(text);
+        extend_unique_notes(&mut notes, parsed.notes);
     }
 
-    // Batch-execute the SEARCH/READ commands collected during the windowed
-    // pass. Results are formatted into extra_context for the finalize prompt.
-    let extra_context = execute_pending_commands(
-        content,
-        &pending_commands,
+    // ── Phase 2: iterative reconnaissance ────────────────────────────────
+    // The model now decides what to SEARCH/READ before planning. It sees
+    // the accumulated notes and the file metadata, but NOT the file
+    // content. Each round may emit more commands or DONE; we run at most
+    // MAX_RECON_ROUNDS rounds, applying the per-edit caps on SEARCH/READ.
+    let mut extra_context = String::new();
+    let mut counters = ReconCounters {
+        search_count: 0,
+        read_count: 0,
         max_reads,
-        path_str,
-        log,
-    )?;
+    };
 
-    // Present tentative steps in file order so the finalizer reasons about
-    // them in the same order they appear in the source.
-    tentative_steps.sort_by(|a, b| {
-        a.start_line()
-            .cmp(&b.start_line())
-            .then_with(|| a.end_line().cmp(&b.end_line()))
-    });
+    let recon_rounds = if total_lines == 0 { 0 } else { MAX_RECON_ROUNDS };
+    for round in 0..recon_rounds {
+        ensure_not_cancelled(cancelled)?;
+        let rounds_remaining = MAX_RECON_ROUNDS - round;
+        let notes_block = if notes.is_empty() {
+            String::from("Notes from observation phase: (none)\n\n")
+        } else {
+            format!(
+                "Notes from observation phase:\n{}\n\n",
+                notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
+            )
+        };
+        let results_block = if extra_context.is_empty() {
+            String::from("Inspection results so far: (none)\n\n")
+        } else {
+            format!("Inspection results so far:\n{extra_context}")
+        };
+        let recon_prompt = format!(
+            "You are deciding what to inspect before planning an edit. You do NOT see the file content here — only the notes and the inspection results below.\n\n\
+             File: {path_str} ({total_lines} lines)\n\
+             Task: {task}\n\n\
+             {feedback_block}\
+             {notes_block}\
+             {results_block}\
+             You may issue SEARCH and READ commands to look at parts of the file. The next phase will plan from notes + inspection results, with no other view of the file. Make sure you have enough to plan.\n\n\
+             Round {current_round} of {MAX_RECON_ROUNDS} ({rounds_remaining} round(s) remaining including this one). Per-edit caps so far: {used_searches}/{MAX_PREPLAN_SEARCHES} SEARCH, {used_reads}/{max_reads} READ.\n\n\
+             Output one of:\n\
+             - One or more SEARCH/READ lines (results will be delivered next round):\n\
+             SEARCH: <exact text to find in the file>\n\
+             READ: <start>-<end>\n\
+             - Or, if you have enough information to plan now, exactly:\n\
+             DONE\n\n\
+             Prefer DONE if the notes already cover what you need. Do not request the same thing twice.",
+            current_round = round + 1,
+            used_searches = counters.search_count,
+            used_reads = counters.read_count,
+        );
 
+        let request = ChatRequest {
+            messages: vec![
+                Message::system(
+                    "You are in the reconnaissance phase of edit planning. Decide what to SEARCH/READ in the file, or emit DONE if you have enough. Output only SEARCH:/READ: lines or the single word DONE. No explanations, no markdown.",
+                ),
+                Message::user(&recon_prompt),
+            ],
+            tools: None,
+            tool_choice: None,
+        };
+
+        log_stage(
+            log,
+            path_str,
+            &format!("preplan:recon:{}/{MAX_RECON_ROUNDS}", round + 1),
+        );
+        let response = router
+            .chat_with_cancel(ModelRole::Fast, &request, cancelled)
+            .await?;
+        let text = response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_deref())
+            .unwrap_or("");
+        log_debug(
+            log,
+            path_str,
+            &format!(
+                "preplan:recon:{}/{MAX_RECON_ROUNDS} raw_response:\n{}",
+                round + 1,
+                truncate_multiline(text, 12000)
+            ),
+        );
+
+        let parsed = parse_preplan_recon_response(text);
+        if !parsed.commands.is_empty() {
+            execute_recon_commands(
+                content,
+                &parsed.commands,
+                &mut counters,
+                &mut extra_context,
+                path_str,
+                log,
+            )?;
+        }
+        if parsed.done {
+            break;
+        }
+    }
+
+    // ── Phase 3: planning ────────────────────────────────────────────────
+    // Plan the edit using only the notes and the inspection results. The
+    // full file content is intentionally NOT in this prompt; large files
+    // wouldn't fit, and we want a single uniform path for all sizes.
     let notes_block = if notes.is_empty() {
-        String::new()
+        String::from("Planning notes: (none collected)\n\n")
     } else {
         format!(
             "Planning notes:\n{}\n\n",
             notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
         )
     };
-    let tentative_steps_block = if tentative_steps.is_empty() {
-        String::new()
+    let results_block = if extra_context.is_empty() {
+        String::from("Inspection results: (none)\n\n")
     } else {
-        format!(
-            "Here are the tentative steps gathered so far. Revisit them and return the final plan only:\n{}\n",
-            format_edit_plan_steps(&tentative_steps)
-        )
+        format!("Inspection results:\n{extra_context}")
     };
     let finalize_prompt = format!(
-        "Finalize the edit plan for one file.\n\n\
-         File: {path_str}\n\
+        "Plan the edit for one file. You do NOT see the file content directly — plan from the notes and inspection results below. Line numbers in your plan must match the actual file.\n\n\
+         File: {path_str} ({total_lines} lines)\n\
          Task: {task}\n\n\
          {feedback_block}\
          {notes_block}\
-         {tentative_steps_block}\
-         {extra_context}\
-         Return only the final edit plan blocks for the whole file, or exactly NO_CHANGES if no edits are needed.\n\
-         Do not include SEARCH, READ, or NOTE in this response.\n\
-         Return up to {MAX_PREPLAN_STEPS} non-overlapping steps for the whole file.\n\
-         Use LITERAL_REPLACE for obvious exact text replacements.\n\
-         Use SMART_EDIT for ambiguous or structural edits.\n\
-         Do not use LITERAL_REPLACE when OLD or NEW spans more than {max_literal_lines} lines.\n\
-         Do not use LITERAL_REPLACE for whole functions, impl blocks, modules, test cases, or other large code blocks even if the text matches exactly.\n\
-         If the edit would require a larger span, split it into smaller LITERAL_REPLACE steps or use SMART_EDIT.\n\
-         Each step should cover at most 5 edit sites.\n\
-         For repeated call-site updates, group nearby exact calls with LITERAL_REPLACE when safe.\n\
-         For code, prefer functions/classes/import blocks.\n\
-         For config/text files, prefer logical sections.\n\
-         Line numbers refer to the full file shown below.\n\n\
-         Output only these step formats:\n\n\
+         {results_block}\
+         Return up to {MAX_PREPLAN_STEPS} non-overlapping steps. Each step should cover at most 5 edit sites.\n\
+         Use LITERAL_REPLACE for short, exact text replacements where you have the OLD text verbatim from a SEARCH or READ result.\n\
+         Use SMART_EDIT for structural or larger changes; the smart-edit phase will see the file content for that region.\n\
+         Do not use LITERAL_REPLACE when OLD or NEW spans more than {max_literal_lines} lines, or for whole functions, impl blocks, modules, or test cases.\n\
+         For code, prefer functions/classes/import blocks. For config/text files, prefer logical sections.\n\n\
+         Output only these step formats, no explanations, no markdown:\n\n\
          LITERAL_REPLACE\n\
          SCOPE <start> <end>\n\
          ALL true\n\
@@ -1599,8 +1616,7 @@ async fn request_preplan_steps(
          NO_CHANGES\n\n\
          Escape hatch: if (and only if) the task itself is incoherent, malformed, contradicts the file, or is impossible to satisfy from this file alone — not merely hard or large — reject it with a single line:\n\
          INVALID_TASK: <one short sentence explaining why>\n\
-         Do not use INVALID_TASK to dodge difficulty. Use it for genuinely broken tasks.\n\n\
-         Full file ({total_lines} lines):\n{numbered_content}"
+         Do not use INVALID_TASK to dodge difficulty. Use it for genuinely broken tasks."
     );
 
     let request = ChatRequest {
@@ -2625,149 +2641,171 @@ mod tests {
     }
 
     #[test]
-    fn parse_preplan_window_response_accepts_notes_and_tentative_steps() {
+    fn parse_preplan_window_response_collects_note_lines() {
         let response = parse_preplan_window_response(
-            "NOTE provider loop 10-20\n\nSMART_EDIT\nREGION 10 20\nTASK: update provider loop\nEND\n",
-        )
-        .unwrap();
-        assert_eq!(response.notes, vec!["provider loop 10-20".to_string()]);
-        assert!(response.commands.is_empty());
+            "NOTE provider loop spans L10-L20\nNOTE: assemble fn signature at L283\n",
+        );
         assert_eq!(
-            response.tentative_steps,
-            vec![EditPlanStep::SmartEdit(EditRegion {
-                start: 10,
-                end: 20,
-                task: "update provider loop".into(),
-            })]
+            response.notes,
+            vec![
+                "provider loop spans L10-L20".to_string(),
+                "assemble fn signature at L283".to_string(),
+            ],
         );
     }
 
     #[test]
-    fn parse_preplan_window_response_accepts_search_and_read_commands() {
+    fn parse_preplan_window_response_silently_ignores_non_notes() {
+        // Anything that isn't a NOTE line is dropped without erroring. That
+        // includes stray control words, hallucinated SEARCH/READ commands,
+        // and partial step blocks. The window phase is observation-only.
         let response = parse_preplan_window_response(
-            "NOTE slice reviewed\nSEARCH: foo\nREAD: 10-20\n",
-        )
-        .unwrap();
-        assert_eq!(response.notes, vec!["slice reviewed".to_string()]);
+            "NOTE looks good\n\
+             SEARCH: foo\n\
+             READ: 10-20\n\
+             SMART_EDIT\n\
+             REGION 1 5\n\
+             TASK: do thing\n\
+             END\n\
+             NO_CHANGES\n\
+             DONE\n",
+        );
+        assert_eq!(response.notes, vec!["looks good".to_string()]);
+    }
+
+    #[test]
+    fn parse_preplan_window_response_accepts_empty_response() {
+        // The model may have nothing to add for a slice — that's fine.
+        let response = parse_preplan_window_response("");
+        assert!(response.notes.is_empty());
+    }
+
+    #[test]
+    fn parse_preplan_recon_response_accepts_search_and_read() {
+        let response = parse_preplan_recon_response("SEARCH: foo\nREAD: 10-20\n");
         assert_eq!(
             response.commands,
             vec![
                 InspectionCommand::Search("foo".into()),
                 InspectionCommand::Read { start: 10, end: 20 },
-            ]
+            ],
         );
-        assert!(response.tentative_steps.is_empty());
+        assert!(!response.done, "explicit DONE not present");
     }
 
     #[test]
-    fn parse_preplan_window_response_accepts_mixed_payload() {
-        let response = parse_preplan_window_response(
-            "NOTE check call sites\n\
-             SEARCH: assemble(\n\
-             READ: 1-5\n\
-             SMART_EDIT\nREGION 1 5\nTASK: rewrite header\nEND\n",
-        )
-        .unwrap();
-        assert_eq!(response.notes, vec!["check call sites".to_string()]);
-        assert_eq!(response.commands.len(), 2);
-        assert_eq!(response.tentative_steps.len(), 1);
-    }
-
-    #[test]
-    fn parse_preplan_window_response_tolerates_stray_control_words() {
-        // Stray DONE_EXPLORING/FINALIZE/PLAN/EXPLORE lines are ignored, not
-        // rejected — the windowed pass has no terminator.
-        let response = parse_preplan_window_response(
-            "NOTE looks good\nDONE_EXPLORING\nFINALIZE\nPLAN\nEXPLORE\n",
-        )
-        .unwrap();
-        assert_eq!(response.notes, vec!["looks good".to_string()]);
+    fn parse_preplan_recon_response_recognizes_done_keyword() {
+        let response = parse_preplan_recon_response("DONE\n");
         assert!(response.commands.is_empty());
-        assert!(response.tentative_steps.is_empty());
+        assert!(response.done);
     }
 
     #[test]
-    fn parse_preplan_window_response_rejects_no_changes() {
-        let err = parse_preplan_window_response("NO_CHANGES")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("must not output NO_CHANGES"));
+    fn parse_preplan_recon_response_treats_empty_as_done() {
+        let response = parse_preplan_recon_response("");
+        assert!(response.commands.is_empty());
+        assert!(response.done, "empty response should terminate the loop");
     }
 
     #[test]
-    fn execute_pending_commands_returns_empty_when_no_commands() {
-        let result = execute_pending_commands("a\nb\n", &[], 6, "test.rs", None).unwrap();
-        assert!(result.is_empty());
+    fn parse_preplan_recon_response_done_alongside_commands_executes_then_stops() {
+        let response = parse_preplan_recon_response("SEARCH: bar\nDONE\n");
+        assert_eq!(
+            response.commands,
+            vec![InspectionCommand::Search("bar".into())],
+        );
+        assert!(response.done);
     }
 
     #[test]
-    fn execute_pending_commands_executes_search_and_read() {
+    fn parse_preplan_recon_response_drops_invalid_read_ranges() {
+        let response = parse_preplan_recon_response("READ: 0-5\nREAD: 10-3\nREAD: bad\n");
+        assert!(response.commands.is_empty());
+        assert!(response.done);
+    }
+
+    #[test]
+    fn parse_preplan_recon_response_alternative_terminators() {
+        for terminator in ["DONE", "NONE", "NO_CHANGES", "FINALIZE", "PLAN"] {
+            let response = parse_preplan_recon_response(terminator);
+            assert!(
+                response.done,
+                "terminator `{terminator}` should set done"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_recon_commands_executes_search_and_read() {
         let content = "fn one() {}\nfn two() {}\nfn three() {}\n";
         let commands = vec![
             InspectionCommand::Search("two".into()),
             InspectionCommand::Read { start: 1, end: 2 },
         ];
-        let result = execute_pending_commands(content, &commands, 6, "test.rs", None).unwrap();
-        assert!(result.contains("SEARCH_RESULT query=`two`"));
-        assert!(result.contains("READ_RESULT range=L1-L2"));
-        assert!(result.contains("fn one()"));
+        let mut counters = ReconCounters {
+            search_count: 0,
+            read_count: 0,
+            max_reads: 6,
+        };
+        let mut extra = String::new();
+        execute_recon_commands(content, &commands, &mut counters, &mut extra, "test.rs", None)
+            .unwrap();
+        assert_eq!(counters.search_count, 1);
+        assert_eq!(counters.read_count, 1);
+        assert!(extra.contains("SEARCH_RESULT query=`two`"));
+        assert!(extra.contains("READ_RESULT range=L1-L2"));
+        assert!(extra.contains("fn one()"));
     }
 
     #[test]
-    fn execute_pending_commands_drops_overflow_with_note() {
+    fn execute_recon_commands_persists_counters_across_calls() {
+        // Counters track totals across multiple recon rounds, not per round.
         let content = "x\n";
-        let read_cmd = InspectionCommand::Read { start: 1, end: 1 };
+        let mut counters = ReconCounters {
+            search_count: 0,
+            read_count: 0,
+            max_reads: 1,
+        };
+        let mut extra = String::new();
+        execute_recon_commands(
+            content,
+            &[InspectionCommand::Read { start: 1, end: 1 }],
+            &mut counters,
+            &mut extra,
+            "test.rs",
+            None,
+        )
+        .unwrap();
+        execute_recon_commands(
+            content,
+            &[InspectionCommand::Read { start: 1, end: 1 }],
+            &mut counters,
+            &mut extra,
+            "test.rs",
+            None,
+        )
+        .unwrap();
+        assert_eq!(counters.read_count, 1, "second read should be capped");
+        assert!(extra.contains("READ 1-1 skipped: per-edit limit"));
+    }
+
+    #[test]
+    fn execute_recon_commands_drops_overflow_with_inline_note() {
+        let content = "x\n";
         let mut commands = Vec::new();
         for _ in 0..(MAX_PREPLAN_SEARCHES + 2) {
             commands.push(InspectionCommand::Search("x".into()));
         }
-        for _ in 0..3 {
-            commands.push(read_cmd.clone());
-        }
-        let result = execute_pending_commands(content, &commands, 1, "test.rs", None).unwrap();
-        assert!(result.contains("2 extra SEARCH"));
-        assert!(result.contains("2 extra READ"));
-    }
-
-    #[test]
-    fn pending_commands_are_deduped_across_windows() {
-        let mut commands = vec![InspectionCommand::Search("foo".into())];
-        extend_unique_commands(
-            &mut commands,
-            vec![
-                InspectionCommand::Search("foo".into()),
-                InspectionCommand::Read { start: 1, end: 5 },
-            ],
-        );
-        assert_eq!(commands.len(), 2);
-    }
-
-    #[test]
-    fn tentative_steps_accumulate_uniquely() {
-        let mut steps = vec![EditPlanStep::SmartEdit(EditRegion {
-            start: 10,
-            end: 20,
-            task: "first".into(),
-        })];
-        extend_unique_tentative_steps(
-            &mut steps,
-            vec![
-                EditPlanStep::SmartEdit(EditRegion {
-                    start: 10,
-                    end: 20,
-                    task: "first".into(),
-                }),
-                EditPlanStep::LiteralReplace {
-                    scope_start: 30,
-                    scope_end: 31,
-                    all: false,
-                    old: vec!["old".into()],
-                    new: vec!["new".into()],
-                },
-            ],
-        );
-
-        assert_eq!(steps.len(), 2);
+        let mut counters = ReconCounters {
+            search_count: 0,
+            read_count: 0,
+            max_reads: 6,
+        };
+        let mut extra = String::new();
+        execute_recon_commands(content, &commands, &mut counters, &mut extra, "test.rs", None)
+            .unwrap();
+        assert_eq!(counters.search_count, MAX_PREPLAN_SEARCHES);
+        assert!(extra.contains("SEARCH `x` skipped: per-edit limit"));
     }
 
     #[test]
