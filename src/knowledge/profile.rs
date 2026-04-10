@@ -56,13 +56,8 @@ pub fn detect_project(root: &Path) -> Result<ProjectInfo> {
     if package_json.exists() {
         if let Ok(content) = std::fs::read_to_string(&package_json) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-                info.name = parsed["name"]
-                    .as_str()
-                    .unwrap_or("unknown")
-                    .to_string();
-                info.description = parsed["description"]
-                    .as_str()
-                    .map(|s| s.to_string());
+                info.name = parsed["name"].as_str().unwrap_or("unknown").to_string();
+                info.description = parsed["description"].as_str().map(|s| s.to_string());
 
                 // Detect package manager
                 if root.join("pnpm-lock.yaml").exists() {

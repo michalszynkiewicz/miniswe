@@ -4,14 +4,16 @@ use anyhow::Result;
 use serde_json::Value;
 use std::fs;
 
-use crate::config::Config;
 use super::ToolResult;
+use crate::config::Config;
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let content = args["content"].as_str().unwrap_or("");
 
     if content.is_empty() {
-        return Ok(ToolResult::err("Missing required parameter: content".into()));
+        return Ok(ToolResult::err(
+            "Missing required parameter: content".into(),
+        ));
     }
 
     // Validate structure
@@ -36,7 +38,5 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 
     fs::write(&scratchpad_path, content)?;
 
-    Ok(ToolResult::ok(
-        "✓ Scratchpad updated".into(),
-    ))
+    Ok(ToolResult::ok("✓ Scratchpad updated".into()))
 }

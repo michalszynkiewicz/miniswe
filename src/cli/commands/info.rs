@@ -58,7 +58,10 @@ pub async fn run() -> Result<()> {
 
     // Display config
     eprintln!("Configuration:");
-    eprintln!("  Model: {} ({})", config.model.model, config.model.provider);
+    eprintln!(
+        "  Model: {} ({})",
+        config.model.model, config.model.provider
+    );
     eprintln!("  Endpoint: {}", config.model.endpoint);
     eprintln!("  Context window: {} tokens", config.model.context_window);
     eprintln!("  Temperature: {}", config.model.temperature);

@@ -72,10 +72,7 @@ pub async fn run() -> Result<()> {
     if ts_langs.is_empty() {
         tui::print_status("Parser: regex (tree-sitter not enabled)");
     } else {
-        tui::print_status(&format!(
-            "Parser: tree-sitter ({})",
-            ts_langs.join(", ")
-        ));
+        tui::print_status(&format!("Parser: tree-sitter ({})", ts_langs.join(", ")));
     }
 
     // Load previous index for incremental reindexing
@@ -133,14 +130,8 @@ pub async fn run() -> Result<()> {
 
     tui::print_separator();
     tui::print_status("Review and edit:");
-    tui::print_status(&format!(
-        "  {} (project profile)",
-        profile_path.display()
-    ));
-    tui::print_status(&format!(
-        "  {} (custom instructions)",
-        guide_path.display()
-    ));
+    tui::print_status(&format!("  {} (project profile)", profile_path.display()));
+    tui::print_status(&format!("  {} (custom instructions)", guide_path.display()));
     tui::print_status(&format!(
         "  {} (model & context settings)",
         config_path.display()

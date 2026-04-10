@@ -159,6 +159,158 @@ async fn llm_client_stream_tool_call() {
     assert_eq!(args["content"], "hello");
 }
 
+// ── LLM client idle-timeout on stuck stream ────────────────────────
+//
+// These tests pin down the behavior added for Task #29: the client
+// *always* streams internally so we can kill a connection that accepts
+// the request, returns headers, and then never sends a body byte.
+// Wiremock doesn't model "accept then hang mid-body", so we roll a tiny
+// raw TCP listener.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+/// Spawn a raw TCP server that:
+///  1. Accepts up to `max_connections` HTTP requests.
+///  2. For each one, reads the request (up to the headers terminator),
+///     writes a 200 OK response with `Content-Type: text/event-stream`,
+///     and then hangs forever without sending any body bytes.
+///
+/// Returns `(base_url, counter)`. The counter increments once per
+/// connection accepted, so tests can assert whether a retry happened.
+async fn start_hanging_sse_server(max_connections: usize) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = Arc::clone(&counter);
+
+    tokio::spawn(async move {
+        for _ in 0..max_connections {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+
+            tokio::spawn(async move {
+                // Drain the request headers so reqwest considers the
+                // write side complete. We don't care about the body.
+                let mut buf = [0u8; 4096];
+                let mut read_total = 0usize;
+                while read_total < 4096 {
+                    match socket.read(&mut buf[read_total..]).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            read_total += n;
+                            if buf[..read_total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+
+                // Send headers that announce an SSE stream, then stall.
+                // We use `Transfer-Encoding: chunked` so the client
+                // doesn't try to size the body by `Content-Length`.
+                let headers = b"HTTP/1.1 200 OK\r\n\
+                    Content-Type: text/event-stream\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    Cache-Control: no-cache\r\n\
+                    \r\n";
+                if socket.write_all(headers).await.is_err() {
+                    return;
+                }
+                let _ = socket.flush().await;
+
+                // Hold the socket open. The test's idle-timeout is
+                // the thing we're proving fires here — once it
+                // elapses, reqwest drops the connection.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+
+    (format!("http://{addr}"), counter)
+}
+
+#[tokio::test]
+async fn llm_client_stream_idle_timeout_fires_on_hung_connection() {
+    // Server headers the request, then never sends a body byte.
+    let (uri, counter) = start_hanging_sse_server(1).await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &uri);
+    // Tight idle timeout and *no* retries — we want to observe the
+    // first-attempt error directly rather than a retry-delay pile.
+    config.model.stream_idle_timeout_secs = 1;
+    config.model.request_timeout_secs = 30;
+    config.model.max_retries = 0;
+
+    let client = LlmClient::new(config.model.clone());
+    let request = ChatRequest {
+        messages: vec![Message::user("hi")],
+        tools: None,
+        tool_choice: None,
+    };
+
+    let start = std::time::Instant::now();
+    let result = client.chat(&request).await;
+    let elapsed = start.elapsed();
+
+    let err = result.expect_err("expected idle-timeout error, got Ok");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("LLM stream idle"),
+        "error should mention idle timeout, got: {msg}"
+    );
+    // Should fail promptly — ~1s idle timeout, plus a little slack.
+    // If this asserts, something is using wall-clock timeout instead.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "idle timeout should fire quickly, took {elapsed:?}"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "exactly one connection should have been made (max_retries=0)"
+    );
+}
+
+#[tokio::test]
+async fn llm_client_stream_idle_timeout_retries_and_eventually_gives_up() {
+    // Two hanging connections — one for the initial attempt, one for
+    // the retry. The retry should also time out, and the caller should
+    // get a final "LLM stream idle" error after both attempts.
+    let (uri, counter) = start_hanging_sse_server(2).await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &uri);
+    config.model.stream_idle_timeout_secs = 1;
+    config.model.request_timeout_secs = 30;
+    config.model.max_retries = 1;
+
+    let client = LlmClient::new(config.model.clone());
+    let request = ChatRequest {
+        messages: vec![Message::user("hi")],
+        tools: None,
+        tool_choice: None,
+    };
+
+    let result = client.chat(&request).await;
+    let err = result.expect_err("expected idle-timeout error after retry");
+    assert!(
+        err.to_string().contains("LLM stream idle"),
+        "error should mention idle timeout, got: {err}"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "should have made initial attempt + 1 retry"
+    );
+}
+
 // ── Single tool call flow ───────────────────────────────────────────
 
 #[tokio::test]

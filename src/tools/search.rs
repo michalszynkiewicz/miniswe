@@ -4,8 +4,8 @@ use anyhow::Result;
 use serde_json::Value;
 use std::process::Command;
 
-use crate::config::Config;
 use super::ToolResult;
+use crate::config::Config;
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let query = args["query"].as_str().unwrap_or("");
@@ -17,16 +17,14 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     } else if !pattern.is_empty() {
         (pattern, false)
     } else {
-        return Ok(ToolResult::err("Provide either 'query' (plain text) or 'pattern' (regex).".into()));
+        return Ok(ToolResult::err(
+            "Provide either 'query' (plain text) or 'pattern' (regex).".into(),
+        ));
     };
 
-    let max_results = args["max_results"]
-        .as_u64()
-        .unwrap_or(20) as usize;
+    let max_results = args["max_results"].as_u64().unwrap_or(20) as usize;
 
-    let scope = args["scope"]
-        .as_str()
-        .unwrap_or("project");
+    let scope = args["scope"].as_str().unwrap_or("project");
 
     let search_dir = match scope {
         "project" | "symbols" => config.project_root.to_string_lossy().to_string(),
@@ -45,7 +43,8 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         "--line-number",
         "--no-heading",
         "--color=never",
-        "--max-columns", "200",
+        "--max-columns",
+        "200",
     ];
     if use_fixed_strings {
         rg_args.push("--fixed-strings");
@@ -57,9 +56,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     rg_args.push(search_term);
     rg_args.push(&search_dir);
 
-    let output = Command::new("rg")
-        .args(&rg_args)
-        .output();
+    let output = Command::new("rg").args(&rg_args).output();
 
     match output {
         Ok(result) => {
@@ -67,7 +64,9 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
             let stderr = String::from_utf8_lossy(&result.stderr);
 
             if stdout.is_empty() && result.status.code() == Some(1) {
-                return Ok(ToolResult::ok(format!("No matches found for: {search_term}")));
+                return Ok(ToolResult::ok(format!(
+                    "No matches found for: {search_term}"
+                )));
             }
 
             if !result.status.success() && !stderr.is_empty() {
@@ -118,7 +117,8 @@ async fn fallback_grep(query: &str, dir: &str, max_results: usize) -> Result<Too
             "--include=*.zig",
             "--include=*.sh",
             "--include=*.bash",
-            "-m", &max_results.to_string(),
+            "-m",
+            &max_results.to_string(),
             query,
             dir,
         ])

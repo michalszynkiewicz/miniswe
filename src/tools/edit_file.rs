@@ -127,14 +127,37 @@ struct SplitResult {
     message: String,
 }
 
+/// A step that was rejected before execution because it overlapped an
+/// earlier step. The kept step is applied normally; the dropped one is
+/// reported as a per-step failure in the result so the agent sees both
+/// the success and the failure side-by-side.
+struct DroppedStep {
+    step: EditPlanStep,
+    reason: String,
+}
+
 /// What one planning attempt produced. The model can return either a
 /// concrete edit plan or, at the finalize phase, reject the task as
 /// invalid via `INVALID_TASK: <reason>`. The escape hatch is meant for
 /// genuinely incoherent or impossible tasks — not "this is hard" — and
 /// short-circuits the entire repair retry loop.
+///
+/// `Steps` carries `dropped` so the executor can report overlapping
+/// steps as failed steps in the per-step output instead of as opaque
+/// warnings.
 enum PreplanOutcome {
-    Steps(Vec<EditPlanStep>),
+    Steps {
+        steps: Vec<EditPlanStep>,
+        dropped: Vec<DroppedStep>,
+    },
     InvalidTask(String),
+    /// The model emitted `INVALID_TASK` but its reason looks like it just
+    /// didn't find the target in the *current* file state — which is a
+    /// missing prerequisite, not an incoherent task. We suppress the
+    /// rejection and ask the loop to retry with a hint.
+    OverreachedRejection {
+        suppressed_reason: String,
+    },
 }
 
 /// What the whole pre-plan retry loop produced. Distinguishes "applied
@@ -244,8 +267,8 @@ async fn execute_preplanned_steps(
         )
         .await?;
 
-        let steps = match outcome {
-            PreplanOutcome::Steps(s) => s,
+        let (steps, dropped) = match outcome {
+            PreplanOutcome::Steps { steps, dropped } => (steps, dropped),
             PreplanOutcome::InvalidTask(reason) => {
                 // The model rejected the task as fundamentally invalid.
                 // Short-circuit the entire retry loop and surface the
@@ -257,9 +280,37 @@ async fn execute_preplanned_steps(
                 );
                 return Ok(PreplanResult::InvalidTask(reason));
             }
+            PreplanOutcome::OverreachedRejection { suppressed_reason } => {
+                // The model said INVALID_TASK but the reason was about a
+                // missing target, not an incoherent task. Set up a repair
+                // context that explicitly tells it to plan the edit
+                // instead, and continue the retry loop.
+                log_debug(
+                    log,
+                    path_str,
+                    &format!(
+                        "preplan:overreached_rejection attempt={attempt} suppressed_reason={suppressed_reason}"
+                    ),
+                );
+                progress_log.push_str(&format!(
+                    "{label}; suppressed false-positive INVALID_TASK ({suppressed_reason}) and will retry\n"
+                ));
+                repair_context = Some(RepairContext {
+                    previous_plan: Vec::new(),
+                    completed_steps: Vec::new(),
+                    failed_step: None,
+                    failure_reason: format!(
+                        "The previous attempt rejected this task with `INVALID_TASK: {suppressed_reason}`. \
+                         That reason describes a missing target in the *current* file state, which is exactly what an edit is for — \
+                         it does NOT make the task incoherent. Plan the edit that creates or updates the target. \
+                         Reserve INVALID_TASK only for tasks that contradict reality (wrong language, internally inconsistent goals)."
+                    ),
+                });
+                continue;
+            }
         };
 
-        if steps.is_empty() {
+        if steps.is_empty() && dropped.is_empty() {
             log_debug(log, path_str, "preplan:return_no_steps");
             if current == original {
                 return Ok(PreplanResult::NoChanges);
@@ -295,7 +346,9 @@ async fn execute_preplanned_steps(
             }));
         }
 
-        let step_count = steps.len();
+        let kept_count = steps.len();
+        let dropped_count = dropped.len();
+        let total_planned = kept_count + dropped_count;
         let mut attempt_message = if let Some(ctx) = &repair_context {
             format!("{label}; previous plan failed: {}", ctx.failure_reason)
         } else {
@@ -316,7 +369,8 @@ async fn execute_preplanned_steps(
             cancelled,
             log,
             steps.clone(),
-            step_count,
+            dropped,
+            total_planned,
             attempt_message,
             "via pre-plan",
         )
@@ -377,6 +431,7 @@ async fn execute_planned_steps(
     cancelled: Option<&AtomicBool>,
     log: Option<&SessionLog>,
     steps: Vec<EditPlanStep>,
+    dropped: Vec<DroppedStep>,
     planned_count: usize,
     mut message: String,
     success_label: &str,
@@ -384,6 +439,7 @@ async fn execute_planned_steps(
     let mut current = current_base.to_string();
     let mut total_ops = 0usize;
     let mut completed_count = 0usize;
+    let dropped_count = dropped.len();
     // Records of steps that have been successfully applied to `current`,
     // captured in execution order so the repair planner can see exactly
     // what shifted and what's left.
@@ -480,6 +536,85 @@ async fn execute_planned_steps(
                     }
                 }
             }
+            EditPlanStep::ReplaceScope {
+                scope_start,
+                scope_end,
+                new,
+            } => {
+                match apply_replace_scope(&current, *scope_start, *scope_end, new) {
+                    Ok((candidate, _)) => {
+                        current = candidate;
+                        // Wholesale scope replace counts as one op for
+                        // accounting parity with other plan steps.
+                        total_ops += 1;
+                        completed_count += 1;
+                        completed_records.push(step.clone());
+                        message.push_str(&format!(
+                            "Pre-plan step {} scope L{}-L{}: replaced scope ({} new line(s))\n",
+                            idx + 1,
+                            scope_start,
+                            scope_end,
+                            new.len(),
+                        ));
+                    }
+                    Err(scope_error) => {
+                        // Same fallback strategy as the literal-replace
+                        // path: hand the region to the smart executor
+                        // with a task that explains what we wanted, so
+                        // the planner gets a second shot at it.
+                        let fallback_task = format!(
+                            "The planned scope replacement failed: {scope_error}\n\
+                             Apply the same intended change manually within this region only.\n\n\
+                             Intended NEW (entire region):\n{}",
+                            new.join("\n")
+                        );
+                        let region = EditRegion {
+                            start: *scope_start,
+                            end: *scope_end,
+                            task: fallback_task,
+                        };
+                        let (candidate, count) = execute_smart_step(
+                            path_str,
+                            &region.task,
+                            &current,
+                            router,
+                            lsp_validation,
+                            &region,
+                            MAX_PATCH_ATTEMPTS,
+                            false,
+                            cancelled,
+                            log,
+                        )
+                        .await
+                        .map_err(|e| PlannedExecutionFailure {
+                            current_content: current.clone(),
+                            message: format!(
+                                "{message}Pre-plan step {} scope L{}-L{} failed after {} completed step(s): {scope_error}; smart fallback failed: {e}\n",
+                                idx + 1,
+                                scope_start,
+                                scope_end,
+                                completed_count
+                            ),
+                            error: format!(
+                                "step {} scope replace failed: {scope_error}; smart fallback failed: {e}",
+                                idx + 1
+                            ),
+                            completed_steps: completed_records.clone(),
+                            failed_step: Some(step.clone()),
+                        })?;
+                        current = candidate;
+                        total_ops += count;
+                        completed_count += 1;
+                        completed_records.push(step.clone());
+                        message.push_str(&format!(
+                            "Pre-plan step {} scope fallback L{}-L{}: applied {count} operation(s)\n",
+                            idx + 1,
+                            scope_start,
+                            scope_end
+                        ));
+                    }
+                }
+            }
             EditPlanStep::SmartEdit(region) => {
                 let region_label =
                     format!("step {} smart L{}-L{}", idx + 1, region.start, region.end);
@@ -523,6 +658,18 @@ async fn execute_planned_steps(
         }
     }
 
+    // Surface overlap-rejected steps as per-step failures so the agent
+    // sees them alongside the successes. The kept steps are already
+    // applied; the dropped steps appear here purely as feedback.
+    for d in &dropped {
+        message.push_str(&format!(
+            "Pre-plan step L{}-L{}: FAILED — {}\n",
+            d.step.start_line(),
+            d.step.end_line(),
+            d.reason
+        ));
+    }
+
     let validation_note = validate_candidate_for_write(
         path_str,
         path,
@@ -548,8 +695,13 @@ async fn execute_planned_steps(
         message.push_str(&note);
         message.push('\n');
     }
+    let dropped_note = if dropped_count > 0 {
+        format!(", {dropped_count} dropped (overlap)")
+    } else {
+        String::new()
+    };
     let summary = format!(
-        "✓ {success_label}: {completed_count}/{planned_count} step(s) completed, {total_ops} operation(s) applied to {path_str} ({} lines)\n",
+        "✓ {success_label}: {completed_count}/{planned_count} step(s) completed{dropped_note}, {total_ops} operation(s) applied to {path_str} ({} lines)\n",
         current.lines().count()
     );
     message = format!("{summary}{message}");
@@ -1579,10 +1731,11 @@ async fn request_preplan_steps(
          {notes_block}\
          {results_block}\
          Plan the edit. You only see the notes and inspection results above — line numbers in your plan must match the real file.\n\n\
-         Up to {MAX_PREPLAN_STEPS} non-overlapping steps, each covering at most 5 edit sites.\n\
+         Up to {MAX_PREPLAN_STEPS} non-overlapping steps, each covering at most 5 edit sites. Steps must not share any line, including endpoints — L10-L20 and L20-L30 overlap.\n\
          Every step must change something. Do not emit a LITERAL_REPLACE whose NEW is identical to its OLD, and do not emit a SMART_EDIT whose task is to verify a region is unchanged or to keep it as-is — just leave those regions out of the plan.\n\
          Use LITERAL_REPLACE when you have the OLD text verbatim from an inspection result and OLD/NEW each span ≤ {max_literal_lines} lines. Otherwise use SMART_EDIT — its execution phase will see the region content.\n\
          Never use LITERAL_REPLACE for whole functions, impl blocks, modules, or test cases.\n\n\
+         If no edits are needed, return an empty response.\n\n\
          Output only these blocks, nothing else:\n\n\
          LITERAL_REPLACE\n\
          SCOPE <start> <end>\n\
@@ -1594,20 +1747,27 @@ async fn request_preplan_steps(
          <replacement text>\n\
          END_NEW\n\
          END\n\n\
+         You may omit the OLD: ... END_OLD block when ALL is true and you want to replace the *entire* SCOPE wholesale (the whole L<start>-L<end> range becomes NEW). This is shorter and avoids retyping a long OLD when the range is already exact:\n\n\
+         LITERAL_REPLACE\n\
+         SCOPE <start> <end>\n\
+         ALL true\n\
+         NEW:\n\
+         <replacement text for the entire scope>\n\
+         END_NEW\n\
+         END\n\n\
          SMART_EDIT\n\
          REGION <start> <end>\n\
          TASK: <specific edit for this region>\n\
          END\n\n\
-         Or, if no edits are needed:\n\
-         NO_CHANGES\n\n\
-         If the task itself is incoherent, contradicts the file, or is impossible — not merely hard — reject with one line:\n\
+         INVALID_TASK is ONLY for tasks that contradict reality — e.g. \"rename function X\" when X does not appear anywhere in the file, or a task that requires syntax from a different language than this file (the file path above shows the extension). It is NOT for missing prerequisites: if the task says \"update the call to f() to pass arg Y\" and Y isn't a parameter of f yet, that's the task — add Y to the call. Plan the edit. Do not reject because something the task wants doesn't exist yet; that's what the edit is for.\n\
+         Only if the task is genuinely incoherent, reject with exactly one line:\n\
          INVALID_TASK: <one short sentence>"
     );
 
     let request = ChatRequest {
         messages: vec![
             Message::system(
-                "Final planning phase. Output only edit-plan blocks, NO_CHANGES, or INVALID_TASK: <reason>. No markdown.",
+                "Final planning phase. Output only edit-plan blocks, an empty response if no changes are needed, or INVALID_TASK: <reason> for incoherent tasks. No markdown.",
             ),
             Message::user(&finalize_prompt),
         ],
@@ -1634,6 +1794,18 @@ async fn request_preplan_steps(
     );
 
     if let Some(reason) = parse_invalid_task(text) {
+        if is_likely_missing_target_reason(&reason) {
+            log_debug(
+                log,
+                path_str,
+                &format!(
+                    "preplan:finalize:file:1-{total_lines} invalid_task SUPPRESSED (looks like missing prerequisite, not incoherent task) reason={reason}"
+                ),
+            );
+            return Ok(PreplanOutcome::OverreachedRejection {
+                suppressed_reason: reason,
+            });
+        }
         log_debug(
             log,
             path_str,
@@ -1644,7 +1816,7 @@ async fn request_preplan_steps(
         return Ok(PreplanOutcome::InvalidTask(reason));
     }
 
-    let mut steps = match parse_edit_plan(text) {
+    let parsed = match parse_edit_plan(text) {
         Ok(steps) => steps,
         Err(e) => {
             log_debug(
@@ -1658,6 +1830,24 @@ async fn request_preplan_steps(
             return Err(e);
         }
     };
+
+    // Recover from overlapping steps: keep the first occurrence (in source
+    // order), partition the rest as dropped-with-reason. The executor will
+    // apply the kept steps and report the dropped ones as failed steps in
+    // the per-step output, so the agent sees both successes and failures
+    // in the same shape.
+    let (mut steps, dropped) = partition_overlapping_steps(parsed);
+    if !dropped.is_empty() {
+        log_debug(
+            log,
+            path_str,
+            &format!(
+                "preplan:finalize:file:1-{total_lines} dropped_overlapping_steps={}",
+                dropped.len()
+            ),
+        );
+    }
+
     log_debug(
         log,
         path_str,
@@ -1682,7 +1872,7 @@ async fn request_preplan_steps(
         );
         return Err(e);
     }
-    Ok(PreplanOutcome::Steps(steps))
+    Ok(PreplanOutcome::Steps { steps, dropped })
 }
 
 fn validate_steps_in_file(steps: &[EditPlanStep], total_lines: usize) -> Result<()> {
@@ -1695,7 +1885,10 @@ fn validate_steps_in_file(steps: &[EditPlanStep], total_lines: usize) -> Result<
             );
         }
     }
-    reject_overlapping_steps(steps)
+    // Overlap is handled upstream by `partition_overlapping_steps`, which
+    // keeps the first occurrence in source order and reports the rest as
+    // dropped steps in the per-step output instead of bailing on the plan.
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1736,6 +1929,17 @@ pub enum EditPlanStep {
         old: Vec<String>,
         new: Vec<String>,
     },
+    /// Replace the *entire* contents of a line range with new text. The
+    /// finalize prompt presents this as a `LITERAL_REPLACE` block where
+    /// `OLD:` is omitted — useful for scoped rewrites where the model
+    /// already knows the surrounding range and would otherwise have to
+    /// echo the full OLD verbatim, doubling output tokens (and providing
+    /// extra opportunity for repetition loops on degraded models).
+    ReplaceScope {
+        scope_start: usize,
+        scope_end: usize,
+        new: Vec<String>,
+    },
 }
 
 impl EditPlanStep {
@@ -1743,6 +1947,7 @@ impl EditPlanStep {
         match self {
             Self::SmartEdit(region) => region.start,
             Self::LiteralReplace { scope_start, .. } => *scope_start,
+            Self::ReplaceScope { scope_start, .. } => *scope_start,
         }
     }
 
@@ -1750,6 +1955,7 @@ impl EditPlanStep {
         match self {
             Self::SmartEdit(region) => region.end,
             Self::LiteralReplace { scope_end, .. } => *scope_end,
+            Self::ReplaceScope { scope_end, .. } => *scope_end,
         }
     }
 }
@@ -1777,6 +1983,18 @@ fn format_edit_plan_steps(steps: &[EditPlanStep]) -> String {
                 out.push_str("OLD:\n");
                 out.push_str(&old.join("\n"));
                 out.push_str("\nEND_OLD\nNEW:\n");
+                out.push_str(&new.join("\n"));
+                out.push_str("\nEND_NEW\nEND\n\n");
+            }
+            EditPlanStep::ReplaceScope {
+                scope_start,
+                scope_end,
+                new,
+            } => {
+                out.push_str("LITERAL_REPLACE\n");
+                out.push_str(&format!("SCOPE {scope_start} {scope_end}\n"));
+                out.push_str("ALL true\n");
+                out.push_str("NEW:\n");
                 out.push_str(&new.join("\n"));
                 out.push_str("\nEND_NEW\nEND\n\n");
             }
@@ -1808,6 +2026,49 @@ fn parse_invalid_task(text: &str) -> Option<String> {
         Some(_) => return None,
     };
     Some(after.trim().to_string())
+}
+
+/// Decide whether an `INVALID_TASK` reason from the model is actually a
+/// false positive — i.e. the model couldn't find the *target* of the edit
+/// in the current file state and treated that as the task being incoherent.
+/// In reality, "the thing the task wants to change isn't there yet" is
+/// exactly what edits are for: the planner should plan the edit, not
+/// reject the task.
+///
+/// We match on a small set of phrases that have shown up in real benches.
+/// The check is intentionally conservative — we only suppress when the
+/// reason is unambiguously about missing/absent state.
+fn is_likely_missing_target_reason(reason: &str) -> bool {
+    let r = reason.to_lowercase();
+    // Phrases that describe a missing target in the current file state.
+    const MISSING_PHRASES: &[&str] = &[
+        "not found",
+        "no match",
+        "no matches",
+        "not present",
+        "isn't present",
+        "is not present",
+        "doesn't exist",
+        "does not exist",
+        "doesn't appear",
+        "does not appear",
+        "isn't in the file",
+        "is not in the file",
+        "not in the file",
+        "no such",
+        "cannot find",
+        "can't find",
+        "could not find",
+        "couldn't find",
+        "missing from",
+        "missing in",
+        "absent from",
+        "not yet present",
+        "not yet exist",
+        "not yet defined",
+        "undefined",
+    ];
+    MISSING_PHRASES.iter().any(|p| r.contains(p))
 }
 
 /// Render a `RepairContext` into a planner-facing block. Used at the top
@@ -1854,12 +2115,53 @@ fn truncate_multiline(text: &str, max_chars: usize) -> String {
     format!("{truncated}\n...({char_count} chars total, truncated)\n")
 }
 
+/// Strip a single outer ```...``` markdown fence from `text`, if present.
+///
+/// The finalize prompt explicitly says "no markdown", but smaller models
+/// sometimes wrap their entire structured response in a ``` fence anyway
+/// (often with a language tag like ```rust). When that happens the parser
+/// fails on the leading backticks even though the body is otherwise
+/// well-formed. This helper detects that one common shape and returns the
+/// inner body so parsing can proceed.
+///
+/// Behaviour:
+/// - If the leading non-whitespace characters are not ``` we return the
+///   input unchanged (no fence to strip).
+/// - If a leading ``` is present we drop everything from the start through
+///   the first newline (i.e. the fence line, including any language tag).
+/// - If there is *also* a trailing ``` (anywhere later in the text) we drop
+///   it and everything after it. If the response was truncated mid-output
+///   and never closed the fence, we still strip the opener and keep the
+///   rest — that gives us the best shot at parsing a partial reply.
+fn strip_code_fences(text: &str) -> String {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return text.to_string();
+    };
+    let Some(newline_pos) = rest.find('\n') else {
+        return text.to_string();
+    };
+    let body = &rest[newline_pos + 1..];
+    let inner = match body.rfind("```") {
+        Some(pos) => &body[..pos],
+        None => body,
+    };
+    inner.to_string()
+}
+
 pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
-    if text.trim() == "NO_CHANGES" {
+    // Empty response = no changes needed. The finalize prompt no longer
+    // asks for an explicit NO_CHANGES sentinel; if the model still emits
+    // one (alone or as a stray token among real steps) we treat it as a
+    // no-op marker rather than failing the parse.
+    if text.trim().is_empty() {
         return Ok(Vec::new());
     }
+
+    let unfenced = strip_code_fences(text);
+    let text = unfenced.as_str();
     if text.trim().is_empty() {
-        bail!("empty edit plan");
+        return Ok(Vec::new());
     }
 
     let lines: Vec<&str> = text.lines().collect();
@@ -1869,6 +2171,13 @@ pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
     while i < lines.len() {
         let line = lines[i];
         if line.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Tolerate a stray NO_CHANGES token from older prompts or
+        // confused models — treat it as a no-op separator.
+        if line.trim() == "NO_CHANGES" {
             i += 1;
             continue;
         }
@@ -1910,6 +2219,43 @@ pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
             };
             i += 1;
 
+            // Peek at the next non-blank line to decide between the two
+            // LITERAL_REPLACE forms:
+            //
+            //   OLD:        — classic literal replace, OLD must match
+            //               in scope, replaced 1× or all× by NEW.
+            //
+            //   NEW:        — scope replace; the entire SCOPE is
+            //               wholesale replaced with NEW. Only valid
+            //               when ALL true was specified, since "match
+            //               1 of N" has no meaning without an OLD to
+            //               match against.
+            let mut peek = i;
+            while peek < lines.len() && lines[peek].trim().is_empty() {
+                peek += 1;
+            }
+            let head = lines.get(peek).copied().unwrap_or("");
+            if head == "NEW:" {
+                if !all {
+                    bail!(
+                        "LITERAL_REPLACE without OLD requires ALL true (got ALL false) — use the OLD form for a single-occurrence replacement"
+                    );
+                }
+                i = peek + 1;
+                let (new, next) = collect_until(&lines, i, "END_NEW")?;
+                i = next + 1;
+
+                expect_line(&lines, i, "END")?;
+                i += 1;
+
+                steps.push(EditPlanStep::ReplaceScope {
+                    scope_start,
+                    scope_end,
+                    new,
+                });
+                continue;
+            }
+
             expect_line(&lines, i, "OLD:")?;
             i += 1;
             let (old, next) = collect_until(&lines, i, "END_OLD")?;
@@ -1948,7 +2294,9 @@ pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
             steps.len()
         );
     }
-    reject_overlapping_steps(&steps)?;
+    // Overlap is *not* a parse error: the planner caller resolves overlaps
+    // by keeping the first step in source order and reporting the rest as
+    // dropped steps in the per-step output. See `partition_overlapping_steps`.
     Ok(steps)
 }
 
@@ -2042,32 +2390,56 @@ fn reject_overlapping_regions(regions: &[EditRegion]) -> Result<()> {
     Ok(())
 }
 
-fn reject_overlapping_steps(steps: &[EditPlanStep]) -> Result<()> {
-    let mut sorted: Vec<&EditPlanStep> = steps.iter().collect();
-    sorted.sort_unstable_by(|a, b| {
-        a.start_line()
-            .cmp(&b.start_line())
-            .then_with(|| a.end_line().cmp(&b.end_line()))
+/// Partition planned steps into "kept" (first occurrence wins, by source
+/// order) and "dropped" (overlaps an earlier step). The kept set keeps
+/// original emission order so downstream logging stays intuitive. The
+/// dropped set carries the original step plus a human-readable reason
+/// pointing at the kept step that caused the conflict, so the executor
+/// can report each one as a failed step in the per-step output.
+fn partition_overlapping_steps(steps: Vec<EditPlanStep>) -> (Vec<EditPlanStep>, Vec<DroppedStep>) {
+    // Sort by source position so "first wins" is deterministic and matches
+    // file order rather than emission order.
+    let mut indexed: Vec<(usize, EditPlanStep)> = steps.into_iter().enumerate().collect();
+    indexed.sort_by(|a, b| {
+        a.1.start_line()
+            .cmp(&b.1.start_line())
+            .then_with(|| a.1.end_line().cmp(&b.1.end_line()))
+            .then_with(|| a.0.cmp(&b.0))
     });
 
-    for pair in sorted.windows(2) {
-        let prev = pair[0];
-        let next = pair[1];
-        if next.start_line() <= prev.end_line() {
-            bail!(
-                "edit plan has overlapping steps: L{}-L{} overlaps L{}-L{}",
+    let mut kept: Vec<(usize, EditPlanStep)> = Vec::with_capacity(indexed.len());
+    let mut dropped: Vec<(usize, DroppedStep)> = Vec::new();
+    for (orig_idx, step) in indexed {
+        let conflict = kept.iter().find(|(_, prev)| {
+            // [a,b] overlaps [c,d] iff a <= d && c <= b
+            step.start_line() <= prev.end_line() && prev.start_line() <= step.end_line()
+        });
+        if let Some((_, prev)) = conflict {
+            let reason = format!(
+                "overlaps earlier step L{}-L{}",
                 prev.start_line(),
-                prev.end_line(),
-                next.start_line(),
-                next.end_line()
+                prev.end_line()
             );
+            dropped.push((orig_idx, DroppedStep { step, reason }));
+        } else {
+            kept.push((orig_idx, step));
         }
     }
-    Ok(())
+
+    // Restore original emission order so downstream "in order" logging stays
+    // intuitive for the agent.
+    kept.sort_by_key(|(idx, _)| *idx);
+    dropped.sort_by_key(|(idx, _)| *idx);
+    (
+        kept.into_iter().map(|(_, s)| s).collect(),
+        dropped.into_iter().map(|(_, d)| d).collect(),
+    )
 }
 
 /// Parse strict patch DSL blocks.
 pub fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
+    let unfenced = strip_code_fences(text);
+    let text = unfenced.as_str();
     if text.trim() == "NO_CHANGES" {
         return Ok(Vec::new());
     }
@@ -2260,6 +2632,53 @@ pub fn apply_literal_replace_in_scope(
     out.push_str(&replaced_scope);
     out.push_str(&content[end_byte..]);
     Ok((out, count))
+}
+
+/// Replace the entire L`scope_start`..=L`scope_end` slice of `content`
+/// with `new`. Unlike `apply_literal_replace_in_scope` there is no OLD
+/// block to anchor against — the caller has decided the *whole* scope
+/// should be rewritten. Used by `EditPlanStep::ReplaceScope` (the
+/// `LITERAL_REPLACE` form that omits `OLD:`).
+///
+/// Returns the rewritten file plus a (synthetic) op count of 1 so the
+/// caller's per-step accounting stays consistent with the regular
+/// literal replace path.
+pub fn apply_replace_scope(
+    content: &str,
+    scope_start: usize,
+    scope_end: usize,
+    new: &[String],
+) -> Result<(String, usize)> {
+    if scope_start == 0 || scope_end < scope_start {
+        bail!("invalid replace scope L{scope_start}-L{scope_end}");
+    }
+    let line_count = content.lines().count();
+    if scope_end > line_count {
+        bail!("replace scope L{scope_start}-L{scope_end} outside {line_count} line file");
+    }
+
+    let parts: Vec<&str> = content.split_inclusive('\n').collect();
+    let start_byte: usize = parts[..scope_start - 1].iter().map(|part| part.len()).sum();
+    let end_byte: usize = parts[..scope_end].iter().map(|part| part.len()).sum();
+
+    // Preserve the trailing newline of the last line in the scope (if it
+    // had one) so the file structure stays intact when the new text is
+    // shorter or longer.
+    let scope_ends_with_newline = parts
+        .get(scope_end - 1)
+        .map(|line| line.ends_with('\n'))
+        .unwrap_or(false);
+
+    let mut new_text = new.join("\n");
+    if scope_ends_with_newline && !new_text.ends_with('\n') {
+        new_text.push('\n');
+    }
+
+    let mut out = String::with_capacity(content.len() + new_text.len());
+    out.push_str(&content[..start_byte]);
+    out.push_str(&new_text);
+    out.push_str(&content[end_byte..]);
+    Ok((out, 1))
 }
 
 fn apply_resolved_patch(content: &str, mut resolved: Vec<ResolvedOp>) -> Result<String> {
@@ -2625,6 +3044,58 @@ mod tests {
         assert!(!feedback.contains("Current known callee signatures"));
     }
 
+    fn smart_step(start: usize, end: usize) -> EditPlanStep {
+        EditPlanStep::SmartEdit(EditRegion {
+            start,
+            end,
+            task: format!("dummy task L{start}-L{end}"),
+        })
+    }
+
+    #[test]
+    fn partition_overlapping_steps_keeps_first_in_source_order() {
+        // Three steps in emission order: middle one overlaps the first.
+        // The first (by source line) wins; the overlapper is reported as
+        // dropped, the third non-overlapping step is kept.
+        let steps = vec![
+            smart_step(5, 15),
+            smart_step(10, 20), // overlaps step at L5-L15
+            smart_step(25, 35),
+        ];
+        let (kept, dropped) = partition_overlapping_steps(steps);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].start_line(), 5);
+        assert_eq!(kept[1].start_line(), 25);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].step.start_line(), 10);
+        assert!(
+            dropped[0].reason.contains("L5-L15"),
+            "reason should reference the conflicting kept step, got {:?}",
+            dropped[0].reason
+        );
+    }
+
+    #[test]
+    fn partition_overlapping_steps_treats_shared_endpoint_as_overlap() {
+        // L10-L20 and L20-L30 share line 20 — that counts as overlap so
+        // the planner can't smuggle two edits through a single shared
+        // endpoint.
+        let steps = vec![smart_step(10, 20), smart_step(20, 30)];
+        let (kept, dropped) = partition_overlapping_steps(steps);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].start_line(), 10);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].step.start_line(), 20);
+    }
+
+    #[test]
+    fn partition_overlapping_steps_keeps_disjoint_steps() {
+        let steps = vec![smart_step(1, 5), smart_step(10, 15), smart_step(20, 25)];
+        let (kept, dropped) = partition_overlapping_steps(steps);
+        assert_eq!(kept.len(), 3);
+        assert!(dropped.is_empty());
+    }
+
     #[test]
     fn parse_preplan_window_response_collects_note_lines() {
         let response = parse_preplan_window_response(
@@ -2856,6 +3327,65 @@ mod tests {
     }
 
     #[test]
+    fn missing_target_reasons_are_recognised() {
+        // Phrases that have actually shown up in benches.
+        let cases = [
+            "function `foo` not found in file",
+            "no match for `bar` in current state",
+            "the parameter `Y` does not exist in f's signature",
+            "target identifier doesn't appear in the file",
+            "auth module is not present yet",
+            "type X is not yet defined",
+            "could not find the requested symbol",
+            "couldn't find any matching block",
+            "cannot find region 10-20",
+            "the helper is missing from this file",
+            "import statement absent from current state",
+            "undefined identifier requested",
+            "no such function in this module",
+        ];
+        for case in cases {
+            assert!(
+                is_likely_missing_target_reason(case),
+                "expected missing-target reason: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn legitimately_incoherent_reasons_are_not_suppressed() {
+        // These describe a real problem with the task itself, not a
+        // missing target — they should NOT be suppressed.
+        let cases = [
+            "the task asks to write Python in this Rust file",
+            "the request is internally contradictory",
+            "task asks to delete the same line twice",
+            "this file is empty and the task is to refactor existing logic",
+            "the requested change would corrupt the file",
+        ];
+        for case in cases {
+            assert!(
+                !is_likely_missing_target_reason(case),
+                "should NOT suppress: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_target_reason_check_is_case_insensitive() {
+        assert!(is_likely_missing_target_reason("FUNCTION NOT FOUND"));
+        assert!(is_likely_missing_target_reason("Symbol Doesn't Exist"));
+        assert!(is_likely_missing_target_reason("No Match"));
+    }
+
+    #[test]
+    fn missing_target_reason_empty_is_not_suppressed() {
+        // An empty INVALID_TASK reason is still a real (if uninformative)
+        // rejection — let it through.
+        assert!(!is_likely_missing_target_reason(""));
+    }
+
+    #[test]
     fn format_repair_context_first_step_failed_renders_empty_completed() {
         let ctx = RepairContext {
             previous_plan: vec![EditPlanStep::SmartEdit(EditRegion {
@@ -2943,6 +3473,268 @@ mod tests {
         assert!(block.contains("smart edit returned no diff"));
         // The "first step failed" stub must NOT appear when partial success exists.
         assert!(!block.contains("(none — the first step failed"));
+    }
+
+    #[test]
+    fn strip_code_fences_removes_full_wrap_with_language_tag() {
+        let input = "```rust\nLITERAL_REPLACE\nSCOPE 1 1\nALL true\nOLD:\nfoo\nEND_OLD\nNEW:\nbar\nEND_NEW\nEND\n```";
+        let stripped = strip_code_fences(input);
+        assert!(!stripped.contains("```"));
+        assert!(stripped.starts_with("LITERAL_REPLACE"));
+        assert!(stripped.contains("END_NEW"));
+    }
+
+    #[test]
+    fn strip_code_fences_removes_full_wrap_without_language_tag() {
+        let input = "```\nREPLACE_AT 5\nOLD:\nx\nEND_OLD\nNEW:\ny\nEND_NEW\n```";
+        let stripped = strip_code_fences(input);
+        assert!(!stripped.contains("```"));
+        assert!(stripped.starts_with("REPLACE_AT 5"));
+    }
+
+    #[test]
+    fn strip_code_fences_tolerates_leading_whitespace() {
+        let input = "\n  \n```rust\nSMART_EDIT\nREGION 1 5\nTASK: x\nEND\n```\n";
+        let stripped = strip_code_fences(input);
+        assert!(!stripped.contains("```"));
+        assert!(stripped.starts_with("SMART_EDIT"));
+    }
+
+    #[test]
+    fn strip_code_fences_keeps_text_with_no_fence() {
+        let input = "LITERAL_REPLACE\nSCOPE 1 1\nALL true\nOLD:\nfoo\nEND_OLD\nNEW:\nbar\nEND_NEW\nEND\n";
+        let stripped = strip_code_fences(input);
+        // Identical pass-through.
+        assert_eq!(stripped, input);
+    }
+
+    #[test]
+    fn strip_code_fences_handles_truncated_unclosed_fence() {
+        // Model started a ```rust block but ran out of tokens before
+        // closing it. We should still strip the opener and keep the
+        // body so the parser has a chance.
+        let input = "```rust\nLITERAL_REPLACE\nSCOPE 1 1\nALL true\nOLD:\nfoo\nEND_OLD\nNEW:\nbar\nEND_NEW\nEND\n";
+        let stripped = strip_code_fences(input);
+        assert!(!stripped.starts_with("```"));
+        assert!(stripped.starts_with("LITERAL_REPLACE"));
+        assert!(stripped.contains("END_NEW"));
+    }
+
+    #[test]
+    fn strip_code_fences_does_not_touch_inline_backticks() {
+        // Backticks inside an otherwise plain block must not be
+        // misinterpreted as a closing fence by some greedy regex
+        // somewhere — we only consider an outer leading ``` fence.
+        let input = "REPLACE_AT 1\nOLD:\nlet `s` = 1;\nEND_OLD\nNEW:\nlet `t` = 2;\nEND_NEW\n";
+        let stripped = strip_code_fences(input);
+        assert_eq!(stripped, input);
+    }
+
+    #[test]
+    fn parse_edit_plan_accepts_markdown_fenced_response() {
+        // Real failure mode from past benches: model wraps the entire
+        // structured response in a ```rust ... ``` fence even though the
+        // prompt forbids markdown. Parsing must succeed and return the
+        // step inside.
+        let input = "```rust\nLITERAL_REPLACE\nSCOPE 1 1\nALL true\nOLD:\nfoo\nEND_OLD\nNEW:\nbar\nEND_NEW\nEND\n```";
+        let steps = parse_edit_plan(input).expect("fenced plan should parse");
+        assert_eq!(steps.len(), 1);
+        match &steps[0] {
+            EditPlanStep::LiteralReplace { scope_start, scope_end, all, old, new } => {
+                assert_eq!(*scope_start, 1);
+                assert_eq!(*scope_end, 1);
+                assert!(*all);
+                assert_eq!(old, &vec!["foo".to_string()]);
+                assert_eq!(new, &vec!["bar".to_string()]);
+            }
+            other => panic!("unexpected step variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_edit_plan_accepts_literal_replace_without_old() {
+        // The model omits the OLD: block — we should produce a
+        // ReplaceScope step that rewrites the entire scope.
+        let input = "\
+LITERAL_REPLACE
+SCOPE 10 12
+ALL true
+NEW:
+new line one
+new line two
+END_NEW
+END
+";
+        let steps = parse_edit_plan(input).expect("no-OLD literal should parse");
+        assert_eq!(steps.len(), 1);
+        match &steps[0] {
+            EditPlanStep::ReplaceScope {
+                scope_start,
+                scope_end,
+                new,
+            } => {
+                assert_eq!(*scope_start, 10);
+                assert_eq!(*scope_end, 12);
+                assert_eq!(
+                    new,
+                    &vec!["new line one".to_string(), "new line two".to_string()]
+                );
+            }
+            other => panic!("expected ReplaceScope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_edit_plan_no_old_form_tolerates_blank_line_before_new() {
+        // The model put a blank line between `ALL true` and `NEW:`.
+        let input = "\
+LITERAL_REPLACE
+SCOPE 1 3
+ALL true
+
+NEW:
+hello
+END_NEW
+END
+";
+        let steps = parse_edit_plan(input).expect("blank line should be tolerated");
+        assert_eq!(steps.len(), 1);
+        assert!(matches!(steps[0], EditPlanStep::ReplaceScope { .. }));
+    }
+
+    #[test]
+    fn parse_edit_plan_no_old_form_rejects_all_false() {
+        // ALL false has no meaning without an OLD anchor — bail loudly
+        // rather than silently replacing the whole scope.
+        let input = "\
+LITERAL_REPLACE
+SCOPE 1 3
+ALL false
+NEW:
+hello
+END_NEW
+END
+";
+        let err = parse_edit_plan(input).expect_err("ALL false + no OLD should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ALL true"),
+            "error should mention ALL true requirement, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_edit_plan_classic_literal_replace_still_parses() {
+        // Don't regress the existing OLD-bearing form when adding the
+        // peek-ahead branch.
+        let input = "\
+LITERAL_REPLACE
+SCOPE 5 7
+ALL false
+OLD:
+foo()
+END_OLD
+NEW:
+bar()
+END_NEW
+END
+";
+        let steps = parse_edit_plan(input).expect("classic literal replace should still parse");
+        assert_eq!(steps.len(), 1);
+        match &steps[0] {
+            EditPlanStep::LiteralReplace {
+                scope_start,
+                scope_end,
+                all,
+                old,
+                new,
+            } => {
+                assert_eq!(*scope_start, 5);
+                assert_eq!(*scope_end, 7);
+                assert!(!*all);
+                assert_eq!(old, &vec!["foo()".to_string()]);
+                assert_eq!(new, &vec!["bar()".to_string()]);
+            }
+            other => panic!("expected LiteralReplace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_replace_scope_replaces_entire_range() {
+        let content = "line one\nline two\nline three\nline four\n";
+        let new = vec!["fresh two".to_string(), "fresh three".to_string()];
+        let (out, count) = apply_replace_scope(content, 2, 3, &new).expect("scope replace works");
+        assert_eq!(count, 1);
+        assert_eq!(out, "line one\nfresh two\nfresh three\nline four\n");
+    }
+
+    #[test]
+    fn apply_replace_scope_supports_grow_and_shrink() {
+        // Replacing 2 lines with 4 lines.
+        let content = "a\nb\nc\nd\n";
+        let new = vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string(),
+            "delta".to_string(),
+        ];
+        let (grew, _) = apply_replace_scope(content, 2, 3, &new).unwrap();
+        assert_eq!(grew, "a\nalpha\nbravo\ncharlie\ndelta\nd\n");
+
+        // Replacing 4 lines with 1.
+        let (shrunk, _) = apply_replace_scope("a\nb\nc\nd\ne\n", 2, 4, &vec!["only".to_string()]).unwrap();
+        assert_eq!(shrunk, "a\nonly\ne\n");
+    }
+
+    #[test]
+    fn apply_replace_scope_preserves_missing_trailing_newline() {
+        // The last line of the scope had no trailing newline (e.g.
+        // because the file itself doesn't end with one and the scope
+        // extends to EOF). The result should not get a synthetic
+        // newline appended.
+        let content = "a\nb\nlast";
+        let (out, _) = apply_replace_scope(content, 3, 3, &vec!["replaced".to_string()]).unwrap();
+        assert_eq!(out, "a\nb\nreplaced");
+    }
+
+    #[test]
+    fn apply_replace_scope_rejects_out_of_range() {
+        let content = "a\nb\nc\n";
+        let err = apply_replace_scope(content, 1, 99, &vec!["x".to_string()])
+            .expect_err("scope past EOF should error");
+        assert!(err.to_string().contains("outside"));
+    }
+
+    #[test]
+    fn format_edit_plan_steps_emits_replace_scope_without_old() {
+        let steps = vec![EditPlanStep::ReplaceScope {
+            scope_start: 4,
+            scope_end: 6,
+            new: vec!["aaa".into(), "bbb".into()],
+        }];
+        let out = format_edit_plan_steps(&steps);
+        // Must use the LITERAL_REPLACE shape but skip the OLD section.
+        assert!(out.contains("LITERAL_REPLACE"));
+        assert!(out.contains("SCOPE 4 6"));
+        assert!(out.contains("ALL true"));
+        assert!(out.contains("NEW:\naaa\nbbb\nEND_NEW"));
+        assert!(!out.contains("OLD:"));
+        assert!(!out.contains("END_OLD"));
+    }
+
+    #[test]
+    fn parse_patch_accepts_markdown_fenced_response() {
+        let input = "```\nREPLACE_AT 5\nOLD:\nold line\nEND_OLD\nNEW:\nnew line\nEND_NEW\n```";
+        let ops = parse_patch(input).expect("fenced patch should parse");
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            PatchOp::ReplaceAt { start, old, new } => {
+                assert_eq!(*start, 5);
+                assert_eq!(old, &vec!["old line".to_string()]);
+                assert_eq!(new, &vec!["new line".to_string()]);
+            }
+            other => panic!("unexpected op variant: {other:?}"),
+        }
     }
 
     #[test]

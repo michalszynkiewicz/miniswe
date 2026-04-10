@@ -2,8 +2,8 @@
 
 mod helpers;
 
-use std::fs;
 use miniswe::tools::snapshots::SnapshotManager;
+use std::fs;
 
 #[test]
 fn snapshot_init_creates_shadow_git() {
@@ -14,7 +14,10 @@ fn snapshot_init_creates_shadow_git() {
 
     assert!(config.project_root.join(".miniswe/shadow-git").exists());
     let snapshots = snap.list_snapshots().unwrap();
-    assert!(snapshots.contains("round 0"), "should have initial snapshot: {snapshots}");
+    assert!(
+        snapshots.contains("round 0"),
+        "should have initial snapshot: {snapshots}"
+    );
 }
 
 #[test]
@@ -29,7 +32,10 @@ fn revert_all_restores_to_session_start() {
     snap.begin_round(1).unwrap();
 
     // Verify modified
-    assert_eq!(fs::read_to_string(helpers::project_path(&config, "test.txt")).unwrap(), "modified");
+    assert_eq!(
+        fs::read_to_string(helpers::project_path(&config, "test.txt")).unwrap(),
+        "modified"
+    );
 
     // Revert to start
     snap.revert_all().unwrap();
@@ -85,8 +91,14 @@ fn revert_single_file() {
     snap.revert_file("a.txt", 0).unwrap();
 
     // a.txt should be original, b.txt should stay modified
-    assert_eq!(fs::read_to_string(helpers::project_path(&config, "a.txt")).unwrap(), "a_original");
-    assert_eq!(fs::read_to_string(helpers::project_path(&config, "b.txt")).unwrap(), "b_modified");
+    assert_eq!(
+        fs::read_to_string(helpers::project_path(&config, "a.txt")).unwrap(),
+        "a_original"
+    );
+    assert_eq!(
+        fs::read_to_string(helpers::project_path(&config, "b.txt")).unwrap(),
+        "b_modified"
+    );
 }
 
 #[test]
@@ -96,11 +108,19 @@ fn revert_new_file_roundtrip() {
     let mut snap = SnapshotManager::init(&config.project_root).unwrap();
 
     // Create a new file and snapshot it
-    fs::write(helpers::project_path(&config, "new_file.txt"), "new content").unwrap();
+    fs::write(
+        helpers::project_path(&config, "new_file.txt"),
+        "new content",
+    )
+    .unwrap();
     snap.begin_round(1).unwrap();
 
     // Modify the new file
-    fs::write(helpers::project_path(&config, "new_file.txt"), "modified content").unwrap();
+    fs::write(
+        helpers::project_path(&config, "new_file.txt"),
+        "modified content",
+    )
+    .unwrap();
     snap.begin_round(2).unwrap();
 
     // Revert to round 1 — should have original "new content"

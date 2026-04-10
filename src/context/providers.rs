@@ -5,9 +5,9 @@
 
 use crate::config::Config;
 use crate::context::compress;
+use crate::knowledge::ProjectIndex;
 use crate::knowledge::graph::DependencyGraph;
 use crate::knowledge::repo_map;
-use crate::knowledge::ProjectIndex;
 use std::fs;
 
 /// Input available to all providers for the current turn.
@@ -43,7 +43,9 @@ pub trait ContextProvider: Send + Sync {
 pub struct ProfileProvider;
 
 impl ContextProvider for ProfileProvider {
-    fn name(&self) -> &'static str { "profile" }
+    fn name(&self) -> &'static str {
+        "profile"
+    }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
         let path = input.config.miniswe_path("profile.md");
@@ -59,15 +61,22 @@ impl ContextProvider for ProfileProvider {
 pub struct GuideProvider;
 
 impl ContextProvider for GuideProvider {
-    fn name(&self) -> &'static str { "guide" }
+    fn name(&self) -> &'static str {
+        "guide"
+    }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
         let path = input.config.miniswe_path("guide.md");
         let content = fs::read_to_string(path).ok()?;
-        if content.contains("<!-- Add project-specific instructions") && content.lines().count() <= 5 {
+        if content.contains("<!-- Add project-specific instructions")
+            && content.lines().count() <= 5
+        {
             return None;
         }
-        Some(ContextBlock { header: "[GUIDE]", content })
+        Some(ContextBlock {
+            header: "[GUIDE]",
+            content,
+        })
     }
 }
 
@@ -75,7 +84,9 @@ impl ContextProvider for GuideProvider {
 pub struct ProjectNotesProvider;
 
 impl ContextProvider for ProjectNotesProvider {
-    fn name(&self) -> &'static str { "project_notes" }
+    fn name(&self) -> &'static str {
+        "project_notes"
+    }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
         let path = input.config.project_root.join(".ai").join("README.md");
@@ -92,12 +103,17 @@ impl ContextProvider for ProjectNotesProvider {
 pub struct PlanProvider;
 
 impl ContextProvider for PlanProvider {
-    fn name(&self) -> &'static str { "plan" }
+    fn name(&self) -> &'static str {
+        "plan"
+    }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
         let path = input.config.miniswe_path("plan.md");
         let content = fs::read_to_string(path).ok()?;
-        Some(ContextBlock { header: "[PLAN]", content })
+        Some(ContextBlock {
+            header: "[PLAN]",
+            content,
+        })
     }
 }
 
@@ -105,7 +121,9 @@ impl ContextProvider for PlanProvider {
 pub struct LessonsProvider;
 
 impl ContextProvider for LessonsProvider {
-    fn name(&self) -> &'static str { "lessons" }
+    fn name(&self) -> &'static str {
+        "lessons"
+    }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
         let path = input.config.miniswe_path("lessons.md");
@@ -117,7 +135,10 @@ impl ContextProvider for LessonsProvider {
         // they're cheap and the keyword filter often misses relevant sections
         // when section headings don't overlap with the user's phrasing.
         if input.keywords.is_empty() || content.len() < 2000 {
-            return Some(ContextBlock { header: "[LESSONS]", content });
+            return Some(ContextBlock {
+                header: "[LESSONS]",
+                content,
+            });
         }
         // Extract only sections matching keywords
         let mut relevant = String::new();
@@ -125,17 +146,23 @@ impl ContextProvider for LessonsProvider {
         for line in content.lines() {
             if line.starts_with("## ") {
                 let heading_lower = line.to_lowercase();
-                in_section = input.keywords.iter().any(|kw| {
-                    kw.len() >= 3 && heading_lower.contains(&kw.to_lowercase())
-                });
+                in_section = input
+                    .keywords
+                    .iter()
+                    .any(|kw| kw.len() >= 3 && heading_lower.contains(&kw.to_lowercase()));
             }
             if in_section {
                 relevant.push_str(line);
                 relevant.push('\n');
             }
         }
-        if relevant.is_empty() { None } else {
-            Some(ContextBlock { header: "[LESSONS]", content: relevant })
+        if relevant.is_empty() {
+            None
+        } else {
+            Some(ContextBlock {
+                header: "[LESSONS]",
+                content: relevant,
+            })
         }
     }
 }
@@ -144,7 +171,9 @@ impl ContextProvider for LessonsProvider {
 pub struct RepoMapProvider;
 
 impl ContextProvider for RepoMapProvider {
-    fn name(&self) -> &'static str { "repo_map" }
+    fn name(&self) -> &'static str {
+        "repo_map"
+    }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
         let miniswe_dir = input.config.miniswe_dir();
@@ -157,8 +186,13 @@ impl ContextProvider for RepoMapProvider {
             &input.keywords,
             &input.config.project_root,
         );
-        if map.is_empty() { None } else {
-            Some(ContextBlock { header: "[REPO MAP]", content: map })
+        if map.is_empty() {
+            None
+        } else {
+            Some(ContextBlock {
+                header: "[REPO MAP]",
+                content: map,
+            })
         }
     }
 }
@@ -167,7 +201,9 @@ impl ContextProvider for RepoMapProvider {
 pub struct McpProvider;
 
 impl ContextProvider for McpProvider {
-    fn name(&self) -> &'static str { "mcp" }
+    fn name(&self) -> &'static str {
+        "mcp"
+    }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
         let mcp = input.mcp_summary?;
@@ -182,12 +218,17 @@ impl ContextProvider for McpProvider {
 pub struct ScratchpadProvider;
 
 impl ContextProvider for ScratchpadProvider {
-    fn name(&self) -> &'static str { "scratchpad" }
+    fn name(&self) -> &'static str {
+        "scratchpad"
+    }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
         let path = input.config.miniswe_path("scratchpad.md");
         let content = fs::read_to_string(path).ok()?;
-        Some(ContextBlock { header: "[SCRATCHPAD]", content })
+        Some(ContextBlock {
+            header: "[SCRATCHPAD]",
+            content,
+        })
     }
 }
 
@@ -195,7 +236,9 @@ impl ContextProvider for ScratchpadProvider {
 pub struct UsageGuideProvider;
 
 impl ContextProvider for UsageGuideProvider {
-    fn name(&self) -> &'static str { "usage_guide" }
+    fn name(&self) -> &'static str {
+        "usage_guide"
+    }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
         if !super::is_meta_question(input.user_message) {
@@ -212,10 +255,14 @@ impl ContextProvider for UsageGuideProvider {
 pub struct PlanModeProvider;
 
 impl ContextProvider for PlanModeProvider {
-    fn name(&self) -> &'static str { "plan_mode" }
+    fn name(&self) -> &'static str {
+        "plan_mode"
+    }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
-        if !input.plan_only { return None; }
+        if !input.plan_only {
+            return None;
+        }
         Some(ContextBlock {
             header: "[MODE:PLAN]",
             content: "Read-only.No edits/shell.Write plan via task_update.".into(),

@@ -8,26 +8,22 @@ use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 
+use super::ToolResult;
 use crate::config::Config;
 use crate::context::compress;
-use super::ToolResult;
 
 /// Fallback max lines if config is not available.
 
-
 /// File extensions that get compression applied.
 const COMPRESSIBLE: &[&str] = &[
-    "rs", "py", "js", "ts", "tsx", "jsx", "go", "java",
-    "c", "cpp", "h", "hpp", "rb", "sh", "bash",
+    "rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh", "bash",
 ];
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     // Max lines derived from context budget (~80 chars/line)
     let max_lines = config.tool_output_budget_chars() / 80;
 
-    let path_str = args["path"]
-        .as_str()
-        .unwrap_or("");
+    let path_str = args["path"].as_str().unwrap_or("");
 
     if path_str.is_empty() {
         return Ok(ToolResult::err("Missing required parameter: path".into()));
@@ -40,7 +36,9 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     }
 
     if path.is_dir() {
-        return Ok(ToolResult::err(format!("{path_str} is a directory, not a file. Use search or shell(\"ls\") instead.")));
+        return Ok(ToolResult::err(format!(
+            "{path_str} is a directory, not a file. Use search or shell(\"ls\") instead."
+        )));
     }
 
     // Check file size before reading (reject files > 10MB to avoid OOM)
@@ -79,10 +77,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     }
 
     // Determine if we should compress this file
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let should_compress = COMPRESSIBLE.contains(&ext);
 
     let mut output = String::new();

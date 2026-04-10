@@ -31,8 +31,15 @@ async fn read_file_returns_content_with_line_numbers() {
         .await
         .unwrap();
 
-    assert!(result.success, "read_file should succeed: {}", result.content);
-    assert!(result.content.contains("test.txt"), "should mention filename");
+    assert!(
+        result.success,
+        "read_file should succeed: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("test.txt"),
+        "should mention filename"
+    );
     assert!(result.content.contains("3 lines"), "should show line count");
     // Check line numbers are present
     assert!(result.content.contains("1│"), "should have line 1");
@@ -59,7 +66,10 @@ async fn read_file_with_line_range() {
     assert!(result.content.contains("L3-5"), "should mention line range");
     assert!(result.content.contains("line 3"), "should contain line 3");
     assert!(result.content.contains("line 5"), "should contain line 5");
-    assert!(!result.content.contains("line 1\n"), "should not contain line 1 content");
+    assert!(
+        !result.content.contains("line 1\n"),
+        "should not contain line 1 content"
+    );
 }
 
 #[tokio::test]
@@ -133,7 +143,11 @@ async fn write_file_creates_new_file() {
         .await
         .unwrap();
 
-    assert!(result.success, "write_file should succeed: {}", result.content);
+    assert!(
+        result.success,
+        "write_file should succeed: {}",
+        result.content
+    );
     assert!(result.content.contains("Created"));
 
     // Verify file exists on disk
@@ -163,7 +177,11 @@ async fn write_file_creates_parent_dirs() {
 async fn write_file_overwrites_existing() {
     let (_tmp, config) = helpers::create_test_project();
 
-    fs::write(helpers::project_path(&config, "existing.txt"), "old content").unwrap();
+    fs::write(
+        helpers::project_path(&config, "existing.txt"),
+        "old content",
+    )
+    .unwrap();
 
     let args = json!({
         "path": "existing.txt",
@@ -188,7 +206,11 @@ async fn write_file_without_content_creates_empty_file() {
         .await
         .unwrap();
 
-    assert!(result.success, "write_file should create empty file: {}", result.content);
+    assert!(
+        result.success,
+        "write_file should create empty file: {}",
+        result.content
+    );
     assert!(result.content.contains("Created empty file empty.txt"));
     assert_eq!(
         fs::read_to_string(helpers::project_path(&config, "empty.txt")).unwrap(),
@@ -199,10 +221,138 @@ async fn write_file_without_content_creates_empty_file() {
 }
 
 #[tokio::test]
+async fn write_file_new_python_file_with_syntax_error_is_warning_not_failure() {
+    // Regression: creating a brand-new helper .py script whose contents
+    // py_compile rejects (e.g. an unresolved import or syntax issue) used
+    // to flip result.success to false even though the file was written as
+    // requested. The user can't tell from a "failed" tool result whether
+    // the file actually got written.
+    //
+    // New behavior: for new files (no baseline) the checker output is
+    // surfaced as a WARNING and result.success stays true.
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("python3 not available, skipping test");
+        return;
+    }
+
+    let (_tmp, config) = helpers::create_test_project();
+
+    let args = json!({
+        "path": "new_helper.py",
+        // Deliberately invalid Python — bad indent / unfinished function.
+        "content": "def helper(\n    return 42\n",
+    });
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    // The file was written; the tool call succeeded.
+    assert!(
+        result.success,
+        "writing a new .py file should NOT fail just because py_compile complains: {}",
+        result.content
+    );
+    // The checker output should still appear, marked as a WARNING.
+    assert!(
+        result.content.contains("WARNING")
+            && result.content.contains("newly-created new_helper.py"),
+        "expected WARNING about new file, got: {}",
+        result.content
+    );
+    // File exists on disk with the requested content.
+    let disk =
+        fs::read_to_string(helpers::project_path(&config, "new_helper.py")).unwrap();
+    assert_eq!(disk, "def helper(\n    return 42\n");
+}
+
+#[tokio::test]
+async fn write_file_overwriting_python_with_syntax_error_still_fails() {
+    // Counterpoint: if the file already existed (and presumably compiled
+    // before), overwriting it with broken Python *is* a regression and
+    // SHOULD flip success to false. Otherwise the leniency on new files
+    // would mask real breakage on edits.
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("python3 not available, skipping test");
+        return;
+    }
+
+    let (_tmp, config) = helpers::create_test_project();
+
+    // Pre-existing valid .py file.
+    fs::write(
+        helpers::project_path(&config, "helper.py"),
+        "def helper():\n    return 42\n",
+    )
+    .unwrap();
+
+    let args = json!({
+        "path": "helper.py",
+        "content": "def helper(\n    return 42\n",
+    });
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(
+        !result.success,
+        "overwriting an existing file with broken syntax should fail: {}",
+        result.content
+    );
+}
+
+#[tokio::test]
+async fn write_file_new_python_file_with_valid_content_succeeds_silently() {
+    // Sanity check: a new .py file with valid syntax should succeed
+    // without any WARNING marker.
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("python3 not available, skipping test");
+        return;
+    }
+
+    let (_tmp, config) = helpers::create_test_project();
+
+    let args = json!({
+        "path": "good_helper.py",
+        "content": "def helper():\n    return 42\n",
+    });
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "valid python file should succeed: {}", result.content);
+    assert!(
+        result.content.contains("[py_compile] OK"),
+        "expected py_compile OK marker, got: {}",
+        result.content
+    );
+    assert!(
+        !result.content.contains("WARNING"),
+        "should not mark valid file as WARNING, got: {}",
+        result.content
+    );
+}
+
+#[tokio::test]
 async fn write_file_without_content_rejects_existing_file() {
     let (_tmp, config) = helpers::create_test_project();
 
-    fs::write(helpers::project_path(&config, "existing.txt"), "old content").unwrap();
+    fs::write(
+        helpers::project_path(&config, "existing.txt"),
+        "old content",
+    )
+    .unwrap();
 
     let args = json!({"path": "existing.txt"});
     let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
@@ -238,16 +388,22 @@ async fn delete_file_missing_path_or_file_fails() {
     let (_tmp, config) = helpers::create_test_project();
 
     let missing_path_args = json!({"action": "delete"});
-    let missing_path = tools::execute_tool("file", &missing_path_args, &config, &perms(&config), None)
-        .await
-        .unwrap();
+    let missing_path =
+        tools::execute_tool("file", &missing_path_args, &config, &perms(&config), None)
+            .await
+            .unwrap();
     assert!(!missing_path.success);
-    assert!(missing_path.content.contains("Missing required parameter: path"));
+    assert!(
+        missing_path
+            .content
+            .contains("Missing required parameter: path")
+    );
 
     let missing_file_args = json!({"action": "delete", "path": "nope.txt"});
-    let missing_file = tools::execute_tool("file", &missing_file_args, &config, &perms(&config), None)
-        .await
-        .unwrap();
+    let missing_file =
+        tools::execute_tool("file", &missing_file_args, &config, &perms(&config), None)
+            .await
+            .unwrap();
     assert!(!missing_file.success);
     assert!(missing_file.content.contains("File not found: nope.txt"));
 }
@@ -326,7 +482,11 @@ async fn edit_file_not_found() {
 async fn edit_old_not_found_in_file() {
     let (_tmp, config) = helpers::create_test_project();
 
-    fs::write(helpers::project_path(&config, "miss.txt"), "actual content\n").unwrap();
+    fs::write(
+        helpers::project_path(&config, "miss.txt"),
+        "actual content\n",
+    )
+    .unwrap();
 
     let args = json!({"action": "replace",
         "path": "miss.txt",
@@ -379,7 +539,11 @@ async fn search_no_matches() {
     let (_tmp, config) = helpers::create_test_project();
 
     fs::create_dir_all(helpers::project_path(&config, "src")).unwrap();
-    fs::write(helpers::project_path(&config, "src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(
+        helpers::project_path(&config, "src/main.rs"),
+        "fn main() {}\n",
+    )
+    .unwrap();
 
     let args = json!({"action": "search", "query": "ZZZZUNIQUENOMATCH"});
     let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
@@ -487,7 +651,10 @@ async fn shell_truncates_many_lines() {
         result.content.lines().next().unwrap_or("")
     );
     // Should keep the LAST N lines (tail priority), so "500" should be visible
-    assert!(result.content.contains("500"), "Should contain the last line (500)");
+    assert!(
+        result.content.contains("500"),
+        "Should contain the last line (500)"
+    );
     // "1" (first line) might or might not be visible depending on exact truncation
 }
 
@@ -503,7 +670,11 @@ async fn task_update_creates_scratchpad() {
         .await
         .unwrap();
 
-    assert!(result.success, "task_update should succeed: {}", result.content);
+    assert!(
+        result.success,
+        "task_update should succeed: {}",
+        result.content
+    );
 
     let path = config.miniswe_path("scratchpad.md");
     assert!(path.exists());
@@ -540,7 +711,14 @@ async fn task_update_rejects_missing_sections() {
 async fn unknown_tool_returns_error() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let result = tools::execute_tool("nonexistent_tool", &json!({}), &config, &perms(&config), None).await;
+    let result = tools::execute_tool(
+        "nonexistent_tool",
+        &json!({}),
+        &config,
+        &perms(&config),
+        None,
+    )
+    .await;
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -556,7 +734,11 @@ async fn unknown_action_returns_error() {
         .await
         .unwrap();
 
-    assert!(!result.success, "unknown action should fail: {}", result.content);
+    assert!(
+        !result.success,
+        "unknown action should fail: {}",
+        result.content
+    );
 }
 
 #[tokio::test]
@@ -569,9 +751,21 @@ async fn file_help_returns_action_list() {
         .unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("read"), "help should list read action: {}", result.content);
-    assert!(!result.content.contains("\n- write:"), "file help should no longer advertise write: {}", result.content);
-    assert!(result.content.contains("replace"), "help should list replace action: {}", result.content);
+    assert!(
+        result.content.contains("read"),
+        "help should list read action: {}",
+        result.content
+    );
+    assert!(
+        !result.content.contains("\n- write:"),
+        "file help should no longer advertise write: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("replace"),
+        "help should list replace action: {}",
+        result.content
+    );
 }
 
 #[tokio::test]
@@ -584,8 +778,16 @@ async fn code_help_returns_action_list() {
         .unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("goto_definition"), "help should list goto_definition: {}", result.content);
-    assert!(result.content.contains("repo_map"), "help should list repo_map: {}", result.content);
+    assert!(
+        result.content.contains("goto_definition"),
+        "help should list goto_definition: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("repo_map"),
+        "help should list repo_map: {}",
+        result.content
+    );
 }
 
 #[tokio::test]
@@ -598,8 +800,16 @@ async fn web_help_returns_action_list() {
         .unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("search"), "help should list search: {}", result.content);
-    assert!(result.content.contains("fetch"), "help should list fetch: {}", result.content);
+    assert!(
+        result.content.contains("search"),
+        "help should list search: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("fetch"),
+        "help should list fetch: {}",
+        result.content
+    );
 }
 
 // ── missing required params ─────────────────────────────────────────
@@ -627,7 +837,10 @@ async fn write_file_missing_content() {
         .unwrap();
 
     assert!(result.success);
-    assert_eq!(fs::read_to_string(helpers::project_path(&config, "file.txt")).unwrap(), "");
+    assert_eq!(
+        fs::read_to_string(helpers::project_path(&config, "file.txt")).unwrap(),
+        ""
+    );
 }
 
 #[tokio::test]
@@ -663,13 +876,26 @@ async fn edit_whitespace_normalized_fallback() {
         .await
         .unwrap();
 
-    assert!(result.success, "whitespace-normalized edit should succeed: {}", result.content);
-    assert!(result.content.contains("fuzzy/normalized matching"),
-        "should mention fuzzy/normalized matching: {}", result.content);
+    assert!(
+        result.success,
+        "whitespace-normalized edit should succeed: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("fuzzy/normalized matching"),
+        "should mention fuzzy/normalized matching: {}",
+        result.content
+    );
 
     let disk = fs::read_to_string(helpers::project_path(&config, "ws_test.rs")).unwrap();
-    assert!(disk.contains("let x = 42;"), "replacement should be applied");
-    assert!(disk.contains("let y = 99;"), "replacement should be applied");
+    assert!(
+        disk.contains("let x = 42;"),
+        "replacement should be applied"
+    );
+    assert!(
+        disk.contains("let y = 99;"),
+        "replacement should be applied"
+    );
 }
 
 #[tokio::test]
@@ -689,7 +915,11 @@ async fn edit_whitespace_normalized_single_line() {
         .await
         .unwrap();
 
-    assert!(result.success, "single-line normalized edit should succeed: {}", result.content);
+    assert!(
+        result.success,
+        "single-line normalized edit should succeed: {}",
+        result.content
+    );
     let disk = fs::read_to_string(helpers::project_path(&config, "ws_single.rs")).unwrap();
     assert!(disk.contains("let value = 20;"));
 }
@@ -700,7 +930,11 @@ async fn edit_whitespace_normalized_single_line() {
 async fn edit_not_found_suggests_edit_file() {
     let (_tmp, config) = helpers::create_test_project();
 
-    fs::write(helpers::project_path(&config, "hint_test.txt"), "actual content\n").unwrap();
+    fs::write(
+        helpers::project_path(&config, "hint_test.txt"),
+        "actual content\n",
+    )
+    .unwrap();
 
     let args = json!({"action": "replace",
         "path": "hint_test.txt",
@@ -728,7 +962,8 @@ async fn get_project_info_returns_profile() {
     fs::write(
         config.miniswe_path("profile.md"),
         "# Test\n## Overview\n- Name: test-proj\n- Language: Rust\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let args = json!({"action": "project_info"});
     let result = tools::execute_tool("code", &args, &config, &perms(&config), None)
@@ -736,8 +971,11 @@ async fn get_project_info_returns_profile() {
         .unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("test-proj") || result.content.contains("PROFILE"),
-        "should contain profile: {}", result.content);
+    assert!(
+        result.content.contains("test-proj") || result.content.contains("PROFILE"),
+        "should contain profile: {}",
+        result.content
+    );
 }
 
 #[tokio::test]
@@ -750,8 +988,11 @@ async fn get_architecture_notes_missing_file() {
         .unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("does not exist"),
-        "should say file doesn't exist: {}", result.content);
+    assert!(
+        result.content.contains("does not exist"),
+        "should say file doesn't exist: {}",
+        result.content
+    );
 }
 
 #[tokio::test]
@@ -760,7 +1001,11 @@ async fn get_architecture_notes_returns_content() {
 
     let ai_dir = helpers::project_path(&config, ".ai");
     fs::create_dir_all(&ai_dir).unwrap();
-    fs::write(ai_dir.join("README.md"), "# Architecture\nLayered design.\n").unwrap();
+    fs::write(
+        ai_dir.join("README.md"),
+        "# Architecture\nLayered design.\n",
+    )
+    .unwrap();
 
     let args = json!({"action": "architecture_notes"});
     let result = tools::execute_tool("code", &args, &config, &perms(&config), None)
@@ -768,8 +1013,11 @@ async fn get_architecture_notes_returns_content() {
         .unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("Layered design"),
-        "should contain notes: {}", result.content);
+    assert!(
+        result.content.contains("Layered design"),
+        "should contain notes: {}",
+        result.content
+    );
 }
 
 // ── transform tool ────────────────────────────────────────────────
@@ -795,7 +1043,11 @@ async fn replace_all_missing_params() {
 async fn replace_all_not_found() {
     let (_tmp, config) = helpers::create_test_project();
 
-    fs::write(helpers::project_path(&config, "target.rs"), "fn main() {}\n").unwrap();
+    fs::write(
+        helpers::project_path(&config, "target.rs"),
+        "fn main() {}\n",
+    )
+    .unwrap();
 
     let args = json!({"action": "replace", "path": "target.rs", "old": "nonexistent", "new": "replacement", "all": true});
     let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
@@ -810,11 +1062,16 @@ async fn replace_all_replaces_every_occurrence() {
     let content = "foo(1);\nfoo(2);\nbar();\nfoo(3);\n";
     fs::write(helpers::project_path(&config, "multi.rs"), content).unwrap();
 
-    let args = json!({"action": "replace", "path": "multi.rs", "old": "foo(", "new": "baz(", "all": true});
+    let args =
+        json!({"action": "replace", "path": "multi.rs", "old": "foo(", "new": "baz(", "all": true});
     let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("3 occurrence"), "should replace 3: {}", result.content);
+    assert!(
+        result.content.contains("3 occurrence"),
+        "should replace 3: {}",
+        result.content
+    );
 
     let disk = fs::read_to_string(helpers::project_path(&config, "multi.rs")).unwrap();
     assert!(!disk.contains("foo("), "no foo( should remain");
@@ -833,7 +1090,11 @@ async fn replace_all_for_adding_argument() {
     let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("2 occurrence"), "should replace 2: {}", result.content);
+    assert!(
+        result.content.contains("2 occurrence"),
+        "should replace 2: {}",
+        result.content
+    );
 
     let disk = fs::read_to_string(helpers::project_path(&config, "calls.rs")).unwrap();
     assert_eq!(disk.matches("override_prompt,").count(), 2);
@@ -903,7 +1164,8 @@ async fn search_query_mode_is_literal() {
     fs::write(
         helpers::project_path(&config, "test.rs"),
         "fn foo() -> Result<()> {\n    Ok(())\n}\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     // query mode: "Result<()>" should match literally (no regex interpretation)
     let args = json!({"action": "search", "query": "Result<()>"});
@@ -912,8 +1174,11 @@ async fn search_query_mode_is_literal() {
         .unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("Result<()>"),
-        "literal search should find Result<()>: {}", result.content);
+    assert!(
+        result.content.contains("Result<()>"),
+        "literal search should find Result<()>: {}",
+        result.content
+    );
 }
 
 #[tokio::test]
@@ -923,7 +1188,8 @@ async fn search_pattern_mode_is_regex() {
     fs::write(
         helpers::project_path(&config, "test.rs"),
         "fn foo() {}\nfn bar() {}\nfn baz_qux() {}\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     // pattern mode: regex to find functions starting with 'b'
     let args = json!({"action": "search", "pattern": "fn b\\w+"});
@@ -932,10 +1198,16 @@ async fn search_pattern_mode_is_regex() {
         .unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("bar") && result.content.contains("baz_qux"),
-        "regex should match bar and baz_qux: {}", result.content);
-    assert!(!result.content.contains("foo"),
-        "regex should not match foo: {}", result.content);
+    assert!(
+        result.content.contains("bar") && result.content.contains("baz_qux"),
+        "regex should match bar and baz_qux: {}",
+        result.content
+    );
+    assert!(
+        !result.content.contains("foo"),
+        "regex should not match foo: {}",
+        result.content
+    );
 }
 
 #[tokio::test]
@@ -948,8 +1220,11 @@ async fn search_needs_query_or_pattern() {
         .unwrap();
 
     assert!(!result.success);
-    assert!(result.content.contains("query") || result.content.contains("pattern"),
-        "should ask for query or pattern: {}", result.content);
+    assert!(
+        result.content.contains("query") || result.content.contains("pattern"),
+        "should ask for query or pattern: {}",
+        result.content
+    );
 }
 
 // ── store-and-preview for large shell output ──────────────────────
@@ -967,13 +1242,17 @@ async fn shell_large_output_saved_to_file() {
         .unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("Full output saved to"),
-        "should have file pointer: {}", result.content.lines().last().unwrap_or(""));
+    assert!(
+        result.content.contains("Full output saved to"),
+        "should have file pointer: {}",
+        result.content.lines().last().unwrap_or("")
+    );
 
     // Verify the file was actually created
     let shell_dir = config.miniswe_dir().join("shell_output");
     assert!(shell_dir.exists(), ".miniswe/shell_output should exist");
-    let files: Vec<_> = fs::read_dir(&shell_dir).unwrap()
+    let files: Vec<_> = fs::read_dir(&shell_dir)
+        .unwrap()
         .filter_map(|e| e.ok())
         .collect();
     assert!(!files.is_empty(), "should have saved output file");
@@ -994,14 +1273,17 @@ fn compressor_no_op_when_under_budget() {
 
     // Can't call async maybe_compress in sync test, but we can verify
     // the budget calculation: 3 small messages << context_window/4
-    let total_tokens: usize = messages.iter()
+    let total_tokens: usize = messages
+        .iter()
         .filter(|m| m.role != "system")
         .map(|m| miniswe::context::estimate_tokens(m.content.as_deref().unwrap_or("")))
         .sum();
     let budget = config.model.context_window / 4;
 
-    assert!(total_tokens < budget,
-        "small conversation ({total_tokens} tokens) should be under budget ({budget})");
+    assert!(
+        total_tokens < budget,
+        "small conversation ({total_tokens} tokens) should be under budget ({budget})"
+    );
     assert_eq!(messages.len(), original_len, "messages should not change");
 }
 
@@ -1025,7 +1307,11 @@ async fn edit_whitespace_tabs_vs_spaces() {
         .await
         .unwrap();
 
-    assert!(result.success, "tab/space normalization should work: {}", result.content);
+    assert!(
+        result.success,
+        "tab/space normalization should work: {}",
+        result.content
+    );
     let disk = fs::read_to_string(helpers::project_path(&config, "tabs.rs")).unwrap();
     assert!(disk.contains("let x = 42;"));
 }
@@ -1068,48 +1354,83 @@ async fn edit_response_contains_context_lines() {
     let content = "line1\nline2\nlet x = 1;\nline4\nline5\n";
     fs::write(helpers::project_path(&config, "ctx.rs"), content).unwrap();
 
-    let args = json!({"action": "replace", "path": "ctx.rs", "old": "let x = 1;", "new": "let x = 42;"});
+    let args =
+        json!({"action": "replace", "path": "ctx.rs", "old": "let x = 1;", "new": "let x = 42;"});
     let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await.unwrap();
+        .await
+        .unwrap();
 
     assert!(result.success);
     // Should show surrounding lines so model has context for follow-up edits
-    assert!(result.content.contains("line2"), "should show lines before edit: {}", result.content);
-    assert!(result.content.contains("line4"), "should show lines after edit: {}", result.content);
-    assert!(result.content.contains("let x = 42;"), "should show the new content: {}", result.content);
+    assert!(
+        result.content.contains("line2"),
+        "should show lines before edit: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("line4"),
+        "should show lines after edit: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("let x = 42;"),
+        "should show the new content: {}",
+        result.content
+    );
 }
-
 
 #[tokio::test]
 async fn write_file_response_shows_tail() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let content = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+    let content = (1..=20)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let args = json!({"path": "new.txt", "content": content});
     let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
-        .await.unwrap();
+        .await
+        .unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("✓ Wrote") || result.content.contains("✓ Created"),
-        "should confirm write: {}", result.content);
-    assert!(result.content.contains("line 20"), "should show tail of file: {}", result.content);
+    assert!(
+        result.content.contains("✓ Wrote") || result.content.contains("✓ Created"),
+        "should confirm write: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("line 20"),
+        "should show tail of file: {}",
+        result.content
+    );
 }
 
 #[tokio::test]
 async fn search_response_shows_file_and_line() {
     let (_tmp, config) = helpers::create_test_project();
 
-    fs::write(helpers::project_path(&config, "findme.rs"), "pub fn hello() {}\nfn world() {}\n").unwrap();
+    fs::write(
+        helpers::project_path(&config, "findme.rs"),
+        "pub fn hello() {}\nfn world() {}\n",
+    )
+    .unwrap();
 
     let args = json!({"action": "search", "query": "pub fn hello"});
     let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await.unwrap();
+        .await
+        .unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("findme.rs"),
-        "should show filename: {}", result.content);
-    assert!(result.content.contains("pub fn hello"),
-        "should show matching line: {}", result.content);
+    assert!(
+        result.content.contains("findme.rs"),
+        "should show filename: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("pub fn hello"),
+        "should show matching line: {}",
+        result.content
+    );
 }
 
 #[tokio::test]
@@ -1120,12 +1441,14 @@ async fn get_repo_map_response_shows_symbols() {
     fs::create_dir_all(helpers::project_path(&config, "src")).unwrap();
     fs::write(
         helpers::project_path(&config, "src/lib.rs"),
-        "pub struct Config {\n    pub name: String,\n}\n\npub fn run() -> bool {\n    true\n}\n"
-    ).unwrap();
+        "pub struct Config {\n    pub name: String,\n}\n\npub fn run() -> bool {\n    true\n}\n",
+    )
+    .unwrap();
     fs::write(
         helpers::project_path(&config, "Cargo.toml"),
-        "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"
-    ).unwrap();
+        "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
 
     // Index the project
     let miniswe_dir = config.miniswe_dir();
@@ -1137,11 +1460,15 @@ async fn get_repo_map_response_shows_symbols() {
 
     let args = json!({"action": "repo_map"});
     let result = tools::execute_tool("code", &args, &config, &perms(&config), None)
-        .await.unwrap();
+        .await
+        .unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("Config") || result.content.contains("run"),
-        "should show symbols: {}", result.content);
+    assert!(
+        result.content.contains("Config") || result.content.contains("run"),
+        "should show symbols: {}",
+        result.content
+    );
 }
 
 #[tokio::test]
@@ -1161,7 +1488,10 @@ async fn revert_tool_through_execute() {
     // Revert to round 1
     let msg = snap.revert_to_round(1).unwrap();
     assert!(msg.contains("round 1"), "should confirm revert: {msg}");
-    assert_eq!(fs::read_to_string(helpers::project_path(&config, "code.rs")).unwrap(), "original");
+    assert_eq!(
+        fs::read_to_string(helpers::project_path(&config, "code.rs")).unwrap(),
+        "original"
+    );
 }
 
 #[tokio::test]
@@ -1171,23 +1501,29 @@ async fn diagnostics_response_is_actionable() {
     // Create a Rust project with a type error
     fs::write(
         helpers::project_path(&config, "Cargo.toml"),
-        "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"
-    ).unwrap();
+        "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
     fs::create_dir_all(helpers::project_path(&config, "src")).unwrap();
     fs::write(
         helpers::project_path(&config, "src/main.rs"),
-        "fn main() {\n    let x: u32 = \"not a number\";\n    println!(\"{x}\");\n}\n"
-    ).unwrap();
+        "fn main() {\n    let x: u32 = \"not a number\";\n    println!(\"{x}\");\n}\n",
+    )
+    .unwrap();
 
     let args = json!({"action": "diagnostics"});
     let result = tools::execute_tool("code", &args, &config, &perms(&config), None)
-        .await.unwrap();
+        .await
+        .unwrap();
 
     // diagnostics runs cargo check — should report errors
     if result.content.contains("error") {
         // Good — it found the error
-        assert!(result.content.contains("mismatched") || result.content.contains("expected"),
-            "should show type error details: {}", result.content);
+        assert!(
+            result.content.contains("mismatched") || result.content.contains("expected"),
+            "should show type error details: {}",
+            result.content
+        );
     }
     // If cargo isn't available, test is a no-op
 }

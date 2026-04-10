@@ -54,7 +54,10 @@ async fn lsp_spawn_and_initialize() {
     while !client.is_ready() && start.elapsed() < Duration::from_secs(60) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(client.is_ready(), "LSP should be ready after initialization");
+    assert!(
+        client.is_ready(),
+        "LSP should be ready after initialization"
+    );
     assert!(!client.has_crashed(), "LSP should not have crashed");
 
     client.shutdown().await;
@@ -88,26 +91,32 @@ async fn lsp_diagnostics_on_type_error() {
 
     // Notify LSP and get diagnostics
     client.notify_file_changed(&main_rs).expect("notify failed");
-    let diags = client.get_diagnostics(&main_rs, Duration::from_secs(30)).await;
+    let diags = client
+        .get_diagnostics(&main_rs, Duration::from_secs(30))
+        .await;
 
     // Should have at least one error diagnostic
     assert!(
         !diags.is_empty(),
         "expected diagnostics for type error, got none"
     );
-    let has_error = diags.iter().any(|d| {
-        d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)
-    });
-    assert!(has_error, "expected at least one ERROR diagnostic, got: {diags:?}");
+    let has_error = diags
+        .iter()
+        .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR));
+    assert!(
+        has_error,
+        "expected at least one ERROR diagnostic, got: {diags:?}"
+    );
 
     // Error message should mention type mismatch
-    let error_msgs: Vec<&str> = diags.iter()
+    let error_msgs: Vec<&str> = diags
+        .iter()
         .filter(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
         .map(|d| d.message.as_str())
         .collect();
-    let has_type_msg = error_msgs.iter().any(|m| {
-        m.contains("mismatched") || m.contains("expected") || m.contains("type")
-    });
+    let has_type_msg = error_msgs
+        .iter()
+        .any(|m| m.contains("mismatched") || m.contains("expected") || m.contains("type"));
     assert!(
         has_type_msg,
         "error should mention type mismatch, got: {error_msgs:?}"
@@ -141,15 +150,24 @@ async fn lsp_diagnostics_clear_on_fix() {
     // Write bad code
     fs::write(&main_rs, "fn main() {\n    let x: u32 = \"bad\";\n}\n").unwrap();
     client.notify_file_changed(&main_rs).unwrap();
-    let diags = client.get_diagnostics(&main_rs, Duration::from_secs(30)).await;
+    let diags = client
+        .get_diagnostics(&main_rs, Duration::from_secs(30))
+        .await;
     assert!(!diags.is_empty(), "should have errors for bad code");
 
     // Fix the code
-    fs::write(&main_rs, "fn main() {\n    let x: u32 = 42;\n    println!(\"{x}\");\n}\n").unwrap();
+    fs::write(
+        &main_rs,
+        "fn main() {\n    let x: u32 = 42;\n    println!(\"{x}\");\n}\n",
+    )
+    .unwrap();
     client.notify_file_changed(&main_rs).unwrap();
-    let diags = client.get_diagnostics(&main_rs, Duration::from_secs(30)).await;
+    let diags = client
+        .get_diagnostics(&main_rs, Duration::from_secs(30))
+        .await;
 
-    let errors: Vec<_> = diags.iter()
+    let errors: Vec<_> = diags
+        .iter()
         .filter(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
         .collect();
     assert!(
@@ -235,7 +253,10 @@ fn detect_rust_project() {
 fn detect_typescript_project() {
     let tmp = tempfile::TempDir::new().unwrap();
     fs::write(tmp.path().join("tsconfig.json"), "{}").unwrap();
-    assert_eq!(LspServer::detect(tmp.path()), Some(LspServer::TypeScriptLanguageServer));
+    assert_eq!(
+        LspServer::detect(tmp.path()),
+        Some(LspServer::TypeScriptLanguageServer)
+    );
 }
 
 #[test]

@@ -12,6 +12,7 @@ pub mod llm;
 pub mod logging;
 pub mod lsp;
 pub mod mcp;
+pub mod runtime;
 pub mod tools;
 pub mod tui;
 

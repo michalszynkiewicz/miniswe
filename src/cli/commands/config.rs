@@ -27,7 +27,11 @@ pub async fn run() -> Result<()> {
     eprintln!();
     eprintln!("[hardware]");
     eprintln!("  vram_gb = {}", config.hardware.vram_gb);
-    eprintln!("  vram_reserve_gb = {} (usable: {}GB)", config.hardware.vram_reserve_gb, config.hardware.vram_gb - config.hardware.vram_reserve_gb);
+    eprintln!(
+        "  vram_reserve_gb = {} (usable: {}GB)",
+        config.hardware.vram_reserve_gb,
+        config.hardware.vram_gb - config.hardware.vram_reserve_gb
+    );
     eprintln!("  ram_budget_gb = {}", config.hardware.ram_budget_gb);
     eprintln!();
     eprintln!("[web]");

@@ -5,10 +5,10 @@
 
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-use std::io::Read;
+use std::fs::File;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::ToolResult;
@@ -17,13 +17,10 @@ use crate::config::Config;
 /// Maximum characters per output line before truncation (display).
 const MAX_LINE_CHARS: usize = 1000;
 
-/// Maximum total bytes to read from stdout+stderr combined.
-const MAX_OUTPUT_BYTES: usize = 512 * 1024; // 512KB
-
 pub struct RunningShellCommand {
     child: Child,
-    stdout_handle: JoinHandle<Vec<u8>>,
-    stderr_handle: JoinHandle<Vec<u8>>,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
 }
 
 pub enum ShellWaitOutcome {
@@ -42,14 +39,8 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     };
     match wait(running, timeout_secs, config, None) {
         Ok(ShellWaitOutcome::Completed(result)) => Ok(result),
-        Ok(ShellWaitOutcome::TimedOut(mut running)) => {
-            let _ = running.child.kill();
-            Ok(render_killed_result(running, timeout_secs))
-        }
-        Ok(ShellWaitOutcome::Interrupted(mut running)) => {
-            let _ = running.child.kill();
-            Ok(render_interrupted_result(running))
-        }
+        Ok(ShellWaitOutcome::TimedOut(running)) => Ok(kill(running, timeout_secs)),
+        Ok(ShellWaitOutcome::Interrupted(running)) => Ok(interrupt(running)),
         Err(e) => Err(e),
     }
 }
@@ -62,45 +53,40 @@ pub fn start(args: &Value, config: &Config) -> Result<RunningShellCommand> {
         ));
     }
 
-    // Spawn the child process
-    let mut child = match Command::new("sh")
+    let temp_dir = config.miniswe_dir().join("shell_tmp");
+    std::fs::create_dir_all(&temp_dir)?;
+    let unique = format!(
+        "{}_{}",
+        chrono::Local::now().format("%Y%m%d_%H%M%S_%f"),
+        std::process::id()
+    );
+    let stdout_path = temp_dir.join(format!("{unique}_stdout.txt"));
+    let stderr_path = temp_dir.join(format!("{unique}_stderr.txt"));
+    let stdout_file = File::create(&stdout_path)?;
+    let stderr_file = File::create(&stderr_path)?;
+
+    let mut command_builder = Command::new("sh");
+    command_builder
         .arg("-c")
         .arg(command)
         .current_dir(&config.project_root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+
+    #[cfg(unix)]
     {
-        Ok(c) => c,
-        Err(e) => return Err(anyhow!("Failed to execute command: {e}")),
-    };
+        use std::os::unix::process::CommandExt;
+        command_builder.process_group(0);
+    }
 
-    // Drain stdout and stderr in background threads to prevent pipe deadlock.
-    // If the child writes more than the OS pipe buffer (~64KB) and nobody reads,
-    // the child blocks and try_wait() never sees it exit → false timeout.
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(out) = stdout {
-            let _ = out.take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut buf);
-        }
-        buf
-    });
-
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(err) = stderr {
-            let _ = err.take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut buf);
-        }
-        buf
-    });
+    let child = command_builder
+        .spawn()
+        .map_err(|e| anyhow!("Failed to execute command: {e}"))?;
 
     Ok(RunningShellCommand {
         child,
-        stdout_handle,
-        stderr_handle,
+        stdout_path,
+        stderr_path,
     })
 }
 
@@ -116,9 +102,11 @@ pub fn wait(
             return Ok(ShellWaitOutcome::Interrupted(running));
         }
         match running.child.try_wait() {
-            Ok(Some(_)) => return Ok(ShellWaitOutcome::Completed(render_finished_result(
-                running, config,
-            ))),
+            Ok(Some(_)) => {
+                return Ok(ShellWaitOutcome::Completed(render_finished_result(
+                    running, config,
+                )));
+            }
             Ok(None) => {
                 if Instant::now() > deadline {
                     return Ok(ShellWaitOutcome::TimedOut(running));
@@ -135,19 +123,24 @@ pub fn wait(
 }
 
 pub fn kill(mut running: RunningShellCommand, timeout_secs: u64) -> ToolResult {
-    let _ = running.child.kill();
-    render_killed_result(running, timeout_secs)
-}
-
-fn render_killed_result(mut running: RunningShellCommand, timeout_secs: u64) -> ToolResult {
+    terminate_process_tree(&mut running.child, libc::SIGTERM);
+    std::thread::sleep(Duration::from_millis(200));
+    terminate_process_tree(&mut running.child, libc::SIGKILL);
     let _ = running.child.wait();
+    let _ = cleanup_temp_file(&running.stdout_path);
+    let _ = cleanup_temp_file(&running.stderr_path);
     ToolResult::err(format!(
         "Command timed out after {timeout_secs}s and was killed by user."
     ))
 }
 
-fn render_interrupted_result(mut running: RunningShellCommand) -> ToolResult {
+pub fn interrupt(mut running: RunningShellCommand) -> ToolResult {
+    terminate_process_tree(&mut running.child, libc::SIGTERM);
+    std::thread::sleep(Duration::from_millis(200));
+    terminate_process_tree(&mut running.child, libc::SIGKILL);
     let _ = running.child.wait();
+    let _ = cleanup_temp_file(&running.stdout_path);
+    let _ = cleanup_temp_file(&running.stderr_path);
     ToolResult::err("Command interrupted by user.".into())
 }
 
@@ -158,12 +151,10 @@ fn render_finished_result(mut running: RunningShellCommand, config: &Config) -> 
         .map(|s| s.code().unwrap_or(-1))
         .unwrap_or(-1);
 
-    // Collect output from drain threads
-    let stdout_bytes = running.stdout_handle.join().unwrap_or_default();
-    let stderr_bytes = running.stderr_handle.join().unwrap_or_default();
-
-    let stdout = String::from_utf8_lossy(&stdout_bytes);
-    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    let stdout = std::fs::read_to_string(&running.stdout_path).unwrap_or_default();
+    let stderr = std::fs::read_to_string(&running.stderr_path).unwrap_or_default();
+    let _ = cleanup_temp_file(&running.stdout_path);
+    let _ = cleanup_temp_file(&running.stderr_path);
 
     let mut combined = String::new();
     if !stdout.is_empty() {
@@ -178,16 +169,13 @@ fn render_finished_result(mut running: RunningShellCommand, config: &Config) -> 
     }
 
     // Tail-truncate for error visibility, and cap long lines
-    // Max output lines from context budget (~80 chars/line)
     let max_output_lines = config.tool_output_budget_chars() / 80;
-
     let lines: Vec<&str> = combined.lines().collect();
     let truncated = lines.len() > max_output_lines;
 
     let mut result = format!("[shell: exit {exit_code}");
 
     if truncated {
-        // Save full output to file, show tail + pointer
         let cache_dir = config.miniswe_dir().join("shell_output");
         let _ = std::fs::create_dir_all(&cache_dir);
         let filename = format!("cmd_{}.txt", chrono::Local::now().format("%H%M%S"));
@@ -234,9 +222,29 @@ fn render_finished_result(mut running: RunningShellCommand, config: &Config) -> 
     if exit_code == 0 {
         ToolResult::ok(result)
     } else {
-        ToolResult {
-            content: result,
-            success: false,
+        ToolResult::err(result)
+    }
+}
+
+fn cleanup_temp_file(path: &PathBuf) -> std::io::Result<()> {
+    if path.exists() {
+        std::fs::remove_file(path)
+    } else {
+        Ok(())
+    }
+}
+
+fn terminate_process_tree(child: &mut Child, signal: i32) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        unsafe {
+            let _ = libc::kill(-pid, signal);
+            let _ = libc::kill(pid, signal);
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
     }
 }

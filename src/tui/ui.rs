@@ -6,9 +6,27 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 
 use super::app::{App, AppMode, LineStyle};
+
+const BG_MAIN: Color = Color::Rgb(18, 22, 28);
+const BG_PANEL: Color = Color::Rgb(24, 29, 36);
+const BG_INPUT: Color = Color::Rgb(20, 25, 32);
+const BORDER: Color = Color::Rgb(45, 52, 62);
+const TEXT_PRIMARY: Color = Color::Rgb(220, 226, 235);
+const TEXT_SECONDARY: Color = Color::Rgb(150, 160, 175);
+const TEXT_MUTED: Color = Color::Rgb(110, 120, 135);
+const TEXT_SOFT: Color = Color::Rgb(185, 194, 208);
+const ACCENT_CYAN: Color = Color::Rgb(80, 200, 255);
+const ACCENT_PURPLE: Color = Color::Rgb(170, 120, 255);
+const SUCCESS: Color = Color::Rgb(100, 210, 140);
+const WARNING: Color = Color::Rgb(255, 190, 90);
+const ERROR: Color = Color::Rgb(255, 95, 95);
+const USER_LINE: Color = Color::Rgb(95, 165, 255);
+const CMD_LINE: Color = Color::Rgb(140, 220, 170);
 
 /// Render the full UI.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -21,20 +39,59 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// Normal mode: output pane + input line + optional permission prompt.
 fn draw_normal(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    frame.render_widget(Block::default().style(Style::default().bg(BG_MAIN)), area);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3), // top bar
             Constraint::Min(5),    // output
             Constraint::Length(3), // input
         ])
         .split(area);
 
-    draw_output(frame, app, chunks[0]);
-    draw_input(frame, app, chunks[1]);
+    draw_topbar(frame, app, chunks[0]);
+    draw_output(frame, app, chunks[1]);
+    draw_input(frame, app, chunks[2]);
 
     if app.pending_permission.is_some() {
         draw_permission_modal(frame, app, area);
     }
+}
+
+fn draw_topbar(frame: &mut Frame, app: &App, area: Rect) {
+    let status = if let Some(active_job) = &app.active_job {
+        format!("working: {active_job}")
+    } else if app.is_thinking {
+        "working".to_string()
+    } else {
+        "ready".to_string()
+    };
+
+    let line = Line::from(vec![
+        Span::styled(
+            "miniswe",
+            Style::default()
+                .fg(TEXT_PRIMARY)
+                .bg(BG_PANEL)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".repeat(area.width.saturating_sub(44) as usize)),
+        Span::styled(
+            format!(" {status} "),
+            Style::default()
+                .fg(ACCENT_PURPLE)
+                .bg(BG_PANEL)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+
+    let widget = Paragraph::new(line).block(
+        Block::default()
+            .borders(Borders::LEFT | Borders::RIGHT | Borders::TOP | Borders::BOTTOM)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(BG_PANEL)),
+    );
+    frame.render_widget(widget, area);
 }
 
 /// Draw the scrollable output pane.
@@ -42,20 +99,30 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
     let inner_height = area.height.saturating_sub(2) as usize; // minus borders
 
     // Convert output lines to ratatui Lines with styles
-    let styled_lines: Vec<Line> = app.output.iter().map(|ol| {
-        let style = match ol.style {
-            LineStyle::Normal => Style::default(),
-            LineStyle::Assistant => Style::default().fg(Color::White),
-            LineStyle::ToolCall => Style::default().fg(Color::Yellow),
-            LineStyle::ToolOk => Style::default().fg(Color::Green),
-            LineStyle::ToolErr => Style::default().fg(Color::Red),
-            LineStyle::Status => Style::default().fg(Color::DarkGray),
-            LineStyle::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            LineStyle::Separator => Style::default().fg(Color::DarkGray),
-            LineStyle::Thinking => Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        };
-        Line::from(Span::styled(&ol.text, style))
-    }).collect();
+    let styled_lines: Vec<Line> = app
+        .output
+        .iter()
+        .map(|ol| {
+            let style = match ol.style {
+                LineStyle::Normal => Style::default().fg(USER_LINE).bg(BG_PANEL),
+                LineStyle::Assistant => Style::default().fg(TEXT_PRIMARY).bg(BG_PANEL),
+                LineStyle::ToolCall => Style::default().fg(CMD_LINE).bg(BG_PANEL),
+                LineStyle::ToolOk => Style::default().fg(SUCCESS).bg(BG_PANEL),
+                LineStyle::ToolErr => Style::default().fg(ERROR).bg(BG_PANEL),
+                LineStyle::Status => Style::default().fg(TEXT_MUTED).bg(BG_PANEL),
+                LineStyle::Error => Style::default()
+                    .fg(ERROR)
+                    .bg(BG_PANEL)
+                    .add_modifier(Modifier::BOLD),
+                LineStyle::Separator => Style::default().fg(BORDER).bg(BG_PANEL),
+                LineStyle::Thinking => Style::default()
+                    .fg(TEXT_MUTED)
+                    .bg(BG_PANEL)
+                    .add_modifier(Modifier::ITALIC),
+            };
+            Line::from(Span::styled(&ol.text, style))
+        })
+        .collect();
 
     // Add thinking indicator if active
     let mut lines = styled_lines;
@@ -64,10 +131,15 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
         let frame_idx = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() / 80) as usize % frames.len();
+            .as_millis()
+            / 80) as usize
+            % frames.len();
         lines.push(Line::from(Span::styled(
             format!("{} thinking...", frames[frame_idx]),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(TEXT_MUTED)
+                .bg(BG_PANEL)
+                .add_modifier(Modifier::ITALIC),
         )));
     }
 
@@ -75,7 +147,7 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
     if !app.token_buffer.is_empty() {
         lines.push(Line::from(Span::styled(
             &app.token_buffer,
-            Style::default().fg(Color::White),
+            Style::default().fg(TEXT_PRIMARY).bg(BG_PANEL),
         )));
     }
 
@@ -84,29 +156,39 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
     let scroll = if app.scroll_offset == 0 {
         total.saturating_sub(inner_height)
     } else {
-        total.saturating_sub(inner_height).saturating_sub(app.scroll_offset as usize)
+        total
+            .saturating_sub(inner_height)
+            .saturating_sub(app.scroll_offset as usize)
     };
 
-    let title = if app.is_thinking {
-        " miniswe (working...) "
+    let title = if app.scroll_offset > 0 {
+        " transcript (scrolled) ".to_string()
+    } else if let Some(active_job) = &app.active_job {
+        format!(" transcript ({active_job}) ")
+    } else if app.is_thinking {
+        " transcript (working) ".to_string()
     } else {
-        " miniswe "
+        " transcript ".to_string()
     };
 
     let output_widget = Paragraph::new(lines)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(Style::default().fg(Color::Cyan)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .title_style(Style::default().fg(TEXT_SOFT).bg(BG_PANEL))
+                .border_style(Style::default().fg(BORDER))
+                .style(Style::default().bg(BG_PANEL)),
+        )
         .wrap(Wrap { trim: false })
+        .style(Style::default().bg(BG_PANEL))
         .scroll((scroll as u16, 0));
 
     frame.render_widget(output_widget, area);
 
     // Scrollbar
     if total > inner_height {
-        let mut scrollbar_state = ScrollbarState::new(total)
-            .position(scroll);
+        let mut scrollbar_state = ScrollbarState::new(total).position(scroll);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("↑"))
@@ -120,9 +202,9 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
 /// Draw the input line.
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let style = if app.is_thinking {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(TEXT_MUTED)
     } else {
-        Style::default().fg(Color::Magenta)
+        Style::default().fg(BORDER)
     };
 
     if app.is_thinking {
@@ -131,14 +213,18 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         let frame_idx = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() / 80) as usize % frames.len();
+            .as_millis()
+            / 80) as usize
+            % frames.len();
         let input_text = format!("{} working...", frames[frame_idx]);
         let input_widget = Paragraph::new(input_text)
-            .block(Block::default()
-                .borders(Borders::ALL)
-                .border_style(style)
-                .title(" working — Ctrl+C to interrupt "))
-            .style(Style::default().fg(Color::DarkGray));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(style)
+                    .title(" working — Ctrl+C to interrupt "),
+            )
+            .style(Style::default().fg(TEXT_MUTED).bg(BG_INPUT));
         frame.render_widget(input_widget, area);
         // Hide cursor while working
     } else {
@@ -149,11 +235,16 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
             visible_input_window(&app.input, app.cursor, visible_width);
         let input_text = format!("{prefix}{visible_input}");
         let input_widget = Paragraph::new(input_text)
-            .block(Block::default()
-                .borders(Borders::ALL)
-                .border_style(style)
-                .title(" Ctrl+O: details | ↑↓: history | PgUp/Dn: scroll "))
-            .style(Style::default().fg(Color::White));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(style)
+                    .title(
+                        " ask the agent to inspect files, propose a patch, run tests, or explain a diff... ",
+                    )
+                    .title_style(Style::default().fg(TEXT_SOFT).bg(BG_INPUT)),
+            )
+            .style(Style::default().fg(TEXT_SECONDARY).bg(BG_INPUT));
         frame.render_widget(input_widget, area);
 
         // Show cursor only when input is active
@@ -173,7 +264,12 @@ fn draw_permission_modal(frame: &mut Frame, app: &App, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .title(" Permission Required ")
-            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            .border_style(
+                Style::default()
+                    .fg(WARNING)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .style(Style::default().bg(BG_PANEL)),
         modal,
     );
 
@@ -190,7 +286,7 @@ fn draw_permission_modal(frame: &mut Frame, app: &App, area: Rect) {
 
     let text = app.pending_permission.as_deref().unwrap_or("");
     let widget = Paragraph::new(text.to_string())
-        .style(Style::default().fg(Color::Yellow))
+        .style(Style::default().fg(TEXT_PRIMARY).bg(BG_PANEL))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(widget, chunks[0]);
@@ -198,15 +294,17 @@ fn draw_permission_modal(frame: &mut Frame, app: &App, area: Rect) {
     let input_width = chunks[1].width.saturating_sub(2) as usize;
     let prefix = "  ";
     let visible_width = input_width.saturating_sub(prefix.chars().count());
-    let (visible_input, cursor_col) =
-        visible_input_window(&app.input, app.cursor, visible_width);
+    let (visible_input, cursor_col) = visible_input_window(&app.input, app.cursor, visible_width);
     let input_text = format!("{prefix}{visible_input}");
     let widget = Paragraph::new(input_text)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(" [y]es / [n]o / [a]lways "))
-        .style(Style::default().fg(Color::White));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER))
+                .title(" [y]es / [n]o / [a]lways ")
+                .title_style(Style::default().fg(TEXT_SOFT).bg(BG_INPUT)),
+        )
+        .style(Style::default().fg(TEXT_PRIMARY).bg(BG_INPUT));
 
     frame.render_widget(widget, chunks[1]);
 
@@ -250,7 +348,9 @@ fn visible_input_window(input: &str, cursor_byte: usize, max_chars: usize) -> (S
     let end = (start + max_chars).min(total_chars);
 
     let visible: String = chars[start..end].iter().collect();
-    let cursor_col = cursor_char.saturating_sub(start).min(max_chars.saturating_sub(1));
+    let cursor_col = cursor_char
+        .saturating_sub(start)
+        .min(max_chars.saturating_sub(1));
     (visible, cursor_col)
 }
 
@@ -335,8 +435,10 @@ mod tests {
 /// Detail viewer: full-screen view of tool result content.
 fn draw_detail(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    frame.render_widget(Block::default().style(Style::default().bg(BG_MAIN)), area);
 
-    let lines: Vec<Line> = app.detail_content
+    let lines: Vec<Line> = app
+        .detail_content
         .lines()
         .map(|l| Line::from(l.to_string()))
         .collect();
@@ -344,12 +446,15 @@ fn draw_detail(frame: &mut Frame, app: &App) {
     let title = format!(" {} (Ctrl+O or Esc to close) ", app.detail_title);
 
     let detail_widget = Paragraph::new(lines)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(Style::default().fg(Color::Yellow)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(BORDER))
+                .style(Style::default().bg(BG_PANEL)),
+        )
         .wrap(Wrap { trim: false })
-        .style(Style::default().fg(Color::White));
+        .style(Style::default().fg(TEXT_PRIMARY).bg(BG_PANEL));
 
     frame.render_widget(detail_widget, area);
 }

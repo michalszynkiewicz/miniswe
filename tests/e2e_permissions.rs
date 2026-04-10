@@ -49,7 +49,8 @@ async fn path_jail_blocks_traversal() {
 
     assert!(!result.success);
     assert!(
-        result.content.contains("escapes project root") || result.content.contains("Absolute paths"),
+        result.content.contains("escapes project root")
+            || result.content.contains("Absolute paths"),
         "should block traversal: {}",
         result.content
     );
@@ -66,7 +67,11 @@ async fn path_jail_allows_relative_path() {
         .await
         .unwrap();
 
-    assert!(result.success, "relative path should be allowed: {}", result.content);
+    assert!(
+        result.success,
+        "relative path should be allowed: {}",
+        result.content
+    );
 }
 
 #[tokio::test]
@@ -97,7 +102,8 @@ async fn path_jail_blocks_edit_traversal() {
 
     assert!(!result.success);
     assert!(
-        result.content.contains("escapes project root") || result.content.contains("Absolute paths"),
+        result.content.contains("escapes project root")
+            || result.content.contains("Absolute paths"),
         "should block edit traversal: {}",
         result.content
     );
@@ -108,7 +114,11 @@ async fn path_jail_allows_subdirectory() {
     let (_tmp, config) = helpers::create_test_project();
 
     fs::create_dir_all(helpers::project_path(&config, "src/deep")).unwrap();
-    fs::write(helpers::project_path(&config, "src/deep/file.txt"), "nested").unwrap();
+    fs::write(
+        helpers::project_path(&config, "src/deep/file.txt"),
+        "nested",
+    )
+    .unwrap();
 
     let args = json!({"action": "read", "path": "src/deep/file.txt"});
     let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
@@ -280,7 +290,10 @@ fn project_root_is_cwd() {
 
     // Create .miniswe/ — now initialized
     fs::create_dir_all(project.join(".miniswe")).unwrap();
-    assert!(config.is_initialized(), "should be initialized with .miniswe/ dir");
+    assert!(
+        config.is_initialized(),
+        "should be initialized with .miniswe/ dir"
+    );
 }
 
 #[test]

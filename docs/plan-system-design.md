@@ -9,7 +9,7 @@ The model works through tasks in a structured way: create a plan, break into ste
 ```
 1. TASK RECEIVED
    ↓
-2. EXPLORATION PHASE (read-only tools: search, read_file, get_repo_map)
+2. EXPLORATION PHASE (read-only tools: `file(action='search')`, `file(action='read')`, `code(action='repo_map')`)
    Model explores until it understands the scope
    ↓
 3. PLAN CREATION (enforced — model must call plan(action='set') before any writes)
@@ -71,13 +71,13 @@ Full plan with all details.
 ```
 plan(action='set', content='...')     → Create the plan (enforced before writes)
 plan(action='check', step=N)          → Mark step done, trigger snapshot+compression
-plan(action='detail', step=N, content='...')  → Add sub-steps to a step
+plan(action='refine', step=N, content='...')  → Replace one step with a more detailed flat sequence
 plan(action='show')                   → Show full plan
 ```
 
 ## Enforcement
 
-Before allowing edit/write_file/replace_all/fix_file, check if a plan exists:
+Before allowing `edit_file`, `write_file`, `file(action='replace')`, or `file(action='shell')`, check if a plan exists:
 ```rust
 if config.tools.plan && !plan_exists(&config) {
     if is_write_tool(&tc.function.name) {
@@ -123,19 +123,19 @@ The plan itself tracks which round each step completed on, so the model knows ex
 
 ```rust
 fn is_write_tool(name: &str) -> bool {
-    matches!(name, "edit" | "write_file" | "replace_all" | "fix_file" | "shell")
+    matches!(name, "edit_file" | "write_file" | "shell")
 }
 ```
 
 Shell is gated too — `sed`, `mv`, etc. are writes.
 
-Exception: `task_update` is always allowed (scratchpad is freeform notes, not gated).
+Exception: `plan(action='scratchpad')` is always allowed (scratchpad is freeform notes, not gated).
 
 ## Implementation Steps
 
 1. Modify `plan.rs`:
    - Add `plan_exists()` function
-   - Add `action='detail'` for sub-steps
+   - Add `action='refine'` for breaking one step into a more detailed flat sequence
    - On `action='check'`: trigger snapshot + compression
    - `load_plan_context()`: return only current step + completed summary
 
@@ -157,4 +157,4 @@ Exception: `task_update` is always allowed (scratchpad is freeform notes, not ga
 - Auto-detecting when a step is done (model must explicitly check it off)
 - Parallel step execution
 - Plan revision (model can set a new plan, replacing the old one)
-- Sub-step tracking (steps have detail text but no separate checkboxes)
+- Nested sub-step tracking (refinement expands a step into a flat list of replacement steps)

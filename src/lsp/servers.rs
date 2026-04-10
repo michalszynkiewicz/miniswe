@@ -87,7 +87,7 @@ impl LspServer {
             Self::Pyright => vec!["--stdio"],
             Self::Gopls => vec!["serve"],
             Self::Clangd => vec![],
-            Self::Jdtls => vec![],  // args built in build_command()
+            Self::Jdtls => vec![], // args built in build_command()
         }
     }
 
@@ -105,30 +105,42 @@ impl LspServer {
 
     /// Find or install the server binary. Returns the path to the executable.
     pub async fn ensure_binary(&self) -> Result<PathBuf> {
-        // 1. Check system PATH — verify the binary actually works
-        //    (rustup proxies exist in PATH but fail if the component isn't installed)
-        if let Some(path) = find_in_path(self.binary_name()) {
-            if verify_binary(&path, self.version_args()) {
-                return Ok(path);
-            }
-            eprintln!("[lsp] {} found in PATH but doesn't work, downloading...", self.binary_name());
-        }
-
-        // 2. Check our local cache
+        // 1. Check our local cache first — anything we downloaded ourselves is known-good,
+        //    and avoids re-running version verification on every startup.
         let cache_dir = lsp_cache_dir()?;
         let cached = self.cached_binary_path(&cache_dir);
         if cached.exists() {
             return Ok(cached);
         }
 
+        // 2. Check system PATH — verify the binary actually works
+        //    (rustup proxies exist in PATH but fail if the component isn't installed)
+        if let Some(path) = find_in_path(self.binary_name()) {
+            match verify_binary_verbose(&path, self.version_args()) {
+                VerifyResult::Ok => return Ok(path),
+                VerifyResult::Failed { reason } => {
+                    eprintln!(
+                        "[lsp] {} in PATH at {} is unusable ({}), will download a working copy",
+                        self.binary_name(),
+                        path.display(),
+                        reason
+                    );
+                }
+            }
+        }
+
         // 3. Download/install
-        std::fs::create_dir_all(&cache_dir)
-            .context("create lsp-servers cache dir")?;
+        eprintln!("[lsp] downloading {}...", self.binary_name());
+        std::fs::create_dir_all(&cache_dir).context("create lsp-servers cache dir")?;
 
         match self {
             Self::RustAnalyzer => download_rust_analyzer(&cache_dir).await,
             Self::Clangd => download_clangd(&cache_dir).await,
-            Self::TypeScriptLanguageServer => npm_install(&cache_dir, "typescript-language-server", "typescript-language-server"),
+            Self::TypeScriptLanguageServer => npm_install(
+                &cache_dir,
+                "typescript-language-server",
+                "typescript-language-server",
+            ),
             Self::Pyright => npm_install(&cache_dir, "pyright", "pyright-langserver"),
             Self::Gopls => go_install(&cache_dir),
             Self::Jdtls => download_jdtls(&cache_dir).await,
@@ -178,15 +190,57 @@ fn lsp_cache_dir() -> Result<PathBuf> {
     Ok(home.join(".miniswe").join("lsp-servers"))
 }
 
+/// Result of verifying that a binary on disk actually runs.
+#[derive(Debug, PartialEq, Eq)]
+enum VerifyResult {
+    Ok,
+    Failed { reason: String },
+}
+
 /// Verify a binary actually works by running it with version args.
-fn verify_binary(path: &Path, args: &[&str]) -> bool {
-    Command::new(path)
+/// Captures stderr/stdout so failures can be explained instead of swallowed.
+fn verify_binary_verbose(path: &Path, args: &[&str]) -> VerifyResult {
+    let output = match Command::new(path)
         .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => {
+            return VerifyResult::Failed {
+                reason: format!("spawn failed: {e}"),
+            };
+        }
+    };
+
+    if output.status.success() {
+        return VerifyResult::Ok;
+    }
+
+    // Surface the first useful line of stderr so the user can diagnose
+    // (rustup proxy errors look like: "error: 'rust-analyzer' is not installed for the toolchain ...").
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let snippet = stderr
+        .lines()
+        .chain(stdout.lines())
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("no output")
+        .trim()
+        .chars()
+        .take(160)
+        .collect::<String>();
+
+    let exit = output
+        .status
+        .code()
+        .map(|c| format!("exit {c}"))
+        .unwrap_or_else(|| "killed by signal".to_string());
+
+    VerifyResult::Failed {
+        reason: format!("{exit}: {snippet}"),
+    }
 }
 
 /// Check if a binary exists in PATH.
@@ -198,7 +252,11 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
         .filter(|o| o.status.success())
         .and_then(|o| {
             let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if path.is_empty() { None } else { Some(PathBuf::from(path)) }
+            if path.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(path))
+            }
         })
 }
 
@@ -231,20 +289,30 @@ fn has_c_sources(root: &Path) -> bool {
 /// Platform identifier for GitHub release downloads.
 fn platform_triple() -> &'static str {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    { "x86_64-unknown-linux-gnu" }
+    {
+        "x86_64-unknown-linux-gnu"
+    }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    { "aarch64-unknown-linux-gnu" }
+    {
+        "aarch64-unknown-linux-gnu"
+    }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    { "x86_64-apple-darwin" }
+    {
+        "x86_64-apple-darwin"
+    }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    { "aarch64-apple-darwin" }
+    {
+        "aarch64-apple-darwin"
+    }
     #[cfg(not(any(
         all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "aarch64"),
         all(target_os = "macos", target_arch = "x86_64"),
         all(target_os = "macos", target_arch = "aarch64"),
     )))]
-    { "unsupported" }
+    {
+        "unsupported"
+    }
 }
 
 // ── Downloaders ────────────────────────────────────────────────────────
@@ -260,9 +328,7 @@ async fn download_rust_analyzer(cache_dir: &Path) -> Result<PathBuf> {
         "https://github.com/rust-lang/rust-analyzer/releases/latest/download/rust-analyzer-{triple}.gz"
     );
 
-    eprintln!("[lsp] downloading rust-analyzer...");
-    let response = reqwest::get(&url).await
-        .context("download rust-analyzer")?;
+    let response = reqwest::get(&url).await.context("download rust-analyzer")?;
 
     if !response.status().is_success() {
         anyhow::bail!("download failed: HTTP {}", response.status());
@@ -274,7 +340,8 @@ async fn download_rust_analyzer(cache_dir: &Path) -> Result<PathBuf> {
     use std::io::Read;
     let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
     let mut binary = Vec::new();
-    decoder.read_to_end(&mut binary)
+    decoder
+        .read_to_end(&mut binary)
         .context("decompress rust-analyzer")?;
 
     let dest = cache_dir.join("rust-analyzer");
@@ -304,32 +371,37 @@ async fn download_clangd(cache_dir: &Path) -> Result<PathBuf> {
     // Use the clangd releases API to find the latest version
     let api_url = "https://api.github.com/repos/clangd/clangd/releases/latest";
     let client = reqwest::Client::new();
-    let release: serde_json::Value = client.get(api_url)
+    let release: serde_json::Value = client
+        .get(api_url)
         .header("User-Agent", "miniswe")
-        .send().await?
-        .json().await?;
+        .send()
+        .await?
+        .json()
+        .await?;
 
-    let assets = release["assets"].as_array()
+    let assets = release["assets"]
+        .as_array()
         .context("no assets in release")?;
 
-    let asset = assets.iter()
+    let asset = assets
+        .iter()
         .find(|a| {
-            a["name"].as_str()
+            a["name"]
+                .as_str()
                 .is_some_and(|n| n.contains(platform) && n.ends_with(".zip"))
         })
         .context("no matching clangd asset for platform")?;
 
-    let download_url = asset["browser_download_url"].as_str()
+    let download_url = asset["browser_download_url"]
+        .as_str()
         .context("no download URL")?;
 
-    eprintln!("[lsp] downloading clangd...");
     let response = reqwest::get(download_url).await?;
     let zip_bytes = response.bytes().await?;
 
     // Extract zip
     let cursor = std::io::Cursor::new(&zip_bytes);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .context("open clangd zip")?;
+    let mut archive = zip::ZipArchive::new(cursor).context("open clangd zip")?;
 
     // Find the clangd binary inside the archive
     let mut clangd_data = None;
@@ -363,8 +435,6 @@ fn npm_install(cache_dir: &Path, package: &str, binary_name: &str) -> Result<Pat
     if find_in_path("npm").is_none() {
         anyhow::bail!("{package}: npm not found — install Node.js to use this LSP server");
     }
-
-    eprintln!("[lsp] npm install {package}...");
 
     // Initialize package.json if needed
     if !cache_dir.join("package.json").exists() {
@@ -408,7 +478,6 @@ fn go_install(cache_dir: &Path) -> Result<PathBuf> {
     let gobin = cache_dir.join("gobin");
     std::fs::create_dir_all(&gobin)?;
 
-    eprintln!("[lsp] go install gopls...");
     let status = Command::new("go")
         .args(["install", "golang.org/x/tools/gopls@latest"])
         .env("GOBIN", &gobin)
@@ -455,34 +524,41 @@ async fn download_jdtls(cache_dir: &Path) -> Result<PathBuf> {
     // Find latest milestone from Eclipse download site
     let api_url = "https://api.github.com/repos/eclipse-jdtls/eclipse.jdt.ls/releases/latest";
     let client = reqwest::Client::new();
-    let release: serde_json::Value = client.get(api_url)
+    let release: serde_json::Value = client
+        .get(api_url)
         .header("User-Agent", "miniswe")
-        .send().await?
-        .json().await?;
+        .send()
+        .await?
+        .json()
+        .await?;
 
-    let assets = release["assets"].as_array()
+    let assets = release["assets"]
+        .as_array()
         .context("no assets in jdtls release")?;
 
     // Look for the platform-specific tar.gz
     let search = format!("{platform}-{arch}");
-    let asset = assets.iter()
+    let asset = assets
+        .iter()
         .find(|a| {
-            a["name"].as_str()
+            a["name"]
+                .as_str()
                 .is_some_and(|n| n.contains(&search) && n.ends_with(".tar.gz"))
         })
         .or_else(|| {
             // Fall back to generic tar.gz
             assets.iter().find(|a| {
-                a["name"].as_str()
+                a["name"]
+                    .as_str()
                     .is_some_and(|n| n.ends_with(".tar.gz") && !n.contains("source"))
             })
         })
         .context("no matching jdtls asset")?;
 
-    let download_url = asset["browser_download_url"].as_str()
+    let download_url = asset["browser_download_url"]
+        .as_str()
         .context("no download URL")?;
 
-    eprintln!("[lsp] downloading jdtls...");
     let response = reqwest::get(download_url).await?;
     let tar_gz_bytes = response.bytes().await?;
 
@@ -492,8 +568,7 @@ async fn download_jdtls(cache_dir: &Path) -> Result<PathBuf> {
 
     let decoder = flate2::read::GzDecoder::new(&tar_gz_bytes[..]);
     let mut archive = tar::Archive::new(decoder);
-    archive.unpack(&jdtls_dir)
-        .context("extract jdtls tar.gz")?;
+    archive.unpack(&jdtls_dir).context("extract jdtls tar.gz")?;
 
     // The bin/jdtls launcher script needs to be executable
     let launcher = jdtls_dir.join("bin").join("jdtls");
@@ -511,7 +586,9 @@ async fn download_jdtls(cache_dir: &Path) -> Result<PathBuf> {
         let launcher_jar = std::fs::read_dir(&plugins_dir)?
             .filter_map(|e| e.ok())
             .find(|e| {
-                e.file_name().to_string_lossy().starts_with("org.eclipse.equinox.launcher_")
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("org.eclipse.equinox.launcher_")
                     && e.file_name().to_string_lossy().ends_with(".jar")
             })
             .context("no equinox launcher jar found in jdtls")?;
@@ -541,5 +618,79 @@ async fn download_jdtls(cache_dir: &Path) -> Result<PathBuf> {
 
         eprintln!("[lsp] jdtls installed to {}", script_path.display());
         Ok(script_path)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    // We deliberately do *not* write our own scripts and exec them
+    // here. Doing so in a multi-threaded `cargo test` run is racy on
+    // Linux: a concurrent fork in another test can inherit our write
+    // FD and trip `ETXTBSY` when the child tries to exec. Driving a
+    // pre-existing shell (`/bin/sh -c '…'`) skips the write step
+    // entirely and the tests become completely deterministic.
+
+    #[test]
+    fn verify_binary_ok_on_zero_exit() {
+        // `sh -c 'exit 0'` is the smallest "binary runs and returns
+        // success" shape we can construct without creating files.
+        assert_eq!(
+            verify_binary_verbose(Path::new("/bin/sh"), &["-c", "echo 1.2.3; exit 0"]),
+            VerifyResult::Ok
+        );
+    }
+
+    #[test]
+    fn verify_binary_failed_captures_stderr_snippet() {
+        // Mimic a rustup proxy failure: nonzero exit + stderr line
+        // that the user will want to see verbatim in logs.
+        let rustup_msg = "error: 'rust-analyzer' is not installed for the toolchain 'stable-x86_64-unknown-linux-gnu'";
+        match verify_binary_verbose(
+            Path::new("/bin/sh"),
+            &["-c", &format!("echo \"{rustup_msg}\" >&2; exit 1")],
+        ) {
+            VerifyResult::Ok => panic!("expected failure"),
+            VerifyResult::Failed { reason } => {
+                assert!(reason.contains("exit 1"), "reason was: {reason}");
+                assert!(
+                    reason.contains("rust-analyzer") && reason.contains("not installed"),
+                    "reason was: {reason}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verify_binary_failed_when_missing_executable() {
+        let result = verify_binary_verbose(
+            Path::new("/nonexistent/definitely-missing-binary"),
+            &["--version"],
+        );
+        match result {
+            VerifyResult::Ok => panic!("expected failure for missing binary"),
+            VerifyResult::Failed { reason } => {
+                assert!(reason.starts_with("spawn failed"), "reason was: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn verify_binary_truncates_long_lines() {
+        // 500 chars of 'x' on stderr — the snippet that ends up in
+        // the reason string should be truncated to ≤160 chars.
+        match verify_binary_verbose(
+            Path::new("/bin/sh"),
+            &["-c", "printf 'x%.0s' $(seq 1 500) >&2; exit 2"],
+        ) {
+            VerifyResult::Ok => panic!("expected failure"),
+            VerifyResult::Failed { reason } => {
+                // exit prefix + ": " + up-to-160-char snippet
+                assert!(reason.starts_with("exit 2: "), "reason was: {reason}");
+                let snippet = &reason["exit 2: ".len()..];
+                assert!(snippet.len() <= 160, "snippet too long: {}", snippet.len());
+            }
+        }
     }
 }

@@ -1,3 +1,8 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:7d79ff9013a95fa72645a826703e29b8736da169432f80ea3cefa659d234e5b0
-size 141
+# Auto-generated — commit profile.md, guide.md, lessons.md
+# Ignore everything else
+index/
+snippets/
+sessions/
+scratchpad.md
+plan.md
+docs/

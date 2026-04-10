@@ -1,3 +1,6 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:3689a24ccb3f8e676035e80d223badab8c0a176126996ecc8d11b4b85f051771
-size 61
+/target
+models/
+.miniswe/
+.mcp.json
+.env
+**/benchmark_results
