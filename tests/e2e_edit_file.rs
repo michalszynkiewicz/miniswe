@@ -1123,6 +1123,174 @@ async fn execute_preplan_repair_attempt_includes_structured_repair_context() {
 }
 
 #[tokio::test]
+async fn execute_preplan_invalid_task_short_circuits_with_reason() {
+    // Small file → fast path. The finalize call returns INVALID_TASK with
+    // a reason. The retry loop must short-circuit (single LLM call), the
+    // file must be left unchanged, and the tool result must surface the
+    // rejection reason as a failure.
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => helpers::mock_text_response(
+                    "INVALID_TASK: file does not contain any auth code to update",
+                ),
+                _ => unreachable!("INVALID_TASK should short-circuit the retry loop"),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "println!(\"hi\");\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "remove the auth middleware",
+        "lsp_validation": "off"
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(!result.success, "INVALID_TASK should surface as a failure");
+    assert!(
+        result.content.contains("rejected task as invalid"),
+        "expected rejection marker, got: {}",
+        result.content
+    );
+    assert!(
+        result
+            .content
+            .contains("file does not contain any auth code to update"),
+        "expected reason in tool output, got: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("file was not modified"),
+        "expected unmodified note, got: {}",
+        result.content
+    );
+    // Exactly one LLM call — no retries.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // File on disk unchanged.
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "println!(\"hi\");\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_preplan_invalid_task_without_reason_uses_placeholder() {
+    // Bare `INVALID_TASK` (no colon, no reason) should still short-circuit
+    // and surface a "no reason provided" placeholder rather than an empty
+    // string in the user-facing message.
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            helpers::mock_text_response("INVALID_TASK")
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "println!(\"hi\");\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "incoherent task",
+        "lsp_validation": "off"
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(!result.success);
+    assert!(result.content.contains("no reason provided"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "println!(\"hi\");\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_preplan_invalid_task_during_repair_short_circuits() {
+    // Plan 1 fails to apply (literal OLD doesn't match, smart fallback
+    // returns NO_CHANGES three times). On the repair attempt, the model
+    // realizes the task is impossible and emits INVALID_TASK. The retry
+    // loop must stop immediately and surface the reason — no further
+    // planning attempts after the rejection.
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nmissing(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
+                ),
+                1..=3 => helpers::mock_text_response("NO_CHANGES"),
+                4 => helpers::mock_text_response(
+                    "INVALID_TASK: file structure does not match the task description",
+                ),
+                _ => unreachable!("INVALID_TASK should short-circuit the retry loop"),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "call(None)\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "update all calls",
+        "lsp_validation": "off"
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(!result.success, "{}", result.content);
+    assert!(
+        result.content.contains("rejected task as invalid"),
+        "expected rejection marker, got: {}",
+        result.content
+    );
+    assert!(
+        result
+            .content
+            .contains("file structure does not match the task description"),
+        "expected reason in tool output, got: {}",
+        result.content
+    );
+    // 1 plan + 3 fallback NO_CHANGES + 1 INVALID_TASK = 5 calls; nothing after.
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    // File unchanged — plan 1's literal didn't match, so no edits applied.
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "call(None)\n"
+    );
+}
+
+#[tokio::test]
 async fn execute_preplan_parse_failure_returns_error() {
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))

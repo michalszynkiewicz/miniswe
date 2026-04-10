@@ -96,13 +96,25 @@ pub async fn execute(
     )
     .await
     {
-        Ok(Some(candidate_result)) => {
+        Ok(PreplanResult::Applied(candidate_result)) => {
             std::fs::write(&path, &candidate_result.content)?;
             Ok(ToolResult::ok(candidate_result.message))
         }
-        Ok(None) => Ok(ToolResult::ok(format!(
+        Ok(PreplanResult::NoChanges) => Ok(ToolResult::ok(format!(
             "No changes needed in {path_str} for task: {task}"
         ))),
+        Ok(PreplanResult::InvalidTask(reason)) => {
+            let reason = if reason.is_empty() {
+                "no reason provided".to_string()
+            } else {
+                reason
+            };
+            Ok(ToolResult::err(format!(
+                "edit_file rejected task as invalid: {reason}\n\
+                 The pre-plan model determined this task is incoherent, malformed, \
+                 or impossible to satisfy from {path_str} alone. The file was not modified."
+            )))
+        }
         Err(e) => Ok(ToolResult::err(format!(
             "edit_file failed: patch was not applied.\nReason: {}\n",
             e
@@ -113,6 +125,25 @@ pub async fn execute(
 struct SplitResult {
     content: String,
     message: String,
+}
+
+/// What one planning attempt produced. The model can return either a
+/// concrete edit plan or, at the finalize phase, reject the task as
+/// invalid via `INVALID_TASK: <reason>`. The escape hatch is meant for
+/// genuinely incoherent or impossible tasks — not "this is hard" — and
+/// short-circuits the entire repair retry loop.
+enum PreplanOutcome {
+    Steps(Vec<EditPlanStep>),
+    InvalidTask(String),
+}
+
+/// What the whole pre-plan retry loop produced. Distinguishes "applied
+/// edits", "no edits needed", and "model rejected the task as invalid"
+/// so the caller can render an appropriate tool result for each.
+enum PreplanResult {
+    Applied(SplitResult),
+    NoChanges,
+    InvalidTask(String),
 }
 
 struct PlannedExecutionFailure {
@@ -187,7 +218,7 @@ async fn execute_preplanned_steps(
     lsp_validation: LspValidationMode,
     cancelled: Option<&AtomicBool>,
     log: Option<&SessionLog>,
-) -> Result<Option<SplitResult>> {
+) -> Result<PreplanResult> {
     let max_literal_lines = max_literal_replace_lines(config.model.context_window);
     let mut current = original.to_string();
     let mut repair_context: Option<RepairContext> = None;
@@ -201,7 +232,7 @@ async fn execute_preplanned_steps(
             format!("Pre-plan attempt {attempt}")
         };
 
-        let steps = request_preplan_steps(
+        let outcome = request_preplan_steps(
             path_str,
             task,
             &current,
@@ -213,10 +244,25 @@ async fn execute_preplanned_steps(
         )
         .await?;
 
+        let steps = match outcome {
+            PreplanOutcome::Steps(s) => s,
+            PreplanOutcome::InvalidTask(reason) => {
+                // The model rejected the task as fundamentally invalid.
+                // Short-circuit the entire retry loop and surface the
+                // rejection — no point repairing a malformed task.
+                log_debug(
+                    log,
+                    path_str,
+                    &format!("preplan:invalid_task attempt={attempt} reason={reason}"),
+                );
+                return Ok(PreplanResult::InvalidTask(reason));
+            }
+        };
+
         if steps.is_empty() {
             log_debug(log, path_str, "preplan:return_no_steps");
             if current == original {
-                return Ok(None);
+                return Ok(PreplanResult::NoChanges);
             }
 
             let mut message = String::new();
@@ -243,7 +289,7 @@ async fn execute_preplanned_steps(
                 message.push_str(&note);
                 message.push('\n');
             }
-            return Ok(Some(SplitResult {
+            return Ok(PreplanResult::Applied(SplitResult {
                 content: current,
                 message,
             }));
@@ -280,12 +326,12 @@ async fn execute_preplanned_steps(
                 if !progress_log.is_empty() {
                     let mut message = progress_log;
                     message.push_str(&result.message);
-                    return Ok(Some(SplitResult {
+                    return Ok(PreplanResult::Applied(SplitResult {
                         content: result.content,
                         message,
                     }));
                 }
-                return Ok(Some(result));
+                return Ok(PreplanResult::Applied(result));
             }
             Err(e) => {
                 log_debug(
@@ -316,7 +362,7 @@ async fn execute_preplanned_steps(
         ));
         bail!(message);
     }
-    Ok(None)
+    Ok(PreplanResult::NoChanges)
 }
 
 async fn execute_planned_steps(
@@ -1335,7 +1381,7 @@ async fn request_preplan_steps(
     max_literal_lines: usize,
     cancelled: Option<&AtomicBool>,
     log: Option<&SessionLog>,
-) -> Result<Vec<EditPlanStep>> {
+) -> Result<PreplanOutcome> {
     ensure_not_cancelled(cancelled)?;
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
@@ -1551,13 +1597,16 @@ async fn request_preplan_steps(
          END\n\n\
          Or exactly:\n\
          NO_CHANGES\n\n\
+         Escape hatch: if (and only if) the task itself is incoherent, malformed, contradicts the file, or is impossible to satisfy from this file alone — not merely hard or large — reject it with a single line:\n\
+         INVALID_TASK: <one short sentence explaining why>\n\
+         Do not use INVALID_TASK to dodge difficulty. Use it for genuinely broken tasks.\n\n\
          Full file ({total_lines} lines):\n{numbered_content}"
     );
 
     let request = ChatRequest {
         messages: vec![
             Message::system(
-                "You are in the final planning phase for one file edit. Output only strict edit-plan blocks or exactly NO_CHANGES. No explanations, no markdown.",
+                "You are in the final planning phase for one file edit. Output only strict edit-plan blocks, exactly NO_CHANGES, or a single INVALID_TASK: <reason> line for genuinely broken tasks. No explanations, no markdown.",
             ),
             Message::user(&finalize_prompt),
         ],
@@ -1582,6 +1631,17 @@ async fn request_preplan_steps(
             truncate_multiline(text, 12000)
         ),
     );
+
+    if let Some(reason) = parse_invalid_task(text) {
+        log_debug(
+            log,
+            path_str,
+            &format!(
+                "preplan:finalize:file:1-{total_lines} invalid_task reason={reason}"
+            ),
+        );
+        return Ok(PreplanOutcome::InvalidTask(reason));
+    }
 
     let mut steps = match parse_edit_plan(text) {
         Ok(steps) => steps,
@@ -1621,7 +1681,7 @@ async fn request_preplan_steps(
         );
         return Err(e);
     }
-    Ok(steps)
+    Ok(PreplanOutcome::Steps(steps))
 }
 
 fn validate_steps_in_file(steps: &[EditPlanStep], total_lines: usize) -> Result<()> {
@@ -1728,6 +1788,25 @@ fn format_preplan_log(label: &str, steps: &[EditPlanStep]) -> String {
     let plan = format_edit_plan_steps(steps);
     let plan = truncate_multiline(&plan, MAX_PREPLAN_LOG_CHARS);
     format!("Raw {label} ({} step(s), parsed):\n{plan}\n", steps.len())
+}
+
+/// Detect a finalize-phase `INVALID_TASK` rejection. Returns `Some(reason)`
+/// if the response opens with `INVALID_TASK` (optionally followed by `:`
+/// and a reason), and `None` otherwise. The reason is trimmed and may be
+/// empty if the model omits one.
+fn parse_invalid_task(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    let rest = trimmed.strip_prefix("INVALID_TASK")?;
+    // Require either end-of-string, whitespace, or ':' immediately after
+    // the keyword so we don't false-match on something like
+    // `INVALID_TASKLIST` that a model might invent.
+    let after = match rest.chars().next() {
+        None => "",
+        Some(':') => &rest[1..],
+        Some(c) if c.is_whitespace() => rest,
+        Some(_) => return None,
+    };
+    Some(after.trim().to_string())
 }
 
 /// Render a `RepairContext` into a planner-facing block. Used at the top
@@ -2700,6 +2779,44 @@ mod tests {
         assert!(extra.contains("SEARCH_RESULT query=`foo`"));
         assert!(extra.contains("READ_RESULT range=L10-L12"));
         assert!(!extra.contains("Inspection result:"));
+    }
+
+    #[test]
+    fn parse_invalid_task_accepts_keyword_with_reason() {
+        let r = parse_invalid_task("INVALID_TASK: file does not contain any auth code\n");
+        assert_eq!(r, Some("file does not contain any auth code".to_string()));
+    }
+
+    #[test]
+    fn parse_invalid_task_accepts_keyword_with_whitespace_reason() {
+        let r = parse_invalid_task("INVALID_TASK   the request is contradictory\n");
+        assert_eq!(r, Some("the request is contradictory".to_string()));
+    }
+
+    #[test]
+    fn parse_invalid_task_accepts_keyword_alone() {
+        let r = parse_invalid_task("INVALID_TASK");
+        assert_eq!(r, Some(String::new()));
+    }
+
+    #[test]
+    fn parse_invalid_task_tolerates_leading_whitespace() {
+        let r = parse_invalid_task("  \n  INVALID_TASK: oops\n");
+        assert_eq!(r, Some("oops".to_string()));
+    }
+
+    #[test]
+    fn parse_invalid_task_rejects_lookalikes() {
+        // Don't false-match on a word that just starts with INVALID_TASK.
+        assert_eq!(parse_invalid_task("INVALID_TASKLIST"), None);
+        assert_eq!(parse_invalid_task("INVALID_TASKING: foo"), None);
+    }
+
+    #[test]
+    fn parse_invalid_task_rejects_unrelated_text() {
+        assert_eq!(parse_invalid_task("NO_CHANGES"), None);
+        assert_eq!(parse_invalid_task("LITERAL_REPLACE\nSCOPE 1 1\n"), None);
+        assert_eq!(parse_invalid_task(""), None);
     }
 
     #[test]
