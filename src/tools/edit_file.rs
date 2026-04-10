@@ -812,9 +812,9 @@ struct PreplanWindowResponse {
 #[derive(Debug)]
 struct PreplanReconResponse {
     commands: Vec<InspectionCommand>,
-    /// True if the model emitted DONE (or NO_CHANGES, or any other "stop"
-    /// signal). The recon loop also stops when commands are empty even
-    /// without an explicit DONE.
+    /// True if the model emitted the literal word DONE. The recon loop
+    /// also stops when commands are empty (even without an explicit DONE),
+    /// so this only matters when the response *also* carried commands.
     done: bool,
 }
 
@@ -872,12 +872,7 @@ fn parse_preplan_recon_response(text: &str) -> PreplanReconResponse {
         if line.is_empty() {
             continue;
         }
-        if line.eq_ignore_ascii_case("DONE")
-            || line.eq_ignore_ascii_case("NONE")
-            || line.eq_ignore_ascii_case("NO_CHANGES")
-            || line.eq_ignore_ascii_case("FINALIZE")
-            || line.eq_ignore_ascii_case("PLAN")
-        {
+        if line.eq_ignore_ascii_case("DONE") {
             done = true;
             continue;
         }
@@ -1407,20 +1402,15 @@ async fn request_preplan_steps(
             )
         };
         let prompt = format!(
-            "You are observing one file slice-by-slice to gather context for an edit plan.\n\n\
-             File: {path_str}\n\
+            "File: {path_str}\n\
              Task: {task}\n\n\
              {feedback_block}\
              {notes_block}\
-             This is slice {current_slice} of {total_slices}, covering lines {start_line}-{end_line} of {total_lines}.\n\
-             Adjacent slices overlap by {PREPLAN_READ_OVERLAP} lines.\n\n\
-             Your only job in this phase is OBSERVATION. Output zero or more NOTE lines that future planning phases will rely on. You will not see this slice again — capture what matters now.\n\n\
-             Good notes are concrete and reusable: function/struct spans with line numbers, signatures verbatim (especially for anything the task touches), the exact line where a relevant block starts, places where the file structure differs from expectation. Reference line numbers from the slice content below.\n\n\
-             Bad notes are vague or restate the obvious: \"this file has 800 lines\", \"there is a function\", commentary, opinions, proposed changes.\n\n\
-             Output format (one per line, no other content):\n\
-             NOTE <concise factual observation referencing line numbers when relevant>\n\n\
-             Do NOT propose edits, do NOT request additional reads, do NOT plan. Other phases handle those.\n\n\
-             Slice content:\n{slice}",
+             Slice {current_slice}/{total_slices}, lines {start_line}-{end_line} of {total_lines}.\n\n\
+             Output 0+ NOTE lines about landmarks the planner will need: function/struct spans with line numbers, exact signatures the task touches, the line where a relevant block starts. Reference line numbers from the slice. Skip vague observations and anything the planner can derive itself.\n\n\
+             Format (one per line, nothing else):\n\
+             NOTE <fact with line number>\n\n\
+             Slice:\n{slice}",
             current_slice = idx + 1,
             total_slices = windows.len(),
             start_line = start + 1,
@@ -1430,7 +1420,7 @@ async fn request_preplan_steps(
         let request = ChatRequest {
             messages: vec![
                 Message::system(
-                    "You are in the observation phase of edit planning. Walk through one file slice and emit NOTE lines for the planner to use later. No edits, no questions, no SEARCH/READ — only NOTE lines. No explanations, no markdown.",
+                    "Observation phase. Output only NOTE lines about file landmarks. No edits, no SEARCH/READ, no markdown.",
                 ),
                 Message::user(&prompt),
             ],
@@ -1483,36 +1473,33 @@ async fn request_preplan_steps(
     let recon_rounds = if total_lines == 0 { 0 } else { MAX_RECON_ROUNDS };
     for round in 0..recon_rounds {
         ensure_not_cancelled(cancelled)?;
-        let rounds_remaining = MAX_RECON_ROUNDS - round;
         let notes_block = if notes.is_empty() {
-            String::from("Notes from observation phase: (none)\n\n")
+            String::from("Notes: (none)\n\n")
         } else {
             format!(
-                "Notes from observation phase:\n{}\n\n",
+                "Notes:\n{}\n\n",
                 notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
             )
         };
         let results_block = if extra_context.is_empty() {
-            String::from("Inspection results so far: (none)\n\n")
+            String::from("Results so far: (none)\n\n")
         } else {
-            format!("Inspection results so far:\n{extra_context}")
+            format!("Results so far:\n{extra_context}")
         };
         let recon_prompt = format!(
-            "You are deciding what to inspect before planning an edit. You do NOT see the file content here — only the notes and the inspection results below.\n\n\
-             File: {path_str} ({total_lines} lines)\n\
+            "File: {path_str} ({total_lines} lines)\n\
              Task: {task}\n\n\
              {feedback_block}\
              {notes_block}\
              {results_block}\
-             You may issue SEARCH and READ commands to look at parts of the file. The next phase will plan from notes + inspection results, with no other view of the file. Make sure you have enough to plan.\n\n\
-             Round {current_round} of {MAX_RECON_ROUNDS} ({rounds_remaining} round(s) remaining including this one). Per-edit caps so far: {used_searches}/{MAX_PREPLAN_SEARCHES} SEARCH, {used_reads}/{max_reads} READ.\n\n\
-             Output one of:\n\
-             - One or more SEARCH/READ lines (results will be delivered next round):\n\
-             SEARCH: <exact text to find in the file>\n\
-             READ: <start>-<end>\n\
-             - Or, if you have enough information to plan now, exactly:\n\
+             The next phase plans from these notes and results only — no other view of the file. Decide what else you need before planning.\n\n\
+             Round {current_round}/{MAX_RECON_ROUNDS}. Used: {used_searches}/{MAX_PREPLAN_SEARCHES} SEARCH, {used_reads}/{max_reads} READ.\n\n\
+             Output one or more of:\n\
+             SEARCH: <exact text to find>\n\
+             READ: <start>-<end>\n\n\
+             Or, if the notes already cover what you need, exactly:\n\
              DONE\n\n\
-             Prefer DONE if the notes already cover what you need. Do not request the same thing twice.",
+             Don't repeat searches or reads from above.",
             current_round = round + 1,
             used_searches = counters.search_count,
             used_reads = counters.read_count,
@@ -1521,7 +1508,7 @@ async fn request_preplan_steps(
         let request = ChatRequest {
             messages: vec![
                 Message::system(
-                    "You are in the reconnaissance phase of edit planning. Decide what to SEARCH/READ in the file, or emit DONE if you have enough. Output only SEARCH:/READ: lines or the single word DONE. No explanations, no markdown.",
+                    "Reconnaissance phase. Output SEARCH:/READ: lines or the single word DONE. No markdown.",
                 ),
                 Message::user(&recon_prompt),
             ],
@@ -1573,10 +1560,10 @@ async fn request_preplan_steps(
     // full file content is intentionally NOT in this prompt; large files
     // wouldn't fit, and we want a single uniform path for all sizes.
     let notes_block = if notes.is_empty() {
-        String::from("Planning notes: (none collected)\n\n")
+        String::from("Notes: (none)\n\n")
     } else {
         format!(
-            "Planning notes:\n{}\n\n",
+            "Notes:\n{}\n\n",
             notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
         )
     };
@@ -1586,23 +1573,21 @@ async fn request_preplan_steps(
         format!("Inspection results:\n{extra_context}")
     };
     let finalize_prompt = format!(
-        "Plan the edit for one file. You do NOT see the file content directly — plan from the notes and inspection results below. Line numbers in your plan must match the actual file.\n\n\
-         File: {path_str} ({total_lines} lines)\n\
+        "File: {path_str} ({total_lines} lines)\n\
          Task: {task}\n\n\
          {feedback_block}\
          {notes_block}\
          {results_block}\
-         Return up to {MAX_PREPLAN_STEPS} non-overlapping steps. Each step should cover at most 5 edit sites.\n\
-         Use LITERAL_REPLACE for short, exact text replacements where you have the OLD text verbatim from a SEARCH or READ result.\n\
-         Use SMART_EDIT for structural or larger changes; the smart-edit phase will see the file content for that region.\n\
-         Do not use LITERAL_REPLACE when OLD or NEW spans more than {max_literal_lines} lines, or for whole functions, impl blocks, modules, or test cases.\n\
-         For code, prefer functions/classes/import blocks. For config/text files, prefer logical sections.\n\n\
-         Output only these step formats, no explanations, no markdown:\n\n\
+         Plan the edit. You only see the notes and inspection results above — line numbers in your plan must match the real file.\n\n\
+         Up to {MAX_PREPLAN_STEPS} non-overlapping steps, each covering at most 5 edit sites.\n\
+         Use LITERAL_REPLACE when you have the OLD text verbatim from an inspection result and OLD/NEW each span ≤ {max_literal_lines} lines. Otherwise use SMART_EDIT — its execution phase will see the region content.\n\
+         Never use LITERAL_REPLACE for whole functions, impl blocks, modules, or test cases.\n\n\
+         Output only these blocks, nothing else:\n\n\
          LITERAL_REPLACE\n\
          SCOPE <start> <end>\n\
          ALL true\n\
          OLD:\n\
-         <exact text to replace>\n\
+         <exact text>\n\
          END_OLD\n\
          NEW:\n\
          <replacement text>\n\
@@ -1612,17 +1597,16 @@ async fn request_preplan_steps(
          REGION <start> <end>\n\
          TASK: <specific edit for this region>\n\
          END\n\n\
-         Or exactly:\n\
+         Or, if no edits are needed:\n\
          NO_CHANGES\n\n\
-         Escape hatch: if (and only if) the task itself is incoherent, malformed, contradicts the file, or is impossible to satisfy from this file alone — not merely hard or large — reject it with a single line:\n\
-         INVALID_TASK: <one short sentence explaining why>\n\
-         Do not use INVALID_TASK to dodge difficulty. Use it for genuinely broken tasks."
+         If the task itself is incoherent, contradicts the file, or is impossible — not merely hard — reject with one line:\n\
+         INVALID_TASK: <one short sentence>"
     );
 
     let request = ChatRequest {
         messages: vec![
             Message::system(
-                "You are in the final planning phase for one file edit. Output only strict edit-plan blocks, exactly NO_CHANGES, or a single INVALID_TASK: <reason> line for genuinely broken tasks. No explanations, no markdown.",
+                "Final planning phase. Output only edit-plan blocks, NO_CHANGES, or INVALID_TASK: <reason>. No markdown.",
             ),
             Message::user(&finalize_prompt),
         ],
@@ -2725,14 +2709,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_preplan_recon_response_alternative_terminators() {
-        for terminator in ["DONE", "NONE", "NO_CHANGES", "FINALIZE", "PLAN"] {
-            let response = parse_preplan_recon_response(terminator);
+    fn parse_preplan_recon_response_only_recognizes_done_terminator() {
+        // We only accept the literal word DONE. Other "stop" words like
+        // NONE / NO_CHANGES / FINALIZE / PLAN are not parsed as
+        // terminators — they fall through as unknown lines and the loop
+        // terminates only because the response has no commands.
+        for word in ["NONE", "NO_CHANGES", "FINALIZE", "PLAN", "STOP"] {
+            let response = parse_preplan_recon_response(word);
             assert!(
-                response.done,
-                "terminator `{terminator}` should set done"
+                response.commands.is_empty(),
+                "`{word}` should not produce a command"
             );
+            // done is true here only because commands is empty (the
+            // empty-response fallthrough), not because the word matched.
+            assert!(response.done);
         }
+
+        // DONE is the one terminator that explicitly sets done even
+        // alongside other commands.
+        let with_command = parse_preplan_recon_response("SEARCH: foo\nDONE\n");
+        assert_eq!(with_command.commands.len(), 1);
+        assert!(with_command.done);
     }
 
     #[test]
