@@ -22,16 +22,15 @@ use crate::lsp::LspClient;
 /// Max lines per window for reliable LLM recall.
 const WINDOW_SIZE: usize = 800;
 /// Overlap between windows to catch edits at boundaries.
-const WINDOW_OVERLAP: usize = 100;
 const PREPLAN_READ_OVERLAP: usize = 60;
+/// Files at or below this line count skip the windowed pre-plan pass entirely
+/// and go straight to finalize, since the whole file fits in a single prompt.
+const SMALL_FILE_THRESHOLD: usize = 200;
 const MAX_PATCH_ATTEMPTS: usize = 3;
 const MAX_PLAN_ATTEMPTS: usize = 4;
-const MAX_LITERAL_FALLBACK_ATTEMPTS: usize = 2;
-const MAX_PLANNED_REGIONS: usize = 100;
 const MAX_PREPLAN_STEPS: usize = 100;
 const MAX_PREPLAN_LOG_CHARS: usize = 20000;
 const LARGE_TRUNCATION_MIN_LINES: usize = 50;
-const MAX_PREPLAN_EXPLORE_ATTEMPTS: usize = 4;
 
 fn ensure_not_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
     if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -120,6 +119,25 @@ struct PlannedExecutionFailure {
     current_content: String,
     message: String,
     error: String,
+    /// Steps from the plan that already applied successfully to
+    /// `current_content`. Recorded in execution order (descending source
+    /// line). Empty when the very first step blew up.
+    completed_steps: Vec<EditPlanStep>,
+    /// The step that failed, if any. `None` means the plan executed
+    /// fully but then post-validation (e.g. LSP) rejected the result, so
+    /// every step in `completed_steps` succeeded individually.
+    failed_step: Option<EditPlanStep>,
+}
+
+/// Structured information passed to `request_preplan_steps` when running
+/// a repair attempt. Carries enough context for the planner to reason
+/// about *why* the previous plan failed and what state the file is in
+/// now, instead of seeing only an opaque error string.
+struct RepairContext {
+    previous_plan: Vec<EditPlanStep>,
+    completed_steps: Vec<EditPlanStep>,
+    failed_step: Option<EditPlanStep>,
+    failure_reason: String,
 }
 
 fn max_literal_replace_lines(context_window: usize) -> usize {
@@ -172,12 +190,11 @@ async fn execute_preplanned_steps(
 ) -> Result<Option<SplitResult>> {
     let max_literal_lines = max_literal_replace_lines(config.model.context_window);
     let mut current = original.to_string();
-    let mut last_error: Option<String> = None;
-    let mut previous_plan: Option<String> = None;
+    let mut repair_context: Option<RepairContext> = None;
     let mut progress_log = String::new();
 
     for attempt in 1..=MAX_PLAN_ATTEMPTS {
-        let label = if last_error.is_some() {
+        let label = if repair_context.is_some() {
             format!("Pre-plan repair attempt {attempt}")
         } else {
             log_stage(log, path_str, "preplan:start");
@@ -189,8 +206,7 @@ async fn execute_preplanned_steps(
             task,
             &current,
             router,
-            last_error.as_deref(),
-            previous_plan.as_deref(),
+            repair_context.as_ref(),
             max_literal_lines,
             cancelled,
             log,
@@ -234,8 +250,8 @@ async fn execute_preplanned_steps(
         }
 
         let step_count = steps.len();
-        let mut attempt_message = if let Some(error) = &last_error {
-            format!("{label}; previous plan failed: {error}")
+        let mut attempt_message = if let Some(ctx) = &repair_context {
+            format!("{label}; previous plan failed: {}", ctx.failure_reason)
         } else {
             label.clone()
         };
@@ -281,198 +297,26 @@ async fn execute_preplanned_steps(
                     ),
                 );
                 progress_log.push_str(&e.message);
-                previous_plan = Some(format_edit_plan_steps(&steps));
-                last_error = Some(e.error);
+                repair_context = Some(RepairContext {
+                    previous_plan: steps,
+                    completed_steps: e.completed_steps,
+                    failed_step: e.failed_step,
+                    failure_reason: e.error,
+                });
                 current = e.current_content;
             }
         }
     }
 
     let mut message = progress_log;
-    if let Some(error) = last_error {
+    if let Some(ctx) = repair_context {
         message.push_str(&format!(
-            "Pre-plan exhausted after {MAX_PLAN_ATTEMPTS} attempt(s); last failure: {error}\n"
+            "Pre-plan exhausted after {MAX_PLAN_ATTEMPTS} attempt(s); last failure: {}\n",
+            ctx.failure_reason
         ));
         bail!(message);
     }
     Ok(None)
-}
-
-async fn execute_split_fallback(
-    path_str: &str,
-    task: &str,
-    path: &std::path::Path,
-    original: &str,
-    router: &ModelRouter,
-    broad_error: &str,
-    config: &Config,
-    lsp: Option<&LspClient>,
-    lsp_validation: LspValidationMode,
-    cancelled: Option<&AtomicBool>,
-    log: Option<&SessionLog>,
-) -> Result<Option<SplitResult>> {
-    let regions =
-        request_region_plan(path_str, task, original, router, broad_error, cancelled, log).await?;
-    if regions.is_empty() {
-        log_debug(
-            log,
-            path_str,
-            &format!(
-                "split_plan:return_no_regions broad_error={}",
-                truncate_multiline(broad_error, 2000)
-            ),
-        );
-        return Ok(None);
-    }
-
-    let region_count = regions.len();
-    execute_planned_regions(
-        path_str,
-        path,
-        original,
-        router,
-        config,
-        lsp,
-        lsp_validation,
-        cancelled,
-        log,
-        regions,
-        region_count,
-        format!(
-            "Broad patch failed: {broad_error}\nSplit fallback: {region_count} region(s) planned"
-        ),
-        "via split fallback",
-    )
-        .await
-        .map(Some)
-}
-
-async fn execute_planned_regions(
-    path_str: &str,
-    path: &std::path::Path,
-    original: &str,
-    router: &ModelRouter,
-    config: &Config,
-    lsp: Option<&LspClient>,
-    lsp_validation: LspValidationMode,
-    cancelled: Option<&AtomicBool>,
-    log: Option<&SessionLog>,
-    regions: Vec<EditRegion>,
-    planned_count: usize,
-    mut message: String,
-    success_label: &str,
-) -> Result<SplitResult> {
-    let mut current = original.to_string();
-    let mut total_ops = 0usize;
-    let mut completed_steps = 0usize;
-    if !message.ends_with('\n') {
-        message.push('\n');
-    }
-
-    let mut regions_desc = regions;
-    regions_desc.sort_by(|a, b| b.start.cmp(&a.start).then_with(|| b.end.cmp(&a.end)));
-
-    for (idx, region) in regions_desc.iter().enumerate() {
-        let mut feedback: Option<String> = None;
-        let mut last_region_error = String::new();
-        let region_label = format!("region {} L{}-L{}", idx + 1, region.start, region.end);
-
-        for attempt in 1..=MAX_PATCH_ATTEMPTS {
-            let (ops, _) = match request_patch_for_region(
-                path_str,
-                &region.task,
-                &current,
-                router,
-                region,
-                feedback.as_deref(),
-                lsp_validation,
-                cancelled,
-                log,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    last_region_error = e.to_string();
-                    if attempt < MAX_PATCH_ATTEMPTS {
-                        feedback = Some(last_region_error.clone());
-                        continue;
-                    }
-                    break;
-                }
-            };
-
-            if ops.is_empty() {
-                message.push_str(&format!("Split {region_label}: no changes\n"));
-                completed_steps += 1;
-                last_region_error.clear();
-                break;
-            }
-
-            let candidate =
-                match apply_patch_dry_run_in_region(&current, &ops, region.start, region.end) {
-                    Ok(candidate) => candidate,
-                    Err(e) => {
-                        last_region_error = e.to_string();
-                        if attempt < MAX_PATCH_ATTEMPTS {
-                            feedback = Some(last_region_error.clone());
-                            continue;
-                        }
-                        break;
-                    }
-                };
-
-            if let Err(e) = validate_candidate(path_str, &current, &candidate) {
-                last_region_error = e.to_string();
-                if attempt < MAX_PATCH_ATTEMPTS {
-                    feedback = Some(last_region_error.clone());
-                    continue;
-                }
-                break;
-            }
-
-            total_ops += ops.len();
-            completed_steps += 1;
-            current = candidate;
-            message.push_str(&format!(
-                "Split {region_label}: applied {} operation(s)\n",
-                ops.len()
-            ));
-            last_region_error.clear();
-            break;
-        }
-
-        if !last_region_error.is_empty() {
-            bail!("{region_label} failed: {last_region_error}");
-        }
-    }
-
-    let validation_note = validate_candidate_for_write(
-        path_str,
-        path,
-        original,
-        &current,
-        config,
-        lsp,
-        lsp_validation,
-        cancelled,
-        log,
-    )
-    .await?;
-    if let Some(note) = validation_note {
-        message.push_str(&note);
-        message.push('\n');
-    }
-    let summary = format!(
-        "✓ {success_label}: {completed_steps}/{planned_count} step(s) completed, {total_ops} operation(s) applied to {path_str} ({} lines)\n",
-        current.lines().count()
-    );
-    message = format!("{summary}{message}");
-
-    Ok(SplitResult {
-        content: current,
-        message,
-    })
 }
 
 async fn execute_planned_steps(
@@ -493,7 +337,11 @@ async fn execute_planned_steps(
 ) -> std::result::Result<SplitResult, PlannedExecutionFailure> {
     let mut current = current_base.to_string();
     let mut total_ops = 0usize;
-    let mut completed_steps = 0usize;
+    let mut completed_count = 0usize;
+    // Records of steps that have been successfully applied to `current`,
+    // captured in execution order so the repair planner can see exactly
+    // what shifted and what's left.
+    let mut completed_records: Vec<EditPlanStep> = Vec::new();
     if !message.ends_with('\n') {
         message.push('\n');
     }
@@ -521,7 +369,8 @@ async fn execute_planned_steps(
                     Ok((candidate, count)) => {
                         current = candidate;
                         total_ops += count;
-                        completed_steps += 1;
+                        completed_count += 1;
+                        completed_records.push(step.clone());
                         message.push_str(&format!(
                             "Pre-plan step {} literal L{}-L{}: replaced {count} occurrence(s)\n",
                             idx + 1,
@@ -550,7 +399,7 @@ async fn execute_planned_steps(
                             router,
                             lsp_validation,
                             &region,
-                            MAX_LITERAL_FALLBACK_ATTEMPTS,
+                            MAX_PATCH_ATTEMPTS,
                             false,
                             cancelled,
                             log,
@@ -563,16 +412,19 @@ async fn execute_planned_steps(
                                 idx + 1,
                                 scope_start,
                                 scope_end,
-                                completed_steps
+                                completed_count
                             ),
                             error: format!(
                                 "step {} literal replace failed: {literal_error}; smart fallback failed: {e}",
                                 idx + 1
                             ),
+                            completed_steps: completed_records.clone(),
+                            failed_step: Some(step.clone()),
                         })?;
                         current = candidate;
                         total_ops += count;
-                        completed_steps += 1;
+                        completed_count += 1;
+                        completed_records.push(step.clone());
                         message.push_str(&format!(
                             "Pre-plan step {} literal fallback L{}-L{}: applied {count} operation(s)\n",
                             idx + 1,
@@ -601,18 +453,22 @@ async fn execute_planned_steps(
                 .map_err(|e| PlannedExecutionFailure {
                     current_content: current.clone(),
                     message: format!(
-                        "{message}Pre-plan {region_label} failed after {completed_steps} completed step(s): {e}\n",
+                        "{message}Pre-plan {region_label} failed after {completed_count} completed step(s): {e}\n",
                     ),
                     error: format!("{region_label} failed: {e}"),
+                    completed_steps: completed_records.clone(),
+                    failed_step: Some(step.clone()),
                 })?;
 
                 if count == 0 {
                     message.push_str(&format!("Pre-plan {region_label}: no changes\n"));
-                    completed_steps += 1;
+                    completed_count += 1;
+                    completed_records.push(step.clone());
                 } else {
                     total_ops += count;
                     current = candidate;
-                    completed_steps += 1;
+                    completed_count += 1;
+                    completed_records.push(step.clone());
                     message.push_str(&format!(
                         "Pre-plan {region_label}: applied {count} operation(s)\n"
                     ));
@@ -636,16 +492,18 @@ async fn execute_planned_steps(
     .map_err(|e| PlannedExecutionFailure {
         current_content: current.clone(),
         message: format!(
-            "{message}Pre-plan validation failed after {completed_steps}/{planned_count} completed step(s): {e}\n"
+            "{message}Pre-plan validation failed after {completed_count}/{planned_count} completed step(s): {e}\n"
         ),
         error: e.to_string(),
+        completed_steps: completed_records.clone(),
+        failed_step: None,
     })?;
     if let Some(note) = validation_note {
         message.push_str(&note);
         message.push('\n');
     }
     let summary = format!(
-        "✓ {success_label}: {completed_steps}/{planned_count} step(s) completed, {total_ops} operation(s) applied to {path_str} ({} lines)\n",
+        "✓ {success_label}: {completed_count}/{planned_count} step(s) completed, {total_ops} operation(s) applied to {path_str} ({} lines)\n",
         current.lines().count()
     );
     message = format!("{summary}{message}");
@@ -900,22 +758,11 @@ fn is_signature_mismatch_error(error: &str) -> bool {
         && (error.contains("arguments, found") || error.contains("mismatched types"))
 }
 
-enum PreplanAssistantResponse {
-    Plan(String),
-    Inspect(Vec<InspectionCommand>),
-    NoChanges,
-}
-
-struct PreplanReadResponse {
-    notes: Vec<String>,
-    tentative_steps: Vec<EditPlanStep>,
-}
-
-struct PreplanExploreResponse {
+#[derive(Debug)]
+struct PreplanWindowResponse {
     notes: Vec<String>,
     commands: Vec<InspectionCommand>,
     tentative_steps: Vec<EditPlanStep>,
-    done_exploring: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -924,123 +771,15 @@ enum InspectionCommand {
     Read { start: usize, end: usize },
 }
 
-fn parse_preplan_assistant_response(text: &str) -> Result<PreplanAssistantResponse> {
-    let trimmed = text.trim();
-    let nonempty: Vec<&str> = trimmed.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
-    if nonempty.iter().all(|line| {
-        has_case_insensitive_prefix(line, "SEARCH:")
-            || has_case_insensitive_prefix(line, "READ:")
-            || line.eq_ignore_ascii_case("NO_REGIONS")
-            || line.eq_ignore_ascii_case("NO_CHANGES")
-    }) {
-        let mut commands = Vec::new();
-        for line in nonempty {
-            if line.eq_ignore_ascii_case("NO_REGIONS") || line.eq_ignore_ascii_case("NO_CHANGES") {
-                continue;
-            }
-            if let Some(rest) = strip_case_insensitive_prefix(line, "SEARCH:") {
-                let query = rest.trim();
-                if query.is_empty() {
-                    bail!("empty SEARCH query");
-                }
-                commands.push(InspectionCommand::Search(query.to_string()));
-                continue;
-            }
-            if let Some(rest) = strip_case_insensitive_prefix(line, "READ:") {
-                let rest = rest.trim();
-                let (start, end) = rest
-                    .split_once('-')
-                    .ok_or_else(|| anyhow::anyhow!("READ must be in the form READ: <start>-<end>"))?;
-                let start = start.trim().parse::<usize>()?;
-                let end = end.trim().parse::<usize>()?;
-                if start == 0 || end < start {
-                    bail!("invalid READ range {start}-{end}");
-                }
-                commands.push(InspectionCommand::Read { start, end });
-            }
-        }
-        if !commands.is_empty() {
-            return Ok(PreplanAssistantResponse::Inspect(commands));
-        }
-        if trimmed.eq_ignore_ascii_case("NO_REGIONS") || trimmed.eq_ignore_ascii_case("NO_CHANGES")
-        {
-            return Ok(PreplanAssistantResponse::NoChanges);
-        }
-    }
-    Ok(PreplanAssistantResponse::Plan(trimmed.to_string()))
-}
-
-fn parse_preplan_read_response(text: &str) -> Result<PreplanReadResponse> {
+/// Parse the response from a single windowed pre-plan turn. Each window may
+/// emit any mix of NOTE lines, SEARCH/READ commands, and tentative
+/// LITERAL_REPLACE/SMART_EDIT blocks. SEARCH/READ commands are collected and
+/// batch-executed after the full pass; the model never sees results during
+/// the windowed pass itself.
+fn parse_preplan_window_response(text: &str) -> Result<PreplanWindowResponse> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        bail!("empty preplan read response");
-    }
-
-    let mut notes = Vec::new();
-    let mut plan_lines = Vec::new();
-
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() {
-            if !plan_lines.is_empty() {
-                plan_lines.push(String::new());
-            }
-            continue;
-        }
-        if let Some(rest) = strip_case_insensitive_prefix(line, "NOTE ") {
-            let note = rest.trim();
-            if !note.is_empty() {
-                notes.push(note.to_string());
-            }
-            continue;
-        }
-        if let Some(rest) = strip_case_insensitive_prefix(line, "NOTE:") {
-            let note = rest.trim();
-            if !note.is_empty() {
-                notes.push(note.to_string());
-            }
-            continue;
-        }
-        if has_case_insensitive_prefix(line, "SEARCH:") || has_case_insensitive_prefix(line, "READ:")
-        {
-            bail!("read phase supports NOTE lines and tentative steps only");
-        }
-        if line.eq_ignore_ascii_case("NO_CHANGES")
-            || line.eq_ignore_ascii_case("NO_REGIONS")
-            || line.eq_ignore_ascii_case("DONE_EXPLORING")
-            || line.eq_ignore_ascii_case("FINALIZE")
-            || line.eq_ignore_ascii_case("PLAN")
-            || line.eq_ignore_ascii_case("EXPLORE")
-        {
-            bail!("unexpected control line in read phase: {line}");
-        }
-        plan_lines.push(raw_line.to_string());
-    }
-
-    let tentative_steps = if plan_lines.iter().any(|line| !line.trim().is_empty()) {
-        parse_edit_plan(&plan_lines.join("\n"))?
-    } else {
-        Vec::new()
-    };
-
-    Ok(PreplanReadResponse {
-        notes,
-        tentative_steps,
-    })
-}
-
-fn parse_preplan_explore_response(text: &str) -> Result<PreplanExploreResponse> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        bail!("empty preplan explore response");
-    }
-    if trimmed.eq_ignore_ascii_case("DONE_EXPLORING") || trimmed.eq_ignore_ascii_case("FINALIZE") {
-        return Ok(PreplanExploreResponse {
-            notes: Vec::new(),
-            commands: Vec::new(),
-            tentative_steps: Vec::new(),
-            done_exploring: true,
-        });
+        bail!("empty preplan window response");
     }
 
     let mut notes = Vec::new();
@@ -1090,11 +829,16 @@ fn parse_preplan_explore_response(text: &str) -> Result<PreplanExploreResponse> 
             commands.push(InspectionCommand::Read { start, end });
             continue;
         }
-        if line.eq_ignore_ascii_case("DONE_EXPLORING") || line.eq_ignore_ascii_case("FINALIZE") {
+        if line.eq_ignore_ascii_case("DONE_EXPLORING")
+            || line.eq_ignore_ascii_case("FINALIZE")
+            || line.eq_ignore_ascii_case("PLAN")
+            || line.eq_ignore_ascii_case("EXPLORE")
+        {
+            // Tolerate stray control words; the windowed pass has no terminator.
             continue;
         }
-        if line.eq_ignore_ascii_case("NO_CHANGES") || line.eq_ignore_ascii_case("NO_REGIONS") {
-            bail!("explore phase must return DONE_EXPLORING before final NO_CHANGES");
+        if line.eq_ignore_ascii_case("NO_CHANGES") {
+            bail!("windowed pre-plan must not output NO_CHANGES; defer that to the finalize phase");
         }
         plan_lines.push(raw_line.to_string());
     }
@@ -1105,11 +849,10 @@ fn parse_preplan_explore_response(text: &str) -> Result<PreplanExploreResponse> 
         Vec::new()
     };
 
-    Ok(PreplanExploreResponse {
+    Ok(PreplanWindowResponse {
         notes,
         commands,
         tentative_steps,
-        done_exploring: false,
     })
 }
 
@@ -1163,6 +906,131 @@ fn render_numbered_slice(lines: &[&str], start: usize, end: usize) -> String {
         .map(|(offset, line)| format!("{:>4}│{}", start + offset + 1, line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn extend_unique_notes(existing: &mut Vec<String>, new_notes: Vec<String>) {
+    for note in new_notes {
+        if !existing.contains(&note) {
+            existing.push(note);
+        }
+    }
+}
+
+fn extend_unique_tentative_steps(existing: &mut Vec<EditPlanStep>, new_steps: Vec<EditPlanStep>) {
+    for step in new_steps {
+        if !existing.contains(&step) {
+            existing.push(step);
+        }
+    }
+}
+
+fn extend_unique_commands(
+    existing: &mut Vec<InspectionCommand>,
+    new_commands: Vec<InspectionCommand>,
+) {
+    for command in new_commands {
+        if !existing.contains(&command) {
+            existing.push(command);
+        }
+    }
+}
+
+fn format_pending_commands(commands: &[InspectionCommand]) -> String {
+    let mut out = String::new();
+    for command in commands {
+        match command {
+            InspectionCommand::Search(query) => {
+                out.push_str(&format!("- SEARCH: {query}\n"));
+            }
+            InspectionCommand::Read { start, end } => {
+                out.push_str(&format!("- READ: {start}-{end}\n"));
+            }
+        }
+    }
+    out
+}
+
+fn append_inspection_result(extra_context: &mut String, label: &str, result: &str) {
+    extra_context.push_str(label);
+    extra_context.push('\n');
+    extra_context.push_str(result);
+    extra_context.push_str("\n\n");
+}
+
+/// Run all SEARCH/READ commands collected during the windowed pass and
+/// format their results for the finalize prompt. SEARCH and READ commands
+/// each have their own caps; commands beyond the cap are dropped with a
+/// note in the resulting context, not surfaced as errors, since they are
+/// hints from a planning pass and we'd rather still finalize.
+fn execute_pending_commands(
+    content: &str,
+    commands: &[InspectionCommand],
+    max_reads: usize,
+    path_str: &str,
+    log: Option<&SessionLog>,
+) -> Result<String> {
+    let mut extra_context = String::new();
+    let mut search_count = 0usize;
+    let mut read_count = 0usize;
+    let mut dropped_searches = 0usize;
+    let mut dropped_reads = 0usize;
+
+    for command in commands {
+        match command {
+            InspectionCommand::Search(query) => {
+                if search_count >= MAX_PREPLAN_SEARCHES {
+                    dropped_searches += 1;
+                    continue;
+                }
+                search_count += 1;
+                let result = search_in_file(content, query);
+                log_debug(
+                    log,
+                    path_str,
+                    &format!(
+                        "preplan:search:{} {}",
+                        search_count,
+                        truncate_multiline(&result, 4000)
+                    ),
+                );
+                append_inspection_result(
+                    &mut extra_context,
+                    &format!("SEARCH_RESULT query=`{query}`"),
+                    &result,
+                );
+            }
+            InspectionCommand::Read { start, end } => {
+                if read_count >= max_reads {
+                    dropped_reads += 1;
+                    continue;
+                }
+                read_count += 1;
+                let result = read_in_file(content, *start, *end)?;
+                log_debug(
+                    log,
+                    path_str,
+                    &format!(
+                        "preplan:read:{} {}",
+                        read_count,
+                        truncate_multiline(&result, 4000)
+                    ),
+                );
+                append_inspection_result(
+                    &mut extra_context,
+                    &format!("READ_RESULT range=L{start}-L{end}"),
+                    &result,
+                );
+            }
+        }
+    }
+
+    if dropped_searches > 0 || dropped_reads > 0 {
+        extra_context.push_str(&format!(
+            "(note: {dropped_searches} extra SEARCH and {dropped_reads} extra READ command(s) were dropped because the per-phase limits were reached)\n\n",
+        ));
+    }
+
+    Ok(extra_context)
 }
 
 async fn request_patch(
@@ -1463,8 +1331,7 @@ async fn request_preplan_steps(
     task: &str,
     content: &str,
     router: &ModelRouter,
-    feedback: Option<&str>,
-    previous_plan: Option<&str>,
+    repair: Option<&RepairContext>,
     max_literal_lines: usize,
     cancelled: Option<&AtomicBool>,
     log: Option<&SessionLog>,
@@ -1472,9 +1339,7 @@ async fn request_preplan_steps(
     ensure_not_cancelled(cancelled)?;
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
-    let mut search_count = 0usize;
-    let mut read_count = 0usize;
-    let max_reads = if feedback.is_some() {
+    let max_reads = if repair.is_some() {
         MAX_PREPLAN_READS_REPAIR
     } else {
         MAX_PREPLAN_READS_INITIAL
@@ -1485,257 +1350,152 @@ async fn request_preplan_steps(
         .map(|(i, line)| format!("{:>4}│{}", i + 1, line))
         .collect::<Vec<_>>()
         .join("\n");
-    let feedback_block = feedback
-        .map(|failure| {
-            let previous = previous_plan
-                .map(|plan| format!("Previous edit plan:\n{plan}\n\n"))
-                .unwrap_or_default();
-            format!(
-                "Previous edit plan was not applied.\nFailure: {failure}\n{previous}Return a corrected complete edit plan against the current file.\n\n"
-            )
-        })
+    let feedback_block = repair
+        .map(format_repair_context)
         .unwrap_or_default();
-    let mut extra_context = String::new();
     let mut notes = Vec::<String>::new();
     let mut tentative_steps = Vec::<EditPlanStep>::new();
-    let read_windows = if total_lines == 0 {
-        vec![(0, 0)]
+    let mut pending_commands = Vec::<InspectionCommand>::new();
+
+    // Small files fit in a single finalize prompt; skip the windowed pre-plan
+    // pass entirely. Empty files are also handled this way.
+    let run_windowed_pass = total_lines > SMALL_FILE_THRESHOLD;
+
+    if run_windowed_pass {
+        let windows = build_windows(total_lines, WINDOW_SIZE, PREPLAN_READ_OVERLAP);
+
+        for (idx, (start, end)) in windows.iter().copied().enumerate() {
+            let slice = render_numbered_slice(&lines, start, end);
+            let notes_block = if notes.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "Notes gathered so far:\n{}\n\n",
+                    notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
+                )
+            };
+            let tentative_steps_block = if tentative_steps.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "Tentative steps gathered so far:\n{}\n\n",
+                    format_edit_plan_steps(&tentative_steps)
+                )
+            };
+            let pending_block = if pending_commands.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "SEARCH/READ commands queued so far (results will be provided at finalize):\n{}\n\n",
+                    format_pending_commands(&pending_commands)
+                )
+            };
+            let prompt = format!(
+                "Walk through one file in slices to gather context for an edit plan.\n\n\
+                 File: {path_str}\n\
+                 Task: {task}\n\n\
+                 {feedback_block}\
+                 {notes_block}\
+                 {tentative_steps_block}\
+                 {pending_block}\
+                 This is slice {current_slice} of {total_slices}.\n\
+                 It covers full-file lines {start_line}-{end_line}.\n\
+                 Adjacent slices overlap by {PREPLAN_READ_OVERLAP} lines.\n\
+                 You are still gathering context. Do not finalize the plan yet.\n\
+                 Output only any mix of these items, with no explanations and no markdown:\n\
+                 - NOTE <short factual planning note>\n\
+                 - SEARCH: <exact text>   (queued; results delivered at finalize, max {MAX_PREPLAN_SEARCHES} total)\n\
+                 - READ: <start>-<end>    (queued; results delivered at finalize, max {max_reads} total)\n\
+                 - tentative LITERAL_REPLACE and SMART_EDIT blocks using the exact step syntax below\n\n\
+                 Tentative step format:\n\n\
+                 LITERAL_REPLACE\n\
+                 SCOPE <start> <end>\n\
+                 ALL true\n\
+                 OLD:\n\
+                 <exact text to replace>\n\
+                 END_OLD\n\
+                 NEW:\n\
+                 <replacement text>\n\
+                 END_NEW\n\
+                 END\n\n\
+                 SMART_EDIT\n\
+                 REGION <start> <end>\n\
+                 TASK: <specific edit for this region>\n\
+                 END\n\n\
+                 Slice content:\n{slice}",
+                current_slice = idx + 1,
+                total_slices = windows.len(),
+                start_line = start + 1,
+                end_line = end,
+            );
+
+            let request = ChatRequest {
+                messages: vec![
+                    Message::system(
+                        "You are walking through one file slice-by-slice to gather context for an edit plan. Output only NOTE lines, SEARCH/READ commands, and tentative LITERAL_REPLACE/SMART_EDIT blocks. SEARCH/READ results are delivered later at finalize. Do not finalize. No explanations, no markdown.",
+                    ),
+                    Message::user(&prompt),
+                ],
+                tools: None,
+                tool_choice: None,
+            };
+
+            log_stage(
+                log,
+                path_str,
+                &format!("preplan:window:{}/{}:{}-{}", idx + 1, windows.len(), start + 1, end),
+            );
+            let response = router
+                .chat_with_cancel(ModelRole::Fast, &request, cancelled)
+                .await?;
+            let text = response
+                .choices
+                .first()
+                .and_then(|c| c.message.content.as_deref())
+                .unwrap_or("");
+            log_debug(
+                log,
+                path_str,
+                &format!(
+                    "preplan:window:{}/{}:{}-{} raw_response:\n{}",
+                    idx + 1,
+                    windows.len(),
+                    start + 1,
+                    end,
+                    truncate_multiline(text, 12000)
+                ),
+            );
+
+            let response = parse_preplan_window_response(text)?;
+            extend_unique_notes(&mut notes, response.notes);
+            extend_unique_tentative_steps(&mut tentative_steps, response.tentative_steps);
+            extend_unique_commands(&mut pending_commands, response.commands);
+        }
     } else {
-        build_windows(total_lines, WINDOW_SIZE, PREPLAN_READ_OVERLAP)
-    };
-
-    for (idx, (start, end)) in read_windows.iter().copied().enumerate() {
-        let slice = if total_lines == 0 {
-            String::from("(empty file)")
-        } else {
-            render_numbered_slice(&lines, start, end)
-        };
-        let notes_block = if notes.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "Notes gathered so far:\n{}\n\n",
-                notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
-            )
-        };
-        let tentative_steps_block = if tentative_steps.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "Tentative steps gathered so far:\n{}\n\n",
-                format_edit_plan_steps(&tentative_steps)
-            )
-        };
-        let prompt = format!(
-            "Read a file slice before planning edits.\n\n\
-             File: {path_str}\n\
-             Task: {task}\n\n\
-             {feedback_block}\
-             {notes_block}\
-             {tentative_steps_block}\
-             This is slice {current_slice} of {total_slices}.\n\
-             It covers full-file lines {start_line}-{end_line}.\n\
-             Adjacent slices overlap by {PREPLAN_READ_OVERLAP} lines.\n\
-             You are still reading the file. Do not request SEARCH or READ yet. Do not finalize the plan yet.\n\
-             Output only any mix of these items, with no explanations and no markdown:\n\
-             - NOTE <short factual planning note>\n\
-             - tentative LITERAL_REPLACE and SMART_EDIT blocks using the exact step syntax below\n\n\
-             Tentative step format:\n\n\
-             LITERAL_REPLACE\n\
-             SCOPE <start> <end>\n\
-             ALL true\n\
-             OLD:\n\
-             <exact text to replace>\n\
-             END_OLD\n\
-             NEW:\n\
-             <replacement text>\n\
-             END_NEW\n\
-             END\n\n\
-             SMART_EDIT\n\
-             REGION <start> <end>\n\
-             TASK: <specific edit for this region>\n\
-             END\n\n\
-             Slice content:\n{slice}",
-            current_slice = idx + 1,
-            total_slices = read_windows.len(),
-            start_line = if total_lines == 0 { 0 } else { start + 1 },
-            end_line = end,
-        );
-
-        let request = ChatRequest {
-            messages: vec![
-                Message::system(
-                    "You are in the file-reading phase for one file edit. Output only NOTE lines and tentative LITERAL_REPLACE/SMART_EDIT blocks. No SEARCH, no READ, no final plan, no explanations, no markdown.",
-                ),
-                Message::user(&prompt),
-            ],
-            tools: None,
-            tool_choice: None,
-        };
-
         log_stage(
             log,
             path_str,
-            &format!("preplan:read:{}/{}:{}-{}", idx + 1, read_windows.len(), start + 1, end),
+            &format!("preplan:window:skipped_small_file:{total_lines}"),
         );
-        let response = router
-            .chat_with_cancel(ModelRole::Fast, &request, cancelled)
-            .await?;
-        let text = response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.as_deref())
-            .unwrap_or("");
-        log_debug(
-            log,
-            path_str,
-            &format!(
-                "preplan:read:{}/{}:{}-{} raw_response:\n{}",
-                idx + 1,
-                read_windows.len(),
-                start + 1,
-                end,
-                truncate_multiline(text, 12000)
-            ),
-        );
-
-        let response = parse_preplan_read_response(text)?;
-        for note in response.notes {
-            if !notes.contains(&note) {
-                notes.push(note);
-            }
-        }
-        if !response.tentative_steps.is_empty() {
-            tentative_steps = response.tentative_steps;
-        }
     }
 
-    for explore_attempt in 1..=MAX_PREPLAN_EXPLORE_ATTEMPTS {
-        let notes_block = if notes.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "Planning notes:\n{}\n\n",
-                notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
-            )
-        };
-        let tentative_steps_block = if tentative_steps.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "Tentative steps gathered so far:\n{}\n\n",
-                format_edit_plan_steps(&tentative_steps)
-            )
-        };
-        let prompt = format!(
-            "Explore one file before finalizing an edit plan.\n\n\
-             File: {path_str}\n\
-             Task: {task}\n\n\
-             {feedback_block}\
-             {notes_block}\
-             {tentative_steps_block}\
-             {extra_context}\
-             You have already read the full file.\n\
-             You may inspect the current file using these bounded commands:\n\
-             - SEARCH: <exact text>   (current file only, max {MAX_PREPLAN_SEARCHES} total)\n\
-             - READ: <start>-<end>    (current file only, max {max_reads} total in this exploration phase)\n\
-             In this exploration phase, output only one of these forms with no explanations and no markdown:\n\
-             - one or more NOTE lines\n\
-             - one or more SEARCH/READ commands\n\
-             - tentative LITERAL_REPLACE and SMART_EDIT blocks\n\
-             - or exactly DONE_EXPLORING when you are ready for final planning\n\
-             Do not output the final plan yet.\n\
-             Full file ({total_lines} lines):\n{numbered_content}"
-        );
+    // Batch-execute the SEARCH/READ commands collected during the windowed
+    // pass. Results are formatted into extra_context for the finalize prompt.
+    let extra_context = execute_pending_commands(
+        content,
+        &pending_commands,
+        max_reads,
+        path_str,
+        log,
+    )?;
 
-        let request = ChatRequest {
-            messages: vec![
-                Message::system(
-                    "You are in the exploration phase for one file edit. Output only NOTE lines, SEARCH/READ commands, tentative LITERAL_REPLACE/SMART_EDIT blocks, or exactly DONE_EXPLORING. No explanations, no markdown.",
-                ),
-                Message::user(&prompt),
-            ],
-            tools: None,
-            tool_choice: None,
-        };
-
-        log_stage(
-            log,
-            path_str,
-            &format!("preplan:explore:{explore_attempt}:file:1-{total_lines}"),
-        );
-        let response = router
-            .chat_with_cancel(ModelRole::Fast, &request, cancelled)
-            .await?;
-        let text = response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.as_deref())
-            .unwrap_or("");
-        log_debug(
-            log,
-            path_str,
-            &format!(
-                "preplan:explore:{explore_attempt}:file:1-{total_lines} raw_response:\n{}",
-                truncate_multiline(text, 12000)
-            ),
-        );
-
-        let response = parse_preplan_explore_response(text)?;
-        if response.done_exploring {
-            break;
-        }
-        for note in response.notes {
-            if !notes.contains(&note) {
-                notes.push(note);
-            }
-        }
-        if !response.tentative_steps.is_empty() {
-            tentative_steps = response.tentative_steps;
-        }
-        for command in response.commands {
-            match command {
-                InspectionCommand::Search(query) => {
-                    if search_count >= MAX_PREPLAN_SEARCHES {
-                        bail!("preplan exceeded SEARCH limit of {MAX_PREPLAN_SEARCHES}");
-                    }
-                    search_count += 1;
-                    let result = search_in_file(content, &query);
-                    log_debug(
-                        log,
-                        path_str,
-                        &format!(
-                            "preplan:search:{} {}",
-                            search_count,
-                            truncate_multiline(&result, 4000)
-                        ),
-                    );
-                    extra_context.push_str("\nInspection result:\n");
-                    extra_context.push_str(&result);
-                    extra_context.push_str("\n\n");
-                }
-                InspectionCommand::Read { start: read_start, end: read_end } => {
-                    if read_count >= max_reads {
-                        bail!("preplan exceeded READ limit of {max_reads}");
-                    }
-                    read_count += 1;
-                    let result = read_in_file(content, read_start, read_end)?;
-                    log_debug(
-                        log,
-                        path_str,
-                        &format!(
-                            "preplan:read:{} {}",
-                            read_count,
-                            truncate_multiline(&result, 4000)
-                        ),
-                    );
-                    extra_context.push_str("\nInspection result:\n");
-                    extra_context.push_str(&result);
-                    extra_context.push_str("\n\n");
-                }
-            }
-        }
-    }
+    // Present tentative steps in file order so the finalizer reasons about
+    // them in the same order they appear in the source.
+    tentative_steps.sort_by(|a, b| {
+        a.start_line()
+            .cmp(&b.start_line())
+            .then_with(|| a.end_line().cmp(&b.end_line()))
+    });
 
     let notes_block = if notes.is_empty() {
         String::new()
@@ -1864,238 +1624,6 @@ async fn request_preplan_steps(
     Ok(steps)
 }
 
-async fn request_region_plan(
-    path_str: &str,
-    task: &str,
-    content: &str,
-    router: &ModelRouter,
-    broad_error: &str,
-    cancelled: Option<&AtomicBool>,
-    log: Option<&SessionLog>,
-) -> Result<Vec<EditRegion>> {
-    ensure_not_cancelled(cancelled)?;
-    let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len();
-    let windows = build_windows(total_lines, WINDOW_SIZE, WINDOW_OVERLAP);
-    let mut regions = Vec::new();
-    let mut search_count = 0usize;
-    let mut read_count = 0usize;
-
-    for (win_idx, (start, end)) in windows.iter().enumerate() {
-        ensure_not_cancelled(cancelled)?;
-        if regions.len() >= MAX_PLANNED_REGIONS {
-            break;
-        }
-
-        let window_content = lines[*start..*end]
-            .iter()
-            .enumerate()
-            .map(|(i, line)| format!("{:>4}│{}", start + i + 1, line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let remaining = MAX_PLANNED_REGIONS - regions.len();
-
-        let mut extra_context = String::new();
-        let text = loop {
-            let prompt = format!(
-                "A broad patch for {path_str} failed.\n\
-                 Failure: {broad_error}\n\
-                 Original task: {task}\n\n\
-                 You may first inspect the current file using these bounded commands:\n\
-                 - SEARCH: <exact text>   (current file only, max {MAX_PREPLAN_SEARCHES} total)\n\
-                 - READ: <start>-<end>    (current file only, max {MAX_PREPLAN_READS_REPAIR} total)\n\
-                 After any inspection, return the final region plan or NO_REGIONS.\n\
-                 Break the task into up to {remaining} small, non-overlapping line regions within this window.\n\
-                 Each region must be the smallest contiguous block that can be edited independently.\n\
-                 For code, prefer functions/classes/import blocks. For YAML/TOML/JSON/Markdown/config files, prefer logical sections or key blocks.\n\
-                 If the task needs only one region in this window, return one region. If no region is needed in this window, output exactly NO_REGIONS.\n\n\
-                 Output only one of these formats:\n\
-                 SEARCH: <exact text>\n\n\
-                 READ: <start>-<end>\n\n\
-                 REGION <line>\n\
-                 or\n\
-                 REGION <start_line>-<end_line>\n\
-                 TASK: <specific subtask for this region>\n\
-                 END\n\n\
-                 Window {}/{} lines {}-{} of {}:\n{window_content}\n\n\
-                 {extra_context}",
-                win_idx + 1,
-                windows.len(),
-                start + 1,
-                end,
-                total_lines
-            );
-
-            let request = ChatRequest {
-                messages: vec![
-                    Message::system(
-                        "You output only strict REGION blocks or one SEARCH/READ command. No explanations, no markdown.",
-                    ),
-                    Message::user(&prompt),
-                ],
-                tools: None,
-                tool_choice: None,
-            };
-
-            log_stage(
-                log,
-                path_str,
-                &format!("split_plan:window:{}-{}", start + 1, end),
-            );
-            let response = router
-                .chat_with_cancel(ModelRole::Fast, &request, cancelled)
-                .await?;
-            let text = response
-                .choices
-                .first()
-                .and_then(|c| c.message.content.as_deref())
-                .unwrap_or("");
-            log_debug(
-                log,
-                path_str,
-                &format!(
-                    "split_plan:window:{}-{} raw_response:\n{}",
-                    start + 1,
-                    end,
-                    truncate_multiline(text, 12000)
-                ),
-            );
-
-            match parse_preplan_assistant_response(text)? {
-                PreplanAssistantResponse::Plan(plan) => break plan,
-                PreplanAssistantResponse::Inspect(commands) => {
-                    for command in commands {
-                        match command {
-                            InspectionCommand::Search(query) => {
-                                if search_count >= MAX_PREPLAN_SEARCHES {
-                                    bail!("split fallback exceeded SEARCH limit of {MAX_PREPLAN_SEARCHES}");
-                                }
-                                search_count += 1;
-                                let result = search_in_file(content, &query);
-                                log_debug(
-                                    log,
-                                    path_str,
-                                    &format!(
-                                        "split_plan:search:{} {}",
-                                        search_count,
-                                        truncate_multiline(&result, 4000)
-                                    ),
-                                );
-                                extra_context.push_str("Inspection result:\n");
-                                extra_context.push_str(&result);
-                                extra_context.push_str("\n\n");
-                            }
-                            InspectionCommand::Read { start: read_start, end: read_end } => {
-                                if read_count >= MAX_PREPLAN_READS_REPAIR {
-                                    bail!(
-                                        "split fallback exceeded READ limit of {}",
-                                        MAX_PREPLAN_READS_REPAIR
-                                    );
-                                }
-                                read_count += 1;
-                                let result = read_in_file(content, read_start, read_end)?;
-                                log_debug(
-                                    log,
-                                    path_str,
-                                    &format!(
-                                        "split_plan:read:{} {}",
-                                        read_count,
-                                        truncate_multiline(&result, 4000)
-                                    ),
-                                );
-                                extra_context.push_str("Inspection result:\n");
-                                extra_context.push_str(&result);
-                                extra_context.push_str("\n\n");
-                            }
-                        }
-                    }
-                }
-                PreplanAssistantResponse::NoChanges => break "NO_REGIONS".to_string(),
-            }
-        };
-
-        let mut planned = match parse_region_plan(&text) {
-            Ok(regions) => regions,
-            Err(e) => {
-                log_debug(
-                    log,
-                    path_str,
-                    &format!(
-                        "split_plan:window:{}-{} parse_failed {}",
-                        start + 1,
-                        end,
-                        truncate_multiline(&e.to_string(), 2000)
-                    ),
-                );
-                return Err(e);
-            }
-        };
-        log_debug(
-            log,
-            path_str,
-            &format!(
-                "split_plan:window:{}-{} parsed_regions={}\n{}",
-                start + 1,
-                end,
-                planned.len(),
-                truncate_multiline(&format_regions_for_log(&planned), 12000)
-            ),
-        );
-        for region in &planned {
-            if region.start < start + 1 || region.end > *end {
-                log_debug(
-                    log,
-                    path_str,
-                    &format!(
-                        "split_plan:window:{}-{} validation_failed planned region L{}-L{} outside window",
-                        start + 1,
-                        end,
-                        region.start,
-                        region.end
-                    ),
-                );
-                bail!(
-                    "planned region L{}-L{} falls outside window L{}-L{}",
-                    region.start,
-                    region.end,
-                    start + 1,
-                    end
-                );
-            }
-        }
-        regions.append(&mut planned);
-        if regions.len() > MAX_PLANNED_REGIONS {
-            regions.truncate(MAX_PLANNED_REGIONS);
-        }
-    }
-
-    if let Err(e) = reject_overlapping_regions(&regions) {
-        log_debug(
-            log,
-            path_str,
-            &format!(
-                "split_plan:file_validation_failed {}",
-                truncate_multiline(&e.to_string(), 2000)
-            ),
-        );
-        return Err(e);
-    }
-    Ok(regions)
-}
-
-fn validate_regions_in_file(regions: &[EditRegion], total_lines: usize) -> Result<()> {
-    for region in regions {
-        if region.end > total_lines {
-            bail!(
-                "planned region L{}-L{} falls outside file with {total_lines} lines",
-                region.start,
-                region.end
-            );
-        }
-    }
-    reject_overlapping_regions(regions)
-}
-
 fn validate_steps_in_file(steps: &[EditPlanStep], total_lines: usize) -> Result<()> {
     for step in steps {
         if step.end_line() > total_lines {
@@ -2202,22 +1730,38 @@ fn format_preplan_log(label: &str, steps: &[EditPlanStep]) -> String {
     format!("Raw {label} ({} step(s), parsed):\n{plan}\n", steps.len())
 }
 
-fn format_regions_for_log(regions: &[EditRegion]) -> String {
-    if regions.is_empty() {
-        return "NO_REGIONS".to_string();
-    }
-    let mut out = String::new();
-    for region in regions {
-        if region.start == region.end {
-            out.push_str(&format!("REGION {}\nTASK: {}\nEND\n\n", region.start, region.task));
-        } else {
-            out.push_str(&format!(
-                "REGION {}-{}\nTASK: {}\nEND\n\n",
-                region.start, region.end, region.task
-            ));
-        }
-    }
-    out
+/// Render a `RepairContext` into a planner-facing block. Used at the top
+/// of both the windowed pre-plan prompts and the finalize prompt so the
+/// model can see exactly what the previous attempt did, what survived,
+/// what failed, and the failure reason.
+fn format_repair_context(ctx: &RepairContext) -> String {
+    let previous_plan = if ctx.previous_plan.is_empty() {
+        "(empty)\n".to_string()
+    } else {
+        format_edit_plan_steps(&ctx.previous_plan)
+    };
+
+    let completed = if ctx.completed_steps.is_empty() {
+        "(none — the first step failed, file is unchanged from the initial state)\n".to_string()
+    } else {
+        format_edit_plan_steps(&ctx.completed_steps)
+    };
+
+    let failed = match &ctx.failed_step {
+        Some(step) => format_edit_plan_steps(std::slice::from_ref(step)),
+        None => "(no individual step failed; the plan executed in full but post-validation rejected the result — see failure reason below)\n".to_string(),
+    };
+
+    format!(
+        "A previous edit plan was attempted and failed. Use the structured information below to plan a better recovery.\n\n\
+         Previous edit plan (as tried):\n{previous_plan}\n\
+         Steps that succeeded and have ALREADY been applied to the file shown below:\n{completed}\n\
+         Step that FAILED:\n{failed}\n\
+         Failure reason:\n{reason}\n\n\
+         Plan the remaining work needed to complete the original task against the current file content. \
+         If the task already appears complete, return NO_CHANGES.\n\n",
+        reason = ctx.failure_reason,
+    )
 }
 
 fn truncate_multiline(text: &str, max_chars: usize) -> String {
@@ -2231,7 +1775,7 @@ fn truncate_multiline(text: &str, max_chars: usize) -> String {
 }
 
 pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
-    if matches!(text.trim(), "NO_REGIONS" | "NO_CHANGES") {
+    if text.trim() == "NO_CHANGES" {
         return Ok(Vec::new());
     }
     if text.trim().is_empty() {
@@ -2326,40 +1870,6 @@ pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
     }
     reject_overlapping_steps(&steps)?;
     Ok(steps)
-}
-
-pub fn parse_region_plan(text: &str) -> Result<Vec<EditRegion>> {
-    if text.trim() == "NO_REGIONS" {
-        return Ok(Vec::new());
-    }
-    if text.trim().is_empty() {
-        bail!("empty region plan");
-    }
-
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
-    let mut regions = Vec::new();
-
-    while i < lines.len() {
-        let line = lines[i];
-        if line.trim().is_empty() {
-            i += 1;
-            continue;
-        }
-
-        let (region, next) = parse_region_at(&lines, i)?;
-        i = next;
-        regions.push(region);
-    }
-
-    if regions.len() > MAX_PLANNED_REGIONS {
-        bail!(
-            "region plan returned {} regions, maximum is {MAX_PLANNED_REGIONS}",
-            regions.len()
-        );
-    }
-    reject_overlapping_regions(&regions)?;
-    Ok(regions)
 }
 
 fn parse_region_at(lines: &[&str], idx: usize) -> Result<(EditRegion, usize)> {
@@ -3036,55 +2546,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_preplan_assistant_response_supports_search_and_read() {
-        match parse_preplan_assistant_response("SEARCH: context::assemble").unwrap() {
-            PreplanAssistantResponse::Inspect(commands) => {
-                assert_eq!(
-                    commands,
-                    vec![InspectionCommand::Search("context::assemble".into())]
-                );
-            }
-            _ => panic!("expected inspection commands"),
-        }
-        match parse_preplan_assistant_response("READ: 10-20").unwrap() {
-            PreplanAssistantResponse::Inspect(commands) => {
-                assert_eq!(
-                    commands,
-                    vec![InspectionCommand::Read { start: 10, end: 20 }]
-                );
-            }
-            _ => panic!("expected inspection commands"),
-        }
-    }
-
-    #[test]
-    fn parse_preplan_assistant_response_supports_multiple_inspection_commands() {
-        match parse_preplan_assistant_response(
-            "SEARCH: foo\nSEARCH: bar\nREAD: 10-20\nNO_REGIONS",
-        )
-        .unwrap()
-        {
-            PreplanAssistantResponse::Inspect(commands) => {
-                assert_eq!(
-                    commands,
-                    vec![
-                        InspectionCommand::Search("foo".into()),
-                        InspectionCommand::Search("bar".into()),
-                        InspectionCommand::Read { start: 10, end: 20 },
-                    ]
-                );
-            }
-            _ => panic!("expected inspection commands"),
-        }
-    }
-
-    #[test]
-    fn parse_preplan_read_response_accepts_notes_and_tentative_steps_only() {
-        let response = parse_preplan_read_response(
+    fn parse_preplan_window_response_accepts_notes_and_tentative_steps() {
+        let response = parse_preplan_window_response(
             "NOTE provider loop 10-20\n\nSMART_EDIT\nREGION 10 20\nTASK: update provider loop\nEND\n",
         )
         .unwrap();
         assert_eq!(response.notes, vec!["provider loop 10-20".to_string()]);
+        assert!(response.commands.is_empty());
         assert_eq!(
             response.tentative_steps,
             vec![EditPlanStep::SmartEdit(EditRegion {
@@ -3096,12 +2564,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_preplan_explore_response_accepts_done_and_commands() {
-        let done = parse_preplan_explore_response("DONE_EXPLORING").unwrap();
-        assert!(done.done_exploring);
-
-        let response =
-            parse_preplan_explore_response("NOTE slice reviewed\nSEARCH: foo\nREAD: 10-20").unwrap();
+    fn parse_preplan_window_response_accepts_search_and_read_commands() {
+        let response = parse_preplan_window_response(
+            "NOTE slice reviewed\nSEARCH: foo\nREAD: 10-20\n",
+        )
+        .unwrap();
         assert_eq!(response.notes, vec!["slice reviewed".to_string()]);
         assert_eq!(
             response.commands,
@@ -3110,6 +2577,219 @@ mod tests {
                 InspectionCommand::Read { start: 10, end: 20 },
             ]
         );
+        assert!(response.tentative_steps.is_empty());
+    }
+
+    #[test]
+    fn parse_preplan_window_response_accepts_mixed_payload() {
+        let response = parse_preplan_window_response(
+            "NOTE check call sites\n\
+             SEARCH: assemble(\n\
+             READ: 1-5\n\
+             SMART_EDIT\nREGION 1 5\nTASK: rewrite header\nEND\n",
+        )
+        .unwrap();
+        assert_eq!(response.notes, vec!["check call sites".to_string()]);
+        assert_eq!(response.commands.len(), 2);
+        assert_eq!(response.tentative_steps.len(), 1);
+    }
+
+    #[test]
+    fn parse_preplan_window_response_tolerates_stray_control_words() {
+        // Stray DONE_EXPLORING/FINALIZE/PLAN/EXPLORE lines are ignored, not
+        // rejected — the windowed pass has no terminator.
+        let response = parse_preplan_window_response(
+            "NOTE looks good\nDONE_EXPLORING\nFINALIZE\nPLAN\nEXPLORE\n",
+        )
+        .unwrap();
+        assert_eq!(response.notes, vec!["looks good".to_string()]);
+        assert!(response.commands.is_empty());
+        assert!(response.tentative_steps.is_empty());
+    }
+
+    #[test]
+    fn parse_preplan_window_response_rejects_no_changes() {
+        let err = parse_preplan_window_response("NO_CHANGES")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not output NO_CHANGES"));
+    }
+
+    #[test]
+    fn execute_pending_commands_returns_empty_when_no_commands() {
+        let result = execute_pending_commands("a\nb\n", &[], 6, "test.rs", None).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn execute_pending_commands_executes_search_and_read() {
+        let content = "fn one() {}\nfn two() {}\nfn three() {}\n";
+        let commands = vec![
+            InspectionCommand::Search("two".into()),
+            InspectionCommand::Read { start: 1, end: 2 },
+        ];
+        let result = execute_pending_commands(content, &commands, 6, "test.rs", None).unwrap();
+        assert!(result.contains("SEARCH_RESULT query=`two`"));
+        assert!(result.contains("READ_RESULT range=L1-L2"));
+        assert!(result.contains("fn one()"));
+    }
+
+    #[test]
+    fn execute_pending_commands_drops_overflow_with_note() {
+        let content = "x\n";
+        let read_cmd = InspectionCommand::Read { start: 1, end: 1 };
+        let mut commands = Vec::new();
+        for _ in 0..(MAX_PREPLAN_SEARCHES + 2) {
+            commands.push(InspectionCommand::Search("x".into()));
+        }
+        for _ in 0..3 {
+            commands.push(read_cmd.clone());
+        }
+        let result = execute_pending_commands(content, &commands, 1, "test.rs", None).unwrap();
+        assert!(result.contains("2 extra SEARCH"));
+        assert!(result.contains("2 extra READ"));
+    }
+
+    #[test]
+    fn pending_commands_are_deduped_across_windows() {
+        let mut commands = vec![InspectionCommand::Search("foo".into())];
+        extend_unique_commands(
+            &mut commands,
+            vec![
+                InspectionCommand::Search("foo".into()),
+                InspectionCommand::Read { start: 1, end: 5 },
+            ],
+        );
+        assert_eq!(commands.len(), 2);
+    }
+
+    #[test]
+    fn tentative_steps_accumulate_uniquely() {
+        let mut steps = vec![EditPlanStep::SmartEdit(EditRegion {
+            start: 10,
+            end: 20,
+            task: "first".into(),
+        })];
+        extend_unique_tentative_steps(
+            &mut steps,
+            vec![
+                EditPlanStep::SmartEdit(EditRegion {
+                    start: 10,
+                    end: 20,
+                    task: "first".into(),
+                }),
+                EditPlanStep::LiteralReplace {
+                    scope_start: 30,
+                    scope_end: 31,
+                    all: false,
+                    old: vec!["old".into()],
+                    new: vec!["new".into()],
+                },
+            ],
+        );
+
+        assert_eq!(steps.len(), 2);
+    }
+
+    #[test]
+    fn inspection_results_are_labeled() {
+        let mut extra = String::new();
+        append_inspection_result(&mut extra, "SEARCH_RESULT query=`foo`", "SEARCH RESULT for `foo`: 1 hit");
+        append_inspection_result(&mut extra, "READ_RESULT range=L10-L12", "READ RESULT L10-L12:\n  10│x");
+
+        assert!(extra.contains("SEARCH_RESULT query=`foo`"));
+        assert!(extra.contains("READ_RESULT range=L10-L12"));
+        assert!(!extra.contains("Inspection result:"));
+    }
+
+    #[test]
+    fn format_repair_context_first_step_failed_renders_empty_completed() {
+        let ctx = RepairContext {
+            previous_plan: vec![EditPlanStep::SmartEdit(EditRegion {
+                start: 10,
+                end: 20,
+                task: "rewrite header".into(),
+            })],
+            completed_steps: Vec::new(),
+            failed_step: Some(EditPlanStep::SmartEdit(EditRegion {
+                start: 10,
+                end: 20,
+                task: "rewrite header".into(),
+            })),
+            failure_reason: "region missing anchor".into(),
+        };
+
+        let block = format_repair_context(&ctx);
+        assert!(block.contains("A previous edit plan was attempted and failed."));
+        assert!(block.contains("Previous edit plan (as tried):"));
+        assert!(block.contains("rewrite header"));
+        assert!(block.contains(
+            "Steps that succeeded and have ALREADY been applied to the file shown below:\n(none — the first step failed, file is unchanged from the initial state)"
+        ));
+        assert!(block.contains("Step that FAILED:"));
+        assert!(block.contains("Failure reason:\nregion missing anchor"));
+        assert!(block.contains("If the task already appears complete, return NO_CHANGES."));
+    }
+
+    #[test]
+    fn format_repair_context_validation_failure_has_no_failed_step() {
+        let step_a = EditPlanStep::SmartEdit(EditRegion {
+            start: 10,
+            end: 20,
+            task: "first step".into(),
+        });
+        let step_b = EditPlanStep::SmartEdit(EditRegion {
+            start: 30,
+            end: 40,
+            task: "second step".into(),
+        });
+        let ctx = RepairContext {
+            previous_plan: vec![step_a.clone(), step_b.clone()],
+            completed_steps: vec![step_a, step_b],
+            failed_step: None,
+            failure_reason: "LSP diagnostics worsened: 0 -> 4 errors".into(),
+        };
+
+        let block = format_repair_context(&ctx);
+        // Both steps appear in completed.
+        assert!(block.contains("first step"));
+        assert!(block.contains("second step"));
+        assert!(block.contains(
+            "Step that FAILED:\n(no individual step failed; the plan executed in full but post-validation rejected the result"
+        ));
+        assert!(block.contains("LSP diagnostics worsened"));
+    }
+
+    #[test]
+    fn format_repair_context_partial_success_lists_completed_and_failed() {
+        let completed_step = EditPlanStep::LiteralReplace {
+            scope_start: 5,
+            scope_end: 10,
+            all: false,
+            old: vec!["foo".into()],
+            new: vec!["bar".into()],
+        };
+        let failed_step = EditPlanStep::SmartEdit(EditRegion {
+            start: 30,
+            end: 40,
+            task: "rewrite second region".into(),
+        });
+        let ctx = RepairContext {
+            previous_plan: vec![completed_step.clone(), failed_step.clone()],
+            completed_steps: vec![completed_step],
+            failed_step: Some(failed_step),
+            failure_reason: "smart edit returned no diff".into(),
+        };
+
+        let block = format_repair_context(&ctx);
+        // Completed section names the literal replace.
+        assert!(block.contains("LITERAL_REPLACE"));
+        assert!(block.contains("OLD:\nfoo"));
+        // Failed section names the smart edit.
+        assert!(block.contains("rewrite second region"));
+        assert!(block.contains("smart edit returned no diff"));
+        // The "first step failed" stub must NOT appear when partial success exists.
+        assert!(!block.contains("(none — the first step failed"));
     }
 
     #[test]
