@@ -1444,7 +1444,8 @@ async fn execute_empty_file_skips_window_and_recon_phases() {
     );
 
     // Verify the one call we made was the planning prompt, not the
-    // observation or reconnaissance prompt.
+    // observation or reconnaissance prompt. Each phase has a distinct
+    // system message that we can match against.
     let requests = mock_server
         .received_requests()
         .await
@@ -1452,15 +1453,15 @@ async fn execute_empty_file_skips_window_and_recon_phases() {
     assert_eq!(requests.len(), 1);
     let body = String::from_utf8(requests[0].body.clone()).unwrap();
     assert!(
-        body.contains("Plan the edit for one file"),
+        body.contains("Final planning phase"),
         "first call should be the finalize prompt, got: {body}"
     );
     assert!(
-        !body.contains("observation phase"),
+        !body.contains("Observation phase"),
         "first call should NOT be the observation prompt"
     );
     assert!(
-        !body.contains("reconnaissance phase"),
+        !body.contains("Reconnaissance phase"),
         "first call should NOT be the recon prompt"
     );
 
