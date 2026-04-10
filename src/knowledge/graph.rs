@@ -44,11 +44,7 @@ impl DependencyGraph {
         }
 
         // Collect all source files that have symbols
-        let source_files: Vec<&str> = index
-            .summaries
-            .keys()
-            .map(|s| s.as_str())
-            .collect();
+        let source_files: Vec<&str> = index.summaries.keys().map(|s| s.as_str()).collect();
 
         // Build petgraph for PageRank computation
         let mut graph = DiGraph::<&str, ()>::new();
@@ -77,10 +73,9 @@ impl DependencyGraph {
                                     .or_default()
                                     .push(def_file.to_string());
 
-                                if let (Some(&from), Some(&to)) = (
-                                    node_map.get(ref_file.as_str()),
-                                    node_map.get(def_file),
-                                ) {
+                                if let (Some(&from), Some(&to)) =
+                                    (node_map.get(ref_file.as_str()), node_map.get(def_file))
+                                {
                                     graph.add_edge(from, to, ());
                                 }
                             }
@@ -112,8 +107,7 @@ impl DependencyGraph {
 
                     for my_sym in &file_symbols {
                         for other_sym in &other_symbols {
-                            if other_sym.signature.contains(&my_sym.name) && my_sym.name.len() > 2
-                            {
+                            if other_sym.signature.contains(&my_sym.name) && my_sym.name.len() > 2 {
                                 edges
                                     .entry(other_file.clone())
                                     .or_default()

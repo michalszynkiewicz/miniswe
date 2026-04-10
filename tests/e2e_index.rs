@@ -11,10 +11,10 @@ mod helpers;
 use std::fs;
 
 use miniswe::config::Config;
-use miniswe::knowledge::indexer;
-use miniswe::knowledge::graph::{DependencyGraph, populate_symbol_deps};
-use miniswe::knowledge::repo_map;
 use miniswe::knowledge::ProjectIndex;
+use miniswe::knowledge::graph::{DependencyGraph, populate_symbol_deps};
+use miniswe::knowledge::indexer;
+use miniswe::knowledge::repo_map;
 use miniswe::tools;
 use miniswe::tools::permissions::PermissionManager;
 use serde_json::json;
@@ -65,7 +65,9 @@ pub fn create_config() -> Config {
     assert!(!config_syms.is_empty(), "Should find Config symbol");
 
     // Tree-sitter and regex extractors should both report Rust structs as "struct"
-    let config_sym = config_syms.iter().find(|s| s.kind == "struct")
+    let config_sym = config_syms
+        .iter()
+        .find(|s| s.kind == "struct")
         .expect("Should find Config with kind=struct (not class)");
     assert_eq!(config_sym.file, "src/config.rs");
     assert_eq!(config_sym.line, 3, "Config struct should be on line 3");
@@ -140,7 +142,10 @@ fn second() {
 
     let first = &index.lookup("first")[0];
     assert_eq!(first.line, 1);
-    assert_eq!(first.end_line, 3, "first() should end on line 3 (closing brace)");
+    assert_eq!(
+        first.end_line, 3,
+        "first() should end on line 3 (closing brace)"
+    );
 
     let second = &index.lookup("second")[0];
     assert_eq!(second.line, 5);
@@ -210,7 +215,11 @@ fn after_nested() {
 
     let sym = &index.lookup("nested")[0];
     assert_eq!(sym.line, 1);
-    assert_eq!(sym.end_line, 9, "nested() should end at line 9, got {}", sym.end_line);
+    assert_eq!(
+        sym.end_line, 9,
+        "nested() should end at line 9, got {}",
+        sym.end_line
+    );
 
     let after = &index.lookup("after_nested")[0];
     assert_eq!(after.line, 11);
@@ -397,8 +406,16 @@ fn repo_map_files_match_after_deletion() {
     let (_tmp, config) = helpers::create_test_project();
 
     fs::create_dir_all(helpers::project_path(&config, "src")).unwrap();
-    fs::write(helpers::project_path(&config, "src/keep.rs"), "pub fn kept() {}\n").unwrap();
-    fs::write(helpers::project_path(&config, "src/delete.rs"), "pub fn deleted() {}\n").unwrap();
+    fs::write(
+        helpers::project_path(&config, "src/keep.rs"),
+        "pub fn kept() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        helpers::project_path(&config, "src/delete.rs"),
+        "pub fn deleted() {}\n",
+    )
+    .unwrap();
 
     // Index with both files
     let index = indexer::index_project(&config.project_root, None).unwrap();
@@ -470,9 +487,8 @@ fn repo_map_respects_budget() {
     // Create many files to exceed budget
     fs::create_dir_all(helpers::project_path(&config, "src")).unwrap();
     for i in 0..50 {
-        let content = format!(
-            "pub struct Type{i} {{}}\npub fn func{i}() {{}}\npub fn helper{i}() {{}}\n"
-        );
+        let content =
+            format!("pub struct Type{i} {{}}\npub fn func{i}() {{}}\npub fn helper{i}() {{}}\n");
         fs::write(
             helpers::project_path(&config, &format!("src/mod{i}.rs")),
             content,

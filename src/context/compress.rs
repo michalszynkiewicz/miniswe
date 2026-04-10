@@ -174,10 +174,17 @@ fn detect_license_header(lines: &[&str], ext: &str) -> usize {
     }
 
     let license_keywords = [
-        "license", "copyright", "permission is hereby granted",
-        "licensed under", "apache license", "mit license",
-        "gnu general public", "all rights reserved", "bsd",
-        "redistribute", "warranty",
+        "license",
+        "copyright",
+        "permission is hereby granted",
+        "licensed under",
+        "apache license",
+        "mit license",
+        "gnu general public",
+        "all rights reserved",
+        "bsd",
+        "redistribute",
+        "warranty",
     ];
 
     match ext {
@@ -251,10 +258,30 @@ fn is_stdlib_import(trimmed: &str, ext: &str) -> bool {
             let is_import = trimmed.starts_with("import ") || trimmed.starts_with("from ");
             if is_import {
                 let stdlib = [
-                    "os", "sys", "re", "json", "math", "datetime", "collections",
-                    "itertools", "functools", "typing", "pathlib", "io", "abc",
-                    "dataclasses", "enum", "copy", "hashlib", "logging", "unittest",
-                    "argparse", "subprocess", "threading", "time", "random",
+                    "os",
+                    "sys",
+                    "re",
+                    "json",
+                    "math",
+                    "datetime",
+                    "collections",
+                    "itertools",
+                    "functools",
+                    "typing",
+                    "pathlib",
+                    "io",
+                    "abc",
+                    "dataclasses",
+                    "enum",
+                    "copy",
+                    "hashlib",
+                    "logging",
+                    "unittest",
+                    "argparse",
+                    "subprocess",
+                    "threading",
+                    "time",
+                    "random",
                 ];
                 stdlib.iter().any(|lib| {
                     trimmed.starts_with(&format!("import {lib} "))
@@ -269,9 +296,20 @@ fn is_stdlib_import(trimmed: &str, ext: &str) -> bool {
         }
         "js" | "ts" | "tsx" | "jsx" => {
             let builtins = [
-                "\"fs\"", "\"path\"", "\"os\"", "\"url\"", "\"http\"",
-                "\"https\"", "\"crypto\"", "\"util\"", "\"events\"",
-                "'fs'", "'path'", "'os'", "'url'", "'http'",
+                "\"fs\"",
+                "\"path\"",
+                "\"os\"",
+                "\"url\"",
+                "\"http\"",
+                "\"https\"",
+                "\"crypto\"",
+                "\"util\"",
+                "\"events\"",
+                "'fs'",
+                "'path'",
+                "'os'",
+                "'url'",
+                "'http'",
             ];
             let is_import = trimmed.starts_with("import ") || trimmed.starts_with("const ");
             is_import && builtins.iter().any(|b| trimmed.contains(b))
@@ -299,10 +337,30 @@ pub fn elide_std_imports(code: &str, language: &str) -> String {
                 if is_import {
                     // Skip standard library imports
                     let stdlib = [
-                        "os", "sys", "re", "json", "math", "datetime", "collections",
-                        "itertools", "functools", "typing", "pathlib", "io", "abc",
-                        "dataclasses", "enum", "copy", "hashlib", "logging", "unittest",
-                        "argparse", "subprocess", "threading", "time", "random",
+                        "os",
+                        "sys",
+                        "re",
+                        "json",
+                        "math",
+                        "datetime",
+                        "collections",
+                        "itertools",
+                        "functools",
+                        "typing",
+                        "pathlib",
+                        "io",
+                        "abc",
+                        "dataclasses",
+                        "enum",
+                        "copy",
+                        "hashlib",
+                        "logging",
+                        "unittest",
+                        "argparse",
+                        "subprocess",
+                        "threading",
+                        "time",
+                        "random",
                     ];
                     stdlib.iter().any(|lib| {
                         trimmed.starts_with(&format!("import {lib}"))
@@ -316,15 +374,23 @@ pub fn elide_std_imports(code: &str, language: &str) -> String {
             "js" | "ts" | "tsx" | "jsx" => {
                 // Skip node builtins
                 let builtins = [
-                    "\"fs\"", "\"path\"", "\"os\"", "\"url\"", "\"http\"",
-                    "\"https\"", "\"crypto\"", "\"util\"", "\"events\"",
-                    "'fs'", "'path'", "'os'", "'url'", "'http'",
+                    "\"fs\"",
+                    "\"path\"",
+                    "\"os\"",
+                    "\"url\"",
+                    "\"http\"",
+                    "\"https\"",
+                    "\"crypto\"",
+                    "\"util\"",
+                    "\"events\"",
+                    "'fs'",
+                    "'path'",
+                    "'os'",
+                    "'url'",
+                    "'http'",
                 ];
                 let is_import = trimmed.starts_with("import ") || trimmed.starts_with("const ");
-                is_import
-                    && builtins
-                        .iter()
-                        .any(|b| trimmed.contains(b))
+                is_import && builtins.iter().any(|b| trimmed.contains(b))
             }
             _ => false,
         };
@@ -395,128 +461,140 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
     let action = args["action"].as_str().unwrap_or("");
 
     match tool_name {
-        "file" => {
-            match action {
-                "read" => {
-                    let path = args["path"].as_str().unwrap_or("?");
-                    let line_count = content.lines().count();
-                    let mut sigs = Vec::new();
-                    for line in content.lines() {
-                        let stripped = if let Some(pos) = line.find('│') {
-                            &line[pos + '│'.len_utf8()..]
-                        } else {
-                            line
-                        };
-                        let trimmed = stripped.trim();
-                        if (trimmed.starts_with("pub fn ")
-                            || trimmed.starts_with("pub async fn ")
-                            || trimmed.starts_with("fn ")
-                            || trimmed.starts_with("async fn "))
-                            && trimmed.contains('(')
-                        {
-                            let sig = trimmed.split('{').next().unwrap_or(trimmed).trim();
-                            if sig.len() < 80 { sigs.push(sig.to_string()); }
-                        }
-                        if (trimmed.starts_with("pub struct ")
-                            || trimmed.starts_with("pub enum ")
-                            || trimmed.starts_with("pub trait ")
-                            || trimmed.starts_with("struct ")
-                            || trimmed.starts_with("enum ")
-                            || trimmed.starts_with("trait "))
-                            && !trimmed.contains(';')
-                        {
-                            let def = trimmed.split('{').next().unwrap_or(trimmed).trim();
-                            if def.len() < 80 { sigs.push(def.to_string()); }
-                        }
-                        if sigs.len() >= 10 { break; }
-                    }
-                    if sigs.is_empty() {
-                        format!("[read:{path} ({line_count}L) — use file(action='read', path='{path}') to re-read]")
+        "file" => match action {
+            "read" => {
+                let path = args["path"].as_str().unwrap_or("?");
+                let line_count = content.lines().count();
+                let mut sigs = Vec::new();
+                for line in content.lines() {
+                    let stripped = if let Some(pos) = line.find('│') {
+                        &line[pos + '│'.len_utf8()..]
                     } else {
-                        format!(
-                            "[read:{path} ({line_count}L) — use file(action='read', path='{path}') to re-read]\n{}",
-                            sigs.join("\n")
-                        )
-                    }
-                }
-                "search" => {
-                    let query = args["query"].as_str().unwrap_or("?");
-                    let match_count = content.lines().filter(|l| !l.starts_with('[')).count();
-                    format!("[search:\"{query}\"→{match_count} matches]")
-                }
-                "replace" => {
-                    let path = args["path"].as_str().unwrap_or("?");
-                    if content.contains('✓') {
-                        if content.contains("error") && (content.contains("[cargo check]") || content.contains("[lsp]")) {
-                            let errors: Vec<&str> = content.lines()
-                                .filter(|l| l.contains("error")).take(2).collect();
-                            format!("[replace:{path}→ok but errors: {}]", errors.join("; "))
-                        } else {
-                            format!("[replace:{path}→ok]")
+                        line
+                    };
+                    let trimmed = stripped.trim();
+                    if (trimmed.starts_with("pub fn ")
+                        || trimmed.starts_with("pub async fn ")
+                        || trimmed.starts_with("fn ")
+                        || trimmed.starts_with("async fn "))
+                        && trimmed.contains('(')
+                    {
+                        let sig = trimmed.split('{').next().unwrap_or(trimmed).trim();
+                        if sig.len() < 80 {
+                            sigs.push(sig.to_string());
                         }
-                    } else {
-                        let reason = content.lines()
-                            .find(|l| l.contains("not found") || l.contains("matches"))
-                            .map(|l| crate::truncate_chars(l.trim(), 60))
-                            .unwrap_or_else(|| "unknown".into());
-                        format!("[replace:{path}→FAILED: {reason}]")
+                    }
+                    if (trimmed.starts_with("pub struct ")
+                        || trimmed.starts_with("pub enum ")
+                        || trimmed.starts_with("pub trait ")
+                        || trimmed.starts_with("struct ")
+                        || trimmed.starts_with("enum ")
+                        || trimmed.starts_with("trait "))
+                        && !trimmed.contains(';')
+                    {
+                        let def = trimmed.split('{').next().unwrap_or(trimmed).trim();
+                        if def.len() < 80 {
+                            sigs.push(def.to_string());
+                        }
+                    }
+                    if sigs.len() >= 10 {
+                        break;
                     }
                 }
-                "write" => {
-                    let path = args["path"].as_str().unwrap_or("?");
-                    if content.contains('✓') {
-                        let lines = content.lines().next().unwrap_or("");
-                        format!("[write:{path}→{lines}]")
+                if sigs.is_empty() {
+                    format!(
+                        "[read:{path} ({line_count}L) — use file(action='read', path='{path}') to re-read]"
+                    )
+                } else {
+                    format!(
+                        "[read:{path} ({line_count}L) — use file(action='read', path='{path}') to re-read]\n{}",
+                        sigs.join("\n")
+                    )
+                }
+            }
+            "search" => {
+                let query = args["query"].as_str().unwrap_or("?");
+                let match_count = content.lines().filter(|l| !l.starts_with('[')).count();
+                format!("[search:\"{query}\"→{match_count} matches]")
+            }
+            "replace" => {
+                let path = args["path"].as_str().unwrap_or("?");
+                if content.contains('✓') {
+                    if content.contains("error")
+                        && (content.contains("[cargo check]") || content.contains("[lsp]"))
+                    {
+                        let errors: Vec<&str> = content
+                            .lines()
+                            .filter(|l| l.contains("error"))
+                            .take(2)
+                            .collect();
+                        format!("[replace:{path}→ok but errors: {}]", errors.join("; "))
                     } else {
-                        format!("[write:{path}→failed]")
+                        format!("[replace:{path}→ok]")
                     }
+                } else {
+                    let reason = content
+                        .lines()
+                        .find(|l| l.contains("not found") || l.contains("matches"))
+                        .map(|l| crate::truncate_chars(l.trim(), 60))
+                        .unwrap_or_else(|| "unknown".into());
+                    format!("[replace:{path}→FAILED: {reason}]")
                 }
-                "shell" => {
-                    let cmd = args["command"].as_str().unwrap_or("?");
-                    let short_cmd = crate::truncate_chars(cmd, 30);
-                    let exit_code = if content.contains("exit 0") { "ok" } else { "err" };
-                    format!("[shell:\"{short_cmd}\"→{exit_code}]")
-                }
-                _ => format!("[file.{action}→done]"),
             }
-        }
-        "code" => {
-            match action {
-                "diagnostics" => {
-                    let errors = content.lines().filter(|l| l.contains("error")).count();
-                    let warnings = content.lines().filter(|l| l.contains("warning")).count();
-                    format!("[diag:{errors}E,{warnings}W]")
+            "write" => {
+                let path = args["path"].as_str().unwrap_or("?");
+                if content.contains('✓') {
+                    let lines = content.lines().next().unwrap_or("");
+                    format!("[write:{path}→{lines}]")
+                } else {
+                    format!("[write:{path}→failed]")
                 }
-                _ => format!("[code.{action}→done]"),
             }
-        }
-        "web" => {
-            match action {
-                "search" => {
-                    let query = args["query"].as_str().unwrap_or("?");
-                    let result_count = content.lines()
-                        .filter(|l| l.starts_with(|c: char| c.is_ascii_digit())).count();
-                    format!("[web_search:\"{query}\"→{result_count} results]")
-                }
-                "fetch" => {
-                    let url = args["url"].as_str().unwrap_or("?");
-                    format!("[web_fetch:{url}→{}chars]", content.len())
-                }
-                _ => format!("[web.{action}→done]"),
+            "shell" => {
+                let cmd = args["command"].as_str().unwrap_or("?");
+                let short_cmd = crate::truncate_chars(cmd, 30);
+                let exit_code = if content.contains("exit 0") {
+                    "ok"
+                } else {
+                    "err"
+                };
+                format!("[shell:\"{short_cmd}\"→{exit_code}]")
             }
-        }
-        "plan" => {
-            match action {
-                "scratchpad" => "[scratchpad→ok]".to_string(),
-                _ => format!("[plan.{action}→done]"),
+            _ => format!("[file.{action}→done]"),
+        },
+        "code" => match action {
+            "diagnostics" => {
+                let errors = content.lines().filter(|l| l.contains("error")).count();
+                let warnings = content.lines().filter(|l| l.contains("warning")).count();
+                format!("[diag:{errors}E,{warnings}W]")
             }
-        }
-        "fix_file" => {
+            _ => format!("[code.{action}→done]"),
+        },
+        "web" => match action {
+            "search" => {
+                let query = args["query"].as_str().unwrap_or("?");
+                let result_count = content
+                    .lines()
+                    .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+                    .count();
+                format!("[web_search:\"{query}\"→{result_count} results]")
+            }
+            "fetch" => {
+                let url = args["url"].as_str().unwrap_or("?");
+                format!("[web_fetch:{url}→{}chars]", content.len())
+            }
+            _ => format!("[web.{action}→done]"),
+        },
+        "plan" => match action {
+            "scratchpad" => "[scratchpad→ok]".to_string(),
+            _ => format!("[plan.{action}→done]"),
+        },
+        "edit_file" => {
             let path = args["path"].as_str().unwrap_or("?");
             if content.contains('✓') {
-                format!("[fix_file:{path}→ok]")
+                format!("[edit_file:{path}→ok]")
             } else {
-                format!("[fix_file:{path}→failed]")
+                format!("[edit_file:{path}→failed]")
             }
         }
         "mcp_use" => {
@@ -534,7 +612,17 @@ fn extract_symbol_names_from_content(content: &str) -> Vec<String> {
     for line in content.lines().take(50) {
         let trimmed = line.trim();
         // Look for function/struct/class definitions
-        for keyword in &["pub fn ", "fn ", "pub struct ", "struct ", "pub enum ", "class ", "def ", "function ", "export function "] {
+        for keyword in &[
+            "pub fn ",
+            "fn ",
+            "pub struct ",
+            "struct ",
+            "pub enum ",
+            "class ",
+            "def ",
+            "function ",
+            "export function ",
+        ] {
             if trimmed.contains(keyword) {
                 if let Some(after) = trimmed.split(keyword).nth(1) {
                     let name: String = after
@@ -590,7 +678,8 @@ def hello():
 
     #[test]
     fn test_elide_rust_std_imports() {
-        let code = "use std::collections::HashMap;\nuse crate::config::Config;\nuse anyhow::Result;\n";
+        let code =
+            "use std::collections::HashMap;\nuse crate::config::Config;\nuse anyhow::Result;\n";
         let elided = elide_std_imports(code, "rs");
         assert!(!elided.contains("std::collections"));
         assert!(elided.contains("crate::config"));
@@ -602,8 +691,14 @@ def hello():
         let args = serde_json::json!({"action": "read", "path": "src/main.rs"});
         let content = "pub fn main() {\n    println!(\"hello\");\n}\n";
         let summary = summarize_tool_result("file", &args, content);
-        assert!(summary.contains("src/main.rs"), "should have path: {summary}");
-        assert!(summary.contains("read"), "should hint at re-read: {summary}");
+        assert!(
+            summary.contains("src/main.rs"),
+            "should have path: {summary}"
+        );
+        assert!(
+            summary.contains("read"),
+            "should hint at re-read: {summary}"
+        );
     }
 
     #[test]
@@ -668,7 +763,12 @@ def hello():
         let compressed = compress_for_reading(code, "rs");
         // Doc comments must be kept
         assert!(compressed[0].is_some());
-        assert!(compressed[0].as_ref().unwrap().contains("Module description"));
+        assert!(
+            compressed[0]
+                .as_ref()
+                .unwrap()
+                .contains("Module description")
+        );
         assert!(compressed[1].is_some());
     }
 

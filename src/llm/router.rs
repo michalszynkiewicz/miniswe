@@ -11,8 +11,8 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 
-use crate::config::{Config, ModelConfig, ModelRole};
 use super::{ChatRequest, ChatResponse, LlmClient};
+use crate::config::{Config, ModelConfig, ModelRole};
 
 /// Routes LLM requests to the appropriate client based on model role.
 pub struct ModelRouter {
@@ -92,10 +92,7 @@ impl ModelRouter {
     pub fn startup_summary(&self) -> Vec<String> {
         if !self.is_multi_model() {
             let cfg = self.config_for(ModelRole::Default);
-            return vec![format!(
-                "Model: {} @ {}",
-                cfg.model, cfg.endpoint
-            )];
+            return vec![format!("Model: {} @ {}", cfg.model, cfg.endpoint)];
         }
 
         let mut lines = vec!["Models:".to_string()];
@@ -112,10 +109,7 @@ impl ModelRouter {
                 continue; // Same as default, skip
             }
             let cfg = self.config_for(*role);
-            lines.push(format!(
-                "  {label}: {} @ {}",
-                cfg.model, cfg.endpoint
-            ));
+            lines.push(format!("  {label}: {} @ {}", cfg.model, cfg.endpoint));
         }
         lines
     }
@@ -123,6 +117,18 @@ impl ModelRouter {
     /// Non-streaming chat request (for summarization, etc.).
     pub async fn chat(&self, role: ModelRole, request: &ChatRequest) -> Result<ChatResponse> {
         self.client_for(role).chat(request).await
+    }
+
+    /// Non-streaming chat request with optional cancellation.
+    pub async fn chat_with_cancel(
+        &self,
+        role: ModelRole,
+        request: &ChatRequest,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<ChatResponse> {
+        self.client_for(role)
+            .chat_with_cancel(request, cancelled)
+            .await
     }
 
     /// Convenience: stream a chat request using the client for the given role.
@@ -136,7 +142,9 @@ impl ModelRouter {
     where
         F: FnMut(&str),
     {
-        self.client_for(role).chat_stream(request, on_token, cancelled).await
+        self.client_for(role)
+            .chat_stream(request, on_token, cancelled)
+            .await
     }
 
     fn key_for(&self, role: ModelRole) -> &str {

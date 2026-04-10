@@ -52,10 +52,7 @@ pub fn index_project(root: &Path, previous: Option<&ProjectIndex>) -> Result<Pro
             continue;
         }
 
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();
@@ -97,20 +94,19 @@ pub fn index_project(root: &Path, previous: Option<&ProjectIndex>) -> Result<Pro
 
                 // (Re-)index this file
                 if let Ok(content) = std::fs::read_to_string(path) {
-                    let mut symbols = if let Some(ts_result) =
-                        ts_extract::extract(&rel_str, &content, ext)
-                    {
-                        for sym_ref in &ts_result.references {
-                            index
-                                .references
-                                .entry(rel_str.clone())
-                                .or_default()
-                                .push(sym_ref.name.clone());
-                        }
-                        ts_result.symbols
-                    } else {
-                        extract_symbols(&rel_str, &content, ext)
-                    };
+                    let mut symbols =
+                        if let Some(ts_result) = ts_extract::extract(&rel_str, &content, ext) {
+                            for sym_ref in &ts_result.references {
+                                index
+                                    .references
+                                    .entry(rel_str.clone())
+                                    .or_default()
+                                    .push(sym_ref.name.clone());
+                            }
+                            ts_result.symbols
+                        } else {
+                            extract_symbols(&rel_str, &content, ext)
+                        };
 
                     // Compute end_line for each symbol
                     compute_end_lines(&mut symbols, &content);
@@ -136,7 +132,10 @@ pub fn index_project(root: &Path, previous: Option<&ProjectIndex>) -> Result<Pro
     index.file_tree.sort();
 
     if reused > 0 {
-        tracing::info!("Incremental index: {reused} files reused, {} re-indexed", file_count - reused);
+        tracing::info!(
+            "Incremental index: {reused} files reused, {} re-indexed",
+            file_count - reused
+        );
     }
 
     Ok(index)
@@ -146,16 +145,8 @@ pub fn index_project(root: &Path, previous: Option<&ProjectIndex>) -> Result<Pro
 ///
 /// Removes old symbols for that file, re-extracts, recomputes end_lines,
 /// updates mtime, and saves the index to disk. Takes <1ms per file.
-pub fn reindex_file(
-    rel_path: &str,
-    abs_path: &Path,
-    index: &mut ProjectIndex,
-    miniswe_dir: &Path,
-) {
-    let ext = abs_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+pub fn reindex_file(rel_path: &str, abs_path: &Path, index: &mut ProjectIndex, miniswe_dir: &Path) {
+    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     if !SOURCE_EXTENSIONS.contains(&ext) {
         return;
@@ -201,7 +192,9 @@ pub fn reindex_file(
     // Update summary and mtime
     let summary = generate_summary(&content, &symbols, ext);
     index.summaries.insert(rel_path.to_string(), summary);
-    index.mtimes.insert(rel_path.to_string(), file_mtime(abs_path));
+    index
+        .mtimes
+        .insert(rel_path.to_string(), file_mtime(abs_path));
 
     // Recount
     index.total_symbols = index.symbols.values().map(|v| v.len()).sum();
@@ -625,11 +618,7 @@ fn extract_name_after(line: &str, keyword: &str) -> Option<String> {
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
         .collect();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    if name.is_empty() { None } else { Some(name) }
 }
 
 /// Generate a one-line summary of a file.
@@ -650,11 +639,7 @@ fn generate_summary(content: &str, symbols: &[Symbol], ext: &str) -> String {
     }
 
     let kinds: Vec<&str> = symbols.iter().map(|s| s.kind.as_str()).collect();
-    let names: Vec<&str> = symbols
-        .iter()
-        .take(5)
-        .map(|s| s.name.as_str())
-        .collect();
+    let names: Vec<&str> = symbols.iter().take(5).map(|s| s.name.as_str()).collect();
 
     let kind_summary = {
         let mut counts: HashMap<&str, usize> = HashMap::new();
@@ -834,10 +819,7 @@ pub fn audit_file_sizes(root: &Path, max_lines: usize) -> Vec<(String, usize)> {
             continue;
         }
 
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         if !SOURCE_EXTENSIONS.contains(&ext) {
             continue;

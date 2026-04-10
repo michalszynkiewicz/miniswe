@@ -101,8 +101,19 @@ pub struct ModelConfig {
     pub max_output_tokens: usize,
     /// Timeout in seconds for non-streaming chat requests.
     pub request_timeout_secs: u64,
+    /// Idle timeout (seconds) for streamed LLM responses. If no token
+    /// activity is observed for this many seconds the request is killed
+    /// and retried as a transient failure. Distinguishes "stuck
+    /// connection" from "model thinking hard" — a model that is
+    /// producing tokens steadily, even slowly, is *not* idle.
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
     /// Maximum number of transient retry attempts for LLM requests.
     pub max_retries: usize,
+}
+
+fn default_stream_idle_timeout_secs() -> u64 {
+    30
 }
 
 /// Token budget allocation for context assembly.
@@ -316,7 +327,8 @@ impl Default for ModelConfig {
             context_window: 50000,
             temperature: 0.15,
             max_output_tokens: 16384,
-            request_timeout_secs: 60,
+            request_timeout_secs: 120,
+            stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             max_retries: 6,
         }
     }

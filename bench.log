@@ -1,36 +1,44 @@
-nohup: ignoring input
-=== miniswe provider benchmark: task_B_max_rounds_flag ===
-SHA:          cc34d2626faf32c1b6dd1b8b33af693fb936b098
-Strategy:     bisect
-Task:         Add a CLI flag that lets the user limit the maximum number of agent rounds per s...
-Endpoint:     http://localhost:8464
-Results:      /home/michal/dev/minime/benchmark_results/task_B_max_rounds_flag_20260402_173120
-Timeout:      1800s per run
-Max rounds:   50 per attempt
-Max attempts: 3 per run
-Runs/variant: 1
+=== Docker-isolated provider benchmark ===
+Image:    miniswe-bench
+SHA:      cc34d2626faf32c1b6dd1b8b33af693fb936b098
+Timeout:  2400s
+Rounds:   80
+Results:  /home/claude/minime/benchmark_results/docker_20260405_113807
+Task:     Add a CLI flag --system-prompt-override (short: -s) that takes a string and repl...
 
-Checking LLM endpoint...
-OK
+Building Docker image...
+#15 exporting layers
+#15 exporting layers 11.4s done
+#15 writing image sha256:2aa6db4020837e94363d0ad3c7ab4e743a749ad701ad8ba62519d8dce586a3a2 done
+#15 naming to docker.io/library/miniswe-bench done
+#15 DONE 11.4s
 
-═══ PHASE 1: Coarse triage ═══
+═══ Phase 1: baseline vs all_off ═══
 
---- 00_baseline (run 1/1) ---
-    attempt 1/3 (1800s remaining)
-    validation: FAIL (0/6) compile:FAIL build:SKIP help:SKIP parse:SKIP test:SKIP smoke:SKIP 
-    attempt 1: FAIL
-    attempt 2/3 (1440s remaining)
-    validation: PASS (6/6) compile:PASS build:PASS help:PASS(--max-rounds) parse:PASS test:PASS smoke:PASS(1r) 
-    attempt 2: PASS
-    RESULT: PASS in 2 attempt(s), 964s total
-    rounds=97 tools=94 errors=13 tokens=497
+--- 00_baseline ---
+=== ATTEMPT 1/3 (2400s remaining) ===
+compile:FAIL
+build:SKIP
+=== ATTEMPT 1 RESULT: 0/6 ===
+=== ATTEMPT 2/3 (1098s remaining) ===
+compile:FAIL
+build:SKIP
+=== ATTEMPT 2 RESULT: 0/6 ===
+=== ATTEMPT 3: SKIPPED (-1s left) ===
+=== FINAL: 0/6 after 3 attempt(s) ===
 
---- 01_all_off (run 1/1) ---
-    attempt 1/3 (1800s remaining)
-    validation: PASS (6/6) compile:PASS build:PASS help:PASS(--max-rounds) parse:PASS test:PASS smoke:PASS(1r) 
-    attempt 1: PASS
-    RESULT: PASS in 1 attempt(s), 291s total
-    rounds=46 tools=45 errors=1 tokens=285
+    === FINAL: 0/6 after 3 attempt(s) ===
+    rounds=182 attempts=2 wall=2401s
+    compile:FAIL
+    compile:FAIL
 
---- 02_core_off (run 1/1) ---
-    attempt 1/3 (1800s remaining)
+
+=================================================================
+  RESULTS
+=================================================================
+Variant                Rounds  Att     Time Result
+-----------------------------------------------------------------
+00_baseline               182    2    2401s  0/6
+=================================================================
+
+Detailed results: /home/claude/minime/benchmark_results/docker_20260405_113807/

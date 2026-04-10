@@ -32,6 +32,7 @@ use crate::knowledge::graph::DependencyGraph;
 use crate::knowledge::indexer;
 use crate::knowledge::{ProjectIndex, repo_map};
 use crate::llm::ModelRouter;
+use crate::logging::SessionLog;
 use crate::lsp::LspClient;
 
 /// Result of executing a tool.
@@ -124,9 +125,10 @@ async fn execute_file_tool(
             if let Err(e) = perms.resolve_and_check_path(path) {
                 return Ok(ToolResult::err(e));
             }
+            let baseline = capture_edit_baseline(path, config, lsp).await;
             let mut result = edit::execute(args, config).await?;
             if result.success {
-                finalize_file_edit(path, config, &mut result, lsp).await;
+                finalize_file_edit(path, config, &mut result, lsp, baseline).await;
             }
             Ok(result)
         }
@@ -165,9 +167,10 @@ async fn execute_write_file_tool(
     if let Err(e) = perms.resolve_and_check_path(path) {
         return Ok(ToolResult::err(e));
     }
+    let baseline = capture_edit_baseline(path, config, lsp).await;
     let mut result = write_file::execute(args, config).await?;
     if result.success {
-        finalize_file_edit(path, config, &mut result, lsp).await;
+        finalize_file_edit(path, config, &mut result, lsp, baseline).await;
     }
     Ok(result)
 }
@@ -273,17 +276,65 @@ pub async fn execute_edit_file_tool(
     perms: &PermissionManager,
     router: &ModelRouter,
     lsp: Option<&LspClient>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+    log: Option<&SessionLog>,
 ) -> Result<ToolResult> {
     let path = args["path"].as_str().unwrap_or("");
     if let Err(e) = perms.resolve_and_check_path(path) {
         return Ok(ToolResult::err(e));
     }
 
-    let mut result = edit_file::execute(args, config, router, lsp).await?;
+    let baseline = capture_edit_baseline(path, config, lsp).await;
+    let mut result = edit_file::execute(args, config, router, lsp, cancelled, log).await?;
     if result.success {
-        finalize_file_edit(path, config, &mut result, lsp).await;
+        finalize_file_edit(path, config, &mut result, lsp, baseline).await;
     }
     Ok(result)
+}
+
+/// State captured for a file *before* an edit runs. Used by `auto_check`
+/// to distinguish errors the edit *introduced* from errors that were
+/// already there (or that the file is brand new and we have no baseline
+/// at all).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EditBaseline {
+    /// LSP error count for the file before the edit. 0 if LSP is
+    /// unavailable, the file is new, or the count couldn't be obtained.
+    pub lsp_errors: usize,
+    /// Whether the file existed on disk before the edit. False for files
+    /// being created by write_file or by edit_file's new-file path.
+    pub existed_before: bool,
+}
+
+impl EditBaseline {
+    pub(crate) fn new_unknown() -> Self {
+        Self {
+            lsp_errors: 0,
+            existed_before: false,
+        }
+    }
+}
+
+/// Capture pre-edit baseline state for a file. Returns LSP error count
+/// (0 if unavailable) and whether the file existed on disk before this
+/// edit. Called *before* dispatching to write_file / edit_file / replace
+/// so that `auto_check` can tell brand-new files apart from edits.
+async fn capture_edit_baseline(
+    path: &str,
+    config: &Config,
+    lsp: Option<&LspClient>,
+) -> EditBaseline {
+    let abs_path = config.project_root.join(path);
+    let existed_before = abs_path.exists();
+    let lsp_errors = if existed_before {
+        lsp_error_count_inner(&abs_path, config, lsp).await
+    } else {
+        0
+    };
+    EditBaseline {
+        lsp_errors,
+        existed_before,
+    }
 }
 
 async fn finalize_file_edit(
@@ -291,9 +342,34 @@ async fn finalize_file_edit(
     config: &Config,
     result: &mut ToolResult,
     lsp: Option<&LspClient>,
+    baseline: EditBaseline,
 ) {
     reindex_changed_file(path, config);
-    auto_check(path, config, result, lsp).await;
+    auto_check(path, config, result, lsp, baseline).await;
+}
+
+/// Inner: query the LSP error count for an existing file path. Returns 0
+/// if LSP is unavailable or the file isn't reachable.
+async fn lsp_error_count_inner(
+    abs_path: &std::path::Path,
+    config: &Config,
+    lsp: Option<&LspClient>,
+) -> usize {
+    let Some(lsp) = lsp else {
+        return 0;
+    };
+    if !lsp.is_ready() || lsp.has_crashed() {
+        return 0;
+    }
+    if lsp.notify_file_changed(abs_path).is_err() {
+        return 0;
+    }
+    let timeout = std::time::Duration::from_millis(config.lsp.diagnostic_timeout_ms);
+    let diags = lsp.get_diagnostics(abs_path, timeout).await;
+    diags
+        .iter()
+        .filter(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
+        .count()
 }
 
 /// Re-index a single changed file. Best-effort — doesn't fail the tool call.
@@ -312,7 +388,25 @@ fn reindex_changed_file(rel_path: &str, config: &Config) {
 /// Auto-run type checker after editing a source file. Appends output + source
 /// context around errors to the tool result. Runs in a blocking thread to
 /// avoid stalling the async runtime.
-async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: Option<&LspClient>) {
+///
+/// `baseline` carries the LSP error count for the file *before* the edit
+/// was applied AND whether the file existed at all. The result is marked as
+/// failure only if the edit caused the error count to grow on a pre-existing
+/// file. Pre-existing errors that the edit didn't touch are surfaced as
+/// informational; errors in brand-new files (where we have no baseline at
+/// all) are surfaced as WARNINGs — non-blocking, but flagged loudly enough
+/// that the agent doesn't shrug them off. This applies to both the LSP path
+/// and the non-LSP fallback checkers (cargo check, py_compile, tsc, go vet,
+/// mvn).
+async fn auto_check(
+    path: &str,
+    config: &Config,
+    result: &mut ToolResult,
+    lsp: Option<&LspClient>,
+    baseline: EditBaseline,
+) {
+    let baseline_errors = baseline.lsp_errors;
+    let is_new_file = !baseline.existed_before;
     // Try LSP diagnostics first — ~200ms vs 2-5s for compiler check
     {
         if let Some(lsp) = lsp {
@@ -328,13 +422,47 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
                             .iter()
                             .filter(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
                             .collect();
+                        // For brand-new files we have no baseline at all,
+                        // so any errors are surfaced as informational —
+                        // don't flip success on new helper scripts whose
+                        // imports happen to be unresolved.
+                        let regressed = !is_new_file && errors.len() > baseline_errors;
                         if errors.is_empty() {
                             result.content.push_str("\n[lsp] OK");
+                        } else if is_new_file {
+                            let capped = errors.len().min(5);
+                            result.content.push_str(&format!(
+                                "\n[lsp] WARNING: {} error(s) introduced by newly-created {path} — fix before relying on this file:\n",
+                                errors.len()
+                            ));
+                            for diag in &errors[..capped] {
+                                let line = diag.range.start.line + 1;
+                                let col = diag.range.start.character + 1;
+                                result.content.push_str(&format!(
+                                    "{}:{}:{}: error: {}\n",
+                                    path, line, col, diag.message
+                                ));
+                            }
+                            if errors.len() > capped {
+                                result.content.push_str(&format!(
+                                    "... and {} more errors\n",
+                                    errors.len() - capped
+                                ));
+                            }
+                        } else if !regressed {
+                            // Pre-existing errors weren't introduced by this
+                            // edit — surface them as informational, don't
+                            // flip success.
+                            result.content.push_str(&format!(
+                                "\n[lsp] OK ({} pre-existing error(s) in {path}, unchanged by this edit)",
+                                errors.len()
+                            ));
                         } else {
                             let capped = errors.len().min(5);
                             result.content.push_str(&format!(
-                                "\n[lsp] {} error(s) in {path}:\n",
-                                errors.len()
+                                "\n[lsp] {} error(s) in {path} (was {} before this edit):\n",
+                                errors.len(),
+                                baseline_errors
                             ));
                             for diag in &errors[..capped] {
                                 let line = diag.range.start.line + 1;
@@ -430,10 +558,33 @@ async fn auto_check(path: &str, config: &Config, result: &mut ToolResult, lsp: O
         .collect();
 
     if relevant.is_empty() {
-        result
-            .content
-            .push_str(&format!("\n[{checker_name}] failed (no details captured)"));
-        result.success = false;
+        if is_new_file {
+            // New file with no parseable error details — surface as a
+            // warning so the agent doesn't shrug it off, but don't flip
+            // success (the file was written as requested).
+            result.content.push_str(&format!(
+                "\n[{checker_name}] WARNING: errors reported for newly-created {path} but no details were captured — fix before relying on this file"
+            ));
+        } else {
+            result
+                .content
+                .push_str(&format!("\n[{checker_name}] failed (no details captured)"));
+            result.success = false;
+        }
+        return;
+    }
+
+    if is_new_file {
+        // For brand-new files we have no baseline — the model is
+        // creating a helper script whose imports may not yet resolve in
+        // the project's environment, etc. Surface as a WARNING so the
+        // agent treats it as a real signal, but do NOT flip success —
+        // the file was written as requested.
+        result.content.push_str(&format!(
+            "\n[{checker_name}] WARNING: {} line(s) reported for newly-created {path} — fix before relying on this file\n",
+            relevant.len()
+        ));
+        result.content.push_str(&relevant.join("\n"));
         return;
     }
 

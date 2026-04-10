@@ -67,9 +67,17 @@ impl SessionLog {
             let mut f = f.try_clone().ok();
             if let Some(ref mut f) = f {
                 let _ = writeln!(f, "# miniswe session log");
-                let _ = writeln!(f, "# started: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+                let _ = writeln!(
+                    f,
+                    "# started: {}",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                );
                 let _ = writeln!(f, "# project: {}", config.project_root.display());
-                let _ = writeln!(f, "# model: {} @ {}", config.model.model, config.model.endpoint);
+                let _ = writeln!(
+                    f,
+                    "# model: {} @ {}",
+                    config.model.model, config.model.endpoint
+                );
                 let _ = writeln!(f, "# level: {}", config.logging.level);
                 let _ = writeln!(f, "---");
             }
@@ -95,7 +103,9 @@ impl SessionLog {
             return;
         }
         let icon = if success { "✓" } else { "✗" };
-        self.write(&format!("[tool] {icon} {name}({args_summary}) → {first_line}"));
+        self.write(&format!(
+            "[tool] {icon} {name}({args_summary}) → {first_line}"
+        ));
     }
 
     /// Log the start of an agent round (info level).
@@ -150,7 +160,10 @@ impl SessionLog {
             return;
         }
         let icon = if success { "✓" } else { "✗" };
-        self.write(&format!("[tool:result] {icon} {name}\n{}", truncate(content, 2000)));
+        self.write(&format!(
+            "[tool:result] {icon} {name}\n{}",
+            truncate(content, 2000)
+        ));
     }
 
     /// Log a file modification (debug level).
@@ -164,6 +177,22 @@ impl SessionLog {
     /// Log an LLM error (debug level).
     pub fn llm_error(&self, error: &str) {
         self.write(&format!("[error:llm] {error}"));
+    }
+
+    /// Log an internal tool stage transition (debug level).
+    pub fn tool_stage(&self, tool: &str, stage: &str) {
+        if self.level < LogLevel::Debug {
+            return;
+        }
+        self.write(&format!("[tool:stage] {tool} {stage}"));
+    }
+
+    /// Log additional tool diagnostics (debug level).
+    pub fn tool_debug(&self, tool: &str, detail: &str) {
+        if self.level < LogLevel::Debug {
+            return;
+        }
+        self.write(&format!("[tool:debug] {tool} {}", truncate(detail, 20000)));
     }
 
     // ── Trace level: internals ──────────────────────────────────────
@@ -183,7 +212,9 @@ impl SessionLog {
         if self.level < LogLevel::Trace {
             return;
         }
-        self.write(&format!("[masking] {masked_count}/{total} tool results compressed"));
+        self.write(&format!(
+            "[masking] {masked_count}/{total} tool results compressed"
+        ));
     }
 
     /// Log a custom trace message (trace level).

@@ -39,14 +39,14 @@ miniswe operates on one principle: **give the model the right tools and let it d
 
 ### Core Components
 
-- **Grouped Tools** — 5 top-level tools (`file`, `code`, `web`, `plan`, `fix_file`) with action-based dispatch. Reduces function list size for small models while keeping full functionality via `action='help'`.
+- **Compact Tool Surface** — grouped tools (`file`, `code`, `web`, `plan`) plus focused top-level editors (`edit_file`, `write_file`) and optional `mcp_use`.
 - **Pull-based Context** — Context actions (`code(action='repo_map')`, `code(action='project_info')`, `code(action='architecture_notes')`) let the model fetch project knowledge on demand instead of injecting everything into the system prompt.
 - **Unified Compression** — Single-pass timeline compression. When conversation exceeds the token budget, older messages are LLM-summarized into a narrative and archived to `.miniswe/session_archive.md`.
 - **Knowledge Engine** — Tree-sitter AST parsing (19 languages), PageRank-based dependency graph, doc-header extraction for file summaries, incremental re-indexing after edits.
 - **LSP Integration** — Auto-downloads rust-analyzer (or other language servers). Provides ~200ms diagnostics after edits (vs 2-5s cargo check) plus `code(action='goto_definition')` and `code(action='find_references')`.
-- **fix_file Tool** — LLM-powered atomic patching. Describe a change and it applies validated edits across one file, with pre-planned literal replacements for obvious repeated text edits, scoped smart edits for structural changes, split fallback for broad patches, and optional LSP validation.
+- **edit_file Tool** — LLM-powered atomic patching. Describe a change and it applies validated edits across one file, with pre-planned literal replacements for obvious repeated text edits, scoped smart edits for structural changes, split fallback for broad patches, and optional LSP validation.
 - **Smart Edit** — 3-layer fuzzy matching (exact trim, indentation-preserving, line-similarity), bracket balance detection, edit failure tracking (forces write after 2 failures).
-- **Tool System** — 5 grouped tools + `fix_file` + unlimited MCP tools. Path jailing, shell approval, per-query web access control.
+- **Tool System** — grouped tools plus `edit_file`, `write_file`, and optional MCP tools. Path jailing, shell approval, and per-query web access control.
 - **LLM Interface** — OpenAI-compatible API with streaming, tool call parsing, multi-model routing (plan/code/fast roles).
 
 ### Context Budget (dynamic, based on context_window)
@@ -64,7 +64,7 @@ Per-result budget: `context_window / 10` (~6000 chars at 60K). Large results (we
 
 | Command | Description |
 |---------|-------------|
-| `miniswe` | Interactive REPL mode (Ctrl+R history search) |
+| `miniswe` | Interactive REPL mode |
 | `miniswe "message"` | Single-shot agent execution |
 | `miniswe -y "message"` | Headless mode (auto-approve all permissions) |
 | `miniswe init` | Initialize project (index, profile, graph) |
@@ -80,21 +80,25 @@ Per-result budget: `context_window / 10` (~6000 chars at 60K). Large results (we
 | `/clear` | Clear conversation history only |
 | `/help` | Show available commands |
 | `quit` | Exit |
+| `Ctrl+O` | Toggle detail viewer for the latest tool result |
 | `Ctrl+C` | Interrupt current LLM generation |
-| `Ctrl+R` | Search input history |
+| `Ctrl+D` | Exit |
+| `Up` / `Down` | Scroll output when input is empty; otherwise navigate input history |
+| `PgUp` / `PgDn` | Scroll output faster |
+| `Ctrl+Home` / `Ctrl+End` | Jump to top or bottom of output |
 
 ## Tools
 
-Tools are grouped to reduce the function list for small models. Each group uses `action='help'` to list available sub-actions.
+Tools are grouped where that keeps the surface small. File editing uses focused top-level tools.
 
 ### `file` — File I/O and shell
 
 | Action | Purpose |
 |--------|---------|
 | `read` | Read file contents with line numbers (auto-truncated to budget) |
-| `write` | Create or rewrite files (preferred for files under 200 lines) |
+| `delete` | Delete an existing file |
 | `replace` | Replace text in a file (fuzzy matching fallback, `all=true` for every occurrence) |
-| `search` | ripgrep search — `query` (plain text) or `pattern` (regex) |
+| `search` | Local ripgrep search inside the project — `query` (plain text) or `pattern` (regex) |
 | `shell` | Execute shell commands (output saved to file if large) |
 | `revert` | Revert files to a previous round via shadow git snapshots |
 
@@ -113,7 +117,7 @@ Tools are grouped to reduce the function list for small models. Each group uses 
 
 | Action | Purpose |
 |--------|---------|
-| `search` | Web search via Serper (shows query, asks permission) |
+| `search` | General web search via Serper when configured; otherwise falls back to GitHub repository search only |
 | `fetch` | Fetch URL as markdown (large pages saved to file with preview) |
 
 ### `plan` — Structured planning
@@ -122,7 +126,7 @@ Tools are grouped to reduce the function list for small models. Each group uses 
 |--------|---------|
 | `set` | Create a plan with compile-gated steps |
 | `check` | Mark step done (runs compile gate if enabled) |
-| `refine` | Split a step into substeps |
+| `refine` | Replace one step with a more detailed flat sequence of steps |
 | `show` | View current plan |
 | `scratchpad` | Save working notes (agent's memory) |
 
@@ -130,18 +134,23 @@ Tools are grouped to reduce the function list for small models. Each group uses 
 
 | Tool | Purpose |
 |------|---------|
-| `fix_file` | LLM-powered code transformation — describe a change, it gets applied atomically |
+| `edit_file` | LLM-powered code transformation — describe a change, it gets applied atomically |
+| `write_file` | Create or overwrite a file; omit `content` only to create a new empty file |
 | `mcp_use` | Call any tool on a connected MCP server |
 
-`fix_file` accepts `path` and `task`, plus optional `lsp_validation`.
+`edit_file` accepts `path` and `task`, plus optional `lsp_validation`.
 
-For broad edits such as updating repeated call sites, `fix_file` can pre-plan smaller steps before patching. The plan may use deterministic literal replacements for exact text changes and scoped LLM patching for ambiguous or structural regions. All edits are validated atomically before the file is finalized.
+For broad edits such as updating repeated call sites, `edit_file` can pre-plan smaller steps before patching. The plan may use deterministic literal replacements for exact text changes and scoped LLM patching for ambiguous or structural regions. All edits are validated atomically before the file is finalized.
 
 | `lsp_validation` | Behavior |
 |------------------|----------|
 | `auto` | Default. Use LSP diagnostics if available; skip if unavailable. |
 | `require` | Require LSP diagnostics and reject patches that worsen file errors. |
 | `off` | Skip LSP diagnostics, useful for unsupported text/config files. |
+
+`write_file` accepts `path` and optional `content`.
+If `content` is omitted, it creates a new empty file.
+Do not use it for partial edits to existing files.
 
 ## LSP Support
 
@@ -188,6 +197,14 @@ plan = true             # plan tool group
 search_backend = "serper"
 fetch_backend = "jina"
 ```
+
+To enable general web search, put your Serper key in:
+
+```text
+~/.miniswe/serper.key
+```
+
+Without that key, `web(search)` falls back to GitHub repository search only.
 
 ## Benchmarking
 

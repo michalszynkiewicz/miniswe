@@ -37,6 +37,4 @@ pub enum Command {
         /// The planning question or task
         message: String,
     },
-
 }
-

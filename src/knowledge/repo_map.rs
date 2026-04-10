@@ -42,10 +42,7 @@ pub fn render(
     let mut file_symbols: HashMap<&str, Vec<&Symbol>> = HashMap::new();
     for symbols in index.symbols.values() {
         for sym in symbols {
-            file_symbols
-                .entry(sym.file.as_str())
-                .or_default()
-                .push(sym);
+            file_symbols.entry(sym.file.as_str()).or_default().push(sym);
         }
     }
 

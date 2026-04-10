@@ -18,7 +18,7 @@ The plan tool definition had `name: "diagnostics"` instead of `name: "plan"`. Th
 |---|---|---|---|---|
 | Baseline (plan fix only) | **0/6** | 2 | 2401s | 182 |
 | Exp 1: describe_code tool | **6/6** | 3 | 2419s | — |
-| Exp 2: strict plan + detail | **5/6** | 2 | 2403s | — |
+| Exp 2: strict plan + step refinement | **5/6** | 2 | 2403s | — |
 
 ### Validation checks (6 total)
 1. `cargo check` — compilation
@@ -52,9 +52,9 @@ The plan tool definition had `name: "diagnostics"` instead of `name: "plan"`. Th
 
 **Changes**:
 - Steps must be completed in order (check rejects out-of-order)
-- New `plan(action='detail', step=N, content='...')` action for sub-step breakdown
+- At the time of this experiment, the branch under test exposed a dedicated action for step breakdown. The current product uses `plan(action='refine', ...)` to replace one step with a more detailed flat sequence.
 - Plan injection highlights current step, hides non-current sub-steps
-- System prompt guides explicit workflow: explore → plan → detail → execute → check → verify
+- System prompt guides explicit workflow: explore → plan → refine → execute → check → verify
 - Enhanced plan feedback (step count, next step guidance)
 - Fixed plan tool name from `diagnostics` to `plan`
 
@@ -65,7 +65,7 @@ The plan tool definition had `name: "diagnostics"` instead of `name: "plan"`. Th
 - Attempt 2: 5/6 — same issue, couldn't fix within remaining time
 - Attempt 3: Skipped (timeout)
 
-**Decision**: Not merged. The strict plan enforcement showed promise (5/6 on first attempt vs baseline 0/6) but the model still struggled with updating all call sites. The `detail` sub-step feature was available but may not have been used effectively. Results documented here.
+**Decision**: Not merged. The strict plan enforcement showed promise (5/6 on first attempt vs baseline 0/6) but the model still struggled with updating all call sites. The step-breakdown feature available in that experiment may not have been used effectively. Results documented here.
 
 ## Key Observations
 

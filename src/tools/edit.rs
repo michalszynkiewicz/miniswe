@@ -19,12 +19,12 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 
     if path_str.is_empty() {
         return Ok(ToolResult::err(
-            "Missing required parameter: path. Expected JSON arguments: {\"action\":\"replace\",\"path\":\"src/main.rs\",\"old\":\"exact text to replace\",\"new\":\"replacement text\"}. Do not use start_line/end_line with replace. For multi-location edits, use fix_file.".into()
+            "Missing required parameter: path. Expected JSON arguments: {\"action\":\"replace\",\"path\":\"src/main.rs\",\"old\":\"exact text to replace\",\"new\":\"replacement text\"}. Do not use start_line/end_line with replace. For multi-location edits, use edit_file.".into()
         ));
     }
     if old.is_empty() {
         return Ok(ToolResult::err(
-            "Missing required parameter: old. Expected JSON arguments: {\"action\":\"replace\",\"path\":\"src/main.rs\",\"old\":\"exact text to replace\",\"new\":\"replacement text\"}. Do not use start_line/end_line with replace. For multi-location edits, use fix_file.".into()
+            "Missing required parameter: old. The replace action needs both `old` (the exact text already in the file) and `new` (what to put there). Do not retry replace without `old` — instead call edit_file with {\"path\":\"<file>\",\"task\":\"<what to change and why>\"} and let it produce the patch for you.".into()
         ));
     }
 
@@ -118,7 +118,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
             output.push_str("Note: matched with fuzzy/normalized matching — your 'old' text didn't match exactly.\n");
             if total_lines < 200 {
                 output.push_str(&format!(
-                    "Note: {path_str} is {total_lines} lines. For additional semantic edits, prefer fix_file unless you are writing the complete file content.\n"
+                    "Note: {path_str} is {total_lines} lines. For additional semantic edits, prefer edit_file unless you are writing the complete file content.\n"
                 ));
             }
             return Ok(ToolResult::ok(output));
@@ -149,7 +149,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
             }
         }
         err_msg.push_str(&format!("[{path_str}: {} lines total]\n", file_lines.len()));
-        err_msg.push_str("HINT: Copy the exact text from the line numbers shown above into 'old', or use fix_file for a semantic edit.\n");
+        err_msg.push_str("HINT: Copy the exact text from the line numbers shown above into 'old', or use edit_file for a semantic edit.\n");
         return Ok(ToolResult::err(err_msg));
     }
 
@@ -168,7 +168,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         return Ok(ToolResult::err(format!(
             "old_content matches {count} locations in {path_str} (at {}).\n\
              Include more surrounding lines in 'old' to make the match unique, \
-             or use fix_file for a semantic edit.",
+             or use edit_file for a semantic edit.",
             match_lines.join(", ")
         )));
     }
@@ -215,7 +215,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     // Nudge the model toward the semantic editor for follow-up code edits.
     if total_lines < 200 {
         output.push_str(&format!(
-            "\nNote: {path_str} is {total_lines} lines. For additional semantic edits, prefer fix_file unless you are writing the complete file content.\n"
+            "\nNote: {path_str} is {total_lines} lines. For additional semantic edits, prefer edit_file unless you are writing the complete file content.\n"
         ));
     }
 

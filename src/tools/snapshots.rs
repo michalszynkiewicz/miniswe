@@ -83,10 +83,16 @@ impl SnapshotManager {
     pub fn revert_to_round(&self, target_round: usize) -> Result<String> {
         // Find the commit for that round
         let output = self.git_output(&[
-            "log", "--oneline", "--all", "--grep", &format!("round {target_round}")
+            "log",
+            "--oneline",
+            "--all",
+            "--grep",
+            &format!("round {target_round}"),
         ])?;
 
-        let commit = output.lines().next()
+        let commit = output
+            .lines()
+            .next()
             .and_then(|l| l.split_whitespace().next())
             .context(format!("no snapshot found for round {target_round}"))?
             .to_string();
@@ -97,16 +103,24 @@ impl SnapshotManager {
             anyhow::bail!("git checkout failed for round {target_round}");
         }
 
-        Ok(format!("Reverted to round {target_round} (commit {commit})"))
+        Ok(format!(
+            "Reverted to round {target_round} (commit {commit})"
+        ))
     }
 
     /// Revert a single file to its state at a specific round.
     pub fn revert_file(&self, path: &str, target_round: usize) -> Result<String> {
         let output = self.git_output(&[
-            "log", "--oneline", "--all", "--grep", &format!("round {target_round}")
+            "log",
+            "--oneline",
+            "--all",
+            "--grep",
+            &format!("round {target_round}"),
         ])?;
 
-        let commit = output.lines().next()
+        let commit = output
+            .lines()
+            .next()
             .and_then(|l| l.split_whitespace().next())
             .context(format!("no snapshot found for round {target_round}"))?
             .to_string();
@@ -132,8 +146,10 @@ impl SnapshotManager {
     /// Run a git command with the shadow git dir and work tree.
     fn git(&self, args: &[&str]) -> Result<std::process::ExitStatus> {
         Command::new("git")
-            .arg("--git-dir").arg(&self.git_dir)
-            .arg("--work-tree").arg(&self.work_tree)
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .arg("--work-tree")
+            .arg(&self.work_tree)
             .args(args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -144,7 +160,8 @@ impl SnapshotManager {
     /// Set a config value in the shadow git repo.
     fn git_config(&self, key: &str, value: &str) -> Result<()> {
         Command::new("git")
-            .arg("--git-dir").arg(&self.git_dir)
+            .arg("--git-dir")
+            .arg(&self.git_dir)
             .args(["config", key, value])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -156,8 +173,10 @@ impl SnapshotManager {
     /// Run a git command and capture stdout.
     fn git_output(&self, args: &[&str]) -> Result<String> {
         let output = Command::new("git")
-            .arg("--git-dir").arg(&self.git_dir)
-            .arg("--work-tree").arg(&self.work_tree)
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .arg("--work-tree")
+            .arg(&self.work_tree)
             .args(args)
             .output()
             .context("failed to run git")?;

@@ -60,10 +60,7 @@ fn get_tags_config(ext: &str) -> Option<TagsConfiguration> {
         }
 
         #[cfg(feature = "lang-go")]
-        "go" => make_config(
-            tree_sitter_go::LANGUAGE.into(),
-            tree_sitter_go::TAGS_QUERY,
-        ),
+        "go" => make_config(tree_sitter_go::LANGUAGE.into(), tree_sitter_go::TAGS_QUERY),
 
         // Tier 2: opt-in languages
         #[cfg(feature = "lang-java")]
@@ -73,10 +70,7 @@ fn get_tags_config(ext: &str) -> Option<TagsConfiguration> {
         ),
 
         #[cfg(feature = "lang-c")]
-        "c" | "h" => make_config(
-            tree_sitter_c::LANGUAGE.into(),
-            tree_sitter_c::TAGS_QUERY,
-        ),
+        "c" | "h" => make_config(tree_sitter_c::LANGUAGE.into(), tree_sitter_c::TAGS_QUERY),
 
         #[cfg(feature = "lang-cpp")]
         "cpp" | "hpp" | "cc" | "cxx" | "hh" => make_config(
@@ -150,10 +144,7 @@ fn get_tags_config(ext: &str) -> Option<TagsConfiguration> {
 
 /// Helper to build a TagsConfiguration, returning None on error.
 #[cfg(feature = "tree-sitter")]
-fn make_config(
-    language: tree_sitter::Language,
-    tags_query: &str,
-) -> Option<TagsConfiguration> {
+fn make_config(language: tree_sitter::Language, tags_query: &str) -> Option<TagsConfiguration> {
     TagsConfiguration::new(language, tags_query, "").ok()
 }
 
@@ -359,8 +350,12 @@ fn enrich_rust_impl_blocks(file: &str, content: &str, result: &mut ExtractionRes
         let mut end = i;
         for j in i..lines.len() {
             for ch in lines[j].chars() {
-                if ch == '{' { depth += 1; }
-                if ch == '}' { depth -= 1; }
+                if ch == '{' {
+                    depth += 1;
+                }
+                if ch == '}' {
+                    depth -= 1;
+                }
             }
             if depth <= 0 && j > i {
                 end = j;
@@ -428,8 +423,12 @@ fn extract_impl_type_name(header: &str) -> String {
             let mut depth = 0;
             let mut end = 0;
             for (i, ch) in after_impl.chars().enumerate() {
-                if ch == '<' { depth += 1; }
-                if ch == '>' { depth -= 1; }
+                if ch == '<' {
+                    depth += 1;
+                }
+                if ch == '>' {
+                    depth -= 1;
+                }
                 if depth == 0 {
                     end = i + 1;
                     break;

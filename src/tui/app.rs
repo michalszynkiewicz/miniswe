@@ -66,6 +66,8 @@ pub struct App {
     pub should_quit: bool,
     /// Whether LLM is currently generating
     pub is_thinking: bool,
+    /// Current active job description, if any
+    pub active_job: Option<String>,
     /// Current streaming token buffer (accumulated between newlines)
     pub token_buffer: String,
     /// Tool results for Ctrl+O detail viewer (tool_name → full content)
@@ -91,6 +93,7 @@ impl App {
             saved_input: String::new(),
             should_quit: false,
             is_thinking: false,
+            active_job: None,
             token_buffer: String::new(),
             tool_results: Vec::new(),
             pending_permission: None,
@@ -101,10 +104,7 @@ impl App {
     /// Load input history from file.
     pub fn load_history(&mut self, path: &std::path::Path) {
         if let Ok(content) = std::fs::read_to_string(path) {
-            self.history = content
-                .lines()
-                .map(|l| l.to_string())
-                .collect();
+            self.history = content.lines().map(|l| l.to_string()).collect();
         }
     }
 
@@ -113,7 +113,9 @@ impl App {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let content = self.history.iter()
+        let content = self
+            .history
+            .iter()
             .rev()
             .take(200)
             .rev()
@@ -159,6 +161,14 @@ impl App {
             });
             self.scroll_offset = 0;
         }
+    }
+
+    pub fn set_active_job(&mut self, description: impl Into<String>) {
+        self.active_job = Some(description.into());
+    }
+
+    pub fn clear_active_job(&mut self) {
+        self.active_job = None;
     }
 
     /// Submit the current input, returning it and adding to history.
@@ -281,7 +291,8 @@ impl App {
 
     /// Store a tool result for the detail viewer.
     pub fn store_tool_result(&mut self, name: &str, content: &str) {
-        self.tool_results.push((name.to_string(), content.to_string()));
+        self.tool_results
+            .push((name.to_string(), content.to_string()));
         // Keep last 50
         if self.tool_results.len() > 50 {
             self.tool_results.remove(0);

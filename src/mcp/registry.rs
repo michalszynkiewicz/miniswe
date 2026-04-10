@@ -156,23 +156,22 @@ impl McpRegistry {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<String> {
-        let client = self
-            .clients
-            .get_mut(server_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!("MCP server '{server_name}' not connected. Available: {}",
-                    self.servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "))
-            })?;
+        let client = self.clients.get_mut(server_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "MCP server '{server_name}' not connected. Available: {}",
+                self.servers
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
 
         client.call_tool(tool_name, arguments)
     }
 
     /// Get the full schema for a specific tool (for validation/display).
-    pub fn get_tool_schema(
-        &self,
-        server_name: &str,
-        tool_name: &str,
-    ) -> Option<&McpToolInfo> {
+    pub fn get_tool_schema(&self, server_name: &str, tool_name: &str) -> Option<&McpToolInfo> {
         self.servers
             .iter()
             .find(|s| s.name == server_name)?

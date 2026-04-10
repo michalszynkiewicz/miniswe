@@ -152,7 +152,11 @@ END
 }
 
 #[test]
-fn parse_edit_plan_rejects_overlapping_steps() {
+fn parse_edit_plan_accepts_overlapping_steps() {
+    // Overlap is no longer a parse error — the planner caller
+    // (`partition_overlapping_steps`) drops overlappers in source order
+    // and reports them as failed steps. The parser just returns whatever
+    // structurally-valid blocks it finds.
     let plan = "\
 LITERAL_REPLACE
 SCOPE 1 10
@@ -171,8 +175,8 @@ TASK: edit another block
 END
 ";
 
-    let err = edit_file::parse_edit_plan(plan).unwrap_err().to_string();
-    assert!(err.contains("overlapping steps"));
+    let steps = edit_file::parse_edit_plan(plan).unwrap();
+    assert_eq!(steps.len(), 2);
 }
 
 #[test]
@@ -950,6 +954,59 @@ async fn execute_preplan_uses_literal_replacements_before_smart_edits() {
 }
 
 #[tokio::test]
+async fn execute_preplan_applies_literal_replace_without_old() {
+    // Small file. The plan emits a LITERAL_REPLACE block that omits the
+    // OLD: section — i.e. the new ReplaceScope form. The executor should
+    // wholesale-replace the SCOPE range with the NEW content without
+    // any LLM round-trip for a smart fallback.
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => helpers::mock_text_response("NOTE noop"),
+                1 => helpers::mock_text_response("DONE"),
+                2 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 2 3\nALL true\nNEW:\nfresh two\nfresh three\nEND_NEW\nEND\n",
+                ),
+                _ => unreachable!("scope replace should not need a smart fallback"),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(
+        config.project_root.join("main.rs"),
+        "line one\nline two\nline three\nline four\n",
+    )
+    .unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "rewrite middle two lines",
+        "lsp_validation": "off"
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("scope L2-L3"));
+    // window + recon + finalize, no patch round needed = 3
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "line one\nfresh two\nfresh three\nline four\n"
+    );
+}
+
+#[tokio::test]
 async fn execute_preplan_literal_step_falls_back_to_smart_edit() {
     // Small file. The literal step's OLD doesn't match the file content,
     // so the smart fallback kicks in.
@@ -1339,6 +1396,131 @@ async fn execute_preplan_invalid_task_during_repair_short_circuits() {
 }
 
 #[tokio::test]
+async fn execute_preplan_invalid_task_with_missing_target_reason_is_suppressed_and_retries() {
+    // The model rejects with INVALID_TASK but the reason is "target not
+    // found in current state" — that's a missing prerequisite, NOT an
+    // incoherent task. We should suppress the rejection, set up a repair
+    // context with a hint, and retry. On the second attempt the model
+    // produces a valid plan and the edit applies.
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                // Plan attempt 1: window, recon (DONE), finalize → false-positive INVALID_TASK
+                0 => helpers::mock_text_response("NOTE noop"),
+                1 => helpers::mock_text_response("DONE"),
+                2 => helpers::mock_text_response(
+                    "INVALID_TASK: target function `foo` not found in the file",
+                ),
+                // Plan attempt 2 (after suppression + repair context): window, recon, finalize → real plan
+                3 => helpers::mock_text_response("NOTE understood"),
+                4 => helpers::mock_text_response("DONE"),
+                5 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\noriginal();\nEND_OLD\nNEW:\nfoo();\nEND_NEW\nEND\n",
+                ),
+                _ => panic!("unexpected extra call #{n} — repair retry should have succeeded"),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "original();\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "rename original to foo",
+        "lsp_validation": "off"
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(
+        result.success,
+        "expected success after suppression+repair, got: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("suppressed false-positive INVALID_TASK"),
+        "expected suppression note in tool output, got: {}",
+        result.content
+    );
+    // plan1: 3 preplan calls (rejected) + plan2: 3 preplan calls (succeeded) = 6 total
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    // File should now contain the renamed call.
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "foo();\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_preplan_invalid_task_with_real_incoherent_reason_still_short_circuits() {
+    // Counterpoint to the suppression test: a "real" INVALID_TASK reason
+    // that doesn't mention any missing/not-found phrases should still
+    // short-circuit the loop (no retry) and surface the rejection.
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => helpers::mock_text_response("NOTE noop"),
+                1 => helpers::mock_text_response("DONE"),
+                2 => helpers::mock_text_response(
+                    "INVALID_TASK: the task asks to write Python in this Rust file",
+                ),
+                _ => unreachable!(
+                    "real INVALID_TASK should short-circuit the retry loop without further calls"
+                ),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "println!(\"hi\");\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "convert this file to Python",
+        "lsp_validation": "off"
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(!result.success);
+    assert!(
+        result.content.contains("rejected task as invalid"),
+        "expected rejection marker, got: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("write Python in this Rust file"),
+        "expected reason in tool output, got: {}",
+        result.content
+    );
+    // window + recon + finalize = 3 calls, no retry.
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "println!(\"hi\");\n"
+    );
+}
+
+#[tokio::test]
 async fn execute_preplan_parse_failure_returns_error() {
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1366,6 +1548,89 @@ async fn execute_preplan_parse_failure_returns_error() {
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "old();\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_preplan_overlapping_steps_apply_first_and_report_rest_failed() {
+    // The planner emits two SMART_EDIT steps that overlap (shared line 3).
+    // The first wins by source order, the second is reported as a failed
+    // step in the per-step output. The overall edit_file call still
+    // succeeds because at least one step applied.
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                // window phase
+                0 => helpers::mock_text_response("NOTE noop"),
+                // recon phase
+                1 => helpers::mock_text_response("DONE"),
+                // finalize: two overlapping SMART_EDIT steps
+                2 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1 3\nTASK: rewrite the first three lines\nEND\n\
+                     \n\
+                     SMART_EDIT\nREGION 3 5\nTASK: rewrite lines three through five\nEND\n",
+                ),
+                // smart-edit patch for the kept (first) step L1-L3
+                _ => helpers::mock_text_response(
+                    "REPLACE_AT 1\nOLD:\nalpha\nbeta\ngamma\nEND_OLD\nNEW:\nALPHA\nBETA\nGAMMA\nEND_NEW\n",
+                ),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(
+        config.project_root.join("main.rs"),
+        "alpha\nbeta\ngamma\ndelta\nepsilon\n",
+    )
+    .unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "rewrite the file",
+        "lsp_validation": "off"
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None)
+        .await
+        .unwrap();
+
+    // The kept step applied — overall success.
+    assert!(result.success, "{}", result.content);
+    // Summary reflects 1/2 with the dropped count called out.
+    assert!(
+        result.content.contains("1/2 step(s) completed"),
+        "missing 1/2 summary in: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("1 dropped (overlap)"),
+        "missing dropped (overlap) note in: {}",
+        result.content
+    );
+    // Per-step output: the dropped step is reported as a FAILED step
+    // pointing at the kept one.
+    assert!(
+        result.content.contains("Pre-plan step L3-L5: FAILED"),
+        "missing per-step failure for dropped overlap in: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("overlaps earlier step L1-L3"),
+        "missing overlap reason in: {}",
+        result.content
+    );
+    // The kept step actually wrote the file.
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "ALPHA\nBETA\nGAMMA\ndelta\nepsilon\n"
     );
 }
 

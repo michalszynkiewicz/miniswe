@@ -15,6 +15,24 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE_NAME="miniswe-bench"
 RESULTS_DIR="${REPO_DIR}/benchmark_results/docker_$(date +%Y%m%d_%H%M%S)"
 BASELINE_SHA="cc34d2626faf32c1b6dd1b8b33af693fb936b098"
+ACTIVE_CONTAINER_NAME=""
+ACTIVE_TMP_SCRIPT=""
+
+cleanup() {
+    set +e
+
+    if [[ -n "${ACTIVE_CONTAINER_NAME}" ]]; then
+        docker rm -f "${ACTIVE_CONTAINER_NAME}" >/dev/null 2>&1 || true
+    fi
+
+    if [[ -n "${ACTIVE_TMP_SCRIPT}" ]]; then
+        rm -f "${ACTIVE_TMP_SCRIPT}" >/dev/null 2>&1 || true
+    fi
+
+    docker image rm -f "${IMAGE_NAME}" >/dev/null 2>&1 || true
+}
+
+trap cleanup EXIT INT TERM
 
 # Defaults
 TIMEOUT=1800
@@ -123,6 +141,7 @@ run_variant() {
     local name="$1"
     local disabled="${2:-}"
     local variant_dir="${RESULTS_DIR}/${name}"
+    local container_name="miniswe-bench-${name}-$$"
     mkdir -p "${variant_dir}"
 
     echo "--- ${name} ---"
@@ -336,6 +355,7 @@ SCRIPT
     tmp_script=$(mktemp)
     echo "${container_script}" > "${tmp_script}"
     chmod +x "${tmp_script}"
+    ACTIVE_TMP_SCRIPT="${tmp_script}"
 
     local start_time
     start_time=$(date +%s)
@@ -347,14 +367,16 @@ SCRIPT
     # - Network host for LLM access
     # - Timeout on the container itself
     # Remove stale endpoint if it exists
-    docker rm -f "miniswe-bench-${name}" 2>/dev/null || true
+    docker rm -f "${container_name}" 2>/dev/null || true
+
+    ACTIVE_CONTAINER_NAME="${container_name}"
 
     docker run --rm \
         --network=host \
         -v "${variant_dir}:/output" \
         -v "${variant_dir}/config.toml:/config/config.toml:ro" \
         -v "${tmp_script}:/run.sh:ro" \
-        --name "miniswe-bench-${name}-$$" \
+        --name "${container_name}" \
         "${IMAGE_NAME}" \
         bash /run.sh "${BASELINE_SHA}" "${TASK}" "${TIMEOUT}" \
         2>&1 | tee "${variant_dir}/container.log"
@@ -364,6 +386,8 @@ SCRIPT
     echo $((end_time - start_time)) > "${variant_dir}/wall_s.txt"
 
     rm -f "${tmp_script}"
+    ACTIVE_TMP_SCRIPT=""
+    ACTIVE_CONTAINER_NAME=""
 
     # Parse results
     local wall_s

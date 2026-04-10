@@ -77,10 +77,7 @@ impl ProjectIndex {
             index_dir.join("summaries.json"),
             serde_json::to_string_pretty(&self.summaries)?,
         )?;
-        std::fs::write(
-            index_dir.join("file_tree.txt"),
-            self.file_tree.join("\n"),
-        )?;
+        std::fs::write(index_dir.join("file_tree.txt"), self.file_tree.join("\n"))?;
         std::fs::write(
             index_dir.join("mtimes.json"),
             serde_json::to_string_pretty(&self.mtimes)?,

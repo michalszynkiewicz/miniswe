@@ -24,9 +24,7 @@ async fn edit_shows_10_lines_context() {
     let (_tmp, config) = helpers::create_test_project();
 
     // Create a file with enough lines to see ±10 context
-    let lines: Vec<String> = (1..=30)
-        .map(|i| format!("line {i}"))
-        .collect();
+    let lines: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
     let content = lines.join("\n") + "\n";
     fs::write(helpers::project_path(&config, "ctx.txt"), &content).unwrap();
 
@@ -42,10 +40,22 @@ async fn edit_shows_10_lines_context() {
 
     assert!(result.success);
     // Should show context reaching back ~10 lines (line 5) and forward ~10 (line 25)
-    assert!(result.content.contains("line 5"), "should show line 5 in context");
-    assert!(result.content.contains("line 25"), "should show line 25 in context");
-    assert!(result.content.contains("EDITED LINE 15"), "should show the edit");
-    assert!(result.content.contains("showing L"), "should mention line range");
+    assert!(
+        result.content.contains("line 5"),
+        "should show line 5 in context"
+    );
+    assert!(
+        result.content.contains("line 25"),
+        "should show line 25 in context"
+    );
+    assert!(
+        result.content.contains("EDITED LINE 15"),
+        "should show the edit"
+    );
+    assert!(
+        result.content.contains("showing L"),
+        "should mention line range"
+    );
 }
 
 // ── edit: near-match on failure ─────────────────────────────────────
@@ -91,7 +101,11 @@ async fn edit_not_found_shows_near_match() {
 async fn edit_not_found_no_near_match() {
     let (_tmp, config) = helpers::create_test_project();
 
-    fs::write(helpers::project_path(&config, "nomatch.txt"), "hello world\n").unwrap();
+    fs::write(
+        helpers::project_path(&config, "nomatch.txt"),
+        "hello world\n",
+    )
+    .unwrap();
 
     let args = json!({"action": "replace",
         "path": "nomatch.txt",
@@ -114,9 +128,7 @@ async fn edit_not_found_no_near_match() {
 async fn write_file_includes_tail() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let lines: Vec<String> = (1..=50)
-        .map(|i| format!("line {i}"))
-        .collect();
+    let lines: Vec<String> = (1..=50).map(|i| format!("line {i}")).collect();
     let content = lines.join("\n") + "\n";
 
     let args = json!({
@@ -128,10 +140,16 @@ async fn write_file_includes_tail() {
         .unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("[tail]"), "should have tail section");
+    assert!(
+        result.content.contains("[tail]"),
+        "should have tail section"
+    );
     // Tail should show the last 30 lines (lines 21-50)
     assert!(result.content.contains("line 50"), "should show last line");
-    assert!(result.content.contains("line 21"), "should show line 21 (start of tail)");
+    assert!(
+        result.content.contains("line 21"),
+        "should show line 21 (start of tail)"
+    );
     // Should NOT show line 20 (before the tail)
     assert!(
         !result.content.contains("│line 20\n"),
@@ -153,7 +171,10 @@ async fn write_file_short_file_shows_all_in_tail() {
 
     assert!(result.success);
     assert!(result.content.contains("[tail]"));
-    assert!(result.content.contains("line 1"), "short file should show all lines");
+    assert!(
+        result.content.contains("line 1"),
+        "short file should show all lines"
+    );
     assert!(result.content.contains("line 3"));
 }
 
@@ -188,7 +209,10 @@ async fn auto_check_includes_source_context_on_error() {
     // auto_check should have run and found the type error
     if result.content.contains("[cargo check]") {
         assert!(!result.success, "should fail due to type error");
-        assert!(result.content.contains("error"), "should contain error text");
+        assert!(
+            result.content.contains("error"),
+            "should contain error text"
+        );
         // Should include source context showing the error location
         assert!(
             result.content.contains("[source context]"),
@@ -249,10 +273,22 @@ fn token_budget_masking_keeps_newest() {
     let small = "y".repeat(40); // ~10 tokens
 
     let log: Vec<(String, serde_json::Value, String)> = vec![
-        ("file".into(), json!({"action": "read", "path": "a.rs"}), big.clone()),    // oldest
-        ("file".into(), json!({"action": "read", "path": "b.rs"}), big.clone()),
+        (
+            "file".into(),
+            json!({"action": "read", "path": "a.rs"}),
+            big.clone(),
+        ), // oldest
+        (
+            "file".into(),
+            json!({"action": "read", "path": "b.rs"}),
+            big.clone(),
+        ),
         ("write_file".into(), json!({"path": "c.rs"}), small.clone()),
-        ("file".into(), json!({"action": "read", "path": "d.rs"}), big.clone()),    // newest
+        (
+            "file".into(),
+            json!({"action": "read", "path": "d.rs"}),
+            big.clone(),
+        ), // newest
     ];
 
     // Budget of 100 tokens: newest two (big=50 + small=10 = 60) fit,
@@ -268,7 +304,10 @@ fn token_budget_masking_keeps_newest() {
     }
 
     assert!(should_mask[0], "oldest should be masked (over budget)");
-    assert!(should_mask[1], "second oldest should be masked (over budget)");
+    assert!(
+        should_mask[1],
+        "second oldest should be masked (over budget)"
+    );
     assert!(!should_mask[2], "write_file fits in budget");
     assert!(!should_mask[3], "newest read fits in budget");
 }
@@ -280,9 +319,17 @@ fn token_budget_masking_nothing_when_under_budget() {
     let small = "content".to_string(); // ~2 tokens
 
     let log: Vec<(String, serde_json::Value, String)> = vec![
-        ("file".into(), json!({"action": "read", "path": "a.rs"}), small.clone()),
+        (
+            "file".into(),
+            json!({"action": "read", "path": "a.rs"}),
+            small.clone(),
+        ),
         ("write_file".into(), json!({"path": "b.rs"}), small.clone()),
-        ("file".into(), json!({"action": "read", "path": "c.rs"}), small.clone()),
+        (
+            "file".into(),
+            json!({"action": "read", "path": "c.rs"}),
+            small.clone(),
+        ),
     ];
 
     // Budget of 1000 tokens: total is ~6 tokens, well under budget
@@ -296,7 +343,10 @@ fn token_budget_masking_nothing_when_under_budget() {
         }
     }
 
-    assert!(!should_mask.iter().any(|m| *m), "nothing should be masked under budget");
+    assert!(
+        !should_mask.iter().any(|m| *m),
+        "nothing should be masked under budget"
+    );
 }
 
 #[test]
@@ -324,8 +374,14 @@ fn rich_summary_includes_function_signatures() {
     );
 
     assert!(summary.contains("src/cli/mod.rs"), "should have path");
-    assert!(summary.contains("pub struct Cli"), "should have struct signature");
-    assert!(summary.contains("pub fn run_cli"), "should have function signature");
+    assert!(
+        summary.contains("pub struct Cli"),
+        "should have struct signature"
+    );
+    assert!(
+        summary.contains("pub fn run_cli"),
+        "should have function signature"
+    );
 }
 
 #[test]
@@ -354,17 +410,30 @@ fn rich_summary_includes_impl_blocks() {
         content,
     );
 
-    assert!(summary.contains("pub struct Config"), "should have struct: {summary}");
-    assert!(summary.contains("pub fn new"), "should have method: {summary}");
-    assert!(summary.contains("pub trait Loadable"), "should have trait: {summary}");
-    assert!(summary.contains("file(action='read'"), "should hint at file(action='read') for re-reading: {summary}");
+    assert!(
+        summary.contains("pub struct Config"),
+        "should have struct: {summary}"
+    );
+    assert!(
+        summary.contains("pub fn new"),
+        "should have method: {summary}"
+    );
+    assert!(
+        summary.contains("pub trait Loadable"),
+        "should have trait: {summary}"
+    );
+    assert!(
+        summary.contains("file(action='read'"),
+        "should hint at file(action='read') for re-reading: {summary}"
+    );
 }
 
 #[test]
 fn rich_summary_edit_with_errors() {
     use miniswe::context::compress::summarize_tool_result;
 
-    let content = "✓ Edited src/main.rs (1 replacement)\n[cargo check]\nerror[E0061]: expected 4 arguments\n";
+    let content =
+        "✓ Edited src/main.rs (1 replacement)\n[cargo check]\nerror[E0061]: expected 4 arguments\n";
 
     let summary = summarize_tool_result(
         "file",
@@ -372,9 +441,14 @@ fn rich_summary_edit_with_errors() {
         content,
     );
 
-    assert!(summary.contains("src/main.rs"), "should have path: {summary}");
-    assert!(summary.contains("error") || summary.contains("FAILED"),
-        "should mention the error: {summary}");
+    assert!(
+        summary.contains("src/main.rs"),
+        "should have path: {summary}"
+    );
+    assert!(
+        summary.contains("error") || summary.contains("FAILED"),
+        "should mention the error: {summary}"
+    );
 }
 
 #[test]
@@ -389,7 +463,12 @@ fn rich_summary_edit_success() {
         content,
     );
 
-    assert!(summary.contains("src/main.rs"), "should have path: {summary}");
-    assert!(!summary.contains("error") && !summary.contains("FAILED"),
-        "should not mention errors: {summary}");
+    assert!(
+        summary.contains("src/main.rs"),
+        "should have path: {summary}"
+    );
+    assert!(
+        !summary.contains("error") && !summary.contains("FAILED"),
+        "should not mention errors: {summary}"
+    );
 }
