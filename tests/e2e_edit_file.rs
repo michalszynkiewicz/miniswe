@@ -980,11 +980,13 @@ async fn execute_preplan_uses_literal_replacements_before_smart_edits() {
 }
 
 #[tokio::test]
-async fn execute_preplan_applies_literal_replace_without_old() {
-    // Small file. The plan emits a LITERAL_REPLACE block that omits the
-    // OLD: section — i.e. the new ReplaceScope form. The executor should
-    // wholesale-replace the SCOPE range with the NEW content without
-    // any LLM round-trip for a smart fallback.
+async fn execute_preplan_rejects_literal_replace_without_old_and_recovers() {
+    // Small file. On attempt 1 the planner emits the now-forbidden
+    // OLD-less LITERAL_REPLACE shortcut — the parser should reject it
+    // and feed the error into the repair prompt, then attempt 2 emits
+    // the proper OLD-bearing form and the edit succeeds. This is the
+    // regression guard for the "hallucinated replacement" failure
+    // mode we saw in the docker_20260411 bench run.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -993,10 +995,15 @@ async fn execute_preplan_applies_literal_replace_without_old() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
+                // Attempt 1: the banned shortcut form — no OLD: block.
                 0 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 2 3\nALL true\nNEW:\nfresh two\nfresh three\nEND_NEW\nEND\n",
                 ),
-                _ => unreachable!("scope replace should not need a smart fallback"),
+                // Attempt 2 (repair): proper form with OLD: verbatim.
+                1 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 2 3\nALL true\nOLD:\nline two\nline three\nEND_OLD\nNEW:\nfresh two\nfresh three\nEND_NEW\nEND\n",
+                ),
+                _ => unreachable!("should succeed on repair attempt"),
             }
         })
         .mount(&mock_server)
@@ -1021,15 +1028,13 @@ async fn execute_preplan_applies_literal_replace_without_old() {
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    // Successful scope replace is the boring happy path now — only the
-    // final summary line is emitted, and no per-step chatter.
     assert!(
         result.content.contains("✓ via pre-plan: applied 1 step(s)"),
         "expected concise success summary, got: {}",
         result.content
     );
-    // finalize only, no patch round needed = 1
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // finalize attempt 1 (rejected) + finalize attempt 2 (succeeded) = 2
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "line one\nfresh two\nfresh three\nline four\n"

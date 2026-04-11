@@ -30,6 +30,11 @@ const PREPLAN_READ_OVERLAP: usize = 60;
 /// observation round is pure latency overhead.
 const SMALL_FILE_THRESHOLD: usize = 200;
 const MAX_PLAN_ATTEMPTS: usize = 4;
+/// Additional plan attempts granted when the failing trajectory is
+/// strictly improving (new LSP error count < best-so-far). Bounds the
+/// "promising-fix-loop" retry credit introduced to stop cutting off
+/// slow converging runs at `MAX_PLAN_ATTEMPTS`.
+const MAX_EXTRA_ATTEMPTS: usize = 2;
 const MAX_PREPLAN_STEPS: usize = 100;
 const MAX_PREPLAN_LOG_CHARS: usize = 20000;
 const LARGE_TRUNCATION_MIN_LINES: usize = 50;
@@ -177,6 +182,11 @@ enum PreplanOutcome {
     /// can recover from. Treat it as a failure and let the outer loop
     /// re-prompt via `RepairContext`.
     EmptyResponse,
+    /// The model emitted something that `parse_edit_plan` rejected
+    /// (unknown token, missing `OLD:` after we removed the no-OLD
+    /// shortcut, malformed SCOPE, etc). Carry the parser's error
+    /// verbatim so the repair prompt can tell the model what to fix.
+    ParseError(String),
 }
 
 /// What the whole pre-plan retry loop produced. Distinguishes "applied
@@ -200,6 +210,89 @@ struct PlannedExecutionFailure {
     /// fully but then post-validation (e.g. LSP) rejected the result, so
     /// every step in `completed_steps` succeeded individually.
     failed_step: Option<EditPlanStep>,
+    /// When the failure is an LSP regression, structured information
+    /// about each error location plus the post-edit file snapshot so
+    /// the replanner can see *which lines* of its patch produced the
+    /// new errors instead of reading a truncated error blob.
+    lsp_regression: Option<LspRegression>,
+}
+
+/// One diagnostic entry carried inside `LspRegression`. Lines and columns
+/// are 1-based, matching the `file:line:col` rendering used throughout
+/// the tool output.
+#[derive(Clone, Debug)]
+struct LspErrorLocation {
+    line: usize,
+    column: usize,
+    message: String,
+}
+
+/// Structured LSP regression captured when post-edit validation fails.
+/// Unlike the opaque error string, this carries the broken candidate
+/// content so the repair prompt can show the planner the *exact lines*
+/// its patch produced around every new error.
+#[derive(Clone, Debug)]
+struct LspRegression {
+    baseline_count: usize,
+    errors: Vec<LspErrorLocation>,
+    /// Extra suffix "... and N more error(s)" — tracked separately so
+    /// the rendered block can repeat the truncation note instead of
+    /// losing it.
+    extra_error_count: usize,
+    /// The candidate file content at the moment validation ran. Used
+    /// by `format_lsp_regression_for_planner` to extract ±5-line
+    /// snippets around each error location.
+    candidate_content: String,
+}
+
+/// Validation outcome when `validate_candidate_for_write` (or its LSP
+/// sub-step) rejects a candidate. Separating `LspRegression` from
+/// `Other` lets the retry loop capture structured diagnostic info to
+/// feed back into the planner, while still allowing non-LSP failures
+/// (truncation gate, IO errors, …) to surface as opaque errors.
+enum ValidationError {
+    LspRegression(LspRegression),
+    Other(anyhow::Error),
+}
+
+impl ValidationError {
+    fn summary(&self) -> String {
+        match self {
+            Self::LspRegression(reg) => {
+                let mut out = format!(
+                    "LSP diagnostics worsened: {} -> {} error(s)",
+                    reg.baseline_count,
+                    reg.errors.len() + reg.extra_error_count
+                );
+                for err in reg.errors.iter().take(5) {
+                    out.push_str(&format!(
+                        "\nL{}:{}: error: {}",
+                        err.line, err.column, err.message
+                    ));
+                }
+                if reg.extra_error_count > 0 {
+                    out.push_str(&format!(
+                        "\n... and {} more error(s)",
+                        reg.extra_error_count
+                    ));
+                }
+                out
+            }
+            Self::Other(e) => e.to_string(),
+        }
+    }
+}
+
+impl From<anyhow::Error> for ValidationError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Other(e)
+    }
+}
+
+impl From<std::io::Error> for ValidationError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Other(e.into())
+    }
 }
 
 /// Structured information passed to `request_preplan_steps` when running
@@ -211,6 +304,10 @@ struct RepairContext {
     completed_steps: Vec<EditPlanStep>,
     failed_step: Option<EditPlanStep>,
     failure_reason: String,
+    /// When the failure was an LSP regression, carries the structured
+    /// diagnostic info so `format_repair_context` can render post-edit
+    /// snippets around each error instead of a truncated blob.
+    lsp_regression: Option<LspRegression>,
 }
 
 fn max_literal_replace_lines(context_window: usize) -> usize {
@@ -275,8 +372,19 @@ async fn execute_preplanned_steps(
     // failure detail still feeds the *inner* model on retry through
     // `RepairContext`, which is built independently below.
     let mut progress_log = String::new();
+    // Track the best (lowest) candidate LSP error count observed across
+    // attempts. When a new failing attempt improves on the best-so-far,
+    // the loop grants an extra attempt credit on the theory that the
+    // planner is converging and deserves another try. Cap extras at
+    // `MAX_EXTRA_ATTEMPTS` so a slowly-wobbling trajectory still
+    // terminates.
+    let mut best_error_count: Option<usize> = None;
+    let mut extra_attempts_granted: usize = 0;
+    let mut attempt_budget = MAX_PLAN_ATTEMPTS;
+    let mut attempt: usize = 0;
 
-    for attempt in 1..=MAX_PLAN_ATTEMPTS {
+    while attempt < attempt_budget {
+        attempt += 1;
         // The label is only used for internal logging (`log_stage` /
         // `log_debug`) and for the inner model's repair feedback prompt.
         // It is intentionally NOT placed in the agent-facing message.
@@ -337,6 +445,7 @@ async fn execute_preplanned_steps(
                          it does NOT make the task incoherent. Plan the edit that creates or updates the target. \
                          Reserve INVALID_TASK only for tasks that contradict reality (wrong language, internally inconsistent goals)."
                     ),
+                    lsp_regression: None,
                 });
                 continue;
             }
@@ -380,6 +489,38 @@ async fn execute_preplanned_steps(
                          or output `INVALID_TASK: <reason>` if the task is incoherent. \
                          Do not return an empty response.",
                     ),
+                    lsp_regression: None,
+                });
+                continue;
+            }
+            PreplanOutcome::ParseError(reason) => {
+                // The model emitted something the plan parser couldn't
+                // accept — most commonly the now-removed OLD-less
+                // LITERAL_REPLACE shortcut. Feed the parser's exact
+                // error back through the repair prompt so the next
+                // attempt can correct it.
+                log_debug(
+                    log,
+                    path_str,
+                    &format!(
+                        "preplan:parse_error attempt={attempt}; will retry reason={}",
+                        truncate_multiline(&reason, 500)
+                    ),
+                );
+                progress_log.push_str(&format!(
+                    "{label}; plan failed to parse, retrying\n"
+                ));
+                repair_context = Some(RepairContext {
+                    previous_plan: Vec::new(),
+                    completed_steps: Vec::new(),
+                    failed_step: None,
+                    failure_reason: format!(
+                        "The previous attempt emitted an edit plan that failed to parse:\n{reason}\n\n\
+                         Re-emit a valid plan. Every LITERAL_REPLACE block must include an OLD: section \
+                         whose contents are copied verbatim from the file view above. If you cannot echo \
+                         OLD verbatim, use SMART_EDIT for that region instead."
+                    ),
+                    lsp_regression: None,
                 });
                 continue;
             }
@@ -391,15 +532,7 @@ async fn execute_preplanned_steps(
                 return Ok(PreplanResult::NoChanges);
             }
 
-            let mut message = String::new();
-            if !progress_log.is_empty() {
-                message.push_str(&progress_log);
-            }
-            message.push_str(&format!(
-                "✓ via pre-plan: converged after {attempt} planning attempt(s), applied edits to {path_str} ({} lines)\n",
-                current.lines().count()
-            ));
-            let validation_note = validate_candidate_for_write(
+            let validation = validate_candidate_for_write(
                 path_str,
                 path,
                 original,
@@ -412,15 +545,76 @@ async fn execute_preplanned_steps(
                 baseline_lsp_errors,
                 perms,
             )
-            .await?;
-            if let Some(note) = validation_note {
-                message.push_str(&note);
-                message.push('\n');
+            .await;
+
+            match validation {
+                Ok(validation_note) => {
+                    let mut message = String::new();
+                    if !progress_log.is_empty() {
+                        message.push_str(&progress_log);
+                    }
+                    message.push_str(&format!(
+                        "✓ via pre-plan: converged after {attempt} planning attempt(s), applied edits to {path_str} ({} lines)\n",
+                        current.lines().count()
+                    ));
+                    if let Some(note) = validation_note {
+                        message.push_str(&note);
+                        message.push('\n');
+                    }
+                    return Ok(PreplanResult::Applied(SplitResult {
+                        content: current,
+                        message,
+                    }));
+                }
+                Err(ValidationError::Other(e)) => return Err(e),
+                Err(ValidationError::LspRegression(regression)) => {
+                    // The planner said "nothing more to do" but the
+                    // accumulated state is still broken. Instead of
+                    // bailing, loop back with a repair context that
+                    // carries the structured LSP errors so the next
+                    // attempt can patch the regression.
+                    let summary = ValidationError::LspRegression(regression.clone()).summary();
+                    log_debug(
+                        log,
+                        path_str,
+                        &format!(
+                            "preplan:converged_validation_failed:{attempt} {}",
+                            truncate_multiline(&summary, 2000)
+                        ),
+                    );
+                    progress_log.push_str(&format!(
+                        "Pre-plan attempt {attempt} converged but validation failed: {}\n",
+                        truncate_multiline(&summary, 400)
+                    ));
+
+                    let new_count = regression.errors.len() + regression.extra_error_count;
+                    let improved = match best_error_count {
+                        Some(best) => new_count < best,
+                        None => false,
+                    };
+                    best_error_count = Some(match best_error_count {
+                        Some(best) => best.min(new_count),
+                        None => new_count,
+                    });
+                    if improved && extra_attempts_granted < MAX_EXTRA_ATTEMPTS {
+                        attempt_budget += 1;
+                        extra_attempts_granted += 1;
+                        progress_log.push_str(&format!(
+                            "Pre-plan attempt {attempt} improved errors to {new_count}; granted extra retry ({}/{})\n",
+                            extra_attempts_granted, MAX_EXTRA_ATTEMPTS
+                        ));
+                    }
+
+                    repair_context = Some(RepairContext {
+                        previous_plan: Vec::new(),
+                        completed_steps: Vec::new(),
+                        failed_step: None,
+                        failure_reason: summary,
+                        lsp_regression: Some(regression),
+                    });
+                    continue;
+                }
             }
-            return Ok(PreplanResult::Applied(SplitResult {
-                content: current,
-                message,
-            }));
         }
 
         let kept_count = steps.len();
@@ -482,11 +676,37 @@ async fn execute_preplanned_steps(
                     "Pre-plan attempt {attempt} failed: {}\n",
                     truncate_multiline(&e.error, 400)
                 ));
+
+                // Promising-fix-loop retry credit. When the failure is
+                // an LSP regression and the new error count is strictly
+                // better than our best-so-far, extend the budget so we
+                // don't cut off a converging trajectory.
+                if let Some(reg) = &e.lsp_regression {
+                    let new_count = reg.errors.len() + reg.extra_error_count;
+                    let improved = match best_error_count {
+                        Some(best) => new_count < best,
+                        None => false,
+                    };
+                    best_error_count = Some(match best_error_count {
+                        Some(best) => best.min(new_count),
+                        None => new_count,
+                    });
+                    if improved && extra_attempts_granted < MAX_EXTRA_ATTEMPTS {
+                        attempt_budget += 1;
+                        extra_attempts_granted += 1;
+                        progress_log.push_str(&format!(
+                            "Pre-plan attempt {attempt} improved errors to {new_count}; granted extra retry ({}/{})\n",
+                            extra_attempts_granted, MAX_EXTRA_ATTEMPTS
+                        ));
+                    }
+                }
+
                 repair_context = Some(RepairContext {
                     previous_plan: steps,
                     completed_steps: e.completed_steps,
                     failed_step: e.failed_step,
                     failure_reason: e.error,
+                    lsp_regression: e.lsp_regression,
                 });
                 current = e.current_content;
             }
@@ -496,7 +716,7 @@ async fn execute_preplanned_steps(
     let mut message = progress_log;
     if let Some(ctx) = repair_context {
         message.push_str(&format!(
-            "Pre-plan exhausted after {MAX_PLAN_ATTEMPTS} attempt(s); last failure: {}\n",
+            "Pre-plan exhausted after {attempt_budget} attempt(s); last failure: {}\n",
             ctx.failure_reason
         ));
         bail!(message);
@@ -618,6 +838,7 @@ async fn execute_planned_steps(
                                     ),
                                     completed_steps: completed_records.clone(),
                                     failed_step: Some(step.clone()),
+                                    lsp_regression: None,
                                 });
                             }
                             WhitespaceOutcome::NoCandidate => {
@@ -665,6 +886,7 @@ async fn execute_planned_steps(
                             ),
                             completed_steps: completed_records.clone(),
                             failed_step: Some(step.clone()),
+                            lsp_regression: None,
                         })?;
                         current = candidate;
                         completed_count += 1;
@@ -674,73 +896,6 @@ async fn execute_planned_steps(
                         // smart executor to redo the region. Surface it.
                         message.push_str(&format!(
                             "literal-replace L{scope_start}-L{scope_end} fell back to smart edit ({count} op(s))\n"
-                        ));
-                    }
-                }
-            }
-            EditPlanStep::ReplaceScope {
-                scope_start,
-                scope_end,
-                new,
-            } => {
-                match apply_replace_scope(&current, *scope_start, *scope_end, new) {
-                    Ok((candidate, _)) => {
-                        current = candidate;
-                        completed_count += 1;
-                        completed_records.push(step.clone());
-                        // Successful scope replace is the boring happy
-                        // path; the final summary captures it.
-                    }
-                    Err(scope_error) => {
-                        // Same fallback strategy as the literal-replace
-                        // path: hand the region to the smart executor
-                        // with a task that explains what we wanted, so
-                        // the planner gets a second shot at it.
-                        let fallback_task = format!(
-                            "The planned scope replacement failed: {scope_error}\n\
-                             Apply the same intended change manually within this region only.\n\n\
-                             Intended NEW (entire region):\n{}",
-                            new.join("\n")
-                        );
-                        let region = EditRegion {
-                            start: *scope_start,
-                            end: *scope_end,
-                            task: fallback_task,
-                        };
-                        let (candidate, count) = execute_smart_step(
-                            path_str,
-                            &region.task,
-                            &current,
-                            router,
-                            lsp_validation,
-                            &region,
-                            false,
-                            cancelled,
-                            log,
-                        )
-                        .await
-                        .map_err(|e| PlannedExecutionFailure {
-                            current_content: current.clone(),
-                            message: format!(
-                                "{message}Pre-plan step {} scope L{}-L{} failed after {} completed step(s): {scope_error}; smart fallback failed: {e}\n",
-                                idx + 1,
-                                scope_start,
-                                scope_end,
-                                completed_count
-                            ),
-                            error: format!(
-                                "step {} scope replace failed: {scope_error}; smart fallback failed: {e}",
-                                idx + 1
-                            ),
-                            completed_steps: completed_records.clone(),
-                            failed_step: Some(step.clone()),
-                        })?;
-                        current = candidate;
-                        completed_count += 1;
-                        completed_records.push(step.clone());
-                        // Smart fallback IS interesting — surface it.
-                        message.push_str(&format!(
-                            "scope-replace L{scope_start}-L{scope_end} fell back to smart edit ({count} op(s))\n"
                         ));
                     }
                 }
@@ -768,6 +923,7 @@ async fn execute_planned_steps(
                     error: format!("{region_label} failed: {e}"),
                     completed_steps: completed_records.clone(),
                     failed_step: Some(step.clone()),
+                    lsp_regression: None,
                 })?;
 
                 if count == 0 {
@@ -816,14 +972,22 @@ async fn execute_planned_steps(
         perms,
     )
     .await
-    .map_err(|e| PlannedExecutionFailure {
-        current_content: current.clone(),
-        message: format!(
-            "{message}Pre-plan validation failed after {completed_count}/{planned_count} completed step(s): {e}\n"
-        ),
-        error: e.to_string(),
-        completed_steps: completed_records.clone(),
-        failed_step: None,
+    .map_err(|e| {
+        let error_summary = e.summary();
+        let lsp_regression = match e {
+            ValidationError::LspRegression(reg) => Some(reg),
+            ValidationError::Other(_) => None,
+        };
+        PlannedExecutionFailure {
+            current_content: current.clone(),
+            message: format!(
+                "{message}Pre-plan validation failed after {completed_count}/{planned_count} completed step(s): {error_summary}\n"
+            ),
+            error: error_summary,
+            completed_steps: completed_records.clone(),
+            failed_step: None,
+            lsp_regression,
+        }
     })?;
     if let Some(note) = validation_note {
         message.push_str(&note);
@@ -906,10 +1070,10 @@ async fn validate_candidate_for_write(
     log: Option<&SessionLog>,
     baseline_lsp_errors: Option<usize>,
     perms: Option<&PermissionManager>,
-) -> Result<Option<String>> {
-    ensure_not_cancelled(cancelled)?;
-    validate_candidate(original, candidate)?;
-    gate_truncation(path_str, original, candidate, perms)?;
+) -> std::result::Result<Option<String>, ValidationError> {
+    ensure_not_cancelled(cancelled).map_err(ValidationError::Other)?;
+    validate_candidate(original, candidate).map_err(ValidationError::Other)?;
+    gate_truncation(path_str, original, candidate, perms).map_err(ValidationError::Other)?;
     log_stage(log, path_str, "validate:lsp");
     validate_candidate_with_lsp(
         path_str,
@@ -933,21 +1097,25 @@ async fn validate_candidate_with_lsp(
     lsp: Option<&LspClient>,
     lsp_validation: LspValidationMode,
     baseline_lsp_errors: Option<usize>,
-) -> Result<Option<String>> {
+) -> std::result::Result<Option<String>, ValidationError> {
     if lsp_validation == LspValidationMode::Off {
         return Ok(Some("[lsp] skipped (off)".into()));
     }
 
     let Some(lsp) = lsp else {
         if lsp_validation == LspValidationMode::Require {
-            bail!("LSP validation required but no LSP client is available");
+            return Err(ValidationError::Other(anyhow::anyhow!(
+                "LSP validation required but no LSP client is available"
+            )));
         }
         return Ok(None);
     };
 
     if !lsp.is_ready() || lsp.has_crashed() {
         if lsp_validation == LspValidationMode::Require {
-            bail!("LSP validation required but LSP is not ready");
+            return Err(ValidationError::Other(anyhow::anyhow!(
+                "LSP validation required but LSP is not ready"
+            )));
         }
         return Ok(None);
     }
@@ -966,7 +1134,9 @@ async fn validate_candidate_with_lsp(
             Ok(diags) => error_diagnostics(&diags).len(),
             Err(e) => {
                 if lsp_validation == LspValidationMode::Require {
-                    bail!("LSP baseline diagnostics failed: {e}");
+                    return Err(ValidationError::Other(anyhow::anyhow!(
+                        "LSP baseline diagnostics failed: {e}"
+                    )));
                 }
                 return Ok(None);
             }
@@ -981,7 +1151,9 @@ async fn validate_candidate_with_lsp(
             let _ = std::fs::write(path, original);
             let _ = diagnostics_for_current_file(lsp, path, timeout).await;
             if lsp_validation == LspValidationMode::Require {
-                bail!("LSP candidate diagnostics failed: {e}");
+                return Err(ValidationError::Other(anyhow::anyhow!(
+                    "LSP candidate diagnostics failed: {e}"
+                )));
             }
             return Ok(None);
         }
@@ -989,10 +1161,11 @@ async fn validate_candidate_with_lsp(
 
     let candidate_errors = error_diagnostics(&candidate_diags);
     if candidate_errors.len() > baseline_count {
-        let summary = format_lsp_error_regression(path_str, baseline_count, &candidate_errors);
+        let regression = build_lsp_regression(baseline_count, &candidate_errors, candidate);
         let _ = std::fs::write(path, original);
         let _ = diagnostics_for_current_file(lsp, path, timeout).await;
-        bail!("{summary}");
+        let _ = path_str; // path_str retained for callers formatting the one-line summary
+        return Err(ValidationError::LspRegression(regression));
     }
 
     Ok(Some(format!(
@@ -1001,6 +1174,35 @@ async fn validate_candidate_with_lsp(
         candidate_errors.len(),
         lsp_validation.as_str()
     )))
+}
+
+/// Build the structured `LspRegression` carried back to the planner.
+/// We keep the first 5 errors inline (matching the one-line summary
+/// cap) and record the remaining count so the summary still says
+/// "and N more".
+fn build_lsp_regression(
+    baseline_count: usize,
+    candidate_errors: &[Diagnostic],
+    candidate_content: &str,
+) -> LspRegression {
+    const MAX_ERRORS: usize = 5;
+    let total = candidate_errors.len();
+    let kept: Vec<LspErrorLocation> = candidate_errors
+        .iter()
+        .take(MAX_ERRORS)
+        .map(|d| LspErrorLocation {
+            line: (d.range.start.line + 1) as usize,
+            column: (d.range.start.character + 1) as usize,
+            message: d.message.clone(),
+        })
+        .collect();
+    let extra_error_count = total.saturating_sub(kept.len());
+    LspRegression {
+        baseline_count,
+        errors: kept,
+        extra_error_count,
+        candidate_content: candidate_content.to_string(),
+    }
 }
 
 async fn diagnostics_for_current_file(
@@ -1018,33 +1220,6 @@ fn error_diagnostics(diagnostics: &[Diagnostic]) -> Vec<Diagnostic> {
         .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
         .cloned()
         .collect()
-}
-
-fn format_lsp_error_regression(
-    path_str: &str,
-    baseline_error_count: usize,
-    candidate_errors: &[Diagnostic],
-) -> String {
-    let mut out = format!(
-        "LSP diagnostics worsened for {path_str}: {baseline_error_count} -> {} error(s)",
-        candidate_errors.len()
-    );
-    for diag in candidate_errors.iter().take(5) {
-        out.push_str(&format!(
-            "\n{}:{}:{}: error: {}",
-            path_str,
-            diag.range.start.line + 1,
-            diag.range.start.character + 1,
-            diag.message
-        ));
-    }
-    if candidate_errors.len() > 5 {
-        out.push_str(&format!(
-            "\n... and {} more error(s)",
-            candidate_errors.len() - 5
-        ));
-    }
-    out
 }
 
 struct PatchResponse {
@@ -1790,18 +1965,12 @@ async fn request_preplan_steps(
          SCOPE <start> <end>\n\
          ALL true\n\
          OLD:\n\
-         <exact text>\n\
+         <exact text copied verbatim from L<start>-L<end>>\n\
          END_OLD\n\
          NEW:\n\
          <replacement text>\n\
          END_NEW\n\n\
-         You may omit the OLD: ... END_OLD block when ALL is true and you want to replace the *entire* SCOPE wholesale (the whole L<start>-L<end> range becomes NEW). This is shorter and avoids retyping a long OLD when the range is already exact:\n\n\
-         LITERAL_REPLACE\n\
-         SCOPE <start> <end>\n\
-         ALL true\n\
-         NEW:\n\
-         <replacement text for the entire scope>\n\
-         END_NEW\n\n\
+         OLD: is required. Copy it from the file content you see above — do not type it from memory. If the region is too large to echo verbatim, use SMART_EDIT instead.\n\n\
          SMART_EDIT\n\
          REGION <start> <end>\n\
          TASK: <specific edit for this region>\n\n\
@@ -1899,7 +2068,11 @@ async fn request_preplan_steps(
                     truncate_multiline(&e.to_string(), 2000)
                 ),
             );
-            return Err(e);
+            // Parse errors used to kill the whole edit_file call. Now we
+            // surface them to the outer retry loop so the repair prompt
+            // can tell the model exactly what was malformed and ask for
+            // a corrected plan on the next attempt.
+            return Ok(PreplanOutcome::ParseError(e.to_string()));
         }
     };
 
@@ -2001,17 +2174,6 @@ pub enum EditPlanStep {
         old: Vec<String>,
         new: Vec<String>,
     },
-    /// Replace the *entire* contents of a line range with new text. The
-    /// finalize prompt presents this as a `LITERAL_REPLACE` block where
-    /// `OLD:` is omitted — useful for scoped rewrites where the model
-    /// already knows the surrounding range and would otherwise have to
-    /// echo the full OLD verbatim, doubling output tokens (and providing
-    /// extra opportunity for repetition loops on degraded models).
-    ReplaceScope {
-        scope_start: usize,
-        scope_end: usize,
-        new: Vec<String>,
-    },
 }
 
 impl EditPlanStep {
@@ -2019,7 +2181,6 @@ impl EditPlanStep {
         match self {
             Self::SmartEdit(region) => region.start,
             Self::LiteralReplace { scope_start, .. } => *scope_start,
-            Self::ReplaceScope { scope_start, .. } => *scope_start,
         }
     }
 
@@ -2027,7 +2188,6 @@ impl EditPlanStep {
         match self {
             Self::SmartEdit(region) => region.end,
             Self::LiteralReplace { scope_end, .. } => *scope_end,
-            Self::ReplaceScope { scope_end, .. } => *scope_end,
         }
     }
 }
@@ -2054,18 +2214,6 @@ fn format_edit_plan_steps(steps: &[EditPlanStep]) -> String {
                 out.push_str("OLD:\n");
                 out.push_str(&old.join("\n"));
                 out.push_str("\nEND_OLD\nNEW:\n");
-                out.push_str(&new.join("\n"));
-                out.push_str("\nEND_NEW\n\n");
-            }
-            EditPlanStep::ReplaceScope {
-                scope_start,
-                scope_end,
-                new,
-            } => {
-                out.push_str("LITERAL_REPLACE\n");
-                out.push_str(&format!("SCOPE {scope_start} {scope_end}\n"));
-                out.push_str("ALL true\n");
-                out.push_str("NEW:\n");
                 out.push_str(&new.join("\n"));
                 out.push_str("\nEND_NEW\n\n");
             }
@@ -2173,16 +2321,80 @@ fn format_repair_context(ctx: &RepairContext) -> String {
         None => "(no individual step failed; the plan executed in full but post-validation rejected the result — see failure reason below)\n".to_string(),
     };
 
+    let failure_block = match &ctx.lsp_regression {
+        Some(reg) => format_lsp_regression_for_planner(reg),
+        None => ctx.failure_reason.clone(),
+    };
+
     format!(
         "A previous edit plan was attempted and failed. Use the structured information below to plan a better recovery.\n\n\
          Previous edit plan (as tried):\n{previous_plan}\n\
          Steps that succeeded and have ALREADY been applied to the file shown below:\n{completed}\n\
          Step that FAILED:\n{failed}\n\
-         Failure reason:\n{reason}\n\n\
+         Failure reason:\n{failure_block}\n\n\
          Plan the remaining work needed to complete the original task against the current file content. \
          If the task already appears complete, return NO_CHANGES.\n\n",
-        reason = ctx.failure_reason,
     )
+}
+
+/// Render an `LspRegression` with per-error post-edit source snippets so
+/// the replanner sees *which lines of its patch* produced each new
+/// error, not just the raw file:line:col blob.
+///
+/// Layout:
+///
+/// ```text
+/// LSP diagnostics worsened: B -> T error(s)
+/// [1] L<line>:<col>: <message>
+///     post-edit context:
+///     <snippet>
+/// [2] ...
+/// ```
+///
+/// The snippet uses the *candidate* file content captured at validation
+/// time so the replanner sees the broken state it produced, not a stale
+/// pre-edit view.
+fn format_lsp_regression_for_planner(reg: &LspRegression) -> String {
+    const CONTEXT_RADIUS: usize = 5;
+    let total = reg.errors.len() + reg.extra_error_count;
+    let mut out = format!(
+        "LSP diagnostics worsened: {} -> {} error(s)\n\
+         The following errors were introduced by the previous attempt's patch. \
+         Each entry shows the post-edit source around the error so you can see exactly what your patch produced.\n",
+        reg.baseline_count, total
+    );
+
+    let lines: Vec<&str> = reg.candidate_content.lines().collect();
+    for (idx, err) in reg.errors.iter().enumerate() {
+        out.push_str(&format!(
+            "\n[{n}] L{line}:{col}: {msg}\n",
+            n = idx + 1,
+            line = err.line,
+            col = err.column,
+            msg = err.message,
+        ));
+        if err.line == 0 || err.line > lines.len() {
+            out.push_str("    (line out of range for post-edit content)\n");
+            continue;
+        }
+        let zero_based = err.line - 1;
+        let start = zero_based.saturating_sub(CONTEXT_RADIUS);
+        let end = (zero_based + CONTEXT_RADIUS + 1).min(lines.len());
+        out.push_str("    post-edit context:\n");
+        for (i, line) in lines[start..end].iter().enumerate() {
+            let line_no = start + i + 1;
+            let marker = if line_no == err.line { ">>" } else { "  " };
+            out.push_str(&format!("    {marker} {line_no:>5} │ {line}\n"));
+        }
+    }
+
+    if reg.extra_error_count > 0 {
+        out.push_str(&format!(
+            "\n... and {} more error(s) not shown\n",
+            reg.extra_error_count
+        ));
+    }
+    out
 }
 
 fn truncate_multiline(text: &str, max_chars: usize) -> String {
@@ -2311,38 +2523,22 @@ pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
             };
             i += 1;
 
-            // Peek at the next non-blank line to decide between the two
-            // LITERAL_REPLACE forms:
-            //
-            //   OLD:        — classic literal replace, OLD must match
-            //               in scope, replaced 1× or all× by NEW.
-            //
-            //   NEW:        — scope replace; the entire SCOPE is
-            //               wholesale replaced with NEW. Only valid
-            //               when ALL true was specified, since "match
-            //               1 of N" has no meaning without an OLD to
-            //               match against.
+            // Reject the old "NEW: without OLD:" shortcut. It let the
+            // model regenerate the replacement text without cross-checking
+            // the scope it was editing, which was the root cause of most
+            // hallucination failures (inventing `&self` on a free fn,
+            // dropping `pub struct Foo {` off the start of a scope, etc).
+            // OLD: is now unconditional so we can verify at parse/apply
+            // time that the model knows what it's replacing.
             let mut peek = i;
             while peek < lines.len() && lines[peek].trim().is_empty() {
                 peek += 1;
             }
             let head = lines.get(peek).copied().unwrap_or("");
             if head == "NEW:" {
-                if !all {
-                    bail!(
-                        "LITERAL_REPLACE without OLD requires ALL true (got ALL false) — use the OLD form for a single-occurrence replacement"
-                    );
-                }
-                i = peek + 1;
-                let (new, next) = collect_until(&lines, i, "END_NEW")?;
-                i = next + 1;
-
-                steps.push(EditPlanStep::ReplaceScope {
-                    scope_start,
-                    scope_end,
-                    new,
-                });
-                continue;
+                bail!(
+                    "LITERAL_REPLACE now requires an OLD: block — copy the exact current text of L{scope_start}-L{scope_end} into OLD:, then put the replacement in NEW:. If the region is too large to echo verbatim, use SMART_EDIT instead (its execution phase will see the region content)."
+                );
             }
 
             expect_line(&lines, i, "OLD:")?;
@@ -2959,53 +3155,6 @@ async fn request_whitespace_drift_confirmation(
         .flat_map(|c| c.to_lowercase())
         .collect();
     Ok(first_word == "yes")
-}
-
-/// Replace the entire L`scope_start`..=L`scope_end` slice of `content`
-/// with `new`. Unlike `apply_literal_replace_in_scope` there is no OLD
-/// block to anchor against — the caller has decided the *whole* scope
-/// should be rewritten. Used by `EditPlanStep::ReplaceScope` (the
-/// `LITERAL_REPLACE` form that omits `OLD:`).
-///
-/// Returns the rewritten file plus a (synthetic) op count of 1 so the
-/// caller's per-step accounting stays consistent with the regular
-/// literal replace path.
-pub fn apply_replace_scope(
-    content: &str,
-    scope_start: usize,
-    scope_end: usize,
-    new: &[String],
-) -> Result<(String, usize)> {
-    if scope_start == 0 || scope_end < scope_start {
-        bail!("invalid replace scope L{scope_start}-L{scope_end}");
-    }
-    let line_count = content.lines().count();
-    if scope_end > line_count {
-        bail!("replace scope L{scope_start}-L{scope_end} outside {line_count} line file");
-    }
-
-    let parts: Vec<&str> = content.split_inclusive('\n').collect();
-    let start_byte: usize = parts[..scope_start - 1].iter().map(|part| part.len()).sum();
-    let end_byte: usize = parts[..scope_end].iter().map(|part| part.len()).sum();
-
-    // Preserve the trailing newline of the last line in the scope (if it
-    // had one) so the file structure stays intact when the new text is
-    // shorter or longer.
-    let scope_ends_with_newline = parts
-        .get(scope_end - 1)
-        .map(|line| line.ends_with('\n'))
-        .unwrap_or(false);
-
-    let mut new_text = new.join("\n");
-    if scope_ends_with_newline && !new_text.ends_with('\n') {
-        new_text.push('\n');
-    }
-
-    let mut out = String::with_capacity(content.len() + new_text.len());
-    out.push_str(&content[..start_byte]);
-    out.push_str(&new_text);
-    out.push_str(&content[end_byte..]);
-    Ok((out, 1))
 }
 
 fn apply_resolved_patch(content: &str, mut resolved: Vec<ResolvedOp>) -> Result<String> {
@@ -3860,6 +4009,7 @@ mod tests {
                 task: "rewrite header".into(),
             })),
             failure_reason: "region missing anchor".into(),
+            lsp_regression: None,
         };
 
         let block = format_repair_context(&ctx);
@@ -3891,6 +4041,7 @@ mod tests {
             completed_steps: vec![step_a, step_b],
             failed_step: None,
             failure_reason: "LSP diagnostics worsened: 0 -> 4 errors".into(),
+            lsp_regression: None,
         };
 
         let block = format_repair_context(&ctx);
@@ -3922,6 +4073,7 @@ mod tests {
             completed_steps: vec![completed_step],
             failed_step: Some(failed_step),
             failure_reason: "smart edit returned no diff".into(),
+            lsp_regression: None,
         };
 
         let block = format_repair_context(&ctx);
@@ -4012,9 +4164,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_edit_plan_accepts_literal_replace_without_old() {
-        // The model omits the OLD: block — we should produce a
-        // ReplaceScope step that rewrites the entire scope.
+    fn parse_edit_plan_rejects_literal_replace_without_old() {
+        // The OLD-less shortcut is gone — the parser must reject it
+        // with a message that tells the planner to either provide OLD
+        // verbatim or switch to SMART_EDIT. This is the primary guard
+        // against hallucinated replacements.
         let input = "\
 LITERAL_REPLACE
 SCOPE 10 12
@@ -4025,47 +4179,22 @@ new line two
 END_NEW
 END
 ";
-        let steps = parse_edit_plan(input).expect("no-OLD literal should parse");
-        assert_eq!(steps.len(), 1);
-        match &steps[0] {
-            EditPlanStep::ReplaceScope {
-                scope_start,
-                scope_end,
-                new,
-            } => {
-                assert_eq!(*scope_start, 10);
-                assert_eq!(*scope_end, 12);
-                assert_eq!(
-                    new,
-                    &vec!["new line one".to_string(), "new line two".to_string()]
-                );
-            }
-            other => panic!("expected ReplaceScope, got {other:?}"),
-        }
+        let err = parse_edit_plan(input).expect_err("no-OLD form must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("OLD:"),
+            "error should instruct the planner to include OLD:, got: {msg}"
+        );
+        assert!(
+            msg.contains("SMART_EDIT"),
+            "error should mention SMART_EDIT as the fallback, got: {msg}"
+        );
     }
 
     #[test]
-    fn parse_edit_plan_no_old_form_tolerates_blank_line_before_new() {
-        // The model put a blank line between `ALL true` and `NEW:`.
-        let input = "\
-LITERAL_REPLACE
-SCOPE 1 3
-ALL true
-
-NEW:
-hello
-END_NEW
-END
-";
-        let steps = parse_edit_plan(input).expect("blank line should be tolerated");
-        assert_eq!(steps.len(), 1);
-        assert!(matches!(steps[0], EditPlanStep::ReplaceScope { .. }));
-    }
-
-    #[test]
-    fn parse_edit_plan_no_old_form_rejects_all_false() {
-        // ALL false has no meaning without an OLD anchor — bail loudly
-        // rather than silently replacing the whole scope.
+    fn parse_edit_plan_rejects_no_old_form_even_when_all_false() {
+        // Same rejection applies regardless of the ALL flag — OLD is
+        // required unconditionally.
         let input = "\
 LITERAL_REPLACE
 SCOPE 1 3
@@ -4075,12 +4204,8 @@ hello
 END_NEW
 END
 ";
-        let err = parse_edit_plan(input).expect_err("ALL false + no OLD should be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("ALL true"),
-            "error should mention ALL true requirement, got: {msg}"
-        );
+        let err = parse_edit_plan(input).expect_err("no-OLD form must be rejected");
+        assert!(err.to_string().contains("OLD:"));
     }
 
     #[test]
@@ -4117,69 +4242,6 @@ END
             }
             other => panic!("expected LiteralReplace, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn apply_replace_scope_replaces_entire_range() {
-        let content = "line one\nline two\nline three\nline four\n";
-        let new = vec!["fresh two".to_string(), "fresh three".to_string()];
-        let (out, count) = apply_replace_scope(content, 2, 3, &new).expect("scope replace works");
-        assert_eq!(count, 1);
-        assert_eq!(out, "line one\nfresh two\nfresh three\nline four\n");
-    }
-
-    #[test]
-    fn apply_replace_scope_supports_grow_and_shrink() {
-        // Replacing 2 lines with 4 lines.
-        let content = "a\nb\nc\nd\n";
-        let new = vec![
-            "alpha".to_string(),
-            "bravo".to_string(),
-            "charlie".to_string(),
-            "delta".to_string(),
-        ];
-        let (grew, _) = apply_replace_scope(content, 2, 3, &new).unwrap();
-        assert_eq!(grew, "a\nalpha\nbravo\ncharlie\ndelta\nd\n");
-
-        // Replacing 4 lines with 1.
-        let (shrunk, _) = apply_replace_scope("a\nb\nc\nd\ne\n", 2, 4, &vec!["only".to_string()]).unwrap();
-        assert_eq!(shrunk, "a\nonly\ne\n");
-    }
-
-    #[test]
-    fn apply_replace_scope_preserves_missing_trailing_newline() {
-        // The last line of the scope had no trailing newline (e.g.
-        // because the file itself doesn't end with one and the scope
-        // extends to EOF). The result should not get a synthetic
-        // newline appended.
-        let content = "a\nb\nlast";
-        let (out, _) = apply_replace_scope(content, 3, 3, &vec!["replaced".to_string()]).unwrap();
-        assert_eq!(out, "a\nb\nreplaced");
-    }
-
-    #[test]
-    fn apply_replace_scope_rejects_out_of_range() {
-        let content = "a\nb\nc\n";
-        let err = apply_replace_scope(content, 1, 99, &vec!["x".to_string()])
-            .expect_err("scope past EOF should error");
-        assert!(err.to_string().contains("outside"));
-    }
-
-    #[test]
-    fn format_edit_plan_steps_emits_replace_scope_without_old() {
-        let steps = vec![EditPlanStep::ReplaceScope {
-            scope_start: 4,
-            scope_end: 6,
-            new: vec!["aaa".into(), "bbb".into()],
-        }];
-        let out = format_edit_plan_steps(&steps);
-        // Must use the LITERAL_REPLACE shape but skip the OLD section.
-        assert!(out.contains("LITERAL_REPLACE"));
-        assert!(out.contains("SCOPE 4 6"));
-        assert!(out.contains("ALL true"));
-        assert!(out.contains("NEW:\naaa\nbbb\nEND_NEW"));
-        assert!(!out.contains("OLD:"));
-        assert!(!out.contains("END_OLD"));
     }
 
     #[test]
