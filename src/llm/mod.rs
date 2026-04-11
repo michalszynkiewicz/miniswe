@@ -76,9 +76,17 @@ impl LlmClient {
         let idle_timeout = Duration::from_secs(self.config.stream_idle_timeout_secs);
 
         let mut attempt = 0usize;
+        let mut noop = |_: &str| {};
         loop {
             let result = self
-                .stream_once_assembled(&url, &body, connect_timeout, idle_timeout, cancelled)
+                .stream_once_assembled(
+                    &url,
+                    &body,
+                    connect_timeout,
+                    idle_timeout,
+                    cancelled,
+                    &mut noop,
+                )
                 .await;
 
             match result {
@@ -103,15 +111,18 @@ impl LlmClient {
 
     /// One streamed attempt: connect, drain SSE chunks (each chunk read
     /// must arrive within `idle_timeout` or we bail), assemble into a
-    /// `ChatResponse`. Used by both `chat_with_cancel` and any future
-    /// caller that wants a single-shot try without retries.
-    async fn stream_once_assembled(
+    /// `ChatResponse`. `on_token` fires once per content delta — pass a
+    /// no-op closure if the caller is not surfacing intermediate tokens
+    /// to the UI. Used by both `chat_with_cancel` (no-op) and
+    /// `chat_stream` (live UI callback).
+    async fn stream_once_assembled<F: FnMut(&str)>(
         &self,
         url: &str,
         body: &Value,
         connect_timeout: Duration,
         idle_timeout: Duration,
         cancelled: Option<&AtomicBool>,
+        on_token: &mut F,
     ) -> Result<ChatResponse> {
         // The initial connect/HTTP-handshake gets the wall-clock timeout —
         // we don't want to dial forever if the server is unreachable.
@@ -159,7 +170,7 @@ impl LlmClient {
 
         if !is_sse {
             return self
-                .read_non_streaming_body(response, idle_timeout, cancelled)
+                .read_non_streaming_body(response, idle_timeout, cancelled, on_token)
                 .await;
         }
 
@@ -225,6 +236,7 @@ impl LlmClient {
                     };
                     if let Some(choice) = parsed.choices.first() {
                         if let Some(content) = &choice.delta.content {
+                            on_token(content);
                             full_content.push_str(content);
                         }
                         if let Some(tc_deltas) = &choice.delta.tool_calls {
@@ -302,12 +314,15 @@ impl LlmClient {
     /// idle-timeout still applies (we don't want a hanging body to wedge
     /// the request indefinitely just because the server returned
     /// `application/json` instead of `text/event-stream`). After the
-    /// body finishes we parse it as a single `ChatResponse`.
-    async fn read_non_streaming_body(
+    /// body finishes we parse it as a single `ChatResponse` and forward
+    /// any assistant text to `on_token` so streaming-style callers still
+    /// get one final UI update.
+    async fn read_non_streaming_body<F: FnMut(&str)>(
         &self,
         response: reqwest::Response,
         idle_timeout: Duration,
         cancelled: Option<&AtomicBool>,
+        on_token: &mut F,
     ) -> Result<ChatResponse> {
         let mut stream = response.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
@@ -342,13 +357,28 @@ impl LlmClient {
 
         let resp: ChatResponse = serde_json::from_slice(&buf)
             .context("Failed to parse LLM response")?;
+        if let Some(content) = resp
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_deref())
+            .filter(|c| !c.is_empty())
+        {
+            on_token(content);
+        }
         Ok(resp)
     }
 
-    /// Send a chat completion request with streaming. Calls `on_token` for each
-    /// content delta and returns the final assembled response.
-    /// Send a streaming chat request. The `cancelled` flag can be set from
-    /// another task (e.g., Ctrl+C handler) to abort mid-stream.
+    /// Send a streaming chat request. Calls `on_token` for each content
+    /// delta and returns the final assembled response. The `cancelled`
+    /// flag can be set from another task (e.g., Ctrl+C handler) to abort
+    /// mid-stream.
+    ///
+    /// Internally shares the SSE / non-SSE / idle-timeout machinery with
+    /// `chat_with_cancel` via [`Self::stream_once_assembled`]. Connect
+    /// failures and idle-timeout errors are retried up to `max_retries`,
+    /// but only if no tokens have been delivered yet on the current
+    /// attempt — once the UI has seen partial content, retrying would
+    /// duplicate it, so we surface the error instead.
     pub async fn chat_stream<F>(
         &self,
         request: &ChatRequest,
@@ -367,146 +397,45 @@ impl LlmClient {
         body["temperature"] = Value::from(self.config.temperature);
         body["max_tokens"] = Value::from(self.config.max_output_tokens);
         body["stream"] = Value::Bool(true);
+        let connect_timeout = Duration::from_secs(self.config.request_timeout_secs);
+        let idle_timeout = Duration::from_secs(self.config.stream_idle_timeout_secs);
 
         let mut attempt = 0usize;
-        let response = loop {
-            let result = self
-                .client
-                .post(&url)
-                .json(&body)
-                .send()
+        loop {
+            let mut had_progress = false;
+            let result = {
+                let mut wrapped = |token: &str| {
+                    had_progress = true;
+                    on_token(token);
+                };
+                self.stream_once_assembled(
+                    &url,
+                    &body,
+                    connect_timeout,
+                    idle_timeout,
+                    Some(cancelled.as_ref()),
+                    &mut wrapped,
+                )
                 .await
-                .with_context(|| format!("Failed to connect to LLM at {url}"));
+            };
 
             match result {
-                Ok(response) if response.status().is_success() => break response,
-                Ok(response) => {
-                    let status = response.status();
-                    let text = response.text().await.unwrap_or_default();
-                    let err = anyhow::anyhow!("LLM API error ({status}): {text}");
-                    if attempt < max_retries && is_retryable_llm_error(&err) {
-                        let delay = retry_delays[attempt];
-                        attempt += 1;
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
-                            _ = wait_for_cancel(cancelled) => bail!("Interrupted by user"),
-                        }
-                        continue;
-                    }
-                    return Err(err);
-                }
-                Err(err) => {
-                    if attempt < max_retries && is_retryable_llm_error(&err) {
-                        let delay = retry_delays[attempt];
-                        attempt += 1;
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
-                            _ = wait_for_cancel(cancelled) => bail!("Interrupted by user"),
-                        }
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
-        };
-
-        let mut stream = response.bytes_stream();
-        let mut full_content = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut current_tool_call_parts: std::collections::HashMap<
-            usize,
-            (String, String, String),
-        > = std::collections::HashMap::new();
-
-        while let Some(chunk) = stream.next().await {
-            if cancelled.load(Ordering::Relaxed) {
-                bail!("Interrupted by user");
-            }
-            let chunk = chunk.context("Stream read error")?;
-            let text = String::from_utf8_lossy(&chunk);
-
-            // SSE format: lines starting with "data: "
-            for line in text.lines() {
-                let line = line.trim();
-                if line == "data: [DONE]" {
-                    break;
-                }
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
-                        if let Some(choice) = chunk.choices.first() {
-                            // Handle content deltas
-                            if let Some(content) = &choice.delta.content {
-                                on_token(content);
-                                full_content.push_str(content);
-                            }
-                            // Handle tool call deltas
-                            if let Some(tc_deltas) = &choice.delta.tool_calls {
-                                for tc_delta in tc_deltas {
-                                    let idx = tc_delta.index.unwrap_or(0);
-                                    let entry =
-                                        current_tool_call_parts.entry(idx).or_insert_with(|| {
-                                            (
-                                                tc_delta.id.clone().unwrap_or_default(),
-                                                String::new(),
-                                                String::new(),
-                                            )
-                                        });
-                                    if let Some(id) = &tc_delta.id {
-                                        if !id.is_empty() {
-                                            entry.0 = id.clone();
-                                        }
-                                    }
-                                    if let Some(func) = &tc_delta.function {
-                                        if let Some(name) = &func.name {
-                                            entry.1.push_str(name);
-                                        }
-                                        if let Some(args) = &func.arguments {
-                                            entry.2.push_str(args);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                Ok(resp) => return Ok(resp),
+                Err(err)
+                    if !had_progress
+                        && attempt < max_retries
+                        && is_retryable_llm_error(&err) =>
+                {
+                    let delay = retry_delays[attempt];
+                    attempt += 1;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
+                        _ = wait_for_cancel(cancelled) => bail!("Interrupted by user"),
                     }
                 }
+                Err(err) => return Err(err),
             }
         }
-
-        // Assemble tool calls from accumulated parts
-        let mut indices: Vec<usize> = current_tool_call_parts.keys().copied().collect();
-        indices.sort();
-        for idx in indices {
-            let Some((id, name, arguments)) = current_tool_call_parts.remove(&idx) else {
-                continue;
-            };
-            tool_calls.push(ToolCall {
-                id,
-                r#type: "function".into(),
-                function: FunctionCall { name, arguments },
-            });
-        }
-
-        Ok(ChatResponse {
-            choices: vec![Choice {
-                message: Message {
-                    role: "assistant".into(),
-                    content: if full_content.is_empty() {
-                        None
-                    } else {
-                        Some(full_content)
-                    },
-                    tool_calls: if tool_calls.is_empty() {
-                        None
-                    } else {
-                        Some(tool_calls)
-                    },
-                    tool_call_id: None,
-                    name: None,
-                },
-                finish_reason: Some("stop".into()),
-            }],
-            usage: None,
-        })
     }
 }
 
