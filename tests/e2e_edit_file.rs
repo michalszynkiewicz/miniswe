@@ -386,6 +386,9 @@ fn literal_replace_in_scope_requires_exact_match_count_for_single() {
 
 #[tokio::test]
 async fn execute_valid_patch_writes_file() {
+    // Small file → the pre-plan pipeline skips the windowed observation
+    // pass entirely and the first LLM call is the finalize prompt. The
+    // second call is the smart-edit patch for the planned step.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -395,11 +398,7 @@ async fn execute_valid_patch_writes_file() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 0 => helpers::mock_text_response(
-                    "SMART_EDIT\nREGION 1-2\nTASK: add setup call\nEND\n",
-                ),
-                1 => helpers::mock_text_response("DONE_EXPLORING"),
-                2 => helpers::mock_text_response(
-                    "SMART_EDIT\nREGION 1-2\nTASK: add setup call\nEND\n",
+                    "SMART_EDIT\nREGION 1 2\nTASK: add setup call\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
                     "INSERT_AFTER 1\nCONTENT:\n    added();\nEND\n",
@@ -415,13 +414,14 @@ async fn execute_valid_patch_writes_file() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "add setup call"});
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("via pre-plan"));
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    // finalize + smart-edit patch = 2
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "fn main() {\n    added();\n}\n"
@@ -430,8 +430,8 @@ async fn execute_valid_patch_writes_file() {
 
 #[tokio::test]
 async fn execute_failed_patch_writes_nothing() {
-    // 1-line file → every plan attempt runs window + recon + finalize +
-    // 3 patch retries (= 6 LLM calls). 4 attempts × 6 = 24 calls.
+    // 1-line file → small-file fast path: each plan attempt runs a single
+    // finalize call plus 3 patch retries (= 4 LLM calls). 4 attempts × 4 = 16.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -439,10 +439,8 @@ async fn execute_failed_patch_writes_nothing() {
         .and(path("/v1/chat/completions"))
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
-            match n % 6 {
-                0 => helpers::mock_text_response("NOTE noop"),
-                1 => helpers::mock_text_response("DONE"),
-                2 => helpers::mock_text_response(
+            match n % 4 {
+                0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -459,15 +457,15 @@ async fn execute_failed_patch_writes_nothing() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change line"});
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(!result.success);
     assert!(result.content.contains("patch was not applied"));
     assert!(result.content.contains("Pre-plan exhausted after 4 attempt(s)"));
-    // 4 plan attempts × (window + recon + finalize + 3 patch retries) = 24
-    assert_eq!(calls.load(Ordering::SeqCst), 24);
+    // 4 plan attempts × (finalize + 3 patch retries) = 16
+    assert_eq!(calls.load(Ordering::SeqCst), 16);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "original\n"
@@ -476,8 +474,8 @@ async fn execute_failed_patch_writes_nothing() {
 
 #[tokio::test]
 async fn execute_repairs_failed_first_patch() {
-    // 1-line file. Plan 1: window + recon + finalize + 3 failing patches.
-    // Plan 2 (repair): window + recon + finalize + 1 successful patch.
+    // 1-line file (small-file fast path). Plan 1: finalize + 3 failing
+    // patches. Plan 2 (repair): finalize + 1 successful patch.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -487,18 +485,14 @@ async fn execute_repairs_failed_first_patch() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 // Plan attempt 1
-                0 => helpers::mock_text_response("NOTE noop"),
-                1 => helpers::mock_text_response("DONE"),
-                2 => helpers::mock_text_response(
+                0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
                 ),
-                3..=5 => helpers::mock_text_response(
+                1..=3 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\nwrong\nEND_OLD\nNEW:\nfixed\nEND_NEW\n",
                 ),
                 // Plan attempt 2 (repair)
-                6 => helpers::mock_text_response("NOTE noop"),
-                7 => helpers::mock_text_response("DONE"),
-                8 => helpers::mock_text_response(
+                4 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -515,15 +509,26 @@ async fn execute_repairs_failed_first_patch() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change line"});
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert!(result.content.contains("Pre-plan repair attempt 2"));
-    // plan1: 3 preplan + 3 failed patches = 6
-    // plan2: 3 preplan + 1 success patch    = 4
-    assert_eq!(calls.load(Ordering::SeqCst), 10);
+    // The agent-facing trail on a multi-attempt success carries one
+    // line per failed attempt followed by the final summary.
+    assert!(
+        result.content.contains("Pre-plan attempt 1 failed"),
+        "expected one-line failed-attempt trail, got: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("✓ via pre-plan: applied 1 step(s)"),
+        "expected concise success summary, got: {}",
+        result.content
+    );
+    // plan1: finalize + 3 failed patches = 4
+    // plan2: finalize + 1 success patch    = 2
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "fixed\n"
@@ -532,8 +537,9 @@ async fn execute_repairs_failed_first_patch() {
 
 #[tokio::test]
 async fn execute_repairs_until_third_patch() {
-    // 1-line file. Plans 1 and 2 fail (3 preplan + 3 patch retries each).
-    // Plan 3 succeeds on its first patch (3 preplan + 1 patch).
+    // 1-line file (small-file fast path). Plans 1 and 2 fail (finalize +
+    // 3 patch retries each). Plan 3 succeeds on its first patch (finalize
+    // + 1 patch).
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -542,14 +548,12 @@ async fn execute_repairs_until_third_patch() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                // Per-attempt preplan: window (NOTE), recon (DONE), finalize (plan).
-                0 | 6 | 12 => helpers::mock_text_response("NOTE noop"),
-                1 | 7 | 13 => helpers::mock_text_response("DONE"),
-                2 | 8 | 14 => helpers::mock_text_response(
+                // Per-attempt preplan: just the finalize call in the small-file fast path.
+                0 | 4 | 8 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
                 ),
                 // Plans 1 and 2 fail their patches.
-                3..=5 | 9..=11 => helpers::mock_text_response(
+                1..=3 | 5..=7 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\nwrong\nEND_OLD\nNEW:\nfixed\nEND_NEW\n",
                 ),
                 // Plan 3's first patch succeeds.
@@ -567,14 +571,29 @@ async fn execute_repairs_until_third_patch() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change line"});
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert!(result.content.contains("Pre-plan repair attempt 3"));
-    // plan1: 3 + 3, plan2: 3 + 3, plan3: 3 + 1 = 16
-    assert_eq!(calls.load(Ordering::SeqCst), 16);
+    // Two failed attempts must show up in the agent-facing trail.
+    assert!(
+        result.content.contains("Pre-plan attempt 1 failed"),
+        "expected attempt-1 failure trail, got: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("Pre-plan attempt 2 failed"),
+        "expected attempt-2 failure trail, got: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("✓ via pre-plan: applied 1 step(s)"),
+        "expected concise success summary, got: {}",
+        result.content
+    );
+    // plan1: 1 + 3, plan2: 1 + 3, plan3: 1 + 1 = 10
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "fixed\n"
@@ -583,8 +602,9 @@ async fn execute_repairs_until_third_patch() {
 
 #[tokio::test]
 async fn execute_preplan_repair_after_failed_plan() {
-    // 3-line file. First plan generates overlapping patch ops that get
-    // rejected, so the whole plan is repaired and the second plan succeeds.
+    // 3-line file (small-file fast path). First plan generates overlapping
+    // patch ops that get rejected, so the whole plan is repaired and the
+    // second plan succeeds.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -594,19 +614,15 @@ async fn execute_preplan_repair_after_failed_plan() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 // Plan attempt 1
-                0 => helpers::mock_text_response("NOTE noop"),
-                1 => helpers::mock_text_response("DONE"),
-                2 => helpers::mock_text_response(
-                    "SMART_EDIT\nREGION 1-2\nTASK: replace the first two-line block\nEND\n",
+                0 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1 2\nTASK: replace the first two-line block\nEND\n",
                 ),
-                3..=5 => helpers::mock_text_response(
+                1..=3 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n\nREPLACE_AT 2\nOLD:\nb\nEND_OLD\nNEW:\ny\nEND_NEW\n",
                 ),
                 // Plan attempt 2 (repair)
-                6 => helpers::mock_text_response("NOTE noop"),
-                7 => helpers::mock_text_response("DONE"),
-                8 => helpers::mock_text_response(
-                    "SMART_EDIT\nREGION 1-2\nTASK: replace the first two-line block\nEND\n",
+                4 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1 2\nTASK: replace the first two-line block\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n",
@@ -622,14 +638,18 @@ async fn execute_preplan_repair_after_failed_plan() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change first block"});
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert!(result.content.contains("Pre-plan repair attempt 2"));
-    // plan1: 3 preplan + 3 failed patches + plan2: 3 preplan + 1 success patch
-    assert_eq!(calls.load(Ordering::SeqCst), 10);
+    assert!(
+        result.content.contains("Pre-plan attempt 1 failed"),
+        "expected one-line failed-attempt trail, got: {}",
+        result.content
+    );
+    // plan1: finalize + 3 failed patches + plan2: finalize + 1 success patch = 6
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "x\nc\n"
@@ -638,8 +658,10 @@ async fn execute_preplan_repair_after_failed_plan() {
 
 #[tokio::test]
 async fn execute_preplan_repair_can_inspect_with_search_and_read() {
-    // Large file (>200 lines). The repair attempt uses the recon phase to
-    // SEARCH/READ before re-planning.
+    // Large file (>200 lines). Each plan attempt runs the windowed
+    // observation pass (1 window because the file fits under WINDOW_SIZE)
+    // followed by finalize. The repair attempt's window emits SEARCH/READ
+    // commands that get batch-executed before its finalize call.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -648,22 +670,21 @@ async fn execute_preplan_repair_can_inspect_with_search_and_read() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                // Plan attempt 1: window + recon + finalize, then 3 failing patches.
+                // Plan attempt 1: window + finalize, then 3 failing patches.
                 0 => helpers::mock_text_response("NOTE first pass"),
-                1 => helpers::mock_text_response("DONE"),
-                2 => helpers::mock_text_response(
-                    "SMART_EDIT\nREGION 1-2\nTASK: change first block\nEND\n",
+                1 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1 2\nTASK: change first block\nEND\n",
                 ),
-                3..=5 => helpers::mock_text_response(
+                2..=4 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n\nREPLACE_AT 2\nOLD:\nb\nEND_OLD\nNEW:\ny\nEND_NEW\n",
                 ),
-                // Plan attempt 2 (repair): window emits a note, recon issues
-                // SEARCH/READ + DONE in a single round, finalize re-plans,
-                // and a single patch succeeds.
-                6 => helpers::mock_text_response("NOTE revisit first block"),
-                7 => helpers::mock_text_response("SEARCH: a\nREAD: 1-2\nDONE"),
-                8 => helpers::mock_text_response(
-                    "SMART_EDIT\nREGION 1-2\nTASK: change first block\nEND\n",
+                // Plan attempt 2 (repair): window emits NOTE + SEARCH/READ
+                // in a single response; inspection results feed into finalize.
+                5 => helpers::mock_text_response(
+                    "NOTE revisit first block\nSEARCH: a\nREAD: 1-2",
+                ),
+                6 => helpers::mock_text_response(
+                    "SMART_EDIT\nREGION 1 2\nTASK: change first block\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n",
@@ -683,15 +704,19 @@ async fn execute_preplan_repair_can_inspect_with_search_and_read() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change first block"});
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert!(result.content.contains("Pre-plan repair attempt 2"));
-    // plan1: window + recon + finalize + 3 failed patches = 6
-    // plan2: window + recon + finalize + 1 success patch  = 4
-    assert_eq!(calls.load(Ordering::SeqCst), 10);
+    assert!(
+        result.content.contains("Pre-plan attempt 1 failed"),
+        "expected one-line failed-attempt trail, got: {}",
+        result.content
+    );
+    // plan1: window + finalize + 3 failed patches = 5
+    // plan2: window + finalize + 1 success patch  = 3
+    assert_eq!(calls.load(Ordering::SeqCst), 8);
     assert!(
         fs::read_to_string(config.project_root.join("main.rs"))
             .unwrap()
@@ -713,6 +738,7 @@ fn large_file_with_block_at_top(block: &str) -> String {
 
 #[tokio::test]
 async fn execute_preplans_bulk_edit_into_regions() {
+    // 3-line file (small-file fast path): finalize + 2 patches (one per region).
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -724,11 +750,7 @@ async fn execute_preplans_bulk_edit_into_regions() {
                 0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1 1\nTASK: update first call\nEND\n\nSMART_EDIT\nREGION 3 3\nTASK: update last call\nEND\n",
                 ),
-                1 => helpers::mock_text_response("DONE_EXPLORING"),
-                2 => helpers::mock_text_response(
-                    "REGION 1 1\nTASK: update first call\nEND\n\nREGION 3 3\nTASK: update last call\nEND\n",
-                ),
-                3 => helpers::mock_text_response(
+                1 => helpers::mock_text_response(
                     "REPLACE_AT 3\nOLD:\ncall_c();\nEND_OLD\nNEW:\ncall_c(None);\nEND_NEW\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -753,20 +775,23 @@ async fn execute_preplans_bulk_edit_into_regions() {
         "task": "update all call sites",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
     assert!(
-        result
-            .content
-            .contains("✓ via pre-plan: 2/2 step(s) completed")
+        result.content.contains("✓ via pre-plan: applied 2 step(s)"),
+        "expected concise summary line, got: {}",
+        result.content
     );
-    assert!(result.content.contains("Pre-plan attempt 1"));
-    assert!(result.content.contains("Raw Pre-plan attempt 1"));
-    assert!(result.content.contains("SMART_EDIT"));
-    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    // The "Pre-plan attempt N" label and the raw plan dump are no
+    // longer in the agent-facing message — they live in the session
+    // log only.
+    assert!(!result.content.contains("Pre-plan attempt"));
+    assert!(!result.content.contains("Raw Pre-plan"));
+    // finalize + 2 patches = 3
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call_a(None);\nkeep();\ncall_c(None);\n"
@@ -775,9 +800,10 @@ async fn execute_preplans_bulk_edit_into_regions() {
 
 #[tokio::test]
 async fn execute_preplan_can_inspect_with_search_and_read() {
-    // Large file → window emits a note, recon emits SEARCH/READ + DONE,
-    // finalize plans the edit. Tests that recon can collect inspection
-    // commands and that their results reach the planner.
+    // Large file → window emits NOTE + SEARCH/READ commands in one response,
+    // the commands are batch-executed, then finalize plans the edit. Tests
+    // that the windowed pass can collect inspection commands and that their
+    // results reach the planner.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -786,16 +812,16 @@ async fn execute_preplan_can_inspect_with_search_and_read() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                // Window: notes only.
-                0 => helpers::mock_text_response("NOTE update first and last call"),
-                // Recon: queue SEARCH/READ alongside DONE so it terminates after one round.
-                1 => helpers::mock_text_response("SEARCH: call_a\nREAD: 1-3\nDONE"),
+                // Window: emit a note plus SEARCH/READ commands in one response.
+                0 => helpers::mock_text_response(
+                    "NOTE update first and last call\nSEARCH: call_a\nREAD: 1-3",
+                ),
                 // Finalize: emit the actual edit plan.
-                2 => helpers::mock_text_response(
+                1 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1 1\nTASK: update first call\nEND\n\nSMART_EDIT\nREGION 3 3\nTASK: update last call\nEND\n",
                 ),
                 // Patches — steps run in descending order, so region 3 first.
-                3 => helpers::mock_text_response(
+                2 => helpers::mock_text_response(
                     "REPLACE_AT 3\nOLD:\ncall_c();\nEND_OLD\nNEW:\ncall_c(None);\nEND_NEW\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -820,14 +846,14 @@ async fn execute_preplan_can_inspect_with_search_and_read() {
         "task": "update all call sites",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert!(result.content.contains("✓ via pre-plan: 2/2 step(s) completed"));
-    // window + recon + finalize + 2 patches = 5
-    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    assert!(result.content.contains("✓ via pre-plan: applied 2 step(s)"));
+    // window + finalize + 2 patches = 4
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert!(
         fs::read_to_string(config.project_root.join("main.rs"))
             .unwrap()
@@ -837,7 +863,7 @@ async fn execute_preplan_can_inspect_with_search_and_read() {
 
 #[tokio::test]
 async fn execute_preplan_can_handle_multiple_inspection_commands_in_one_response() {
-    // The recon phase returns multiple SEARCH and READ commands in a single
+    // The windowed pass returns multiple SEARCH and READ commands in a single
     // response and they all get collected and batch-executed before finalize.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -847,14 +873,13 @@ async fn execute_preplan_can_handle_multiple_inspection_commands_in_one_response
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                0 => helpers::mock_text_response("NOTE update both call sites"),
-                1 => helpers::mock_text_response(
-                    "SEARCH: call_a();\nSEARCH: call_c();\nREAD: 1-3\nDONE",
+                0 => helpers::mock_text_response(
+                    "NOTE update both call sites\nSEARCH: call_a();\nSEARCH: call_c();\nREAD: 1-3",
                 ),
-                2 => helpers::mock_text_response(
+                1 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1 1\nTASK: update first call\nEND\n\nSMART_EDIT\nREGION 3 3\nTASK: update last call\nEND\n",
                 ),
-                3 => helpers::mock_text_response(
+                2 => helpers::mock_text_response(
                     "REPLACE_AT 3\nOLD:\ncall_c();\nEND_OLD\nNEW:\ncall_c(None);\nEND_NEW\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -879,13 +904,13 @@ async fn execute_preplan_can_handle_multiple_inspection_commands_in_one_response
         "task": "update all call sites",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    // window + recon + finalize + 2 patches = 5
-    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    // window + finalize + 2 patches = 4
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert!(
         fs::read_to_string(config.project_root.join("main.rs"))
             .unwrap()
@@ -895,6 +920,8 @@ async fn execute_preplan_can_handle_multiple_inspection_commands_in_one_response
 
 #[tokio::test]
 async fn execute_preplan_uses_literal_replacements_before_smart_edits() {
+    // Small file (6 lines): finalize + 1 smart-edit patch. The LITERAL_REPLACE
+    // step is applied directly without needing an LLM patch call.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -904,10 +931,6 @@ async fn execute_preplan_uses_literal_replacements_before_smart_edits() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 0 => helpers::mock_text_response(
-                    "LITERAL_REPLACE\nSCOPE 1 3\nALL true\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n\nSMART_EDIT\nREGION 4 6\nTASK: update multi-line call\nEND\n",
-                ),
-                1 => helpers::mock_text_response("DONE_EXPLORING"),
-                2 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 3\nALL true\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n\nSMART_EDIT\nREGION 4 6\nTASK: update multi-line call\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -932,21 +955,22 @@ async fn execute_preplan_uses_literal_replacements_before_smart_edits() {
         "task": "update all call sites",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert!(result.content.contains("Raw Pre-plan attempt 1"));
-    assert!(result.content.contains("LITERAL_REPLACE"));
-    assert!(result.content.contains("SMART_EDIT"));
+    // Concise success summary; no raw plan dump, no per-step "applied"
+    // chatter for happy-path steps.
     assert!(
-        result
-            .content
-            .contains("literal L1-L3: replaced 2 occurrence")
+        result.content.contains("✓ via pre-plan: applied 2 step(s)"),
+        "expected concise summary, got: {}",
+        result.content
     );
-    assert!(result.content.contains("smart L4-L6: applied 1 operation"));
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert!(!result.content.contains("Raw Pre-plan"));
+    assert!(!result.content.contains("LITERAL_REPLACE"));
+    // finalize + 1 smart-edit patch = 2
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call(None, None)\nkeep();\ncall(None, None)\ncall(\n    None,\n    None,\n)\n"
@@ -967,9 +991,7 @@ async fn execute_preplan_applies_literal_replace_without_old() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                0 => helpers::mock_text_response("NOTE noop"),
-                1 => helpers::mock_text_response("DONE"),
-                2 => helpers::mock_text_response(
+                0 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 2 3\nALL true\nNEW:\nfresh two\nfresh three\nEND_NEW\nEND\n",
                 ),
                 _ => unreachable!("scope replace should not need a smart fallback"),
@@ -992,14 +1014,20 @@ async fn execute_preplan_applies_literal_replace_without_old() {
         "task": "rewrite middle two lines",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert!(result.content.contains("scope L2-L3"));
-    // window + recon + finalize, no patch round needed = 3
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    // Successful scope replace is the boring happy path now — only the
+    // final summary line is emitted, and no per-step chatter.
+    assert!(
+        result.content.contains("✓ via pre-plan: applied 1 step(s)"),
+        "expected concise success summary, got: {}",
+        result.content
+    );
+    // finalize only, no patch round needed = 1
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "line one\nfresh two\nfresh three\nline four\n"
@@ -1018,9 +1046,7 @@ async fn execute_preplan_literal_step_falls_back_to_smart_edit() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                0 => helpers::mock_text_response("NOTE noop"),
-                1 => helpers::mock_text_response("DONE"),
-                2 => helpers::mock_text_response(
+                0 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -1041,14 +1067,22 @@ async fn execute_preplan_literal_step_falls_back_to_smart_edit() {
         "task": "update all calls",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert!(result.content.contains("literal fallback L1-L1"));
-    // window + recon + finalize + smart-fallback patch = 4
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    // The smart fallback IS interesting (literal didn't match), so it
+    // should still surface with the new wording.
+    assert!(
+        result
+            .content
+            .contains("literal-replace L1-L1 fell back to smart edit"),
+        "expected smart-fallback note, got: {}",
+        result.content
+    );
+    // finalize + smart-fallback patch = 2
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call(None, None)\n"
@@ -1059,7 +1093,7 @@ async fn execute_preplan_literal_step_falls_back_to_smart_edit() {
 async fn execute_preplan_repairs_whole_plan_after_step_retries_fail() {
     // Plan 1 has a literal whose OLD doesn't match. The smart fallback
     // returns NO_CHANGES on every attempt and exhausts, so the whole plan
-    // is repaired.
+    // is repaired. Small-file fast path: each preplan = 1 finalize call.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -1069,16 +1103,12 @@ async fn execute_preplan_repairs_whole_plan_after_step_retries_fail() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 // Plan attempt 1
-                0 => helpers::mock_text_response("NOTE noop"),
-                1 => helpers::mock_text_response("DONE"),
-                2 => helpers::mock_text_response(
+                0 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nmissing(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
-                3..=5 => helpers::mock_text_response("NO_CHANGES"),
+                1..=3 => helpers::mock_text_response("NO_CHANGES"),
                 // Plan attempt 2 (repair)
-                6 => helpers::mock_text_response("NOTE noop"),
-                7 => helpers::mock_text_response("DONE"),
-                8 => helpers::mock_text_response(
+                4 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
                 _ => unreachable!("unexpected extra LLM call"),
@@ -1097,16 +1127,28 @@ async fn execute_preplan_repairs_whole_plan_after_step_retries_fail() {
         "task": "update all calls",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert!(result.content.contains("Pre-plan repair attempt 2"));
-    assert!(result.content.contains("Raw Pre-plan repair attempt 2"));
-    assert!(result.content.contains("OLD:\ncall(None)"));
-    // plan1: 3 preplan + 3 smart-fallback NO_CHANGES + plan2: 3 preplan = 9
-    assert_eq!(calls.load(Ordering::SeqCst), 9);
+    // The agent-facing message no longer carries the raw plan trail or
+    // the "Pre-plan attempt N" labels — those live in the session log.
+    // What it DOES carry on a multi-attempt success is a one-line
+    // failure trail per failed attempt followed by the final summary.
+    assert!(
+        result.content.contains("Pre-plan attempt 1 failed"),
+        "expected one-line failed-attempt trail, got: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("✓ via pre-plan: applied 1 step(s)"),
+        "expected concise success summary on attempt 2, got: {}",
+        result.content
+    );
+    assert!(!result.content.contains("Raw Pre-plan"));
+    // plan1: 1 finalize + 3 smart-fallback NO_CHANGES + plan2: 1 finalize = 5
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call(None, None)\n"
@@ -1129,16 +1171,12 @@ async fn execute_preplan_repair_attempt_includes_structured_repair_context() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 // Plan attempt 1
-                0 => helpers::mock_text_response("NOTE noop"),
-                1 => helpers::mock_text_response("DONE"),
-                2 => helpers::mock_text_response(
+                0 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nmissing(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
-                3..=5 => helpers::mock_text_response("NO_CHANGES"),
+                1..=3 => helpers::mock_text_response("NO_CHANGES"),
                 // Plan attempt 2 (repair)
-                6 => helpers::mock_text_response("NOTE noop"),
-                7 => helpers::mock_text_response("DONE"),
-                8 => helpers::mock_text_response(
+                4 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
                 _ => unreachable!("unexpected extra LLM call"),
@@ -1157,22 +1195,22 @@ async fn execute_preplan_repair_attempt_includes_structured_repair_context() {
         "task": "update all calls",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    // plan1: 3 preplan + 3 smart-fallback + plan2: 3 preplan = 9
-    assert_eq!(calls.load(Ordering::SeqCst), 9);
+    // plan1: 1 finalize + 3 smart-fallback + plan2: 1 finalize = 5
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
 
-    // Inspect the body of the plan-2 finalize request (the 9th, index 8)
+    // Inspect the body of the plan-2 finalize request (index 4)
     // and verify the structured repair-context block reached the model.
     let requests = mock_server
         .received_requests()
         .await
         .expect("mock server should record requests");
-    assert_eq!(requests.len(), 9);
-    let plan2_body = String::from_utf8(requests[8].body.clone()).unwrap();
+    assert_eq!(requests.len(), 5);
+    let plan2_body = String::from_utf8(requests[4].body.clone()).unwrap();
 
     // Marker text from format_repair_context.
     assert!(
@@ -1227,9 +1265,7 @@ async fn execute_preplan_invalid_task_short_circuits_with_reason() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                0 => helpers::mock_text_response("NOTE noop"),
-                1 => helpers::mock_text_response("DONE"),
-                2 => helpers::mock_text_response(
+                0 => helpers::mock_text_response(
                     "INVALID_TASK: file does not contain any auth code to update",
                 ),
                 _ => unreachable!("INVALID_TASK should short-circuit the retry loop"),
@@ -1248,7 +1284,7 @@ async fn execute_preplan_invalid_task_short_circuits_with_reason() {
         "task": "remove the auth middleware",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -1270,8 +1306,8 @@ async fn execute_preplan_invalid_task_short_circuits_with_reason() {
         "expected unmodified note, got: {}",
         result.content
     );
-    // window + recon + finalize = 3, no retries after INVALID_TASK.
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    // finalize only = 1, no retries after INVALID_TASK.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     // File on disk unchanged.
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
@@ -1292,9 +1328,7 @@ async fn execute_preplan_invalid_task_without_reason_uses_placeholder() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                0 => helpers::mock_text_response("NOTE noop"),
-                1 => helpers::mock_text_response("DONE"),
-                2 => helpers::mock_text_response("INVALID_TASK"),
+                0 => helpers::mock_text_response("INVALID_TASK"),
                 _ => unreachable!("INVALID_TASK should short-circuit the retry loop"),
             }
         })
@@ -1311,14 +1345,14 @@ async fn execute_preplan_invalid_task_without_reason_uses_placeholder() {
         "task": "incoherent task",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(!result.success);
     assert!(result.content.contains("no reason provided"));
-    // window + recon + finalize = 3
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    // finalize only = 1
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "println!(\"hi\");\n"
@@ -1341,16 +1375,12 @@ async fn execute_preplan_invalid_task_during_repair_short_circuits() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 // Plan attempt 1
-                0 => helpers::mock_text_response("NOTE noop"),
-                1 => helpers::mock_text_response("DONE"),
-                2 => helpers::mock_text_response(
+                0 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nmissing(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
-                3..=5 => helpers::mock_text_response("NO_CHANGES"),
+                1..=3 => helpers::mock_text_response("NO_CHANGES"),
                 // Plan attempt 2 (repair) — model decides the task is impossible.
-                6 => helpers::mock_text_response("NOTE noop"),
-                7 => helpers::mock_text_response("DONE"),
-                8 => helpers::mock_text_response(
+                4 => helpers::mock_text_response(
                     "INVALID_TASK: file structure does not match the task description",
                 ),
                 _ => unreachable!("INVALID_TASK should short-circuit the retry loop"),
@@ -1369,7 +1399,7 @@ async fn execute_preplan_invalid_task_during_repair_short_circuits() {
         "task": "update all calls",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -1386,8 +1416,8 @@ async fn execute_preplan_invalid_task_during_repair_short_circuits() {
         "expected reason in tool output, got: {}",
         result.content
     );
-    // plan1: 3 preplan + 3 fallback NO_CHANGES + plan2: 3 preplan (final = INVALID_TASK) = 9
-    assert_eq!(calls.load(Ordering::SeqCst), 9);
+    // plan1: 1 finalize + 3 fallback NO_CHANGES + plan2: 1 finalize (INVALID_TASK) = 5
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
     // File unchanged — plan 1's literal didn't match, so no edits applied.
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
@@ -1410,16 +1440,12 @@ async fn execute_preplan_invalid_task_with_missing_target_reason_is_suppressed_a
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                // Plan attempt 1: window, recon (DONE), finalize → false-positive INVALID_TASK
-                0 => helpers::mock_text_response("NOTE noop"),
-                1 => helpers::mock_text_response("DONE"),
-                2 => helpers::mock_text_response(
+                // Plan attempt 1: finalize → false-positive INVALID_TASK
+                0 => helpers::mock_text_response(
                     "INVALID_TASK: target function `foo` not found in the file",
                 ),
-                // Plan attempt 2 (after suppression + repair context): window, recon, finalize → real plan
-                3 => helpers::mock_text_response("NOTE understood"),
-                4 => helpers::mock_text_response("DONE"),
-                5 => helpers::mock_text_response(
+                // Plan attempt 2 (after suppression + repair context): finalize → real plan
+                1 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\noriginal();\nEND_OLD\nNEW:\nfoo();\nEND_NEW\nEND\n",
                 ),
                 _ => panic!("unexpected extra call #{n} — repair retry should have succeeded"),
@@ -1438,7 +1464,7 @@ async fn execute_preplan_invalid_task_with_missing_target_reason_is_suppressed_a
         "task": "rename original to foo",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -1452,8 +1478,8 @@ async fn execute_preplan_invalid_task_with_missing_target_reason_is_suppressed_a
         "expected suppression note in tool output, got: {}",
         result.content
     );
-    // plan1: 3 preplan calls (rejected) + plan2: 3 preplan calls (succeeded) = 6 total
-    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    // plan1: 1 finalize (rejected) + plan2: 1 finalize (succeeded) = 2 total
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     // File should now contain the renamed call.
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
@@ -1474,9 +1500,7 @@ async fn execute_preplan_invalid_task_with_real_incoherent_reason_still_short_ci
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                0 => helpers::mock_text_response("NOTE noop"),
-                1 => helpers::mock_text_response("DONE"),
-                2 => helpers::mock_text_response(
+                0 => helpers::mock_text_response(
                     "INVALID_TASK: the task asks to write Python in this Rust file",
                 ),
                 _ => unreachable!(
@@ -1497,7 +1521,7 @@ async fn execute_preplan_invalid_task_with_real_incoherent_reason_still_short_ci
         "task": "convert this file to Python",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -1512,8 +1536,8 @@ async fn execute_preplan_invalid_task_with_real_incoherent_reason_still_short_ci
         "expected reason in tool output, got: {}",
         result.content
     );
-    // window + recon + finalize = 3 calls, no retry.
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    // finalize only = 1 call, no retry.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "println!(\"hi\");\n"
@@ -1539,7 +1563,7 @@ async fn execute_preplan_parse_failure_returns_error() {
         "task": "update all calls",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -1565,12 +1589,8 @@ async fn execute_preplan_overlapping_steps_apply_first_and_report_rest_failed() 
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                // window phase
-                0 => helpers::mock_text_response("NOTE noop"),
-                // recon phase
-                1 => helpers::mock_text_response("DONE"),
-                // finalize: two overlapping SMART_EDIT steps
-                2 => helpers::mock_text_response(
+                // Small-file fast path — call 0 is finalize: two overlapping SMART_EDIT steps.
+                0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1 3\nTASK: rewrite the first three lines\nEND\n\
                      \n\
                      SMART_EDIT\nREGION 3 5\nTASK: rewrite lines three through five\nEND\n",
@@ -1598,28 +1618,23 @@ async fn execute_preplan_overlapping_steps_apply_first_and_report_rest_failed() 
         "task": "rewrite the file",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     // The kept step applied — overall success.
     assert!(result.success, "{}", result.content);
-    // Summary reflects 1/2 with the dropped count called out.
+    // Summary reflects 1/2 (one applied, one dropped).
     assert!(
-        result.content.contains("1/2 step(s) completed"),
+        result.content.contains("✓ via pre-plan: applied 1/2 step(s)"),
         "missing 1/2 summary in: {}",
         result.content
     );
+    // The dropped step is surfaced in the per-step trail with its
+    // overlap reason.
     assert!(
-        result.content.contains("1 dropped (overlap)"),
+        result.content.contains("dropped step L3-L5 (overlap)"),
         "missing dropped (overlap) note in: {}",
-        result.content
-    );
-    // Per-step output: the dropped step is reported as a FAILED step
-    // pointing at the kept one.
-    assert!(
-        result.content.contains("Pre-plan step L3-L5: FAILED"),
-        "missing per-step failure for dropped overlap in: {}",
         result.content
     );
     assert!(
@@ -1636,9 +1651,9 @@ async fn execute_preplan_overlapping_steps_apply_first_and_report_rest_failed() 
 
 #[tokio::test]
 async fn execute_no_changes_leaves_file_unchanged() {
-    // The mock returns NO_CHANGES for every call. The window parser ignores
-    // it (not a NOTE), the recon parser sees no commands and terminates,
-    // the finalize parser yields zero steps → file untouched.
+    // The mock returns NO_CHANGES for every call. In the small-file fast path
+    // the only preplan call is finalize, whose parser treats NO_CHANGES as an
+    // empty plan → zero steps → file untouched.
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1652,7 +1667,7 @@ async fn execute_no_changes_leaves_file_unchanged() {
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "no op"});
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -1664,12 +1679,12 @@ async fn execute_no_changes_leaves_file_unchanged() {
 }
 
 #[tokio::test]
-async fn execute_empty_file_skips_window_and_recon_phases() {
-    // For an empty file there is nothing to observe and nothing to inspect,
-    // so Phase 1 (window) and Phase 2 (recon) are skipped entirely and the
-    // first LLM call is the planning prompt directly. Without the skip, the
-    // model would have been called with a degenerate 0-line window slice
-    // ("This is slice 1 of 1, covering lines 1-0 of 0").
+async fn execute_empty_file_skips_windowed_pass() {
+    // An empty file is 0 lines, which is ≤ SMALL_FILE_THRESHOLD, so the
+    // small-file fast path kicks in and Phase 1 (windowed observation) is
+    // skipped entirely — the first LLM call is the finalize prompt. Without
+    // the skip, the model would have been called with a degenerate 0-line
+    // window slice ("Slice 1/1, lines 1-0 of 0").
     //
     // We make the planner short-circuit with INVALID_TASK so the test only
     // exercises the preplan phase pipeline, not downstream edit application.
@@ -1696,21 +1711,21 @@ async fn execute_empty_file_skips_window_and_recon_phases() {
         "task": "create a hello file",
         "lsp_validation": "off",
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     // INVALID_TASK short-circuits → exactly one LLM call total.
-    // That single call MUST be the finalize prompt — no window, no recon.
+    // That single call MUST be the finalize prompt — no windowed pass.
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
-        "empty file should skip window+recon and go straight to finalize"
+        "empty file should skip the windowed pass and go straight to finalize"
     );
 
     // Verify the one call we made was the planning prompt, not the
-    // observation or reconnaissance prompt. Each phase has a distinct
-    // system message that we can match against.
+    // observation prompt. Each phase has a distinct system message that we
+    // can match against.
     let requests = mock_server
         .received_requests()
         .await
@@ -1725,10 +1740,6 @@ async fn execute_empty_file_skips_window_and_recon_phases() {
         !body.contains("Observation phase"),
         "first call should NOT be the observation prompt"
     );
-    assert!(
-        !body.contains("Reconnaissance phase"),
-        "first call should NOT be the recon prompt"
-    );
 
     // The planner rejected the task, so the file remains empty.
     assert!(!result.success);
@@ -1740,6 +1751,7 @@ async fn execute_empty_file_skips_window_and_recon_phases() {
 
 #[tokio::test]
 async fn execute_lsp_off_succeeds_without_lsp_client() {
+    // Small file (1 line): finalize + 1 patch = 2 LLM calls.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -1749,10 +1761,6 @@ async fn execute_lsp_off_succeeds_without_lsp_client() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 0 => helpers::mock_text_response(
-                    "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
-                ),
-                1 => helpers::mock_text_response("DONE_EXPLORING"),
-                2 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -1773,13 +1781,13 @@ async fn execute_lsp_off_succeeds_without_lsp_client() {
         "task": "change line",
         "lsp_validation": "off"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
     assert!(result.success, "{}", result.content);
     assert!(result.content.contains("[lsp] skipped (off)"));
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "fixed\n"
@@ -1799,7 +1807,7 @@ async fn execute_rejects_invalid_lsp_validation_mode() {
         "task": "change line",
         "lsp_validation": "sometimes"
     });
-    let result = edit_file::execute(&args, &config, &router, None, None, None)
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -1813,6 +1821,7 @@ async fn execute_rejects_invalid_lsp_validation_mode() {
 
 #[tokio::test]
 async fn execute_edit_file_tool_reindexes_successful_edit() {
+    // Small file (1 line): finalize + 1 patch = 2 LLM calls.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -1822,10 +1831,6 @@ async fn execute_edit_file_tool_reindexes_successful_edit() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 0 => helpers::mock_text_response(
-                    "SMART_EDIT\nREGION 1\nTASK: rename original to replacement\nEND\n",
-                ),
-                1 => helpers::mock_text_response("DONE_EXPLORING"),
-                2 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: rename original to replacement\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -1863,7 +1868,7 @@ async fn execute_edit_file_tool_reindexes_successful_edit() {
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     let updated_index = ProjectIndex::load(&config.miniswe_dir()).unwrap();
     assert!(
         !updated_index.lookup("replacement").is_empty(),

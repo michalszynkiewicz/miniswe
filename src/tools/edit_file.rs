@@ -14,6 +14,7 @@ use lsp_types::{Diagnostic, DiagnosticSeverity};
 use serde_json::Value;
 
 use super::ToolResult;
+use super::permissions::PermissionManager;
 use crate::config::{Config, ModelRole};
 use crate::llm::{ChatRequest, Message, ModelRouter};
 use crate::logging::SessionLog;
@@ -23,9 +24,11 @@ use crate::lsp::LspClient;
 const WINDOW_SIZE: usize = 800;
 /// Overlap between windows to catch edits at boundaries.
 const PREPLAN_READ_OVERLAP: usize = 60;
-/// Max iterations of the reconnaissance loop. Each iteration is one LLM call
-/// where the model decides what to SEARCH/READ next, or emits DONE.
-const MAX_RECON_ROUNDS: usize = 3;
+/// Files up to this many lines skip the windowed observation pass and feed
+/// their full content directly into the finalize prompt. Below this size
+/// the whole file already fits comfortably in a single slice, so the
+/// observation round is pure latency overhead.
+const SMALL_FILE_THRESHOLD: usize = 200;
 const MAX_PATCH_ATTEMPTS: usize = 3;
 const MAX_PLAN_ATTEMPTS: usize = 4;
 const MAX_PREPLAN_STEPS: usize = 100;
@@ -51,6 +54,7 @@ fn log_debug(log: Option<&SessionLog>, path_str: &str, detail: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     args: &Value,
     config: &Config,
@@ -58,6 +62,8 @@ pub async fn execute(
     lsp: Option<&LspClient>,
     cancelled: Option<&AtomicBool>,
     log: Option<&SessionLog>,
+    baseline_lsp_errors: Option<usize>,
+    perms: Option<&PermissionManager>,
 ) -> Result<ToolResult> {
     let path_str = args["path"].as_str().unwrap_or("");
     let task = args["task"].as_str().unwrap_or("");
@@ -93,6 +99,8 @@ pub async fn execute(
         lsp_validation,
         cancelled,
         log,
+        baseline_lsp_errors,
+        perms,
     )
     .await
     {
@@ -230,6 +238,7 @@ impl LspValidationMode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_preplanned_steps(
     path_str: &str,
     task: &str,
@@ -241,13 +250,25 @@ async fn execute_preplanned_steps(
     lsp_validation: LspValidationMode,
     cancelled: Option<&AtomicBool>,
     log: Option<&SessionLog>,
+    baseline_lsp_errors: Option<usize>,
+    perms: Option<&PermissionManager>,
 ) -> Result<PreplanResult> {
     let max_literal_lines = max_literal_replace_lines(config.model.context_window);
     let mut current = original.to_string();
     let mut repair_context: Option<RepairContext> = None;
+    // `progress_log` is the agent-facing trail prepended to a successful
+    // result when the pre-plan needed more than one attempt. We keep it
+    // intentionally terse — one line per failed attempt — because the
+    // verbose per-step trail and the raw plan dump are not useful to the
+    // outer agent (they never see the inner plan otherwise). The full
+    // failure detail still feeds the *inner* model on retry through
+    // `RepairContext`, which is built independently below.
     let mut progress_log = String::new();
 
     for attempt in 1..=MAX_PLAN_ATTEMPTS {
+        // The label is only used for internal logging (`log_stage` /
+        // `log_debug`) and for the inner model's repair feedback prompt.
+        // It is intentionally NOT placed in the agent-facing message.
         let label = if repair_context.is_some() {
             format!("Pre-plan repair attempt {attempt}")
         } else {
@@ -334,6 +355,8 @@ async fn execute_preplanned_steps(
                 lsp_validation,
                 cancelled,
                 log,
+                baseline_lsp_errors,
+                perms,
             )
             .await?;
             if let Some(note) = validation_note {
@@ -349,13 +372,12 @@ async fn execute_preplanned_steps(
         let kept_count = steps.len();
         let dropped_count = dropped.len();
         let total_planned = kept_count + dropped_count;
-        let mut attempt_message = if let Some(ctx) = &repair_context {
-            format!("{label}; previous plan failed: {}", ctx.failure_reason)
-        } else {
-            label.clone()
-        };
-        attempt_message.push('\n');
-        attempt_message.push_str(&format_preplan_log(&label, &steps));
+        // Log the parsed plan so it shows up in the session log for
+        // debugging, but do NOT inject it into the agent-facing message.
+        log_debug(log, path_str, &format_preplan_log(&label, &steps));
+        // The agent-facing message starts empty; per-attempt failures and
+        // the final summary are appended by `execute_planned_steps`.
+        let attempt_message = String::new();
 
         match execute_planned_steps(
             path_str,
@@ -373,6 +395,8 @@ async fn execute_preplanned_steps(
             total_planned,
             attempt_message,
             "via pre-plan",
+            baseline_lsp_errors,
+            perms,
         )
         .await
         {
@@ -396,7 +420,14 @@ async fn execute_preplanned_steps(
                         truncate_multiline(&e.error, 2000)
                     ),
                 );
-                progress_log.push_str(&e.message);
+                // Terse, one-line trail. Full per-step detail still goes
+                // to the session log via `e.message` shouldn't bloat the
+                // agent's view; the inner model gets the structured
+                // failure via `RepairContext` below.
+                progress_log.push_str(&format!(
+                    "Pre-plan attempt {attempt} failed: {}\n",
+                    truncate_multiline(&e.error, 400)
+                ));
                 repair_context = Some(RepairContext {
                     previous_plan: steps,
                     completed_steps: e.completed_steps,
@@ -419,6 +450,7 @@ async fn execute_preplanned_steps(
     Ok(PreplanResult::NoChanges)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_planned_steps(
     path_str: &str,
     path: &std::path::Path,
@@ -435,16 +467,20 @@ async fn execute_planned_steps(
     planned_count: usize,
     mut message: String,
     success_label: &str,
+    baseline_lsp_errors: Option<usize>,
+    perms: Option<&PermissionManager>,
 ) -> std::result::Result<SplitResult, PlannedExecutionFailure> {
     let mut current = current_base.to_string();
-    let mut total_ops = 0usize;
     let mut completed_count = 0usize;
     let dropped_count = dropped.len();
     // Records of steps that have been successfully applied to `current`,
     // captured in execution order so the repair planner can see exactly
     // what shifted and what's left.
     let mut completed_records: Vec<EditPlanStep> = Vec::new();
-    if !message.ends_with('\n') {
+    // Only pad with a newline if the caller already supplied prelude
+    // text that didn't end with one. With the current callers passing
+    // empty, this stays empty so the final summary lands on line 1.
+    if !message.is_empty() && !message.ends_with('\n') {
         message.push('\n');
     }
 
@@ -468,17 +504,13 @@ async fn execute_planned_steps(
                     new,
                     *all,
                 ) {
-                    Ok((candidate, count)) => {
+                    Ok((candidate, _count)) => {
                         current = candidate;
-                        total_ops += count;
                         completed_count += 1;
                         completed_records.push(step.clone());
-                        message.push_str(&format!(
-                            "Pre-plan step {} literal L{}-L{}: replaced {count} occurrence(s)\n",
-                            idx + 1,
-                            scope_start,
-                            scope_end
-                        ));
+                        // Successful literal replace is the boring happy
+                        // path; do not chatter about it. The final summary
+                        // line at the bottom captures the totals.
                     }
                     Err(literal_error) => {
                         let fallback_task = format!(
@@ -524,14 +556,13 @@ async fn execute_planned_steps(
                             failed_step: Some(step.clone()),
                         })?;
                         current = candidate;
-                        total_ops += count;
                         completed_count += 1;
                         completed_records.push(step.clone());
+                        // Smart fallback IS interesting — the planner's
+                        // exact OLD didn't match and we had to ask the
+                        // smart executor to redo the region. Surface it.
                         message.push_str(&format!(
-                            "Pre-plan step {} literal fallback L{}-L{}: applied {count} operation(s)\n",
-                            idx + 1,
-                            scope_start,
-                            scope_end
+                            "literal-replace L{scope_start}-L{scope_end} fell back to smart edit ({count} op(s))\n"
                         ));
                     }
                 }
@@ -544,18 +575,10 @@ async fn execute_planned_steps(
                 match apply_replace_scope(&current, *scope_start, *scope_end, new) {
                     Ok((candidate, _)) => {
                         current = candidate;
-                        // Wholesale scope replace counts as one op for
-                        // accounting parity with other plan steps.
-                        total_ops += 1;
                         completed_count += 1;
                         completed_records.push(step.clone());
-                        message.push_str(&format!(
-                            "Pre-plan step {} scope L{}-L{}: replaced scope ({} new line(s))\n",
-                            idx + 1,
-                            scope_start,
-                            scope_end,
-                            new.len(),
-                        ));
+                        // Successful scope replace is the boring happy
+                        // path; the final summary captures it.
                     }
                     Err(scope_error) => {
                         // Same fallback strategy as the literal-replace
@@ -603,14 +626,11 @@ async fn execute_planned_steps(
                             failed_step: Some(step.clone()),
                         })?;
                         current = candidate;
-                        total_ops += count;
                         completed_count += 1;
                         completed_records.push(step.clone());
+                        // Smart fallback IS interesting — surface it.
                         message.push_str(&format!(
-                            "Pre-plan step {} scope fallback L{}-L{}: applied {count} operation(s)\n",
-                            idx + 1,
-                            scope_start,
-                            scope_end
+                            "scope-replace L{scope_start}-L{scope_end} fell back to smart edit ({count} op(s))\n"
                         ));
                     }
                 }
@@ -642,28 +662,31 @@ async fn execute_planned_steps(
                 })?;
 
                 if count == 0 {
-                    message.push_str(&format!("Pre-plan {region_label}: no changes\n"));
+                    // count == 0 IS interesting — the model returned no
+                    // changes for a region we expected to edit. Surface
+                    // it so the agent knows the step ran but did nothing.
+                    message.push_str(&format!(
+                        "smart-edit L{}-L{}: no changes\n",
+                        region.start, region.end
+                    ));
                     completed_count += 1;
                     completed_records.push(step.clone());
                 } else {
-                    total_ops += count;
                     current = candidate;
                     completed_count += 1;
                     completed_records.push(step.clone());
-                    message.push_str(&format!(
-                        "Pre-plan {region_label}: applied {count} operation(s)\n"
-                    ));
+                    // Successful smart edit is the boring happy path.
                 }
             }
         }
     }
 
-    // Surface overlap-rejected steps as per-step failures so the agent
-    // sees them alongside the successes. The kept steps are already
-    // applied; the dropped steps appear here purely as feedback.
+    // Surface overlap-rejected steps so the agent sees them alongside
+    // the successes. The kept steps are already applied; the dropped
+    // steps appear here purely as feedback.
     for d in &dropped {
         message.push_str(&format!(
-            "Pre-plan step L{}-L{}: FAILED — {}\n",
+            "dropped step L{}-L{} (overlap): {}\n",
             d.step.start_line(),
             d.step.end_line(),
             d.reason
@@ -680,6 +703,8 @@ async fn execute_planned_steps(
         lsp_validation,
         cancelled,
         log,
+        baseline_lsp_errors,
+        perms,
     )
     .await
     .map_err(|e| PlannedExecutionFailure {
@@ -695,15 +720,20 @@ async fn execute_planned_steps(
         message.push_str(&note);
         message.push('\n');
     }
-    let dropped_note = if dropped_count > 0 {
-        format!(", {dropped_count} dropped (overlap)")
+    // Final summary is intentionally one line. Counts only show
+    // partial-completion if some steps were dropped or didn't apply
+    // cleanly; otherwise we just say "applied N step(s)".
+    let summary = if completed_count == planned_count && dropped_count == 0 {
+        format!(
+            "✓ {success_label}: applied {completed_count} step(s) to {path_str} ({} lines)\n",
+            current.lines().count()
+        )
     } else {
-        String::new()
+        format!(
+            "✓ {success_label}: applied {completed_count}/{planned_count} step(s) to {path_str} ({} lines)\n",
+            current.lines().count()
+        )
     };
-    let summary = format!(
-        "✓ {success_label}: {completed_count}/{planned_count} step(s) completed{dropped_note}, {total_ops} operation(s) applied to {path_str} ({} lines)\n",
-        current.lines().count()
-    );
     message = format!("{summary}{message}");
 
     Ok(SplitResult {
@@ -777,7 +807,7 @@ async fn execute_smart_step(
             }
         };
 
-        if let Err(e) = validate_candidate(path_str, current, &candidate) {
+        if let Err(e) = validate_candidate(current, &candidate) {
             last_error = e.to_string();
             if attempt < max_attempts {
                 feedback = Some(last_error.clone());
@@ -792,6 +822,7 @@ async fn execute_smart_step(
     bail!("{last_error}")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn validate_candidate_for_write(
     path_str: &str,
     path: &std::path::Path,
@@ -802,9 +833,12 @@ async fn validate_candidate_for_write(
     lsp_validation: LspValidationMode,
     cancelled: Option<&AtomicBool>,
     log: Option<&SessionLog>,
+    baseline_lsp_errors: Option<usize>,
+    perms: Option<&PermissionManager>,
 ) -> Result<Option<String>> {
     ensure_not_cancelled(cancelled)?;
-    validate_candidate(path_str, original, candidate)?;
+    validate_candidate(original, candidate)?;
+    gate_truncation(path_str, original, candidate, perms)?;
     log_stage(log, path_str, "validate:lsp");
     validate_candidate_with_lsp(
         path_str,
@@ -814,6 +848,7 @@ async fn validate_candidate_for_write(
         config,
         lsp,
         lsp_validation,
+        baseline_lsp_errors,
     )
     .await
 }
@@ -826,6 +861,7 @@ async fn validate_candidate_with_lsp(
     config: &Config,
     lsp: Option<&LspClient>,
     lsp_validation: LspValidationMode,
+    baseline_lsp_errors: Option<usize>,
 ) -> Result<Option<String>> {
     if lsp_validation == LspValidationMode::Off {
         return Ok(Some("[lsp] skipped (off)".into()));
@@ -846,14 +882,24 @@ async fn validate_candidate_with_lsp(
     }
 
     let timeout = Duration::from_millis(config.lsp.diagnostic_timeout_ms);
-    let baseline_errors = match diagnostics_for_current_file(lsp, path, timeout).await {
-        Ok(diags) => error_diagnostics(&diags),
-        Err(e) => {
-            if lsp_validation == LspValidationMode::Require {
-                bail!("LSP baseline diagnostics failed: {e}");
+
+    // Prefer the baseline captured by the outer tool dispatcher
+    // (`capture_edit_baseline` in tools::mod) when it's available. That
+    // baseline is taken once *before* this edit_file call begins, so it
+    // stays consistent across pre-plan retries and matches what the outer
+    // `auto_check` will compare against. Falling back to a local query is
+    // only for legacy / direct callers that don't supply one.
+    let baseline_count = match baseline_lsp_errors {
+        Some(n) => n,
+        None => match diagnostics_for_current_file(lsp, path, timeout).await {
+            Ok(diags) => error_diagnostics(&diags).len(),
+            Err(e) => {
+                if lsp_validation == LspValidationMode::Require {
+                    bail!("LSP baseline diagnostics failed: {e}");
+                }
+                return Ok(None);
             }
-            return Ok(None);
-        }
+        },
     };
 
     std::fs::write(path, candidate)?;
@@ -871,9 +917,8 @@ async fn validate_candidate_with_lsp(
     };
 
     let candidate_errors = error_diagnostics(&candidate_diags);
-    if candidate_errors.len() > baseline_errors.len() {
-        let summary =
-            format_lsp_error_regression(path_str, baseline_errors.len(), &candidate_errors);
+    if candidate_errors.len() > baseline_count {
+        let summary = format_lsp_error_regression(path_str, baseline_count, &candidate_errors);
         let _ = std::fs::write(path, original);
         let _ = diagnostics_for_current_file(lsp, path, timeout).await;
         bail!("{summary}");
@@ -881,7 +926,7 @@ async fn validate_candidate_with_lsp(
 
     Ok(Some(format!(
         "[lsp] OK ({} -> {} error(s), mode={})",
-        baseline_errors.len(),
+        baseline_count,
         candidate_errors.len(),
         lsp_validation.as_str()
     )))
@@ -959,15 +1004,7 @@ fn is_signature_mismatch_error(error: &str) -> bool {
 #[derive(Debug)]
 struct PreplanWindowResponse {
     notes: Vec<String>,
-}
-
-#[derive(Debug)]
-struct PreplanReconResponse {
     commands: Vec<InspectionCommand>,
-    /// True if the model emitted the literal word DONE. The recon loop
-    /// also stops when commands are empty (even without an explicit DONE),
-    /// so this only matters when the response *also* carried commands.
-    done: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -977,12 +1014,17 @@ enum InspectionCommand {
 }
 
 /// Parse the response from a single windowed pre-plan turn. Each window
-/// emits NOTE lines describing structural landmarks for later phases. The
-/// parser is liberal: anything that isn't a recognizable NOTE is silently
-/// ignored. Returning empty notes is fine — the model may have nothing
-/// useful to say about a particular slice.
+/// emits NOTE lines for structural landmarks and optional SEARCH/READ
+/// commands requesting extra context before finalize. Commands are
+/// *collected* across all windows and batch-executed once the full pass
+/// is complete; the model doesn't see results until the finalize prompt.
+///
+/// The parser is liberal: anything that isn't a recognizable NOTE or
+/// SEARCH/READ line is silently ignored. An empty response is fine — the
+/// model may have nothing useful to say about a particular slice.
 fn parse_preplan_window_response(text: &str) -> PreplanWindowResponse {
     let mut notes = Vec::new();
+    let mut commands = Vec::new();
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -1001,31 +1043,6 @@ fn parse_preplan_window_response(text: &str) -> PreplanWindowResponse {
             if !note.is_empty() {
                 notes.push(note.to_string());
             }
-            continue;
-        }
-        // Anything else is silently ignored. The window phase is observation
-        // only — stray control words, half-formed steps, or hallucinated
-        // SEARCH/READ commands all get dropped without erroring out.
-    }
-
-    PreplanWindowResponse { notes }
-}
-
-/// Parse the response from one reconnaissance round. Accepts SEARCH and
-/// READ commands and a DONE terminator. Liberal: unknown lines are ignored,
-/// and an empty/unparseable response is treated as DONE so that the loop
-/// terminates rather than hanging on a confused model.
-fn parse_preplan_recon_response(text: &str) -> PreplanReconResponse {
-    let mut commands = Vec::new();
-    let mut done = false;
-
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.eq_ignore_ascii_case("DONE") {
-            done = true;
             continue;
         }
         if let Some(rest) = strip_case_insensitive_prefix(line, "SEARCH:") {
@@ -1048,16 +1065,12 @@ fn parse_preplan_recon_response(text: &str) -> PreplanReconResponse {
             }
             continue;
         }
-        // Ignore everything else.
+        // Anything else is silently ignored. Stray control words,
+        // half-formed steps, or leftover DONE terminators all get dropped
+        // without erroring out.
     }
 
-    if commands.is_empty() {
-        // An empty response or one with only unknown lines should terminate
-        // the loop, not silently hang waiting for the next round.
-        done = true;
-    }
-
-    PreplanReconResponse { commands, done }
+    PreplanWindowResponse { notes, commands }
 }
 
 fn has_case_insensitive_prefix(text: &str, prefix: &str) -> bool {
@@ -1128,21 +1141,23 @@ fn append_inspection_result(extra_context: &mut String, label: &str, result: &st
     extra_context.push_str("\n\n");
 }
 
-/// Tracks running totals across all reconnaissance rounds so that the
-/// per-edit limits on SEARCH and READ apply globally, not per round.
-struct ReconCounters {
+/// Per-edit totals for SEARCH and READ so that the batch inspection pass
+/// can enforce the same caps whether the model requested one command or
+/// many across several windows.
+struct InspectionCounters {
     search_count: usize,
     read_count: usize,
     max_reads: usize,
 }
 
-/// Execute the SEARCH/READ commands emitted in one recon round, appending
-/// their formatted results to `extra_context`. Commands that exceed the
-/// per-edit caps are dropped with an inline note rather than erroring out.
-fn execute_recon_commands(
+/// Execute the SEARCH/READ commands collected across the windowed
+/// observation pass, appending their formatted results to `extra_context`
+/// for the finalize prompt. Commands that exceed the per-edit caps are
+/// dropped with an inline note rather than erroring out.
+fn execute_inspection_commands(
     content: &str,
     commands: &[InspectionCommand],
-    counters: &mut ReconCounters,
+    counters: &mut InspectionCounters,
     extra_context: &mut String,
     path_str: &str,
     log: Option<&SessionLog>,
@@ -1526,17 +1541,20 @@ async fn request_preplan_steps(
         .map(format_repair_context)
         .unwrap_or_default();
     let mut notes = Vec::<String>::new();
+    let mut collected_commands = Vec::<InspectionCommand>::new();
 
-    // ── Phase 1: windowed observation ────────────────────────────────────
-    // Walk the file slice-by-slice. The model emits NOTE lines describing
-    // structural landmarks. No tentative steps, no SEARCH/READ here — those
-    // come in the recon phase.
-    //
-    // Empty files have nothing to observe and nothing to inspect; both
-    // Phase 1 and Phase 2 are skipped (zero windows / zero recon rounds)
-    // and we go straight to planning, which already knows how to handle
-    // a "0 lines" file from the task alone.
-    let windows = if total_lines == 0 {
+    // Small files (including empty ones) skip the windowed observation
+    // pass entirely: the whole file already fits in the finalize prompt,
+    // so the only value the windows would add is an extra LLM round-trip.
+    let small_file = total_lines <= SMALL_FILE_THRESHOLD;
+
+    // ── Phase 1: windowed observation + inspection collection ───────────
+    // Walk the file slice-by-slice. Each window may emit NOTE lines
+    // describing structural landmarks AND SEARCH/READ commands the
+    // planner will want answered before finalize. Commands are *collected*,
+    // not executed — they're batch-executed once the full pass completes
+    // so the model sees everything at finalize time.
+    let windows = if small_file {
         Vec::new()
     } else {
         build_windows(total_lines, WINDOW_SIZE, PREPLAN_READ_OVERLAP)
@@ -1553,15 +1571,37 @@ async fn request_preplan_steps(
                 notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
             )
         };
+        let pending_block = if collected_commands.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Inspection commands already queued (don't repeat):\n{}\n\n",
+                collected_commands
+                    .iter()
+                    .map(|c| match c {
+                        InspectionCommand::Search(q) => format!("- SEARCH: {q}"),
+                        InspectionCommand::Read { start, end } => {
+                            format!("- READ: {start}-{end}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        };
         let prompt = format!(
             "File: {path_str}\n\
              Task: {task}\n\n\
              {feedback_block}\
              {notes_block}\
+             {pending_block}\
              Slice {current_slice}/{total_slices}, lines {start_line}-{end_line} of {total_lines}.\n\n\
-             Output 0+ NOTE lines about landmarks the planner will need: function/struct spans with line numbers, exact signatures the task touches, the line where a relevant block starts. Reference line numbers from the slice. Skip vague observations and anything the planner can derive itself.\n\n\
-             Format (one per line, nothing else):\n\
-             NOTE <fact with line number>\n\n\
+             Output zero or more of these lines about landmarks the planner will need:\n\
+             NOTE <fact with line number> — function/struct spans, signatures the task touches, the line where a relevant block starts.\n\n\
+             You may also request extra context before finalize with:\n\
+             SEARCH: <exact text to find>\n\
+             READ: <start>-<end>\n\n\
+             SEARCH/READ commands are collected across ALL slices and batch-executed before the finalize phase — their results will reach the planner. Don't repeat commands; the finalize phase already sees every result.\n\n\
+             Reference line numbers from the slice. Skip vague observations and anything the planner can derive itself.\n\n\
              Slice:\n{slice}",
             current_slice = idx + 1,
             total_slices = windows.len(),
@@ -1572,7 +1612,7 @@ async fn request_preplan_steps(
         let request = ChatRequest {
             messages: vec![
                 Message::system(
-                    "Observation phase. Output only NOTE lines about file landmarks. No edits, no SEARCH/READ, no markdown.",
+                    "Observation phase. Output only NOTE lines and/or SEARCH:/READ: commands. No edits, no markdown.",
                 ),
                 Message::user(&prompt),
             ],
@@ -1608,23 +1648,50 @@ async fn request_preplan_steps(
 
         let parsed = parse_preplan_window_response(text);
         extend_unique_notes(&mut notes, parsed.notes);
+        for command in parsed.commands {
+            if !collected_commands.contains(&command) {
+                collected_commands.push(command);
+            }
+        }
     }
 
-    // ── Phase 2: iterative reconnaissance ────────────────────────────────
-    // The model now decides what to SEARCH/READ before planning. It sees
-    // the accumulated notes and the file metadata, but NOT the file
-    // content. Each round may emit more commands or DONE; we run at most
-    // MAX_RECON_ROUNDS rounds, applying the per-edit caps on SEARCH/READ.
+    // ── Phase 2: batch-execute the collected inspection commands ───────
+    // Small files never reach this with anything in collected_commands
+    // because the window loop was skipped; large files may have any
+    // number of queued commands that we now run against the real file
+    // content before finalize.
     let mut extra_context = String::new();
-    let mut counters = ReconCounters {
-        search_count: 0,
-        read_count: 0,
-        max_reads,
-    };
+    if !collected_commands.is_empty() {
+        let mut counters = InspectionCounters {
+            search_count: 0,
+            read_count: 0,
+            max_reads,
+        };
+        execute_inspection_commands(
+            content,
+            &collected_commands,
+            &mut counters,
+            &mut extra_context,
+            path_str,
+            log,
+        )?;
+    }
 
-    let recon_rounds = if total_lines == 0 { 0 } else { MAX_RECON_ROUNDS };
-    for round in 0..recon_rounds {
-        ensure_not_cancelled(cancelled)?;
+    // ── Phase 3: planning ──────────────────────────────────────────────
+    // For small files, the full file content goes directly into the
+    // prompt. For large files the planner only sees the windowed notes
+    // and the batch-executed inspection results — the file itself is too
+    // big to inline.
+    let file_view_block = if small_file {
+        if total_lines == 0 {
+            String::from("File content: (empty)\n\n")
+        } else {
+            format!(
+                "File content ({total_lines} lines):\n{}\n\n",
+                render_numbered_slice(&lines, 0, total_lines),
+            )
+        }
+    } else {
         let notes_block = if notes.is_empty() {
             String::from("Notes: (none)\n\n")
         } else {
@@ -1634,103 +1701,23 @@ async fn request_preplan_steps(
             )
         };
         let results_block = if extra_context.is_empty() {
-            String::from("Results so far: (none)\n\n")
+            String::from("Inspection results: (none)\n\n")
         } else {
-            format!("Results so far:\n{extra_context}")
+            format!("Inspection results:\n{extra_context}")
         };
-        let recon_prompt = format!(
-            "File: {path_str} ({total_lines} lines)\n\
-             Task: {task}\n\n\
-             {feedback_block}\
-             {notes_block}\
-             {results_block}\
-             The next phase plans from these notes and results only — no other view of the file. Decide what else you need before planning.\n\n\
-             Round {current_round}/{MAX_RECON_ROUNDS}. Used: {used_searches}/{MAX_PREPLAN_SEARCHES} SEARCH, {used_reads}/{max_reads} READ.\n\n\
-             Output one or more of:\n\
-             SEARCH: <exact text to find>\n\
-             READ: <start>-<end>\n\n\
-             Or, if the notes already cover what you need, exactly:\n\
-             DONE\n\n\
-             Don't repeat searches or reads from above.",
-            current_round = round + 1,
-            used_searches = counters.search_count,
-            used_reads = counters.read_count,
-        );
-
-        let request = ChatRequest {
-            messages: vec![
-                Message::system(
-                    "Reconnaissance phase. Output SEARCH:/READ: lines or the single word DONE. No markdown.",
-                ),
-                Message::user(&recon_prompt),
-            ],
-            tools: None,
-            tool_choice: None,
-        };
-
-        log_stage(
-            log,
-            path_str,
-            &format!("preplan:recon:{}/{MAX_RECON_ROUNDS}", round + 1),
-        );
-        let response = router
-            .chat_with_cancel(ModelRole::Fast, &request, cancelled)
-            .await?;
-        let text = response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.as_deref())
-            .unwrap_or("");
-        log_debug(
-            log,
-            path_str,
-            &format!(
-                "preplan:recon:{}/{MAX_RECON_ROUNDS} raw_response:\n{}",
-                round + 1,
-                truncate_multiline(text, 12000)
-            ),
-        );
-
-        let parsed = parse_preplan_recon_response(text);
-        if !parsed.commands.is_empty() {
-            execute_recon_commands(
-                content,
-                &parsed.commands,
-                &mut counters,
-                &mut extra_context,
-                path_str,
-                log,
-            )?;
-        }
-        if parsed.done {
-            break;
-        }
-    }
-
-    // ── Phase 3: planning ────────────────────────────────────────────────
-    // Plan the edit using only the notes and the inspection results. The
-    // full file content is intentionally NOT in this prompt; large files
-    // wouldn't fit, and we want a single uniform path for all sizes.
-    let notes_block = if notes.is_empty() {
-        String::from("Notes: (none)\n\n")
-    } else {
-        format!(
-            "Notes:\n{}\n\n",
-            notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
-        )
+        format!("{notes_block}{results_block}")
     };
-    let results_block = if extra_context.is_empty() {
-        String::from("Inspection results: (none)\n\n")
+    let view_note = if small_file {
+        "Plan the edit. You see the full file above — line numbers in your plan must match it exactly."
     } else {
-        format!("Inspection results:\n{extra_context}")
+        "Plan the edit. You only see the notes and inspection results above — line numbers in your plan must match the real file."
     };
     let finalize_prompt = format!(
         "File: {path_str} ({total_lines} lines)\n\
          Task: {task}\n\n\
          {feedback_block}\
-         {notes_block}\
-         {results_block}\
-         Plan the edit. You only see the notes and inspection results above — line numbers in your plan must match the real file.\n\n\
+         {file_view_block}\
+         {view_note}\n\n\
          Up to {MAX_PREPLAN_STEPS} non-overlapping steps, each covering at most 5 edit sites. Steps must not share any line, including endpoints — L10-L20 and L20-L30 overlap.\n\
          Every step must change something. Do not emit a LITERAL_REPLACE whose NEW is identical to its OLD, and do not emit a SMART_EDIT whose task is to verify a region is unchanged or to keep it as-is — just leave those regions out of the plan.\n\
          Use LITERAL_REPLACE when you have the OLD text verbatim from an inspection result and OLD/NEW each span ≤ {max_literal_lines} lines. Otherwise use SMART_EDIT — its execution phase will see the region content.\n\
@@ -1745,20 +1732,17 @@ async fn request_preplan_steps(
          END_OLD\n\
          NEW:\n\
          <replacement text>\n\
-         END_NEW\n\
-         END\n\n\
+         END_NEW\n\n\
          You may omit the OLD: ... END_OLD block when ALL is true and you want to replace the *entire* SCOPE wholesale (the whole L<start>-L<end> range becomes NEW). This is shorter and avoids retyping a long OLD when the range is already exact:\n\n\
          LITERAL_REPLACE\n\
          SCOPE <start> <end>\n\
          ALL true\n\
          NEW:\n\
          <replacement text for the entire scope>\n\
-         END_NEW\n\
-         END\n\n\
+         END_NEW\n\n\
          SMART_EDIT\n\
          REGION <start> <end>\n\
-         TASK: <specific edit for this region>\n\
-         END\n\n\
+         TASK: <specific edit for this region>\n\n\
          INVALID_TASK is ONLY for tasks that contradict reality — e.g. \"rename function X\" when X does not appear anywhere in the file, or a task that requires syntax from a different language than this file (the file path above shows the extension). It is NOT for missing prerequisites: if the task says \"update the call to f() to pass arg Y\" and Y isn't a parameter of f yet, that's the task — add Y to the call. Plan the edit. Do not reject because something the task wants doesn't exist yet; that's what the edit is for.\n\
          Only if the task is genuinely incoherent, reject with exactly one line:\n\
          INVALID_TASK: <one short sentence>"
@@ -1967,8 +1951,7 @@ fn format_edit_plan_steps(steps: &[EditPlanStep]) -> String {
             EditPlanStep::SmartEdit(region) => {
                 out.push_str("SMART_EDIT\n");
                 out.push_str(&format!("REGION {} {}\n", region.start, region.end));
-                out.push_str(&format!("TASK: {}\n", region.task));
-                out.push_str("END\n\n");
+                out.push_str(&format!("TASK: {}\n\n", region.task));
             }
             EditPlanStep::LiteralReplace {
                 scope_start,
@@ -1984,7 +1967,7 @@ fn format_edit_plan_steps(steps: &[EditPlanStep]) -> String {
                 out.push_str(&old.join("\n"));
                 out.push_str("\nEND_OLD\nNEW:\n");
                 out.push_str(&new.join("\n"));
-                out.push_str("\nEND_NEW\nEND\n\n");
+                out.push_str("\nEND_NEW\n\n");
             }
             EditPlanStep::ReplaceScope {
                 scope_start,
@@ -1996,7 +1979,7 @@ fn format_edit_plan_steps(steps: &[EditPlanStep]) -> String {
                 out.push_str("ALL true\n");
                 out.push_str("NEW:\n");
                 out.push_str(&new.join("\n"));
-                out.push_str("\nEND_NEW\nEND\n\n");
+                out.push_str("\nEND_NEW\n\n");
             }
         }
     }
@@ -2182,6 +2165,15 @@ pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
             continue;
         }
 
+        // Tolerate a stray END terminator. The current DSL no longer
+        // uses END as a step terminator (END_OLD/END_NEW are enough),
+        // but older models trained on the prior format may still emit
+        // it. Skip it instead of failing the parse.
+        if line.trim() == "END" {
+            i += 1;
+            continue;
+        }
+
         if line == "SMART_EDIT" {
             i += 1;
             let (region, next) = parse_region_at(&lines, i)?;
@@ -2245,9 +2237,6 @@ pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
                 let (new, next) = collect_until(&lines, i, "END_NEW")?;
                 i = next + 1;
 
-                expect_line(&lines, i, "END")?;
-                i += 1;
-
                 steps.push(EditPlanStep::ReplaceScope {
                     scope_start,
                     scope_end,
@@ -2271,9 +2260,6 @@ pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
             i += 1;
             let (new, next) = collect_until(&lines, i, "END_NEW")?;
             i = next + 1;
-
-            expect_line(&lines, i, "END")?;
-            i += 1;
 
             steps.push(EditPlanStep::LiteralReplace {
                 scope_start,
@@ -2343,8 +2329,7 @@ fn parse_region_at(lines: &[&str], idx: usize) -> Result<(EditRegion, usize)> {
         bail!("region task must not be empty");
     }
 
-    expect_line(lines, idx + 2, "END")?;
-    Ok((EditRegion { start, end, task }, idx + 3))
+    Ok((EditRegion { start, end, task }, idx + 2))
 }
 
 fn parse_two_line_numbers(rest: &str, header: &str, label: &str) -> Result<(usize, usize)> {
@@ -2968,43 +2953,41 @@ fn validate_insert_line(line: usize, total_lines: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate_candidate(path_str: &str, original: &str, candidate: &str) -> Result<()> {
+fn validate_candidate(original: &str, candidate: &str) -> Result<()> {
     if !original.is_empty() && candidate.is_empty() {
         bail!("candidate output is empty for a non-empty file");
-    }
-
-    let old_lines = original.lines().count();
-    let new_lines = candidate.lines().count();
-    if old_lines > LARGE_TRUNCATION_MIN_LINES && new_lines < old_lines / 2 {
-        bail!("candidate truncates file from {old_lines} to {new_lines} lines");
-    }
-
-    if is_brace_file(path_str) {
-        let old_balance = delimiter_imbalance(original);
-        let new_balance = delimiter_imbalance(candidate);
-        if new_balance > old_balance {
-            bail!("candidate worsens delimiter balance from {old_balance} to {new_balance}");
-        }
     }
 
     Ok(())
 }
 
-fn is_brace_file(path: &str) -> bool {
-    let brace_exts = [
-        "rs", "js", "ts", "tsx", "jsx", "go", "java", "c", "cpp", "h", "hpp", "cs", "kt", "swift",
-        "scala", "zig",
-    ];
-    brace_exts
-        .iter()
-        .any(|ext| path.ends_with(&format!(".{ext}")))
-}
+/// Truncation guard — runs at write time only (not in the inner smart-edit
+/// retry loop). Catches the common failure mode where the LLM emits only a
+/// diff fragment and loses the rest of the file. In interactive mode the user
+/// can confirm an intentional large deletion; in headless / test / auto-approve
+/// mode we reject as before.
+fn gate_truncation(
+    path_str: &str,
+    original: &str,
+    candidate: &str,
+    perms: Option<&PermissionManager>,
+) -> Result<()> {
+    let old_lines = original.lines().count();
+    let new_lines = candidate.lines().count();
+    if old_lines <= LARGE_TRUNCATION_MIN_LINES || new_lines >= old_lines / 2 {
+        return Ok(());
+    }
 
-fn delimiter_imbalance(text: &str) -> i64 {
-    let parens = text.matches('(').count() as i64 - text.matches(')').count() as i64;
-    let braces = text.matches('{').count() as i64 - text.matches('}').count() as i64;
-    let brackets = text.matches('[').count() as i64 - text.matches(']').count() as i64;
-    parens.abs() + braces.abs() + brackets.abs()
+    let rejection =
+        format!("candidate truncates {path_str} from {old_lines} to {new_lines} lines");
+    if let Some(perms) = perms
+        && perms.confirm(&format!(
+            "\x1b[1;33medit_file wants to shrink {path_str} from {old_lines} to {new_lines} lines.\x1b[0m\n  Is this intentional? [y]es / [n]o: "
+        ))
+    {
+        return Ok(());
+    }
+    bail!(rejection);
 }
 
 /// Build window ranges for a file.
@@ -3097,6 +3080,51 @@ mod tests {
     }
 
     #[test]
+    fn gate_truncation_allows_small_files() {
+        // Below LARGE_TRUNCATION_MIN_LINES, the guard never fires — even a
+        // "delete everything except one line" edit is allowed (the empty-file
+        // check in validate_candidate still catches full deletion).
+        let original: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let candidate = "line 0\n";
+        assert!(gate_truncation("small.rs", &original, candidate, None).is_ok());
+    }
+
+    #[test]
+    fn gate_truncation_allows_partial_shrink_above_half() {
+        // Shrinking from 100 to 60 lines keeps us above the half threshold,
+        // so the guard stays quiet.
+        let original: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let candidate: String = (0..60).map(|i| format!("line {i}\n")).collect();
+        assert!(gate_truncation("big.rs", &original, &candidate, None).is_ok());
+    }
+
+    #[test]
+    fn gate_truncation_rejects_large_cut_without_perms() {
+        // 100 -> 40 lines on a >50 line file is below half; with no perms
+        // available, the guard rejects (preserving the pre-existing behavior
+        // for tests and headless runs).
+        let original: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let candidate: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        let err = gate_truncation("big.rs", &original, &candidate, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("truncates"), "unexpected error: {msg}");
+        assert!(msg.contains("100"), "should name old line count: {msg}");
+        assert!(msg.contains("40"), "should name new line count: {msg}");
+    }
+
+    #[test]
+    fn gate_truncation_rejects_large_cut_in_headless_mode() {
+        // With an auto-approve PermissionManager (headless), the guard
+        // rejects without prompting — same as passing None.
+        let config = Config::default();
+        let perms = PermissionManager::headless(&config);
+        let original: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let candidate: String = (0..10).map(|i| format!("line {i}\n")).collect();
+        let err = gate_truncation("big.rs", &original, &candidate, Some(&perms)).unwrap_err();
+        assert!(err.to_string().contains("truncates"));
+    }
+
+    #[test]
     fn parse_preplan_window_response_collects_note_lines() {
         let response = parse_preplan_window_response(
             "NOTE provider loop spans L10-L20\nNOTE: assemble fn signature at L283\n",
@@ -3108,17 +3136,48 @@ mod tests {
                 "assemble fn signature at L283".to_string(),
             ],
         );
+        assert!(response.commands.is_empty());
     }
 
     #[test]
-    fn parse_preplan_window_response_silently_ignores_non_notes() {
-        // Anything that isn't a NOTE line is dropped without erroring. That
-        // includes stray control words, hallucinated SEARCH/READ commands,
-        // and partial step blocks. The window phase is observation-only.
+    fn parse_preplan_window_response_collects_search_and_read_commands() {
+        // The windowed pre-plan pass no longer has a separate recon phase —
+        // the model queues SEARCH/READ requests right alongside the notes
+        // it emits, and they get batch-executed before finalize.
+        let response = parse_preplan_window_response(
+            "NOTE callers live at L10-L20\n\
+             SEARCH: assemble(\n\
+             READ: 280-300\n",
+        );
+        assert_eq!(response.notes, vec!["callers live at L10-L20".to_string()]);
+        assert_eq!(
+            response.commands,
+            vec![
+                InspectionCommand::Search("assemble(".into()),
+                InspectionCommand::Read { start: 280, end: 300 },
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_preplan_window_response_drops_invalid_read_ranges() {
+        // Malformed READ ranges (start=0, end<start, non-numeric) are
+        // silently dropped rather than erroring out so the model doesn't
+        // crash the pipeline with a typo.
+        let response = parse_preplan_window_response(
+            "READ: 0-5\nREAD: 10-3\nREAD: bad\nNOTE still here\n",
+        );
+        assert!(response.commands.is_empty());
+        assert_eq!(response.notes, vec!["still here".to_string()]);
+    }
+
+    #[test]
+    fn parse_preplan_window_response_silently_ignores_unknown_lines() {
+        // Stray control words, half-formed edit-plan blocks, and leftover
+        // DONE terminators from the old recon phase all get dropped
+        // without erroring out.
         let response = parse_preplan_window_response(
             "NOTE looks good\n\
-             SEARCH: foo\n\
-             READ: 10-20\n\
              SMART_EDIT\n\
              REGION 1 5\n\
              TASK: do thing\n\
@@ -3127,6 +3186,7 @@ mod tests {
              DONE\n",
         );
         assert_eq!(response.notes, vec!["looks good".to_string()]);
+        assert!(response.commands.is_empty());
     }
 
     #[test]
@@ -3134,91 +3194,31 @@ mod tests {
         // The model may have nothing to add for a slice — that's fine.
         let response = parse_preplan_window_response("");
         assert!(response.notes.is_empty());
-    }
-
-    #[test]
-    fn parse_preplan_recon_response_accepts_search_and_read() {
-        let response = parse_preplan_recon_response("SEARCH: foo\nREAD: 10-20\n");
-        assert_eq!(
-            response.commands,
-            vec![
-                InspectionCommand::Search("foo".into()),
-                InspectionCommand::Read { start: 10, end: 20 },
-            ],
-        );
-        assert!(!response.done, "explicit DONE not present");
-    }
-
-    #[test]
-    fn parse_preplan_recon_response_recognizes_done_keyword() {
-        let response = parse_preplan_recon_response("DONE\n");
         assert!(response.commands.is_empty());
-        assert!(response.done);
     }
 
     #[test]
-    fn parse_preplan_recon_response_treats_empty_as_done() {
-        let response = parse_preplan_recon_response("");
-        assert!(response.commands.is_empty());
-        assert!(response.done, "empty response should terminate the loop");
-    }
-
-    #[test]
-    fn parse_preplan_recon_response_done_alongside_commands_executes_then_stops() {
-        let response = parse_preplan_recon_response("SEARCH: bar\nDONE\n");
-        assert_eq!(
-            response.commands,
-            vec![InspectionCommand::Search("bar".into())],
-        );
-        assert!(response.done);
-    }
-
-    #[test]
-    fn parse_preplan_recon_response_drops_invalid_read_ranges() {
-        let response = parse_preplan_recon_response("READ: 0-5\nREAD: 10-3\nREAD: bad\n");
-        assert!(response.commands.is_empty());
-        assert!(response.done);
-    }
-
-    #[test]
-    fn parse_preplan_recon_response_only_recognizes_done_terminator() {
-        // We only accept the literal word DONE. Other "stop" words like
-        // NONE / NO_CHANGES / FINALIZE / PLAN are not parsed as
-        // terminators — they fall through as unknown lines and the loop
-        // terminates only because the response has no commands.
-        for word in ["NONE", "NO_CHANGES", "FINALIZE", "PLAN", "STOP"] {
-            let response = parse_preplan_recon_response(word);
-            assert!(
-                response.commands.is_empty(),
-                "`{word}` should not produce a command"
-            );
-            // done is true here only because commands is empty (the
-            // empty-response fallthrough), not because the word matched.
-            assert!(response.done);
-        }
-
-        // DONE is the one terminator that explicitly sets done even
-        // alongside other commands.
-        let with_command = parse_preplan_recon_response("SEARCH: foo\nDONE\n");
-        assert_eq!(with_command.commands.len(), 1);
-        assert!(with_command.done);
-    }
-
-    #[test]
-    fn execute_recon_commands_executes_search_and_read() {
+    fn execute_inspection_commands_executes_search_and_read() {
         let content = "fn one() {}\nfn two() {}\nfn three() {}\n";
         let commands = vec![
             InspectionCommand::Search("two".into()),
             InspectionCommand::Read { start: 1, end: 2 },
         ];
-        let mut counters = ReconCounters {
+        let mut counters = InspectionCounters {
             search_count: 0,
             read_count: 0,
             max_reads: 6,
         };
         let mut extra = String::new();
-        execute_recon_commands(content, &commands, &mut counters, &mut extra, "test.rs", None)
-            .unwrap();
+        execute_inspection_commands(
+            content,
+            &commands,
+            &mut counters,
+            &mut extra,
+            "test.rs",
+            None,
+        )
+        .unwrap();
         assert_eq!(counters.search_count, 1);
         assert_eq!(counters.read_count, 1);
         assert!(extra.contains("SEARCH_RESULT query=`two`"));
@@ -3227,27 +3227,22 @@ mod tests {
     }
 
     #[test]
-    fn execute_recon_commands_persists_counters_across_calls() {
-        // Counters track totals across multiple recon rounds, not per round.
+    fn execute_inspection_commands_respects_read_cap() {
+        // The per-edit READ cap is enforced across all queued commands in
+        // the single batch pass.
         let content = "x\n";
-        let mut counters = ReconCounters {
+        let mut counters = InspectionCounters {
             search_count: 0,
             read_count: 0,
             max_reads: 1,
         };
         let mut extra = String::new();
-        execute_recon_commands(
+        execute_inspection_commands(
             content,
-            &[InspectionCommand::Read { start: 1, end: 1 }],
-            &mut counters,
-            &mut extra,
-            "test.rs",
-            None,
-        )
-        .unwrap();
-        execute_recon_commands(
-            content,
-            &[InspectionCommand::Read { start: 1, end: 1 }],
+            &[
+                InspectionCommand::Read { start: 1, end: 1 },
+                InspectionCommand::Read { start: 1, end: 1 },
+            ],
             &mut counters,
             &mut extra,
             "test.rs",
@@ -3259,20 +3254,27 @@ mod tests {
     }
 
     #[test]
-    fn execute_recon_commands_drops_overflow_with_inline_note() {
+    fn execute_inspection_commands_drops_overflow_with_inline_note() {
         let content = "x\n";
         let mut commands = Vec::new();
         for _ in 0..(MAX_PREPLAN_SEARCHES + 2) {
             commands.push(InspectionCommand::Search("x".into()));
         }
-        let mut counters = ReconCounters {
+        let mut counters = InspectionCounters {
             search_count: 0,
             read_count: 0,
             max_reads: 6,
         };
         let mut extra = String::new();
-        execute_recon_commands(content, &commands, &mut counters, &mut extra, "test.rs", None)
-            .unwrap();
+        execute_inspection_commands(
+            content,
+            &commands,
+            &mut counters,
+            &mut extra,
+            "test.rs",
+            None,
+        )
+        .unwrap();
         assert_eq!(counters.search_count, MAX_PREPLAN_SEARCHES);
         assert!(extra.contains("SEARCH `x` skipped: per-edit limit"));
     }

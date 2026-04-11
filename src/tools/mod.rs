@@ -285,7 +285,28 @@ pub async fn execute_edit_file_tool(
     }
 
     let baseline = capture_edit_baseline(path, config, lsp).await;
-    let mut result = edit_file::execute(args, config, router, lsp, cancelled, log).await?;
+    // Pass the LSP error baseline into edit_file so its inner candidate
+    // validation uses the same pre-edit count as the outer auto_check.
+    // Without this, the inner check captures its own baseline at a later
+    // moment — and on slow LSPs (e.g. rust-analyzer still settling) the
+    // two snapshots can disagree, producing contradictory result lines
+    // ("[lsp] OK 2 -> 1" alongside "[lsp] 2 errors (was 1 before)").
+    let baseline_lsp_errors = if baseline.existed_before {
+        Some(baseline.lsp_errors)
+    } else {
+        None
+    };
+    let mut result = edit_file::execute(
+        args,
+        config,
+        router,
+        lsp,
+        cancelled,
+        log,
+        baseline_lsp_errors,
+        Some(perms),
+    )
+    .await?;
     if result.success {
         finalize_file_edit(path, config, &mut result, lsp, baseline).await;
     }
