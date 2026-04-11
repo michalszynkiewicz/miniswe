@@ -15,20 +15,17 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "file".into(),
-                description: "File operations: read, search, shell, delete, replace, revert. Use action='help' for details. For code edits, prefer edit_file. Use delete only for removing an existing file.".into(),
+                description: "File operations: read, search, shell, delete, revert. Use action='help' for details. For code edits use edit_file; for full-file overwrites use write_file.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "description": "One of: read, delete, replace, search, shell, revert, help"
+                            "description": "One of: read, delete, search, shell, revert, help"
                         },
-                        "path": { "type": "string", "description": "File path (required for read/delete/replace/revert)" },
-                        "old": { "type": "string", "description": "Exact text to find (required for action='replace')" },
-                        "new": { "type": "string", "description": "Replacement text (required for action='replace')" },
-                        "all": { "type": "boolean", "description": "Replace all occurrences (for replace)" },
-                        "start_line": { "type": "integer", "description": "Start line for action='read' only. Do not use with replace." },
-                        "end_line": { "type": "integer", "description": "End line for action='read' only. Do not use with replace." },
+                        "path": { "type": "string", "description": "File path (required for read/delete/revert)" },
+                        "start_line": { "type": "integer", "description": "Start line for action='read'" },
+                        "end_line": { "type": "integer", "description": "End line for action='read'" },
                         "query": { "type": "string", "description": "Search text (for search)" },
                         "pattern": { "type": "string", "description": "Regex pattern (for search)" },
                         "scope": { "type": "string", "description": "Search scope (for search)" },
@@ -222,13 +219,13 @@ Available actions for `file`:
 - read: Read a file. Params: path (required), start_line, end_line
 - delete: Delete an existing file. Params: path (required)
   Example: {\"action\":\"delete\",\"path\":\"src/bin/old.rs\"}
-- replace: Replace text. Params: path (required), old (required), new (required), all (optional bool)
-  Example: {\"action\":\"replace\",\"path\":\"src/main.rs\",\"old\":\"exact text\",\"new\":\"replacement\"}
-  Default replaces one unique match. Set all=true for every occurrence.
 - search: Search codebase. Params: query or pattern (one required), scope, max_results
 - shell: Run a command. Params: command (required), timeout
   Example: {\"action\":\"shell\",\"command\":\"cargo check\",\"timeout\":30}
-- revert: Revert files to a previous round. Params: to_round, path (both optional)"
+- revert: Revert files to a previous round. Params: to_round, path (both optional)
+
+For text edits use edit_file (semantic, planner-driven). For full-file overwrites \
+use write_file. There is no longer a deterministic search-and-replace action."
 }
 
 /// Help text for the `code` tool group.

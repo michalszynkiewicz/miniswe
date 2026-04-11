@@ -1,5 +1,4 @@
 //! E2E tests for the loop-fix changes:
-//! - edit tool: expanded ±10 context + near-match on failure
 //! - write_file tool: [tail] section in output
 //! - auto_check: source context around errors
 //! - observation masking: per-type thresholds
@@ -15,111 +14,6 @@ use serde_json::json;
 
 fn perms(config: &Config) -> PermissionManager {
     PermissionManager::headless(config)
-}
-
-// ── edit: expanded context ──────────────────────────────────────────
-
-#[tokio::test]
-async fn edit_shows_10_lines_context() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    // Create a file with enough lines to see ±10 context
-    let lines: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
-    let content = lines.join("\n") + "\n";
-    fs::write(helpers::project_path(&config, "ctx.txt"), &content).unwrap();
-
-    // Edit line 15
-    let args = json!({"action": "replace",
-        "path": "ctx.txt",
-        "old": "line 15",
-        "new": "EDITED LINE 15"
-    });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    assert!(result.success);
-    // Should show context reaching back ~10 lines (line 5) and forward ~10 (line 25)
-    assert!(
-        result.content.contains("line 5"),
-        "should show line 5 in context"
-    );
-    assert!(
-        result.content.contains("line 25"),
-        "should show line 25 in context"
-    );
-    assert!(
-        result.content.contains("EDITED LINE 15"),
-        "should show the edit"
-    );
-    assert!(
-        result.content.contains("showing L"),
-        "should mention line range"
-    );
-}
-
-// ── edit: near-match on failure ─────────────────────────────────────
-
-#[tokio::test]
-async fn edit_not_found_shows_near_match() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    let content = "fn main() {\n    let x = 42;\n    println!(\"{x}\");\n}\n";
-    fs::write(helpers::project_path(&config, "near.txt"), content).unwrap();
-
-    // Try to match with wrong indentation — first line of `old` trimmed
-    // will match a line in the file, triggering the near-match display
-    let args = json!({"action": "replace",
-        "path": "near.txt",
-        "old": "let x = 42;\n    println!(\"wrong\");",
-        "new": "let x = 99;"
-    });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    assert!(!result.success);
-    // Should show a near-match with the actual file content
-    assert!(
-        result.content.contains("near match"),
-        "should show near match section: {}",
-        result.content
-    );
-    assert!(
-        result.content.contains("let x = 42"),
-        "should show the actual line content: {}",
-        result.content
-    );
-    assert!(
-        result.content.contains("4 lines total"),
-        "should show total line count: {}",
-        result.content
-    );
-}
-
-#[tokio::test]
-async fn edit_not_found_no_near_match() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    fs::write(
-        helpers::project_path(&config, "nomatch.txt"),
-        "hello world\n",
-    )
-    .unwrap();
-
-    let args = json!({"action": "replace",
-        "path": "nomatch.txt",
-        "old": "completely different text that does not appear",
-        "new": "replacement"
-    });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    assert!(!result.success);
-    assert!(result.content.contains("not found"));
-    // Should still show file line count for orientation
-    assert!(result.content.contains("1 lines total"));
 }
 
 // ── write_file: tail section ────────────────────────────────────────
@@ -436,8 +330,8 @@ fn rich_summary_edit_with_errors() {
         "✓ Edited src/main.rs (1 replacement)\n[cargo check]\nerror[E0061]: expected 4 arguments\n";
 
     let summary = summarize_tool_result(
-        "file",
-        &json!({"action": "replace", "path": "src/main.rs"}),
+        "edit_file",
+        &json!({"path": "src/main.rs", "task": "fix call"}),
         content,
     );
 
@@ -458,8 +352,8 @@ fn rich_summary_edit_success() {
     let content = "✓ Edited src/main.rs (1 replacement)\n[cargo check] OK\n";
 
     let summary = summarize_tool_result(
-        "file",
-        &json!({"action": "replace", "path": "src/main.rs"}),
+        "edit_file",
+        &json!({"path": "src/main.rs", "task": "fix call"}),
         content,
     );
 

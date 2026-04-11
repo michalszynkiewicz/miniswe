@@ -151,8 +151,6 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let mut last_call_key: Option<String> = None;
     let mut same_call_streak = 0u32;
     let mut calls_since_last_edit = 0u32;
-    let mut edit_fail_count: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
     let mut successful_edits_since_plan_update = 0u32;
     let mut plan_checkpoint_pending = false;
     let mut plan_update_requested = false;
@@ -414,8 +412,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             // Block write tools in plan-only mode
             let file_action = args["action"].as_str().unwrap_or("");
             if plan_only
-                && ((tc.function.name == "file"
-                    && matches!(file_action, "write" | "replace" | "shell"))
+                && ((tc.function.name == "file" && file_action == "shell")
                     || matches!(tc.function.name.as_str(), "edit_file" | "write_file"))
             {
                 let result_msg = Message::tool_result(
@@ -429,9 +426,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             }
 
             // Write gating: require plan before write tools
-            let is_write_action = (tc.function.name == "file"
-                && matches!(file_action, "write" | "replace"))
-                || matches!(tc.function.name.as_str(), "edit_file" | "write_file");
+            let is_write_action = matches!(tc.function.name.as_str(), "edit_file" | "write_file");
             if config.tools.plan && !tools::plan::plan_exists(&config) && is_write_action {
                 let result_msg = Message::tool_result(
                     &tc.id,
@@ -641,9 +636,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
             }
 
             // A successful file write means code changed — reset trackers.
-            let is_file_write = (tc.function.name == "file"
-                && matches!(file_action, "replace" | "write"))
-                || matches!(tc.function.name.as_str(), "edit_file" | "write_file");
+            let is_file_write = matches!(tc.function.name.as_str(), "edit_file" | "write_file");
             if result.success && is_file_write {
                 last_call_key = None;
                 same_call_streak = 0;
@@ -664,19 +657,6 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 }
             } else {
                 calls_since_last_edit += 1;
-            }
-
-            // Track replace failures per file — steer semantic edits to edit_file.
-            if tc.function.name == "file" && file_action == "replace" && !result.success {
-                let path = args["path"].as_str().unwrap_or("").to_string();
-                let count = edit_fail_count.entry(path.clone()).or_insert(0);
-                *count += 1;
-                if *count >= 2 {
-                    result.content.push_str(&format!(
-                        "\nERROR: replace has failed {} times on {path}. STOP using replace. Use edit_file(path, task) for this semantic edit; use write_file(path, content) only when providing the complete replacement file content.\n",
-                        count
-                    ));
-                }
             }
 
             let result_msg = Message::tool_result(&tc.id, &result.content);
@@ -790,9 +770,9 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                     .unwrap_or("project");
                 format!("search \"{query}\" in {scope}")
             }
-            "replace" | "write" => {
+            "delete" => {
                 let path = args["path"].as_str().unwrap_or("?");
-                format!("{action} {path}")
+                format!("delete {path}")
             }
             "shell" => {
                 let cmd = args["command"].as_str().unwrap_or("?");

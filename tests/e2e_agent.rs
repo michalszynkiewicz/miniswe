@@ -645,12 +645,12 @@ async fn invalid_json_args_from_llm() {
 
 #[tokio::test]
 async fn plan_mode_blocks_write_file() {
-    // In plan mode, the run loop blocks file write/replace/shell actions.
+    // In plan mode, the run loop blocks file shell action and write_file/edit_file tools.
     let plan_only = true;
-    let blocked_actions = ["write", "replace", "shell"];
+    let blocked_actions = ["shell"];
     for action in &blocked_actions {
         assert!(
-            plan_only && matches!(*action, "write" | "replace" | "shell"),
+            plan_only && matches!(*action, "shell"),
             "plan mode should block file action: {action}"
         );
     }
@@ -659,7 +659,7 @@ async fn plan_mode_blocks_write_file() {
     let allowed_actions = ["read", "search"];
     for action in &allowed_actions {
         assert!(
-            !matches!(*action, "write" | "replace" | "shell"),
+            !matches!(*action, "shell"),
             "plan mode should allow file action: {action}"
         );
     }

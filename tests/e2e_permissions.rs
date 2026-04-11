@@ -88,15 +88,14 @@ async fn path_jail_blocks_write_absolute() {
 }
 
 #[tokio::test]
-async fn path_jail_blocks_edit_traversal() {
+async fn path_jail_blocks_write_traversal() {
     let (_tmp, config) = helpers::create_test_project();
 
-    let args = json!({"action": "replace",
+    let args = json!({
         "path": "../../../etc/shadow",
-        "old": "root",
-        "new": "hacked"
+        "content": "hacked"
     });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
+    let result = tools::execute_tool("write_file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
@@ -104,7 +103,7 @@ async fn path_jail_blocks_edit_traversal() {
     assert!(
         result.content.contains("escapes project root")
             || result.content.contains("Absolute paths"),
-        "should block edit traversal: {}",
+        "should block write traversal: {}",
         result.content
     );
 }

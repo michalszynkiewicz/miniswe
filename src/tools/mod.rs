@@ -6,7 +6,6 @@
 //! After file edits, the index is incrementally updated.
 
 mod delete_file;
-pub mod edit;
 pub mod edit_file;
 pub mod plan;
 mod read_file;
@@ -68,7 +67,7 @@ pub async fn execute_tool(
     lsp: Option<&LspClient>,
 ) -> Result<ToolResult> {
     match name {
-        "file" => execute_file_tool(args, config, perms, lsp).await,
+        "file" => execute_file_tool(args, config, perms).await,
         "code" => execute_code_tool(args, config, lsp).await,
         "web" => execute_web_tool(args, config, perms).await,
         "write_file" => execute_write_file_tool(args, config, perms, lsp).await,
@@ -93,7 +92,6 @@ async fn execute_file_tool(
     args: &Value,
     config: &Config,
     perms: &PermissionManager,
-    lsp: Option<&LspClient>,
 ) -> Result<ToolResult> {
     let action = args["action"].as_str().unwrap_or("");
 
@@ -120,18 +118,13 @@ async fn execute_file_tool(
             delete_file::execute(args, config).await
         }
 
-        "replace" => {
-            let path = args["path"].as_str().unwrap_or("");
-            if let Err(e) = perms.resolve_and_check_path(path) {
-                return Ok(ToolResult::err(e));
-            }
-            let baseline = capture_edit_baseline(path, config, lsp).await;
-            let mut result = edit::execute(args, config).await?;
-            if result.success {
-                finalize_file_edit(path, config, &mut result, lsp, baseline).await;
-            }
-            Ok(result)
-        }
+        "replace" => Ok(ToolResult::err(
+            "file(action='replace') is no longer supported. For partial edits, call \
+             edit_file with {\"path\":\"<file>\",\"task\":\"<what to change and why>\"} \
+             and let the planner produce the patch. For full-file overwrites use \
+             write_file(path, content)."
+                .into(),
+        )),
 
         "search" => search::execute(args, config).await,
 
