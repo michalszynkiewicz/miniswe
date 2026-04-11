@@ -172,6 +172,110 @@ fn ws_squash(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// Minimum per-line similarity (1.0 = identical, 0.0 = fully disjoint)
+/// for fuzzy relocation to consider a line a match. Conservative — we
+/// would rather miss a real edit than pull the planner into a noisy
+/// confirmation on a line it didn't actually want to touch.
+const FUZZY_MIN_LINE_SIM: f64 = 0.70;
+/// Minimum average similarity across all OLD lines for a fuzzy block
+/// to qualify as a candidate.
+const FUZZY_MIN_BLOCK_SIM: f64 = 0.85;
+
+/// Character-level Levenshtein distance, iterative two-row DP.
+/// Multibyte-safe (operates on `char`s).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let m = a_chars.len();
+    let n = b_chars.len();
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// Fraction of characters shared between two lines, normalized by the
+/// longer length. Two empty strings score as identical.
+fn line_similarity(a: &str, b: &str) -> f64 {
+    let len_a = a.chars().count();
+    let len_b = b.chars().count();
+    let max_len = len_a.max(len_b);
+    if max_len == 0 {
+        return 1.0;
+    }
+    1.0 - (edit_distance(a, b) as f64) / (max_len as f64)
+}
+
+/// Collect all 1-based inclusive `(start, end)` line ranges where the
+/// `old` block approximately matches `content` under character-level
+/// edit distance. Every line must clear `FUZZY_MIN_LINE_SIM` and the
+/// block average must clear `FUZZY_MIN_BLOCK_SIM`.
+///
+/// Ranges already in `exclude` (byte-exact or whitespace-tolerant hits)
+/// are skipped so the picker does not see the same range twice.
+///
+/// Rejects OLD blocks whose lines are all trivially short — fuzzy
+/// scoring is noisy on very short strings and would otherwise match
+/// half the file for a one-word OLD.
+pub(super) fn find_all_fuzzy_line_matches(
+    content: &str,
+    old: &[String],
+    exclude: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    if old.is_empty() {
+        return Vec::new();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let n = old.len();
+    if n > lines.len() {
+        return Vec::new();
+    }
+    // Require at least one OLD line with ≥5 non-whitespace chars.
+    // Single-line "x=1" OLDs are too noisy to fuzzy-match reliably.
+    if !old
+        .iter()
+        .any(|l| l.chars().filter(|c| !c.is_whitespace()).count() >= 5)
+    {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    'outer: for i in 0..=lines.len() - n {
+        let range = (i + 1, i + n);
+        if exclude.contains(&range) {
+            continue;
+        }
+        let mut sum = 0.0f64;
+        for j in 0..n {
+            let sim = line_similarity(lines[i + j], &old[j]);
+            if sim < FUZZY_MIN_LINE_SIM {
+                continue 'outer;
+            }
+            sum += sim;
+        }
+        if sum / n as f64 >= FUZZY_MIN_BLOCK_SIM {
+            out.push(range);
+        }
+    }
+    out
+}
+
 /// Collect all 1-based inclusive `(start, end)` line ranges where the
 /// `old` block matches `content` after per-line whitespace normalization.
 /// Lines are compared after removing every whitespace character.
@@ -267,12 +371,24 @@ pub(super) async fn try_relocate_and_replace(
 ) -> RelocateOutcome {
     let exact = find_all_exact_line_matches(content, old);
     let ws = find_all_ws_tolerant_line_matches(content, old, &exact);
+    // Fuzzy hits only fire when no exact or whitespace-tolerant match
+    // exists at all — fuzzy search is the last resort and we don't want
+    // its approximate hits displacing a high-confidence match from the
+    // picker even under the locality bias.
+    let fuzzy = if exact.is_empty() && ws.is_empty() {
+        find_all_fuzzy_line_matches(content, old, &[])
+    } else {
+        Vec::new()
+    };
 
     // Byte-exact hits come first so ties in the locality-biased picker
-    // resolve in favor of higher-confidence matches.
-    let mut candidates: Vec<(usize, usize)> = Vec::with_capacity(exact.len() + ws.len());
+    // resolve in favor of higher-confidence matches. Fuzzy hits come
+    // last for the same reason.
+    let mut candidates: Vec<(usize, usize)> =
+        Vec::with_capacity(exact.len() + ws.len() + fuzzy.len());
     candidates.extend(exact.iter().copied());
     candidates.extend(ws.iter().copied());
+    candidates.extend(fuzzy.iter().copied());
 
     let Some(located_at) = pick_best_candidate(&candidates, scope_start, scope_end) else {
         return RelocateOutcome::NoCandidate;
@@ -288,8 +404,10 @@ pub(super) async fn try_relocate_and_replace(
     let (new_start, new_end) = located_at;
     let strategy = if exact.contains(&located_at) {
         "byte-exact"
-    } else {
+    } else if ws.contains(&located_at) {
         "whitespace-normalized"
+    } else {
+        "fuzzy line similarity"
     };
 
     // Reconstruct OLD from the actual file lines at the located range.
