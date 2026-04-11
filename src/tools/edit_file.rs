@@ -166,6 +166,18 @@ enum PreplanOutcome {
     OverreachedRejection {
         suppressed_reason: String,
     },
+    /// The model explicitly emitted the `NO_CHANGES` sentinel, meaning the
+    /// task is already satisfied in the current file state. This is the
+    /// legitimate "nothing to do" signal, distinct from an empty response
+    /// (which we now treat as a transient failure worth retrying).
+    NothingToDo,
+    /// The model returned empty or whitespace-only text. This used to
+    /// collapse to `Steps { steps: [], dropped: [] }` and exit the retry
+    /// loop, but bench logs show it's usually a transient pathology
+    /// (stalled inference, template misfire) that a retry with feedback
+    /// can recover from. Treat it as a failure and let the outer loop
+    /// re-prompt via `RepairContext`.
+    EmptyResponse,
 }
 
 /// What the whole pre-plan retry loop produced. Distinguishes "applied
@@ -325,6 +337,49 @@ async fn execute_preplanned_steps(
                          That reason describes a missing target in the *current* file state, which is exactly what an edit is for — \
                          it does NOT make the task incoherent. Plan the edit that creates or updates the target. \
                          Reserve INVALID_TASK only for tasks that contradict reality (wrong language, internally inconsistent goals)."
+                    ),
+                });
+                continue;
+            }
+            PreplanOutcome::NothingToDo => {
+                // Explicit `NO_CHANGES` sentinel — the legitimate "task is
+                // already satisfied" signal. Fall through to the existing
+                // empty-steps convergence path below (which handles both
+                // "nothing changed yet → NoChanges" and "we already applied
+                // edits in an earlier attempt → converged" cases).
+                log_debug(
+                    log,
+                    path_str,
+                    &format!("preplan:nothing_to_do attempt={attempt}"),
+                );
+                (Vec::new(), Vec::new())
+            }
+            PreplanOutcome::EmptyResponse => {
+                // Transient pathology (stalled inference, template misfire,
+                // empty streaming completion). Historically this collapsed
+                // to an empty plan and exited the retry loop, wasting the
+                // whole edit_file invocation on one bad response. Now we
+                // treat it as a failure and feed the model explicit
+                // guidance via `RepairContext`, letting the outer
+                // MAX_PLAN_ATTEMPTS loop re-prompt.
+                log_debug(
+                    log,
+                    path_str,
+                    &format!("preplan:empty_response attempt={attempt}; will retry"),
+                );
+                progress_log.push_str(&format!(
+                    "{label}; model returned empty response, retrying\n"
+                ));
+                repair_context = Some(RepairContext {
+                    previous_plan: Vec::new(),
+                    completed_steps: Vec::new(),
+                    failed_step: None,
+                    failure_reason: String::from(
+                        "The previous attempt returned an empty response, which is not a valid output. \
+                         Either emit valid edit-plan blocks for the changes needed, \
+                         or output exactly `NO_CHANGES` on its own line if the task is already satisfied, \
+                         or output `INVALID_TASK: <reason>` if the task is incoherent. \
+                         Do not return an empty response.",
                     ),
                 });
                 continue;
@@ -1722,7 +1777,7 @@ async fn request_preplan_steps(
          Every step must change something. Do not emit a LITERAL_REPLACE whose NEW is identical to its OLD, and do not emit a SMART_EDIT whose task is to verify a region is unchanged or to keep it as-is — just leave those regions out of the plan.\n\
          Use LITERAL_REPLACE when you have the OLD text verbatim from an inspection result and OLD/NEW each span ≤ {max_literal_lines} lines. Otherwise use SMART_EDIT — its execution phase will see the region content.\n\
          Never use LITERAL_REPLACE for whole functions, impl blocks, modules, or test cases.\n\n\
-         If no edits are needed, return an empty response.\n\n\
+         If the task is already satisfied in the current file, output exactly `NO_CHANGES` on its own line and nothing else. Do NOT return an empty response — empty responses are treated as a failure and retried.\n\n\
          Output only these blocks, nothing else:\n\n\
          LITERAL_REPLACE\n\
          SCOPE <start> <end>\n\
@@ -1751,7 +1806,7 @@ async fn request_preplan_steps(
     let request = ChatRequest {
         messages: vec![
             Message::system(
-                "Final planning phase. Output only edit-plan blocks, an empty response if no changes are needed, or INVALID_TASK: <reason> for incoherent tasks. No markdown.",
+                "Final planning phase. Output only edit-plan blocks, or `NO_CHANGES` if the task is already satisfied, or `INVALID_TASK: <reason>` for incoherent tasks. No markdown. Empty responses are not valid and will be retried.",
             ),
             Message::user(&finalize_prompt),
         ],
@@ -1776,6 +1831,32 @@ async fn request_preplan_steps(
             truncate_multiline(text, 12000)
         ),
     );
+
+    // Empty response is now a pathology signal, not a "nothing to do"
+    // signal. Historically we collapsed it to an empty plan and exited,
+    // but bench logs show it's usually a stalled or misfired inference
+    // and a retry with explicit feedback recovers cleanly. Route it to
+    // the outer retry loop via `EmptyResponse`.
+    if text.trim().is_empty() {
+        log_debug(
+            log,
+            path_str,
+            &format!("preplan:finalize:file:1-{total_lines} empty_response"),
+        );
+        return Ok(PreplanOutcome::EmptyResponse);
+    }
+
+    // Explicit NO_CHANGES sentinel — the legitimate "task is already
+    // satisfied" signal. Route to `NothingToDo` so the caller can
+    // converge cleanly without retrying.
+    if looks_like_no_changes(text) {
+        log_debug(
+            log,
+            path_str,
+            &format!("preplan:finalize:file:1-{total_lines} nothing_to_do"),
+        );
+        return Ok(PreplanOutcome::NothingToDo);
+    }
 
     if let Some(reason) = parse_invalid_task(text) {
         if is_likely_missing_target_reason(&reason) {
@@ -1992,6 +2073,15 @@ fn format_preplan_log(label: &str, steps: &[EditPlanStep]) -> String {
     format!("Raw {label} ({} step(s), parsed):\n{plan}\n", steps.len())
 }
 
+/// Detect a finalize-phase `NO_CHANGES` sentinel — the explicit signal
+/// from the planner that the task is already satisfied. We tolerate
+/// surrounding whitespace and code fences so a model that wraps its
+/// answer in ```` ``` ```` still works.
+fn looks_like_no_changes(text: &str) -> bool {
+    let unfenced = strip_code_fences(text);
+    unfenced.trim() == "NO_CHANGES"
+}
+
 /// Detect a finalize-phase `INVALID_TASK` rejection. Returns `Some(reason)`
 /// if the response opens with `INVALID_TASK` (optionally followed by `:`
 /// and a reason), and `None` otherwise. The reason is trimmed and may be
@@ -2133,10 +2223,13 @@ fn strip_code_fences(text: &str) -> String {
 }
 
 pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
-    // Empty response = no changes needed. The finalize prompt no longer
-    // asks for an explicit NO_CHANGES sentinel; if the model still emits
-    // one (alone or as a stray token among real steps) we treat it as a
-    // no-op marker rather than failing the parse.
+    // Empty input parses to zero steps. The finalize caller now detects
+    // empty responses and `NO_CHANGES` up-front and routes them into
+    // dedicated `PreplanOutcome` variants, so this code path is only
+    // reached when some caller passes a body that turned out to be empty
+    // (e.g. after fence stripping) or on a stray NO_CHANGES token mixed
+    // in with real steps — we tolerate those below rather than failing
+    // the parse.
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -3326,6 +3419,54 @@ mod tests {
         assert_eq!(parse_invalid_task("NO_CHANGES"), None);
         assert_eq!(parse_invalid_task("LITERAL_REPLACE\nSCOPE 1 1\n"), None);
         assert_eq!(parse_invalid_task(""), None);
+    }
+
+    #[test]
+    fn looks_like_no_changes_accepts_bare_sentinel() {
+        assert!(looks_like_no_changes("NO_CHANGES"));
+    }
+
+    #[test]
+    fn looks_like_no_changes_tolerates_surrounding_whitespace() {
+        assert!(looks_like_no_changes("  NO_CHANGES  "));
+        assert!(looks_like_no_changes("\n\nNO_CHANGES\n"));
+        assert!(looks_like_no_changes("\tNO_CHANGES\n\n"));
+    }
+
+    #[test]
+    fn looks_like_no_changes_tolerates_code_fences() {
+        // Smaller models sometimes wrap everything in a fence, and
+        // `strip_code_fences` already handles that shape — we just need
+        // to make sure the NO_CHANGES recognizer composes with it.
+        assert!(looks_like_no_changes("```\nNO_CHANGES\n```"));
+        assert!(looks_like_no_changes("```text\nNO_CHANGES\n```"));
+    }
+
+    #[test]
+    fn looks_like_no_changes_rejects_empty() {
+        // Empty response is the pathology case, not the legitimate
+        // "nothing to do" case — it must NOT be treated as NO_CHANGES.
+        assert!(!looks_like_no_changes(""));
+        assert!(!looks_like_no_changes("   "));
+        assert!(!looks_like_no_changes("\n\n"));
+    }
+
+    #[test]
+    fn looks_like_no_changes_rejects_content_alongside_sentinel() {
+        // A plan with steps is NOT NO_CHANGES, even if the model
+        // sprinkled a stray NO_CHANGES somewhere. (The fall-through
+        // parser tolerates stray sentinels mid-plan; this helper only
+        // recognizes the pure, unambiguous signal.)
+        assert!(!looks_like_no_changes("NO_CHANGES\nLITERAL_REPLACE\nSCOPE 1 1"));
+        assert!(!looks_like_no_changes("LITERAL_REPLACE\nSCOPE 1 1\nNO_CHANGES"));
+        assert!(!looks_like_no_changes("INVALID_TASK: foo"));
+    }
+
+    #[test]
+    fn looks_like_no_changes_rejects_lookalikes() {
+        assert!(!looks_like_no_changes("NO_CHANGE"));
+        assert!(!looks_like_no_changes("NO_CHANGES_NEEDED"));
+        assert!(!looks_like_no_changes("no_changes")); // case-sensitive on purpose
     }
 
     #[test]
