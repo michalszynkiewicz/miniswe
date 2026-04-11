@@ -1655,9 +1655,14 @@ async fn execute_no_changes_leaves_file_unchanged() {
     // the only preplan call is finalize, whose parser treats NO_CHANGES as an
     // empty plan → zero steps → file untouched.
     let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(helpers::mock_text_response("NO_CHANGES"))
+        .respond_with(move |_req: &wiremock::Request| {
+            calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            helpers::mock_text_response("NO_CHANGES")
+        })
         .mount(&mock_server)
         .await;
 
@@ -1672,9 +1677,132 @@ async fn execute_no_changes_leaves_file_unchanged() {
         .unwrap();
 
     assert!(result.success);
+    // Exactly one finalize call — NO_CHANGES is the legitimate "nothing to do"
+    // signal and must NOT trigger a retry loop. (Empty responses now do.)
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "NO_CHANGES should converge in a single finalize call without retrying"
+    );
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "original\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_empty_response_at_finalize_retries_and_recovers() {
+    // Bench logs show the planner sometimes returns an empty response as a
+    // transient pathology (stalled inference, template misfire). Historically
+    // we collapsed that to an empty plan and exited the retry loop, wasting
+    // the whole edit_file invocation on one bad response. Now we treat it
+    // as a failure, feed the model explicit feedback via RepairContext, and
+    // retry within MAX_PLAN_ATTEMPTS. This test proves the retry path works:
+    // the first finalize call returns empty, the second returns a valid plan,
+    // and the edit applies.
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                // Plan attempt 1: finalize → empty response (pathology).
+                0 => helpers::mock_text_response(""),
+                // Plan attempt 2 (after empty-response repair): finalize → real plan.
+                1 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nfoo();\nEND_OLD\nNEW:\nbar();\nEND_NEW\nEND\n",
+                ),
+                _ => panic!("unexpected extra call #{n} — repair retry should have succeeded"),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "foo();\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "rename foo to bar",
+        "lsp_validation": "off",
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(
+        result.success,
+        "expected success after empty-response retry, got: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("empty response"),
+        "expected empty-response note in progress log, got: {}",
+        result.content
+    );
+    // plan1: 1 finalize (empty) + plan2: 1 finalize (succeeded) = 2 total
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "bar();\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_empty_response_exhausts_retries_and_reports_failure() {
+    // If every finalize call returns empty, we exhaust MAX_PLAN_ATTEMPTS and
+    // report a clean failure to the agent instead of silently returning
+    // "nothing to do" (the old behavior, which hid the stall).
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            helpers::mock_text_response("")
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.rs"), "foo();\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "rename foo to bar",
+        "lsp_validation": "off",
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(
+        !result.success,
+        "expected failure after repeated empty responses, got success: {}",
+        result.content
+    );
+    // MAX_PLAN_ATTEMPTS = 4, so we expect 4 finalize calls before bailing.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "expected one call per plan attempt before exhaustion"
+    );
+    assert!(
+        result.content.contains("empty response"),
+        "expected empty-response reason in failure message, got: {}",
+        result.content
+    );
+    // File untouched.
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "foo();\n"
     );
 }
 
