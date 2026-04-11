@@ -406,6 +406,19 @@ impl PermissionManager {
         }
     }
 
+    /// Prompt the user with a free-form yes/no message. Intended for "soft"
+    /// rejections — situations where a check would otherwise bail but the user
+    /// should be able to override in interactive mode. In headless / auto-approve
+    /// mode this returns `false` without prompting, so callers fall back to the
+    /// rejection path.
+    pub fn confirm(&self, prompt: &str) -> bool {
+        if self.auto_approve {
+            return false;
+        }
+        let response = self.request_user_decision(prompt);
+        matches!(response.as_str(), "y" | "yes")
+    }
+
     fn request_user_decision(&self, prompt: &str) -> String {
         if let Some(tx) = self.prompt_events.lock().unwrap().clone() {
             let (response_tx, response_rx) = std::sync::mpsc::channel();
