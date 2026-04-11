@@ -5,9 +5,22 @@
 # no shared target/, no stale binaries.
 #
 # Usage:
-#   ./scripts/run-benchmark-docker.sh [--timeout 1800] [--max-rounds 50]
+#   ./scripts/run-benchmark-docker.sh [--timeout 1800] [--max-rounds 50] \
+#                                     [--model devstral-small-2]
 #
-# LLM server must be running on host (localhost:8464).
+# LLM server must be running on host (localhost:8464). The script only sets
+# the model name written into config.toml — it does not start llama-server.
+#
+# Example server commands (host-side):
+#   # Devstral Small 2 (default)
+#   llama-server --jinja -fa -hf bartowski/Devstral-Small-2-GGUF:Q4_K_M \
+#                --port 8464 -c 60000
+#
+#   # Gemma 4 26B-A4B MoE (Apr 2026 release, 4B active params)
+#   llama-server --jinja -fa \
+#                -m $HOME/models/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf \
+#                --port 8464 -c 60000
+#   # then: ./scripts/run-benchmark-docker.sh --model gemma-4-26B-A4B-it
 
 set -euo pipefail
 
@@ -38,6 +51,7 @@ trap cleanup EXIT INT TERM
 TIMEOUT=1800
 MAX_ROUNDS=50
 TEMPERATURE=0.0
+MODEL="devstral-small-2"
 TASK="Add a CLI flag --system-prompt-override (short: -s) that takes a string and replaces the default system prompt with the provided text. When this flag is set, skip all context providers and just use the override text as the system message. Make sure it works for both single-shot and interactive modes."
 
 # Parse args
@@ -46,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --timeout)      TIMEOUT="$2";      shift 2 ;;
         --max-rounds)   MAX_ROUNDS="$2";   shift 2 ;;
         --temperature)  TEMPERATURE="$2";  shift 2 ;;
+        --model)        MODEL="$2";        shift 2 ;;
         --task)         TASK="$2";         shift 2 ;;
         --sha)          BASELINE_SHA="$2"; shift 2 ;;
         *) echo "Unknown: $1" >&2; exit 1 ;;
@@ -57,6 +72,7 @@ mkdir -p "${RESULTS_DIR}"
 echo "=== Docker-isolated provider benchmark ==="
 echo "Image:    ${IMAGE_NAME}"
 echo "SHA:      ${BASELINE_SHA}"
+echo "Model:    ${MODEL}"
 echo "Timeout:  ${TIMEOUT}s"
 echo "Rounds:   ${MAX_ROUNDS}"
 echo "Results:  ${RESULTS_DIR}"
@@ -85,7 +101,7 @@ generate_config() {
 [model]
 provider = "llama-cpp"
 endpoint = "http://localhost:8464"
-model = "devstral-small-2"
+model = "${MODEL}"
 context_window = 60000
 temperature = ${TEMPERATURE}
 max_output_tokens = 4096
