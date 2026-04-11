@@ -408,97 +408,28 @@ async fn delete_file_missing_path_or_file_fails() {
     assert!(missing_file.content.contains("File not found: nope.txt"));
 }
 
-// ── edit ────────────────────────────────────────────────────────────
+// ── replace deprecation ─────────────────────────────────────────────
 
 #[tokio::test]
-async fn edit_performs_replacement() {
+async fn file_replace_action_returns_deprecation_redirect() {
     let (_tmp, config) = helpers::create_test_project();
+    fs::write(helpers::project_path(&config, "x.txt"), "hello\n").unwrap();
 
-    let content = "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x + y);\n}\n";
-    fs::write(helpers::project_path(&config, "edit_test.txt"), content).unwrap();
-
-    let args = json!({"action": "replace",
-        "path": "edit_test.txt",
-        "old": "    let x = 1;",
-        "new": "    let x = 42;"
-    });
+    let args = json!({"action": "replace", "path": "x.txt", "old": "hello", "new": "world"});
     let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();
 
-    assert!(result.success, "edit should succeed: {}", result.content);
-    assert!(result.content.contains("1 replacement"));
-
-    let disk = fs::read_to_string(helpers::project_path(&config, "edit_test.txt")).unwrap();
-    assert!(disk.contains("let x = 42;"));
-    assert!(!disk.contains("let x = 1;"));
-}
-
-#[tokio::test]
-async fn edit_rejects_ambiguous_match() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    let content = "foo\nbar\nfoo\nbaz\n";
-    fs::write(helpers::project_path(&config, "dupe.txt"), content).unwrap();
-
-    let args = json!({"action": "replace",
-        "path": "dupe.txt",
-        "old": "foo",
-        "new": "qux"
-    });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    assert!(!result.success);
+    assert!(!result.success, "replace should be deprecated");
     assert!(
-        result.content.contains("matches 2 locations"),
-        "should report ambiguity: {}",
+        result.content.contains("edit_file") && result.content.contains("write_file"),
+        "deprecation must redirect to edit_file/write_file: {}",
         result.content
     );
-    // Should show line numbers of matches
-    assert!(result.content.contains("L1"));
-    assert!(result.content.contains("L3"));
-}
 
-#[tokio::test]
-async fn edit_file_not_found() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    let args = json!({"action": "replace",
-        "path": "no_such_file.txt",
-        "old": "foo",
-        "new": "bar"
-    });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    assert!(!result.success);
-    assert!(result.content.contains("not found") || result.content.contains("Not found"));
-}
-
-#[tokio::test]
-async fn edit_old_not_found_in_file() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    fs::write(
-        helpers::project_path(&config, "miss.txt"),
-        "actual content\n",
-    )
-    .unwrap();
-
-    let args = json!({"action": "replace",
-        "path": "miss.txt",
-        "old": "nonexistent text",
-        "new": "replacement"
-    });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    assert!(!result.success);
-    assert!(result.content.contains("not found"));
+    // File must be untouched.
+    let disk = fs::read_to_string(helpers::project_path(&config, "x.txt")).unwrap();
+    assert_eq!(disk, "hello\n");
 }
 
 // ── search ──────────────────────────────────────────────────────────
@@ -762,8 +693,13 @@ async fn file_help_returns_action_list() {
         result.content
     );
     assert!(
-        result.content.contains("replace"),
-        "help should list replace action: {}",
+        !result.content.contains("\n- replace:"),
+        "file help should no longer advertise replace: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("edit_file"),
+        "help should redirect to edit_file: {}",
         result.content
     );
 }
@@ -858,101 +794,6 @@ async fn shell_missing_command() {
 
 // ── whitespace-normalized edit fallback ────────────────────────────
 
-#[tokio::test]
-async fn edit_whitespace_normalized_fallback() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    // File has 4-space indent
-    let content = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
-    fs::write(helpers::project_path(&config, "ws_test.rs"), content).unwrap();
-
-    // old has 2-space indent (wrong whitespace, but same content)
-    let args = json!({"action": "replace",
-        "path": "ws_test.rs",
-        "old": "  let x = 1;\n  let y = 2;",
-        "new": "    let x = 42;\n    let y = 99;"
-    });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    assert!(
-        result.success,
-        "whitespace-normalized edit should succeed: {}",
-        result.content
-    );
-    assert!(
-        result.content.contains("fuzzy/normalized matching"),
-        "should mention fuzzy/normalized matching: {}",
-        result.content
-    );
-
-    let disk = fs::read_to_string(helpers::project_path(&config, "ws_test.rs")).unwrap();
-    assert!(
-        disk.contains("let x = 42;"),
-        "replacement should be applied"
-    );
-    assert!(
-        disk.contains("let y = 99;"),
-        "replacement should be applied"
-    );
-}
-
-#[tokio::test]
-async fn edit_whitespace_normalized_single_line() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    let content = "    let value = 10;\n";
-    fs::write(helpers::project_path(&config, "ws_single.rs"), content).unwrap();
-
-    // Wrong indentation in old
-    let args = json!({"action": "replace",
-        "path": "ws_single.rs",
-        "old": "let value = 10;",
-        "new": "    let value = 20;"
-    });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    assert!(
-        result.success,
-        "single-line normalized edit should succeed: {}",
-        result.content
-    );
-    let disk = fs::read_to_string(helpers::project_path(&config, "ws_single.rs")).unwrap();
-    assert!(disk.contains("let value = 20;"));
-}
-
-// ── edit failure hints ────────────────────────────────────────────
-
-#[tokio::test]
-async fn edit_not_found_suggests_edit_file() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    fs::write(
-        helpers::project_path(&config, "hint_test.txt"),
-        "actual content\n",
-    )
-    .unwrap();
-
-    let args = json!({"action": "replace",
-        "path": "hint_test.txt",
-        "old": "nonexistent content",
-        "new": "replacement"
-    });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    assert!(!result.success);
-    assert!(
-        result.content.contains("edit_file"),
-        "should suggest edit_file: {}",
-        result.content
-    );
-}
-
 // ── context pull-based tools ──────────────────────────────────────
 
 #[tokio::test]
@@ -1018,86 +859,6 @@ async fn get_architecture_notes_returns_content() {
         "should contain notes: {}",
         result.content
     );
-}
-
-// ── transform tool ────────────────────────────────────────────────
-
-// Note: transform needs a ModelRouter which requires an LLM server.
-// These tests verify the non-LLM parts (pattern finding, chunk building).
-// Full integration testing happens in benchmarks.
-
-#[tokio::test]
-async fn replace_all_missing_params() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    fs::write(helpers::project_path(&config, "test.rs"), "fn main() {}\n").unwrap();
-
-    // Missing old
-    let args = json!({"action": "replace", "path": "test.rs", "new": "replacement", "all": true});
-    let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
-    assert!(!result.success);
-    assert!(result.content.contains("old"));
-}
-
-#[tokio::test]
-async fn replace_all_not_found() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    fs::write(
-        helpers::project_path(&config, "target.rs"),
-        "fn main() {}\n",
-    )
-    .unwrap();
-
-    let args = json!({"action": "replace", "path": "target.rs", "old": "nonexistent", "new": "replacement", "all": true});
-    let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
-    assert!(!result.success);
-    assert!(result.content.contains("not found"));
-}
-
-#[tokio::test]
-async fn replace_all_replaces_every_occurrence() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    let content = "foo(1);\nfoo(2);\nbar();\nfoo(3);\n";
-    fs::write(helpers::project_path(&config, "multi.rs"), content).unwrap();
-
-    let args =
-        json!({"action": "replace", "path": "multi.rs", "old": "foo(", "new": "baz(", "all": true});
-    let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
-
-    assert!(result.success);
-    assert!(
-        result.content.contains("3 occurrence"),
-        "should replace 3: {}",
-        result.content
-    );
-
-    let disk = fs::read_to_string(helpers::project_path(&config, "multi.rs")).unwrap();
-    assert!(!disk.contains("foo("), "no foo( should remain");
-    assert_eq!(disk.matches("baz(").count(), 3, "should have 3 baz(");
-    assert!(disk.contains("bar()"), "bar should be untouched");
-}
-
-#[tokio::test]
-async fn replace_all_for_adding_argument() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    let content = "assemble(&config, \"test\", &[], false, None);\nassemble(&config, \"hello\", &[], true, None);\n";
-    fs::write(helpers::project_path(&config, "calls.rs"), content).unwrap();
-
-    let args = json!({"action": "replace", "path": "calls.rs", "old": "assemble(&config,", "new": "assemble(&config, override_prompt,", "all": true});
-    let result = miniswe::tools::edit::execute(&args, &config).await.unwrap();
-
-    assert!(result.success);
-    assert!(
-        result.content.contains("2 occurrence"),
-        "should replace 2: {}",
-        result.content
-    );
-
-    let disk = fs::read_to_string(helpers::project_path(&config, "calls.rs")).unwrap();
-    assert_eq!(disk.matches("override_prompt,").count(), 2);
 }
 
 // ── tool enabling/disabling ───────────────────────────────────────
@@ -1289,95 +1050,8 @@ fn compressor_no_op_when_under_budget() {
 
 // ── edit: whitespace normalization edge cases ─────────────────────
 
-#[tokio::test]
-async fn edit_whitespace_tabs_vs_spaces() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    // File uses tabs
-    let content = "fn main() {\n\tlet x = 1;\n\tlet y = 2;\n}\n";
-    fs::write(helpers::project_path(&config, "tabs.rs"), content).unwrap();
-
-    // Old uses spaces (common model mistake)
-    let args = json!({"action": "replace",
-        "path": "tabs.rs",
-        "old": "    let x = 1;",
-        "new": "\tlet x = 42;"
-    });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    assert!(
-        result.success,
-        "tab/space normalization should work: {}",
-        result.content
-    );
-    let disk = fs::read_to_string(helpers::project_path(&config, "tabs.rs")).unwrap();
-    assert!(disk.contains("let x = 42;"));
-}
-
-#[tokio::test]
-async fn edit_whitespace_empty_lines() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    // File has blank lines between items
-    let content = "fn foo() {}\n\n\nfn bar() {}\n";
-    fs::write(helpers::project_path(&config, "blanks.rs"), content).unwrap();
-
-    // Old omits blank lines
-    let args = json!({"action": "replace",
-        "path": "blanks.rs",
-        "old": "fn foo() {}\nfn bar() {}",
-        "new": "fn foo() {}\n\n\nfn baz() {}"
-    });
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    // This should fail — blank line differences aren't whitespace normalization
-    // (trimming doesn't help with missing lines)
-    // The model should get a helpful error
-    assert!(
-        result.content.contains("edit_file") || result.content.contains("HINT"),
-        "should suggest alternatives: {}",
-        result.content
-    );
-}
-
 // ── tool response content tests ───────────────────────────────────
 // Verify what the model actually sees in tool results
-
-#[tokio::test]
-async fn edit_response_contains_context_lines() {
-    let (_tmp, config) = helpers::create_test_project();
-
-    let content = "line1\nline2\nlet x = 1;\nline4\nline5\n";
-    fs::write(helpers::project_path(&config, "ctx.rs"), content).unwrap();
-
-    let args =
-        json!({"action": "replace", "path": "ctx.rs", "old": "let x = 1;", "new": "let x = 42;"});
-    let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
-        .await
-        .unwrap();
-
-    assert!(result.success);
-    // Should show surrounding lines so model has context for follow-up edits
-    assert!(
-        result.content.contains("line2"),
-        "should show lines before edit: {}",
-        result.content
-    );
-    assert!(
-        result.content.contains("line4"),
-        "should show lines after edit: {}",
-        result.content
-    );
-    assert!(
-        result.content.contains("let x = 42;"),
-        "should show the new content: {}",
-        result.content
-    );
-}
 
 #[tokio::test]
 async fn write_file_response_shows_tail() {

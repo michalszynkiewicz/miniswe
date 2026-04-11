@@ -446,8 +446,6 @@ async fn run_agent_loop(
     // Track consecutive identical tool calls to detect loops
     let mut last_call_key: Option<String> = None;
     let mut same_call_streak = 0u32;
-    let mut edit_fail_count: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
     let mut successful_edits_since_plan_update = 0u32;
     let mut plan_checkpoint_pending = false;
 
@@ -743,9 +741,7 @@ async fn run_agent_loop(
             }
 
             let file_action = args["action"].as_str().unwrap_or("");
-            let is_write_action = (tc.function.name == "file"
-                && matches!(file_action, "write" | "replace"))
-                || matches!(tc.function.name.as_str(), "edit_file" | "write_file");
+            let is_write_action = matches!(tc.function.name.as_str(), "edit_file" | "write_file");
             if config.tools.plan
                 && plan_checkpoint_pending
                 && successful_edits_since_plan_update >= PLAN_HARD_BLOCK_AFTER_EDITS
@@ -893,9 +889,7 @@ async fn run_agent_loop(
             }
 
             // Successful file write = code changed, reset loop detector
-            let is_file_write = (tc.function.name == "file"
-                && matches!(file_action, "replace" | "write"))
-                || matches!(tc.function.name.as_str(), "edit_file" | "write_file");
+            let is_file_write = matches!(tc.function.name.as_str(), "edit_file" | "write_file");
             if result.success && is_file_write {
                 last_call_key = None;
                 same_call_streak = 0;
@@ -912,18 +906,6 @@ async fn run_agent_loop(
                         result.content.push_str("\n");
                         result.content.push_str(PLAN_CHECKPOINT_WARNING);
                     }
-                }
-            }
-
-            if tc.function.name == "file" && file_action == "replace" && !result.success {
-                let path = args["path"].as_str().unwrap_or("").to_string();
-                let count = edit_fail_count.entry(path.clone()).or_insert(0);
-                *count += 1;
-                if *count >= 2 {
-                    result.content.push_str(&format!(
-                        "\nERROR: replace has failed {} times on {path}. STOP using replace. Use edit_file(path, task) for this semantic edit; use write_file(path, content) only when providing the complete replacement file content.\n",
-                        count
-                    ));
                 }
             }
 
@@ -1047,9 +1029,9 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                         .unwrap_or("project");
                     format!("search \"{query}\" in {scope}")
                 }
-                ("file", "replace" | "write") => {
+                ("file", "delete") => {
                     let path = args["path"].as_str().unwrap_or("?");
-                    format!("{action} {path}")
+                    format!("delete {path}")
                 }
                 ("file", "shell") => {
                     let cmd = args["command"].as_str().unwrap_or("?");

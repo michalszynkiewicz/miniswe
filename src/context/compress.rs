@@ -517,39 +517,6 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
                 let match_count = content.lines().filter(|l| !l.starts_with('[')).count();
                 format!("[search:\"{query}\"→{match_count} matches]")
             }
-            "replace" => {
-                let path = args["path"].as_str().unwrap_or("?");
-                if content.contains('✓') {
-                    if content.contains("error")
-                        && (content.contains("[cargo check]") || content.contains("[lsp]"))
-                    {
-                        let errors: Vec<&str> = content
-                            .lines()
-                            .filter(|l| l.contains("error"))
-                            .take(2)
-                            .collect();
-                        format!("[replace:{path}→ok but errors: {}]", errors.join("; "))
-                    } else {
-                        format!("[replace:{path}→ok]")
-                    }
-                } else {
-                    let reason = content
-                        .lines()
-                        .find(|l| l.contains("not found") || l.contains("matches"))
-                        .map(|l| crate::truncate_chars(l.trim(), 60))
-                        .unwrap_or_else(|| "unknown".into());
-                    format!("[replace:{path}→FAILED: {reason}]")
-                }
-            }
-            "write" => {
-                let path = args["path"].as_str().unwrap_or("?");
-                if content.contains('✓') {
-                    let lines = content.lines().next().unwrap_or("");
-                    format!("[write:{path}→{lines}]")
-                } else {
-                    format!("[write:{path}→failed]")
-                }
-            }
             "shell" => {
                 let cmd = args["command"].as_str().unwrap_or("?");
                 let short_cmd = crate::truncate_chars(cmd, 30);
@@ -592,7 +559,18 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
         "edit_file" => {
             let path = args["path"].as_str().unwrap_or("?");
             if content.contains('✓') {
-                format!("[edit_file:{path}→ok]")
+                if content.contains("error")
+                    && (content.contains("[cargo check]") || content.contains("[lsp]"))
+                {
+                    let errors: Vec<&str> = content
+                        .lines()
+                        .filter(|l| l.contains("error"))
+                        .take(2)
+                        .collect();
+                    format!("[edit_file:{path}→ok but errors: {}]", errors.join("; "))
+                } else {
+                    format!("[edit_file:{path}→ok]")
+                }
             } else {
                 format!("[edit_file:{path}→failed]")
             }

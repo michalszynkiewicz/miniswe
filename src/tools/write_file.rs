@@ -57,10 +57,9 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
              (losing {} lines). This is almost certainly accidental — you probably forgot to \
              include the complete file content.\n\
              Options:\n\
-             1. Use edit_file for semantic edits to existing files\n\
-             2. Use file(action='replace') only if you have exact old+new text\n\
-             3. Use file(action='read') first, then write_file with the COMPLETE content\n\
-             4. If the file is already corrupted, use file(action='revert') to restore it",
+             1. Use edit_file for any partial edit to an existing file\n\
+             2. Use file(action='read') first, then write_file with the COMPLETE content\n\
+             3. If the file is already corrupted, use file(action='revert') to restore it",
             old_lines - new_lines
         )));
     }

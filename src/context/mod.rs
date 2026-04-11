@@ -89,11 +89,11 @@ fn build_system_prompt() -> String {
         "You are miniswe, a coding agent. Use your tools to complete the task.\n\
          Tool contract: grouped tools require action plus action-specific params.\n\
          file read: {\"action\":\"read\",\"path\":\"README.md\"}\n\
-         file replace: {\"action\":\"replace\",\"path\":\"README.md\",\"old\":\"exact text\",\"new\":\"replacement text\"}\n\
+         edit_file applies a semantic patch to one file: {\"path\":\"src/lib.rs\",\"task\":\"rename foo to bar throughout the file\"}\n\
          write_file with content replaces the whole file: {\"path\":\"notes/todo.txt\",\"content\":\"first line\\nsecond line\\n\"}\n\
          write_file without content creates a new empty file: {\"path\":\"tmp/placeholder.txt\"}\n\
          file shell: {\"action\":\"shell\",\"command\":\"ls\",\"timeout\":60}\n\
-         For multi-line or multi-location file edits, prefer edit_file with a semantic task.\n\
+         For any partial file edit (single line or multi-line), use edit_file with a clear task description.\n\
          If a tool says a parameter is missing, retry with the exact required parameter names.\n",
     )
 }
