@@ -29,7 +29,6 @@ const PREPLAN_READ_OVERLAP: usize = 60;
 /// the whole file already fits comfortably in a single slice, so the
 /// observation round is pure latency overhead.
 const SMALL_FILE_THRESHOLD: usize = 200;
-const MAX_PATCH_ATTEMPTS: usize = 3;
 const MAX_PLAN_ATTEMPTS: usize = 4;
 const MAX_PREPLAN_STEPS: usize = 100;
 const MAX_PREPLAN_LOG_CHARS: usize = 20000;
@@ -588,7 +587,6 @@ async fn execute_planned_steps(
                             router,
                             lsp_validation,
                             &region,
-                            MAX_PATCH_ATTEMPTS,
                             false,
                             cancelled,
                             log,
@@ -658,7 +656,6 @@ async fn execute_planned_steps(
                             router,
                             lsp_validation,
                             &region,
-                            MAX_PATCH_ATTEMPTS,
                             false,
                             cancelled,
                             log,
@@ -700,7 +697,6 @@ async fn execute_planned_steps(
                     router,
                     lsp_validation,
                     region,
-                    MAX_PATCH_ATTEMPTS,
                     true,
                     cancelled,
                     log,
@@ -804,77 +800,39 @@ async fn execute_smart_step(
     router: &ModelRouter,
     lsp_validation: LspValidationMode,
     region: &EditRegion,
-    max_attempts: usize,
     allow_no_changes: bool,
     cancelled: Option<&AtomicBool>,
     log: Option<&SessionLog>,
 ) -> Result<(String, usize)> {
-    let mut feedback: Option<String> = None;
-    let mut last_error = String::new();
+    // Single-shot: any failure here bubbles up to the plan-level retry
+    // loop (`MAX_PLAN_ATTEMPTS` in `execute_preplanned_steps`), which
+    // re-prompts the planner with full repair context. Bench logs across
+    // many sessions show the inner retry never recovered a region — when
+    // a smart-edit attempt failed, retrying with the same prompt + a
+    // generic feedback string just produced the same failure. Letting
+    // the planner re-plan is strictly better.
+    let (ops, _) = request_patch_for_region(
+        path_str,
+        task,
+        current,
+        router,
+        region,
+        lsp_validation,
+        cancelled,
+        log,
+    )
+    .await?;
 
-    for attempt in 1..=max_attempts {
-        let (ops, _) = match request_patch_for_region(
-            path_str,
-            task,
-            current,
-            router,
-            region,
-            feedback.as_deref(),
-            lsp_validation,
-            cancelled,
-            log,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                last_error = e.to_string();
-                if attempt < max_attempts {
-                    feedback = Some(last_error.clone());
-                    continue;
-                }
-                break;
-            }
-        };
-
-        if ops.is_empty() {
-            if allow_no_changes {
-                return Ok((current.to_string(), 0));
-            }
-            last_error = "smart fallback returned NO_CHANGES".into();
-            if attempt < max_attempts {
-                feedback = Some(last_error.clone());
-                continue;
-            }
-            break;
+    if ops.is_empty() {
+        if allow_no_changes {
+            return Ok((current.to_string(), 0));
         }
-
-        let candidate = match apply_patch_dry_run_in_region(current, &ops, region.start, region.end)
-        {
-            Ok(candidate) => candidate,
-            Err(e) => {
-                last_error = e.to_string();
-                if attempt < max_attempts {
-                    feedback = Some(last_error.clone());
-                    continue;
-                }
-                break;
-            }
-        };
-
-        if let Err(e) = validate_candidate(current, &candidate) {
-            last_error = e.to_string();
-            if attempt < max_attempts {
-                feedback = Some(last_error.clone());
-                continue;
-            }
-            break;
-        }
-
-        return Ok((candidate, ops.len()));
+        bail!("smart fallback returned NO_CHANGES");
     }
 
-    bail!("{last_error}")
+    let candidate = apply_patch_dry_run_in_region(current, &ops, region.start, region.end)?;
+    validate_candidate(current, &candidate)?;
+    Ok((candidate, ops.len()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1442,7 +1400,6 @@ async fn request_patch_for_region(
     content: &str,
     router: &ModelRouter,
     region: &EditRegion,
-    repair_feedback: Option<&str>,
     lsp_validation: LspValidationMode,
     cancelled: Option<&AtomicBool>,
     log: Option<&SessionLog>,
@@ -1465,17 +1422,9 @@ async fn request_patch_for_region(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let repair = repair_feedback
-        .map(|f| {
-            format!(
-                "\nPrevious region patch was not applied.\nFailure: {f}\nReturn a corrected patch for this same line region only.\n"
-            )
-        })
-        .unwrap_or_default();
     let prompt = format!(
         "You are editing one line region in {path_str}: lines {}-{}.\n\
          Task: {task}\n\
-         {repair}\n\
          You may edit ONLY lines {}-{}. Do not target lines outside this region.\n\
          LSP validation mode: {}. Your patch may be rejected if file diagnostics get worse.\n\
          Return a complete patch for this region using the patch DSL exactly:\n\n\

@@ -430,8 +430,9 @@ async fn execute_valid_patch_writes_file() {
 
 #[tokio::test]
 async fn execute_failed_patch_writes_nothing() {
-    // 1-line file → small-file fast path: each plan attempt runs a single
-    // finalize call plus 3 patch retries (= 4 LLM calls). 4 attempts × 4 = 16.
+    // 1-line file → small-file fast path. Each plan attempt now runs
+    // exactly one finalize call plus a single patch attempt (no inner
+    // retry). 4 attempts × 2 calls = 8.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -439,7 +440,7 @@ async fn execute_failed_patch_writes_nothing() {
         .and(path("/v1/chat/completions"))
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
-            match n % 4 {
+            match n % 2 {
                 0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
                 ),
@@ -464,8 +465,8 @@ async fn execute_failed_patch_writes_nothing() {
     assert!(!result.success);
     assert!(result.content.contains("patch was not applied"));
     assert!(result.content.contains("Pre-plan exhausted after 4 attempt(s)"));
-    // 4 plan attempts × (finalize + 3 patch retries) = 16
-    assert_eq!(calls.load(Ordering::SeqCst), 16);
+    // 4 plan attempts × (finalize + 1 patch attempt) = 8
+    assert_eq!(calls.load(Ordering::SeqCst), 8);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "original\n"
@@ -474,8 +475,9 @@ async fn execute_failed_patch_writes_nothing() {
 
 #[tokio::test]
 async fn execute_repairs_failed_first_patch() {
-    // 1-line file (small-file fast path). Plan 1: finalize + 3 failing
-    // patches. Plan 2 (repair): finalize + 1 successful patch.
+    // 1-line file (small-file fast path). Plan 1: finalize + 1 failing
+    // patch (no inner retry). Plan 2 (repair): finalize + 1 successful
+    // patch.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -488,11 +490,11 @@ async fn execute_repairs_failed_first_patch() {
                 0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
                 ),
-                1..=3 => helpers::mock_text_response(
+                1 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\nwrong\nEND_OLD\nNEW:\nfixed\nEND_NEW\n",
                 ),
                 // Plan attempt 2 (repair)
-                4 => helpers::mock_text_response(
+                2 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -526,9 +528,9 @@ async fn execute_repairs_failed_first_patch() {
         "expected concise success summary, got: {}",
         result.content
     );
-    // plan1: finalize + 3 failed patches = 4
-    // plan2: finalize + 1 success patch    = 2
-    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    // plan1: finalize + 1 failed patch  = 2
+    // plan2: finalize + 1 success patch = 2
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "fixed\n"
@@ -537,9 +539,9 @@ async fn execute_repairs_failed_first_patch() {
 
 #[tokio::test]
 async fn execute_repairs_until_third_patch() {
-    // 1-line file (small-file fast path). Plans 1 and 2 fail (finalize +
-    // 3 patch retries each). Plan 3 succeeds on its first patch (finalize
-    // + 1 patch).
+    // 1-line file (small-file fast path). Plans 1 and 2 fail their
+    // single patch attempt (no inner retry). Plan 3 succeeds on its
+    // first patch.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -549,11 +551,11 @@ async fn execute_repairs_until_third_patch() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 // Per-attempt preplan: just the finalize call in the small-file fast path.
-                0 | 4 | 8 => helpers::mock_text_response(
+                0 | 2 | 4 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
                 ),
-                // Plans 1 and 2 fail their patches.
-                1..=3 | 5..=7 => helpers::mock_text_response(
+                // Plans 1 and 2 fail their single patch attempt.
+                1 | 3 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\nwrong\nEND_OLD\nNEW:\nfixed\nEND_NEW\n",
                 ),
                 // Plan 3's first patch succeeds.
@@ -592,8 +594,8 @@ async fn execute_repairs_until_third_patch() {
         "expected concise success summary, got: {}",
         result.content
     );
-    // plan1: 1 + 3, plan2: 1 + 3, plan3: 1 + 1 = 10
-    assert_eq!(calls.load(Ordering::SeqCst), 10);
+    // plan1: 1 + 1, plan2: 1 + 1, plan3: 1 + 1 = 6
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "fixed\n"
@@ -617,11 +619,11 @@ async fn execute_preplan_repair_after_failed_plan() {
                 0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1 2\nTASK: replace the first two-line block\nEND\n",
                 ),
-                1..=3 => helpers::mock_text_response(
+                1 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n\nREPLACE_AT 2\nOLD:\nb\nEND_OLD\nNEW:\ny\nEND_NEW\n",
                 ),
                 // Plan attempt 2 (repair)
-                4 => helpers::mock_text_response(
+                2 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1 2\nTASK: replace the first two-line block\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -648,8 +650,8 @@ async fn execute_preplan_repair_after_failed_plan() {
         "expected one-line failed-attempt trail, got: {}",
         result.content
     );
-    // plan1: finalize + 3 failed patches + plan2: finalize + 1 success patch = 6
-    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    // plan1: finalize + 1 failed patch + plan2: finalize + 1 success patch = 4
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "x\nc\n"
@@ -670,20 +672,20 @@ async fn execute_preplan_repair_can_inspect_with_search_and_read() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                // Plan attempt 1: window + finalize, then 3 failing patches.
+                // Plan attempt 1: window + finalize, then 1 failing patch.
                 0 => helpers::mock_text_response("NOTE first pass"),
                 1 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1 2\nTASK: change first block\nEND\n",
                 ),
-                2..=4 => helpers::mock_text_response(
+                2 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n\nREPLACE_AT 2\nOLD:\nb\nEND_OLD\nNEW:\ny\nEND_NEW\n",
                 ),
                 // Plan attempt 2 (repair): window emits NOTE + SEARCH/READ
                 // in a single response; inspection results feed into finalize.
-                5 => helpers::mock_text_response(
+                3 => helpers::mock_text_response(
                     "NOTE revisit first block\nSEARCH: a\nREAD: 1-2",
                 ),
-                6 => helpers::mock_text_response(
+                4 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1 2\nTASK: change first block\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
@@ -714,9 +716,9 @@ async fn execute_preplan_repair_can_inspect_with_search_and_read() {
         "expected one-line failed-attempt trail, got: {}",
         result.content
     );
-    // plan1: window + finalize + 3 failed patches = 5
-    // plan2: window + finalize + 1 success patch  = 3
-    assert_eq!(calls.load(Ordering::SeqCst), 8);
+    // plan1: window + finalize + 1 failed patch  = 3
+    // plan2: window + finalize + 1 success patch = 3
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
     assert!(
         fs::read_to_string(config.project_root.join("main.rs"))
             .unwrap()
@@ -1090,10 +1092,11 @@ async fn execute_preplan_literal_step_falls_back_to_smart_edit() {
 }
 
 #[tokio::test]
-async fn execute_preplan_repairs_whole_plan_after_step_retries_fail() {
+async fn execute_preplan_repairs_whole_plan_after_smart_fallback_no_changes() {
     // Plan 1 has a literal whose OLD doesn't match. The smart fallback
-    // returns NO_CHANGES on every attempt and exhausts, so the whole plan
-    // is repaired. Small-file fast path: each preplan = 1 finalize call.
+    // returns NO_CHANGES — and because we no longer retry the inner
+    // patch step, that single failure bubbles up immediately to the
+    // plan-level retry, which re-plans with full repair context.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -1106,9 +1109,10 @@ async fn execute_preplan_repairs_whole_plan_after_step_retries_fail() {
                 0 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nmissing(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
-                1..=3 => helpers::mock_text_response("NO_CHANGES"),
+                // Smart fallback (single attempt, no inner retry)
+                1 => helpers::mock_text_response("NO_CHANGES"),
                 // Plan attempt 2 (repair)
-                4 => helpers::mock_text_response(
+                2 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
                 _ => unreachable!("unexpected extra LLM call"),
@@ -1147,8 +1151,8 @@ async fn execute_preplan_repairs_whole_plan_after_step_retries_fail() {
         result.content
     );
     assert!(!result.content.contains("Raw Pre-plan"));
-    // plan1: 1 finalize + 3 smart-fallback NO_CHANGES + plan2: 1 finalize = 5
-    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    // plan1: 1 finalize + 1 smart-fallback NO_CHANGES + plan2: 1 finalize = 3
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call(None, None)\n"
@@ -1157,11 +1161,12 @@ async fn execute_preplan_repairs_whole_plan_after_step_retries_fail() {
 
 #[tokio::test]
 async fn execute_preplan_repair_attempt_includes_structured_repair_context() {
-    // Plan 1 has a literal that doesn't match. After 3 smart-fallback
-    // NO_CHANGES the whole plan is repaired. Plan 2 fixes the file with a
-    // working literal. The plan-2 finalize prompt should carry the
-    // structured repair-context block — that's what this test asserts on
-    // top of the existing repair flow coverage.
+    // Plan 1 has a literal that doesn't match. The smart fallback
+    // returns NO_CHANGES, which now bubbles up immediately (no inner
+    // retry), and the whole plan is repaired. Plan 2 fixes the file
+    // with a working literal. The plan-2 finalize prompt should carry
+    // the structured repair-context block — that's what this test
+    // asserts on top of the existing repair flow coverage.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -1174,9 +1179,10 @@ async fn execute_preplan_repair_attempt_includes_structured_repair_context() {
                 0 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nmissing(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
-                1..=3 => helpers::mock_text_response("NO_CHANGES"),
+                // Smart fallback (single attempt)
+                1 => helpers::mock_text_response("NO_CHANGES"),
                 // Plan attempt 2 (repair)
-                4 => helpers::mock_text_response(
+                2 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
                 _ => unreachable!("unexpected extra LLM call"),
@@ -1200,17 +1206,17 @@ async fn execute_preplan_repair_attempt_includes_structured_repair_context() {
         .unwrap();
 
     assert!(result.success, "{}", result.content);
-    // plan1: 1 finalize + 3 smart-fallback + plan2: 1 finalize = 5
-    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    // plan1: 1 finalize + 1 smart-fallback + plan2: 1 finalize = 3
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
 
-    // Inspect the body of the plan-2 finalize request (index 4)
+    // Inspect the body of the plan-2 finalize request (index 2)
     // and verify the structured repair-context block reached the model.
     let requests = mock_server
         .received_requests()
         .await
         .expect("mock server should record requests");
-    assert_eq!(requests.len(), 5);
-    let plan2_body = String::from_utf8(requests[4].body.clone()).unwrap();
+    assert_eq!(requests.len(), 3);
+    let plan2_body = String::from_utf8(requests[2].body.clone()).unwrap();
 
     // Marker text from format_repair_context.
     assert!(
@@ -1362,10 +1368,10 @@ async fn execute_preplan_invalid_task_without_reason_uses_placeholder() {
 #[tokio::test]
 async fn execute_preplan_invalid_task_during_repair_short_circuits() {
     // Plan 1 fails to apply (literal OLD doesn't match, smart fallback
-    // returns NO_CHANGES three times). On the repair attempt, the model
-    // realizes the task is impossible and emits INVALID_TASK. The retry
-    // loop must stop immediately and surface the reason — no further
-    // planning attempts after the rejection.
+    // returns NO_CHANGES once and bubbles up). On the repair attempt,
+    // the model realizes the task is impossible and emits INVALID_TASK.
+    // The retry loop must stop immediately and surface the reason — no
+    // further planning attempts after the rejection.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -1378,9 +1384,10 @@ async fn execute_preplan_invalid_task_during_repair_short_circuits() {
                 0 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nmissing(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
-                1..=3 => helpers::mock_text_response("NO_CHANGES"),
+                // Smart fallback (single attempt)
+                1 => helpers::mock_text_response("NO_CHANGES"),
                 // Plan attempt 2 (repair) — model decides the task is impossible.
-                4 => helpers::mock_text_response(
+                2 => helpers::mock_text_response(
                     "INVALID_TASK: file structure does not match the task description",
                 ),
                 _ => unreachable!("INVALID_TASK should short-circuit the retry loop"),
@@ -1416,8 +1423,8 @@ async fn execute_preplan_invalid_task_during_repair_short_circuits() {
         "expected reason in tool output, got: {}",
         result.content
     );
-    // plan1: 1 finalize + 3 fallback NO_CHANGES + plan2: 1 finalize (INVALID_TASK) = 5
-    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    // plan1: 1 finalize + 1 fallback NO_CHANGES + plan2: 1 finalize (INVALID_TASK) = 3
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
     // File unchanged — plan 1's literal didn't match, so no edits applied.
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
