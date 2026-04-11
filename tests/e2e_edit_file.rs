@@ -1038,8 +1038,10 @@ async fn execute_preplan_applies_literal_replace_without_old() {
 
 #[tokio::test]
 async fn execute_preplan_literal_step_falls_back_to_smart_edit() {
-    // Small file. The literal step's OLD doesn't match the file content,
-    // so the smart fallback kicks in.
+    // Small file. The literal step's OLD has a typo'd identifier that
+    // can't even whitespace-match the file (so the new whitespace-
+    // tolerant rescue path declines), and the smart fallback kicks in
+    // and recovers via a free-form patch.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -1049,10 +1051,10 @@ async fn execute_preplan_literal_step_falls_back_to_smart_edit() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 0 => helpers::mock_text_response(
-                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncqll(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
                 _ => helpers::mock_text_response(
-                    "REPLACE_AT 1\nOLD:\ncall( None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\n",
+                    "REPLACE_AT 1\nOLD:\ncall(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\n",
                 ),
             }
         })
@@ -1061,7 +1063,7 @@ async fn execute_preplan_literal_step_falls_back_to_smart_edit() {
 
     let (_tmp, mut config) = helpers::create_test_project();
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
-    fs::write(config.project_root.join("main.rs"), "call( None)\n").unwrap();
+    fs::write(config.project_root.join("main.rs"), "call(None)\n").unwrap();
 
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
@@ -1083,11 +1085,138 @@ async fn execute_preplan_literal_step_falls_back_to_smart_edit() {
         "expected smart-fallback note, got: {}",
         result.content
     );
-    // finalize + smart-fallback patch = 2
+    // finalize + smart-fallback patch = 2 (no whitespace-confirmation
+    // round-trip because the typo'd identifier has no whitespace match)
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "call(None, None)\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_literal_replace_recovers_from_whitespace_drift_with_confirmation() {
+    // Reproduces the Gemma `</div >` pathology: the planner emits a
+    // LITERAL_REPLACE whose OLD has trivial whitespace drift (extra
+    // space inside an HTML tag). The byte-exact matcher rejects it, the
+    // new whitespace-tolerant fallback locates the real bytes in scope,
+    // asks the planner via a single round-trip to confirm, and applies
+    // the replacement directly — no smart-edit fallback needed.
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                // Plan finalize: literal with hallucinated whitespace
+                0 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\n<div >hello</div >\nEND_OLD\nNEW:\n<div>world</div>\nEND_NEW\nEND\n",
+                ),
+                // Whitespace-drift confirmation round-trip
+                1 => helpers::mock_text_response("YES"),
+                _ => unreachable!(
+                    "expected exactly 2 calls (finalize + whitespace confirmation), got call #{n}"
+                ),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.html"), "<div>hello</div>\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.html",
+        "task": "change hello to world",
+        "lsp_validation": "off",
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert!(
+        result
+            .content
+            .contains("matched after whitespace normalization"),
+        "expected whitespace-normalization note, got: {}",
+        result.content
+    );
+    // finalize + confirmation = 2 (no smart-fallback round-trip)
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.html")).unwrap(),
+        "<div>world</div>\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_literal_replace_with_whitespace_drift_rejected_bails_to_plan_repair() {
+    // Same setup, but the planner rejects the candidate ("NO"). We
+    // must NOT run the smart-edit fallback after that — bubble straight
+    // up to plan-level repair so the planner can re-emit a correct OLD
+    // with full structured context.
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                // Plan attempt 1: literal with hallucinated whitespace
+                0 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\n<div >hello</div >\nEND_OLD\nNEW:\n<div>WRONG</div>\nEND_NEW\nEND\n",
+                ),
+                // Whitespace-drift confirmation: planner says NO
+                1 => helpers::mock_text_response("NO"),
+                // Plan attempt 2 (repair): correct literal applied
+                2 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\n<div>hello</div>\nEND_OLD\nNEW:\n<div>world</div>\nEND_NEW\nEND\n",
+                ),
+                _ => unreachable!("expected at most 3 calls, got call #{n}"),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(config.project_root.join("main.html"), "<div>hello</div>\n").unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.html",
+        "task": "change hello to world",
+        "lsp_validation": "off",
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert!(
+        result.content.contains("Pre-plan attempt 1 failed"),
+        "expected one-line failed-attempt trail, got: {}",
+        result.content
+    );
+    assert!(
+        result
+            .content
+            .contains("whitespace-tolerant candidate rejected"),
+        "expected the rejection reason in the failure trail, got: {}",
+        result.content
+    );
+    // plan1: 1 finalize + 1 confirmation (NO) + plan2: 1 finalize = 3
+    // Crucially NO smart-edit fallback round-trip in between.
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.html")).unwrap(),
+        "<div>world</div>\n"
     );
 }
 
