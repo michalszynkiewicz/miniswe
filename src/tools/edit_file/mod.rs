@@ -2336,7 +2336,8 @@ pub fn build_windows(
 mod tests {
     use super::*;
     use super::apply::{
-        find_all_exact_line_matches, find_all_ws_tolerant_line_matches, pick_best_candidate,
+        find_all_exact_line_matches, find_all_fuzzy_line_matches,
+        find_all_ws_tolerant_line_matches, pick_best_candidate,
     };
     use super::parse::{
         MAX_FAILED_REASON_CHARS, looks_like_complete, parse_edit_plan, parse_failed,
@@ -2542,6 +2543,61 @@ mod tests {
     #[test]
     fn pick_best_candidate_returns_none_for_empty_list() {
         assert_eq!(pick_best_candidate(&[], 1, 5), None);
+    }
+
+    #[test]
+    fn find_all_fuzzy_rescues_single_char_typo() {
+        // Typo'd identifier: `callback` vs `calback`. Byte-exact and
+        // whitespace-normalized both reject; fuzzy accepts.
+        let content = "fn handler(callback: F) {\n    callback();\n}\n";
+        let hits = find_all_fuzzy_line_matches(content, &s(&["    calback();"]), &[]);
+        assert_eq!(hits, vec![(2, 2)]);
+    }
+
+    #[test]
+    fn find_all_fuzzy_rescues_multiline_near_match() {
+        // Two lines where one has a small typo. Both lines clear the
+        // per-line floor and the block average clears the block floor.
+        let content = "let mut config = Config::default();\nconfig.timeout = 30;\nconfig.retries = 5;\n";
+        let hits = find_all_fuzzy_line_matches(
+            content,
+            &s(&["let mut config = Config::defalt();", "config.timeout = 30;"]),
+            &[],
+        );
+        assert_eq!(hits, vec![(1, 2)]);
+    }
+
+    #[test]
+    fn find_all_fuzzy_rejects_block_below_threshold() {
+        // Block average similarity is too low — the second line is
+        // entirely different. Fuzzy should decline rather than surface a
+        // noisy match.
+        let content = "fn main() {\n    println!(\"hello\");\n}\n";
+        let hits = find_all_fuzzy_line_matches(
+            content,
+            &s(&["fn main() {", "    assert_eq!(foo, bar_baz);"]),
+            &[],
+        );
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn find_all_fuzzy_rejects_trivially_short_old() {
+        // Single-line OLDs shorter than 5 non-whitespace chars are too
+        // noisy to fuzzy-match reliably; the function bails early.
+        let content = "x = 1;\ny = 2;\nz = 3;\n";
+        let hits = find_all_fuzzy_line_matches(content, &s(&["x=1"]), &[]);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn find_all_fuzzy_skips_excluded_ranges() {
+        let content = "callback(foo);\ncallback(foo);\n";
+        // Pretend the first line was already matched exactly elsewhere;
+        // fuzzy should still return the second.
+        let hits =
+            find_all_fuzzy_line_matches(content, &s(&["calback(foo);"]), &[(1, 1)]);
+        assert_eq!(hits, vec![(2, 2)]);
     }
 
     #[test]

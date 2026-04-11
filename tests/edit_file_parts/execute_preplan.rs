@@ -443,11 +443,11 @@ async fn execute_preplan_rejects_literal_replace_without_old_and_recovers() {
 
 #[tokio::test]
 async fn execute_preplan_literal_step_bubbles_up_when_no_relocation_candidate() {
-    // Small file. The literal step's OLD has a typo'd identifier that
-    // can't even whitespace-match the file, so the OLD-relocation rescue
-    // finds no candidate. With the smart-edit fallback removed, the
-    // failure bubbles straight up to plan-level repair, which emits a
-    // corrected literal and the edit succeeds.
+    // Small file. The literal step's OLD is completely unrelated to any
+    // line in the file — byte-exact, whitespace-normalized, and fuzzy
+    // line-similarity all decline. With the smart-edit fallback removed,
+    // the failure bubbles straight up to plan-level repair, which emits
+    // a corrected literal and the edit succeeds.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -456,9 +456,9 @@ async fn execute_preplan_literal_step_bubbles_up_when_no_relocation_candidate() 
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                // Plan attempt 1: typo'd OLD, no relocation candidate
+                // Plan attempt 1: hallucinated OLD, not in file at all
                 0 => helpers::mock_text_response(
-                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\ncqll(None)\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nregister_unrelated_middleware_hook();\nEND_OLD\nNEW:\ncall(None, None)\nEND_NEW\nEND\n",
                 ),
                 // Plan attempt 2 (repair): correct OLD
                 1 => helpers::mock_text_response(
@@ -545,6 +545,61 @@ async fn execute_literal_replace_recovers_from_whitespace_drift_with_confirmatio
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.html")).unwrap(),
         "<div>world</div>\n"
+    );
+}
+
+#[tokio::test]
+async fn execute_literal_replace_recovers_from_single_char_typo_via_fuzzy() {
+    // The planner emits a LITERAL_REPLACE whose OLD has a single-char
+    // typo that whitespace normalization cannot rescue. The fuzzy
+    // line-similarity search locates the real line, asks the planner
+    // to confirm, and applies the replacement at the corrected scope.
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            match n {
+                // Plan finalize: OLD is `calback` but file says `callback`
+                0 => helpers::mock_text_response(
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nlet calback = register_handler();\nEND_OLD\nNEW:\nlet callback = register_handler_v2();\nEND_NEW\nEND\n",
+                ),
+                // Fuzzy-relocation confirmation: planner says YES
+                1 => helpers::mock_text_response("YES"),
+                // Terminal verdict after the successful literal replace.
+                _ => helpers::mock_text_response("COMPLETE\n"),
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    fs::write(
+        config.project_root.join("main.rs"),
+        "let callback = register_handler();\n",
+    )
+    .unwrap();
+
+    let router = miniswe::llm::ModelRouter::new(&config);
+    let args = serde_json::json!({
+        "path": "main.rs",
+        "task": "upgrade handler registration",
+        "lsp_validation": "off",
+    });
+    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
+        .await
+        .unwrap();
+
+    assert!(result.success, "{}", result.content);
+    assert_eq!(result.content.trim(), "✓ edit_file(main.rs): done");
+    // finalize + fuzzy confirmation + verdict-finalize = 3
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
+        "let callback = register_handler_v2();\n"
     );
 }
 
