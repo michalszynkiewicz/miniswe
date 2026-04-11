@@ -20,6 +20,18 @@ use crate::llm::{ChatRequest, Message, ModelRouter};
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
 
+mod apply;
+mod parse;
+
+pub use apply::{apply_literal_replace_in_scope, apply_patch_dry_run};
+pub use parse::{EditPlanStep, EditRegion, PatchOp, parse_edit_plan, parse_patch};
+
+use apply::{RelocateOutcome, apply_patch_dry_run_in_region, try_relocate_and_replace};
+use parse::{
+    MAX_FAILED_REASON_CHARS, format_edit_plan_steps, format_preplan_log, looks_like_complete,
+    parse_failed, parse_needs_clarification, partition_overlapping_steps, truncate_multiline,
+};
+
 /// Max lines per window for reliable LLM recall.
 const WINDOW_SIZE: usize = 800;
 /// Overlap between windows to catch edits at boundaries.
@@ -35,24 +47,24 @@ const MAX_PLAN_ATTEMPTS: usize = 4;
 /// "promising-fix-loop" retry credit introduced to stop cutting off
 /// slow converging runs at `MAX_PLAN_ATTEMPTS`.
 const MAX_EXTRA_ATTEMPTS: usize = 2;
-const MAX_PREPLAN_STEPS: usize = 100;
-const MAX_PREPLAN_LOG_CHARS: usize = 20000;
+pub(super) const MAX_PREPLAN_STEPS: usize = 100;
+pub(super) const MAX_PREPLAN_LOG_CHARS: usize = 20000;
 const LARGE_TRUNCATION_MIN_LINES: usize = 50;
 
-fn ensure_not_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
+pub(super) fn ensure_not_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
     if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         bail!("edit_file interrupted by user");
     }
     Ok(())
 }
 
-fn log_stage(log: Option<&SessionLog>, path_str: &str, stage: &str) {
+pub(super) fn log_stage(log: Option<&SessionLog>, path_str: &str, stage: &str) {
     if let Some(log) = log {
         log.tool_stage("edit_file", &format!("{path_str} {stage}"));
     }
 }
 
-fn log_debug(log: Option<&SessionLog>, path_str: &str, detail: &str) {
+pub(super) fn log_debug(log: Option<&SessionLog>, path_str: &str, detail: &str) {
     if let Some(log) = log {
         log.tool_debug("edit_file", &format!("{path_str} {detail}"));
     }
@@ -108,12 +120,15 @@ pub async fn execute(
     )
     .await
     {
-        Ok(PreplanResult::Applied(candidate_result)) => {
-            std::fs::write(&path, &candidate_result.content)?;
-            Ok(ToolResult::ok(candidate_result.message))
+        Ok(PreplanResult::Applied(content)) => {
+            std::fs::write(&path, &content)?;
+            Ok(ToolResult::ok(format!("✓ edit_file({path_str}): done")))
         }
-        Ok(PreplanResult::NoChanges) => Ok(ToolResult::ok(format!(
-            "No changes needed in {path_str} for task: {task}"
+        Ok(PreplanResult::NothingToDo) => Ok(ToolResult::ok(format!(
+            "✓ edit_file({path_str}): already satisfied"
+        ))),
+        Ok(PreplanResult::Failed(reason)) => Ok(ToolResult::err(format!(
+            "✗ edit_file({path_str}): {reason}"
         ))),
         Ok(PreplanResult::NeedsClarification(question)) => {
             let question = if question.is_empty() {
@@ -130,7 +145,7 @@ pub async fn execute(
             )))
         }
         Err(e) => Ok(ToolResult::err(format!(
-            "edit_file failed: patch was not applied.\nReason: {}\n",
+            "✗ edit_file({path_str}): {}",
             e
         ))),
     }
@@ -145,9 +160,9 @@ struct SplitResult {
 /// earlier step. The kept step is applied normally; the dropped one is
 /// reported as a per-step failure in the result so the agent sees both
 /// the success and the failure side-by-side.
-struct DroppedStep {
-    step: EditPlanStep,
-    reason: String,
+pub(super) struct DroppedStep {
+    pub(super) step: EditPlanStep,
+    pub(super) reason: String,
 }
 
 /// What one planning attempt produced. The model can return a concrete
@@ -157,29 +172,38 @@ struct DroppedStep {
 /// requests short-circuit the entire repair retry loop — the whole point
 /// is to stop burning attempts on guesses.
 ///
-/// `Steps` carries `dropped` so the executor can report overlapping
+/// The pre-plan model's verdict for one iteration against the current
+/// file state. Every round, the inner model sees the task + current file
+/// + prior-attempt history and must pick one of these outputs.
+///
+/// `Continue` carries `dropped` so the executor can report overlapping
 /// steps as failed steps in the per-step output instead of as opaque
 /// warnings.
 enum PreplanOutcome {
-    Steps {
+    /// More edits needed. The model emitted edit-plan blocks that should
+    /// be executed against the current file state.
+    Continue {
         steps: Vec<EditPlanStep>,
         dropped: Vec<DroppedStep>,
     },
+    /// The model says the task is satisfied by the current file state.
+    /// Either nothing needed to change (first iteration), or prior
+    /// iterations already completed the task. Terminal verdict — the
+    /// retry loop stops and reports success.
+    Complete,
+    /// The model decided the task CANNOT be completed — e.g. it requires
+    /// cross-file changes, it contradicts file invariants, or prior
+    /// attempts hit an obstacle the model can't plan around. Carries a
+    /// short reason from the model itself. Terminal verdict — the retry
+    /// loop stops and reports the failure.
+    Failed(String),
     /// The pre-plan model decided the task is too ambiguous, under-specified,
     /// or contradictory to act on. Carries the model's question back to the
     /// caller so the outer agent can rephrase or split the task.
     NeedsClarification(String),
-    /// The model explicitly emitted the `NO_CHANGES` sentinel, meaning the
-    /// task is already satisfied in the current file state. This is the
-    /// legitimate "nothing to do" signal, distinct from an empty response
-    /// (which we now treat as a transient failure worth retrying).
-    NothingToDo,
-    /// The model returned empty or whitespace-only text. This used to
-    /// collapse to `Steps { steps: [], dropped: [] }` and exit the retry
-    /// loop, but bench logs show it's usually a transient pathology
-    /// (stalled inference, template misfire) that a retry with feedback
-    /// can recover from. Treat it as a failure and let the outer loop
-    /// re-prompt via `RepairContext`.
+    /// The model returned empty or whitespace-only text. Treated as a
+    /// transient pathology (stalled inference, template misfire) and
+    /// retried with explicit feedback via `RepairContext`.
     EmptyResponse,
     /// The model emitted something that `parse_edit_plan` rejected
     /// (unknown token, missing `OLD:` after we removed the no-OLD
@@ -188,13 +212,17 @@ enum PreplanOutcome {
     ParseError(String),
 }
 
-/// What the whole pre-plan retry loop produced. Distinguishes "applied
-/// edits", "no edits needed", and "model needs the task clarified before
-/// it can act" so the caller can render an appropriate tool result for
-/// each.
+/// What the whole pre-plan retry loop produced. The outer caller wires
+/// each variant to a one-line agent-facing message, no per-step trail.
 enum PreplanResult {
-    Applied(SplitResult),
-    NoChanges,
+    /// Task is done; file content should be written to disk.
+    Applied(String),
+    /// Task is already satisfied; file was not modified.
+    NothingToDo,
+    /// Task could not be completed; carries a short reason (from the
+    /// inner model if available, or from the retry loop on exhaustion).
+    Failed(String),
+    /// Task is too vague to act on; the agent must rephrase.
     NeedsClarification(String),
 }
 
@@ -295,10 +323,16 @@ impl From<std::io::Error> for ValidationError {
     }
 }
 
-/// Structured information passed to `request_preplan_steps` when running
-/// a repair attempt. Carries enough context for the planner to reason
-/// about *why* the previous plan failed and what state the file is in
-/// now, instead of seeing only an opaque error string.
+/// Structured information passed to `request_preplan_steps` describing
+/// the most recent iteration's attempt. The planner sees it at the top
+/// of every verdict prompt so every round is explicitly aware of what
+/// was just tried and what happened.
+///
+/// Used both for failure context (step blew up, LSP regression, parse
+/// error) and for success context (attempt applied cleanly, time to
+/// decide if the task is now done). `cleanly_applied` flips the
+/// rendering between "failure — plan the recovery" and "success —
+/// decide COMPLETE or CONTINUE".
 struct RepairContext {
     previous_plan: Vec<EditPlanStep>,
     completed_steps: Vec<EditPlanStep>,
@@ -308,6 +342,12 @@ struct RepairContext {
     /// diagnostic info so `format_repair_context` can render post-edit
     /// snippets around each error instead of a truncated blob.
     lsp_regression: Option<LspRegression>,
+    /// True when the previous iteration applied cleanly (no step failed,
+    /// no validation regression). In that case the verdict prompt should
+    /// frame the prior attempt as progress toward the task, not as a
+    /// failure — the model is being asked to decide whether the task is
+    /// now done (COMPLETE) or still needs more work (CONTINUE).
+    cleanly_applied: bool,
 }
 
 fn max_literal_replace_lines(context_window: usize) -> usize {
@@ -364,14 +404,6 @@ async fn execute_preplanned_steps(
     let max_literal_lines = max_literal_replace_lines(config.model.context_window);
     let mut current = original.to_string();
     let mut repair_context: Option<RepairContext> = None;
-    // `progress_log` is the agent-facing trail prepended to a successful
-    // result when the pre-plan needed more than one attempt. We keep it
-    // intentionally terse — one line per failed attempt — because the
-    // verbose per-step trail and the raw plan dump are not useful to the
-    // outer agent (they never see the inner plan otherwise). The full
-    // failure detail still feeds the *inner* model on retry through
-    // `RepairContext`, which is built independently below.
-    let mut progress_log = String::new();
     // Track the best (lowest) candidate LSP error count observed across
     // attempts. When a new failing attempt improves on the best-so-far,
     // the loop grants an extra attempt credit on the theory that the
@@ -385,15 +417,9 @@ async fn execute_preplanned_steps(
 
     while attempt < attempt_budget {
         attempt += 1;
-        // The label is only used for internal logging (`log_stage` /
-        // `log_debug`) and for the inner model's repair feedback prompt.
-        // It is intentionally NOT placed in the agent-facing message.
-        let label = if repair_context.is_some() {
-            format!("Pre-plan repair attempt {attempt}")
-        } else {
+        if repair_context.is_none() {
             log_stage(log, path_str, "preplan:start");
-            format!("Pre-plan attempt {attempt}")
-        };
+        }
 
         let outcome = request_preplan_steps(
             path_str,
@@ -408,7 +434,91 @@ async fn execute_preplanned_steps(
         .await?;
 
         let (steps, dropped) = match outcome {
-            PreplanOutcome::Steps { steps, dropped } => (steps, dropped),
+            PreplanOutcome::Continue { steps, dropped } => (steps, dropped),
+            PreplanOutcome::Complete => {
+                // Terminal verdict from the model: the task is satisfied
+                // by the current file state. If we applied edits along
+                // the way, the file is dirty and needs writing; if not,
+                // it's a clean no-op.
+                log_debug(
+                    log,
+                    path_str,
+                    &format!("preplan:verdict=complete attempt={attempt}"),
+                );
+                if current == original {
+                    return Ok(PreplanResult::NothingToDo);
+                }
+                // Run the normal post-write validation (LSP gate, size
+                // guard, etc). If it passes, commit. If LSP regressed,
+                // feed the regression back and loop — the model's
+                // "complete" verdict was over-optimistic and it gets a
+                // chance to repair before we give up.
+                let validation = validate_candidate_for_write(
+                    path_str,
+                    path,
+                    original,
+                    &current,
+                    config,
+                    lsp,
+                    lsp_validation,
+                    cancelled,
+                    log,
+                    baseline_lsp_errors,
+                    perms,
+                )
+                .await;
+                match validation {
+                    Ok(_note) => return Ok(PreplanResult::Applied(current)),
+                    Err(ValidationError::Other(e)) => return Err(e),
+                    Err(ValidationError::LspRegression(regression)) => {
+                        let summary =
+                            ValidationError::LspRegression(regression.clone()).summary();
+                        log_debug(
+                            log,
+                            path_str,
+                            &format!(
+                                "preplan:complete_validation_failed:{attempt} {}",
+                                truncate_multiline(&summary, 2000)
+                            ),
+                        );
+
+                        let new_count = regression.errors.len() + regression.extra_error_count;
+                        let improved = match best_error_count {
+                            Some(best) => new_count < best,
+                            None => false,
+                        };
+                        best_error_count = Some(match best_error_count {
+                            Some(best) => best.min(new_count),
+                            None => new_count,
+                        });
+                        if improved && extra_attempts_granted < MAX_EXTRA_ATTEMPTS {
+                            attempt_budget += 1;
+                            extra_attempts_granted += 1;
+                        }
+
+                        repair_context = Some(RepairContext {
+                            previous_plan: Vec::new(),
+                            completed_steps: Vec::new(),
+                            failed_step: None,
+                            failure_reason: summary,
+                            lsp_regression: Some(regression),
+                            cleanly_applied: false,
+                        });
+                        continue;
+                    }
+                }
+            }
+            PreplanOutcome::Failed(reason) => {
+                // Terminal verdict from the model: the task cannot be
+                // completed in this file. Short-circuit the retry loop
+                // and surface the model's own reason to the outer agent.
+                log_debug(
+                    log,
+                    path_str,
+                    &format!("preplan:verdict=failed attempt={attempt} reason={reason}"),
+                );
+                return Ok(PreplanResult::Failed(reason));
+            }
             PreplanOutcome::NeedsClarification(question) => {
                 // The pre-plan model decided the task is too vague or
                 // contradictory to act on. Short-circuit the entire retry
@@ -421,56 +531,33 @@ async fn execute_preplanned_steps(
                 );
                 return Ok(PreplanResult::NeedsClarification(question));
             }
-            PreplanOutcome::NothingToDo => {
-                // Explicit `NO_CHANGES` sentinel — the legitimate "task is
-                // already satisfied" signal. Fall through to the existing
-                // empty-steps convergence path below (which handles both
-                // "nothing changed yet → NoChanges" and "we already applied
-                // edits in an earlier attempt → converged" cases).
-                log_debug(
-                    log,
-                    path_str,
-                    &format!("preplan:nothing_to_do attempt={attempt}"),
-                );
-                (Vec::new(), Vec::new())
-            }
             PreplanOutcome::EmptyResponse => {
                 // Transient pathology (stalled inference, template misfire,
-                // empty streaming completion). Historically this collapsed
-                // to an empty plan and exited the retry loop, wasting the
-                // whole edit_file invocation on one bad response. Now we
-                // treat it as a failure and feed the model explicit
-                // guidance via `RepairContext`, letting the outer
-                // MAX_PLAN_ATTEMPTS loop re-prompt.
+                // empty streaming completion). Feed explicit guidance back
+                // via `RepairContext` and let the outer loop re-prompt.
                 log_debug(
                     log,
                     path_str,
                     &format!("preplan:empty_response attempt={attempt}; will retry"),
                 );
-                progress_log.push_str(&format!(
-                    "{label}; model returned empty response, retrying\n"
-                ));
                 repair_context = Some(RepairContext {
                     previous_plan: Vec::new(),
                     completed_steps: Vec::new(),
                     failed_step: None,
                     failure_reason: String::from(
                         "The previous attempt returned an empty response, which is not a valid output. \
-                         Either emit valid edit-plan blocks for the changes needed, \
-                         or output exactly `NO_CHANGES` on its own line if the task is already satisfied, \
-                         or output `NEEDS_CLARIFICATION: <question>` if the task is too vague to act on. \
+                         Emit one of: `LITERAL_REPLACE`/`SMART_EDIT` blocks, `COMPLETE`, `FAILED: <reason>`, or `NEEDS_CLARIFICATION: <question>`. \
                          Do not return an empty response.",
                     ),
                     lsp_regression: None,
+                    cleanly_applied: false,
                 });
                 continue;
             }
             PreplanOutcome::ParseError(reason) => {
                 // The model emitted something the plan parser couldn't
-                // accept — most commonly the now-removed OLD-less
-                // LITERAL_REPLACE shortcut. Feed the parser's exact
-                // error back through the repair prompt so the next
-                // attempt can correct it.
+                // accept. Feed the parser's exact error back through the
+                // repair prompt so the next attempt can correct it.
                 log_debug(
                     log,
                     path_str,
@@ -479,9 +566,6 @@ async fn execute_preplanned_steps(
                         truncate_multiline(&reason, 500)
                     ),
                 );
-                progress_log.push_str(&format!(
-                    "{label}; plan failed to parse, retrying\n"
-                ));
                 repair_context = Some(RepairContext {
                     previous_plan: Vec::new(),
                     completed_steps: Vec::new(),
@@ -493,110 +577,43 @@ async fn execute_preplanned_steps(
                          OLD verbatim, use SMART_EDIT for that region instead."
                     ),
                     lsp_regression: None,
+                    cleanly_applied: false,
                 });
                 continue;
             }
         };
 
+        // `Continue` with an empty plan is a degenerate case — the
+        // model said "more edits" but listed none. Treat it as an empty
+        // response and retry.
         if steps.is_empty() && dropped.is_empty() {
-            log_debug(log, path_str, "preplan:return_no_steps");
-            if current == original {
-                return Ok(PreplanResult::NoChanges);
-            }
-
-            let validation = validate_candidate_for_write(
-                path_str,
-                path,
-                original,
-                &current,
-                config,
-                lsp,
-                lsp_validation,
-                cancelled,
+            log_debug(
                 log,
-                baseline_lsp_errors,
-                perms,
-            )
-            .await;
-
-            match validation {
-                Ok(validation_note) => {
-                    let mut message = String::new();
-                    if !progress_log.is_empty() {
-                        message.push_str(&progress_log);
-                    }
-                    message.push_str(&format!(
-                        "✓ via pre-plan: converged after {attempt} planning attempt(s), applied edits to {path_str} ({} lines)\n",
-                        current.lines().count()
-                    ));
-                    if let Some(note) = validation_note {
-                        message.push_str(&note);
-                        message.push('\n');
-                    }
-                    return Ok(PreplanResult::Applied(SplitResult {
-                        content: current,
-                        message,
-                    }));
-                }
-                Err(ValidationError::Other(e)) => return Err(e),
-                Err(ValidationError::LspRegression(regression)) => {
-                    // The planner said "nothing more to do" but the
-                    // accumulated state is still broken. Instead of
-                    // bailing, loop back with a repair context that
-                    // carries the structured LSP errors so the next
-                    // attempt can patch the regression.
-                    let summary = ValidationError::LspRegression(regression.clone()).summary();
-                    log_debug(
-                        log,
-                        path_str,
-                        &format!(
-                            "preplan:converged_validation_failed:{attempt} {}",
-                            truncate_multiline(&summary, 2000)
-                        ),
-                    );
-                    progress_log.push_str(&format!(
-                        "Pre-plan attempt {attempt} converged but validation failed: {}\n",
-                        truncate_multiline(&summary, 400)
-                    ));
-
-                    let new_count = regression.errors.len() + regression.extra_error_count;
-                    let improved = match best_error_count {
-                        Some(best) => new_count < best,
-                        None => false,
-                    };
-                    best_error_count = Some(match best_error_count {
-                        Some(best) => best.min(new_count),
-                        None => new_count,
-                    });
-                    if improved && extra_attempts_granted < MAX_EXTRA_ATTEMPTS {
-                        attempt_budget += 1;
-                        extra_attempts_granted += 1;
-                        progress_log.push_str(&format!(
-                            "Pre-plan attempt {attempt} improved errors to {new_count}; granted extra retry ({}/{})\n",
-                            extra_attempts_granted, MAX_EXTRA_ATTEMPTS
-                        ));
-                    }
-
-                    repair_context = Some(RepairContext {
-                        previous_plan: Vec::new(),
-                        completed_steps: Vec::new(),
-                        failed_step: None,
-                        failure_reason: summary,
-                        lsp_regression: Some(regression),
-                    });
-                    continue;
-                }
-            }
+                path_str,
+                &format!("preplan:continue_empty_plan attempt={attempt}; will retry"),
+            );
+            repair_context = Some(RepairContext {
+                previous_plan: Vec::new(),
+                completed_steps: Vec::new(),
+                failed_step: None,
+                failure_reason: String::from(
+                    "The previous attempt used the plan syntax but produced zero steps. \
+                     Either emit concrete LITERAL_REPLACE/SMART_EDIT blocks, or emit exactly `COMPLETE` on its own line if the task is already satisfied.",
+                ),
+                lsp_regression: None,
+                cleanly_applied: false,
+            });
+            continue;
         }
 
         let kept_count = steps.len();
         let dropped_count = dropped.len();
         let total_planned = kept_count + dropped_count;
-        // Log the parsed plan so it shows up in the session log for
-        // debugging, but do NOT inject it into the agent-facing message.
-        log_debug(log, path_str, &format_preplan_log(&label, &steps));
-        // The agent-facing message starts empty; per-attempt failures and
-        // the final summary are appended by `execute_planned_steps`.
+        log_debug(
+            log,
+            path_str,
+            &format_preplan_log(&format!("Pre-plan attempt {attempt}"), &steps),
+        );
         let attempt_message = String::new();
 
         match execute_planned_steps(
@@ -621,15 +638,27 @@ async fn execute_preplanned_steps(
         .await
         {
             Ok(result) => {
-                if !progress_log.is_empty() {
-                    let mut message = progress_log;
-                    message.push_str(&result.message);
-                    return Ok(PreplanResult::Applied(SplitResult {
-                        content: result.content,
-                        message,
-                    }));
-                }
-                return Ok(PreplanResult::Applied(result));
+                // The steps executed cleanly. Do NOT declare success
+                // here — the task-aware verdict is still the model's
+                // call. Loop back with a cleanly-applied repair context
+                // so the next iteration can emit COMPLETE (or FAILED,
+                // or CONTINUE if more work is still needed).
+                current = result.content;
+                log_debug(
+                    log,
+                    path_str,
+                    &format!(
+                        "preplan:apply_ok:{attempt} kept={kept_count} dropped={dropped_count}"
+                    ),
+                );
+                repair_context = Some(RepairContext {
+                    previous_plan: steps.clone(),
+                    completed_steps: steps,
+                    failed_step: None,
+                    failure_reason: String::new(),
+                    lsp_regression: None,
+                    cleanly_applied: true,
+                });
             }
             Err(e) => {
                 log_debug(
@@ -640,14 +669,6 @@ async fn execute_preplanned_steps(
                         truncate_multiline(&e.error, 2000)
                     ),
                 );
-                // Terse, one-line trail. Full per-step detail still goes
-                // to the session log via `e.message` shouldn't bloat the
-                // agent's view; the inner model gets the structured
-                // failure via `RepairContext` below.
-                progress_log.push_str(&format!(
-                    "Pre-plan attempt {attempt} failed: {}\n",
-                    truncate_multiline(&e.error, 400)
-                ));
 
                 // Promising-fix-loop retry credit. When the failure is
                 // an LSP regression and the new error count is strictly
@@ -666,10 +687,6 @@ async fn execute_preplanned_steps(
                     if improved && extra_attempts_granted < MAX_EXTRA_ATTEMPTS {
                         attempt_budget += 1;
                         extra_attempts_granted += 1;
-                        progress_log.push_str(&format!(
-                            "Pre-plan attempt {attempt} improved errors to {new_count}; granted extra retry ({}/{})\n",
-                            extra_attempts_granted, MAX_EXTRA_ATTEMPTS
-                        ));
                     }
                 }
 
@@ -679,21 +696,23 @@ async fn execute_preplanned_steps(
                     failed_step: e.failed_step,
                     failure_reason: e.error,
                     lsp_regression: e.lsp_regression,
+                    cleanly_applied: false,
                 });
                 current = e.current_content;
             }
         }
     }
 
-    let mut message = progress_log;
-    if let Some(ctx) = repair_context {
-        message.push_str(&format!(
-            "Pre-plan exhausted after {attempt_budget} attempt(s); last failure: {}\n",
-            ctx.failure_reason
-        ));
-        bail!(message);
-    }
-    Ok(PreplanResult::NoChanges)
+    // Budget exhausted without the model ever emitting a terminal
+    // verdict. Surface whatever the last obstacle was so the outer
+    // agent can decide how to proceed.
+    let last_reason = repair_context
+        .map(|ctx| truncate_multiline(&ctx.failure_reason, MAX_FAILED_REASON_CHARS))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "planner did not converge".to_string());
+    Ok(PreplanResult::Failed(format!(
+        "could not complete after {attempt_budget} attempts. Last obstacle: {last_reason}"
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -760,19 +779,20 @@ async fn execute_planned_steps(
                     }
                     Err(literal_error) => {
                         // Before falling back to smart-edit, try to rescue
-                        // the common pathology where the planner hallucinated
-                        // trivial whitespace in the OLD block (extra space,
-                        // tab vs spaces, stray newline). The whitespace-
-                        // tolerant fallback locates a candidate in scope and
-                        // asks the planner via a single round-trip whether
-                        // that candidate is the intended target.
-                        let outcome = try_whitespace_tolerant_replace(
+                        // a misplaced OLD block by searching the whole file
+                        // for a candidate (byte-exact first, then
+                        // whitespace-tolerant), picking the best match with
+                        // a locality bias toward the declared scope, and
+                        // asking the planner to confirm the corrected line
+                        // range via a single YES/NO round-trip.
+                        let outcome = try_relocate_and_replace(
                             path_str,
                             &current,
                             *scope_start,
                             *scope_end,
                             old,
                             new,
+                            *all,
                             router,
                             cancelled,
                             log,
@@ -780,16 +800,19 @@ async fn execute_planned_steps(
                         .await;
 
                         match outcome {
-                            WhitespaceOutcome::Applied(new_content) => {
+                            RelocateOutcome::Applied {
+                                new_content,
+                                located_at: (new_start, new_end),
+                            } => {
                                 current = new_content;
                                 completed_count += 1;
                                 completed_records.push(step.clone());
                                 message.push_str(&format!(
-                                    "literal-replace L{scope_start}-L{scope_end} matched after whitespace normalization\n"
+                                    "literal-replace L{scope_start}-L{scope_end} relocated to L{new_start}-L{new_end} after planner confirmation\n"
                                 ));
                                 continue;
                             }
-                            WhitespaceOutcome::Rejected => {
+                            RelocateOutcome::Rejected => {
                                 // Planner confirmed the candidate is wrong.
                                 // Don't burn time on smart-edit (which won't
                                 // have any new information); bubble straight
@@ -798,14 +821,14 @@ async fn execute_planned_steps(
                                 return Err(PlannedExecutionFailure {
                                     current_content: current.clone(),
                                     message: format!(
-                                        "{message}Pre-plan step {} literal L{}-L{} failed after {} completed step(s): {literal_error}; whitespace-tolerant candidate rejected by planner\n",
+                                        "{message}Pre-plan step {} literal L{}-L{} failed after {} completed step(s): {literal_error}; relocated candidate rejected by planner\n",
                                         idx + 1,
                                         scope_start,
                                         scope_end,
                                         completed_count
                                     ),
                                     error: format!(
-                                        "step {} literal replace failed: {literal_error}; whitespace-tolerant candidate rejected by planner",
+                                        "step {} literal replace failed: {literal_error}; relocated candidate rejected by planner",
                                         idx + 1
                                     ),
                                     completed_steps: completed_records.clone(),
@@ -813,7 +836,7 @@ async fn execute_planned_steps(
                                     lsp_regression: None,
                                 });
                             }
-                            WhitespaceOutcome::NoCandidate => {
+                            RelocateOutcome::NoCandidate => {
                                 // Fall through to existing smart-edit fallback.
                             }
                         }
@@ -1953,9 +1976,9 @@ async fn request_preplan_steps(
         format!("{notes_block}{results_block}")
     };
     let view_note = if small_file {
-        "Plan the edit. You see the full file above — line numbers in your plan must match it exactly."
+        "You see the full file above — line numbers in any plan must match it exactly."
     } else {
-        "Plan the edit. You only see the notes and inspection results above — line numbers in your plan must match the real file."
+        "You only see the notes and inspection results above — line numbers in any plan must match the real file."
     };
     let finalize_prompt = format!(
         "File: {path_str} ({total_lines} lines)\n\
@@ -1963,12 +1986,14 @@ async fn request_preplan_steps(
          {feedback_block}\
          {file_view_block}\
          {view_note}\n\n\
-         Up to {MAX_PREPLAN_STEPS} non-overlapping steps, each covering at most 5 edit sites. Steps must not share any line, including endpoints — L10-L20 and L20-L30 overlap.\n\
+         Decide the verdict for this iteration against the CURRENT file state. Pick exactly one:\n\n\
+         (A) TASK ALREADY SATISFIED by the current file state. Output exactly one line:\n\
+         COMPLETE\n\
+         Use this when the task is done — whether prior iterations already completed it or the file was already in the desired state. This is a terminal verdict; no further edits will run.\n\n\
+         (B) MORE EDITS NEEDED. Begin the response directly with `LITERAL_REPLACE` or `SMART_EDIT` — no header word, no preamble, no code fences. Up to {MAX_PREPLAN_STEPS} non-overlapping steps, each covering at most 5 edit sites. Steps must not share any line, including endpoints — L10-L20 and L20-L30 overlap.\n\
          Every step must change something. Do not emit a LITERAL_REPLACE whose NEW is identical to its OLD, and do not emit a SMART_EDIT whose task is to verify a region is unchanged or to keep it as-is — just leave those regions out of the plan.\n\
          Use LITERAL_REPLACE when you have the OLD text verbatim from an inspection result and OLD/NEW each span ≤ {max_literal_lines} lines. Otherwise use SMART_EDIT — its execution phase will see the region content.\n\
          Never use LITERAL_REPLACE for whole functions, impl blocks, modules, or test cases.\n\n\
-         If the task is already satisfied in the current file, output exactly `NO_CHANGES` on its own line and nothing else. Do NOT return an empty response — empty responses are treated as a failure and retried.\n\n\
-         Output only these blocks, nothing else:\n\n\
          LITERAL_REPLACE\n\
          SCOPE <start> <end>\n\
          ALL true\n\
@@ -1982,15 +2007,19 @@ async fn request_preplan_steps(
          SMART_EDIT\n\
          REGION <start> <end>\n\
          TASK: <specific edit for this region>\n\n\
-         If the task is genuinely too vague, underspecified, or contradictory to plan without guessing — e.g. it names no concrete target, it asks for an outcome the file can't support, or it requires information only the outer agent has — output exactly one line:\n\
+         (C) TASK CANNOT BE COMPLETED in this file. Output exactly one line:\n\
+         FAILED: <one-line reason, under {MAX_FAILED_REASON_CHARS} chars>\n\
+         Use this when the task requires changes outside this file (e.g. signature change breaks callers elsewhere), contradicts file invariants, or prior attempts kept regressing and you have no better idea. Be concrete: name the obstacle. Not \"LSP errors\" but \"changing parameter N of function F breaks 3 call sites in tests/\". This is a terminal verdict; no further edits will run.\n\n\
+         (D) TASK TOO VAGUE to act on. Output exactly one line:\n\
          NEEDS_CLARIFICATION: <one specific question>\n\
-         Use this only when you would otherwise have to guess. Do NOT use it just because a target the task wants to add doesn't exist yet — that's what the edit is for; plan the edit that creates it. Prefer specific questions over vague ones."
+         Use this only when you would otherwise have to guess. Do NOT use it just because a target the task wants to add doesn't exist yet — that's what the edit is for; plan the edit that creates it. Prefer specific questions over vague ones.\n\n\
+         Output only one of (A)/(B)/(C)/(D). No markdown, no explanation, no empty responses."
     );
 
     let request = ChatRequest {
         messages: vec![
             Message::system(
-                "Final planning phase. Output only edit-plan blocks, or `NO_CHANGES` if the task is already satisfied, or `NEEDS_CLARIFICATION: <question>` if the task is too vague to act on. No markdown. Empty responses are not valid and will be retried.",
+                "Verdict phase. Output exactly one of: `COMPLETE` (task done), one or more `LITERAL_REPLACE`/`SMART_EDIT` blocks (more edits), `FAILED: <reason>` (task impossible), `NEEDS_CLARIFICATION: <question>` (task too vague). Start the response with the keyword itself — no header word, no markdown. Empty responses are not valid.",
             ),
             Message::user(&finalize_prompt),
         ],
@@ -2030,16 +2059,30 @@ async fn request_preplan_steps(
         return Ok(PreplanOutcome::EmptyResponse);
     }
 
-    // Explicit NO_CHANGES sentinel — the legitimate "task is already
-    // satisfied" signal. Route to `NothingToDo` so the caller can
-    // converge cleanly without retrying.
-    if looks_like_no_changes(text) {
+    // Explicit COMPLETE (or legacy NO_CHANGES) sentinel — the model's
+    // verdict that the task is satisfied by the current file state.
+    // Terminal; the retry loop stops and reports success.
+    if looks_like_complete(text) {
         log_debug(
             log,
             path_str,
-            &format!("preplan:finalize:file:1-{total_lines} nothing_to_do"),
+            &format!("preplan:finalize:file:1-{total_lines} verdict=complete"),
         );
-        return Ok(PreplanOutcome::NothingToDo);
+        return Ok(PreplanOutcome::Complete);
+    }
+
+    // Explicit FAILED: <reason> sentinel — the model's verdict that the
+    // task cannot be completed. Terminal; the retry loop stops and
+    // reports the failure with the model's own reason.
+    if let Some(reason) = parse_failed(text) {
+        log_debug(
+            log,
+            path_str,
+            &format!(
+                "preplan:finalize:file:1-{total_lines} verdict=failed reason={reason}"
+            ),
+        );
+        return Ok(PreplanOutcome::Failed(reason));
     }
 
     if let Some(question) = parse_needs_clarification(text) {
@@ -2113,7 +2156,7 @@ async fn request_preplan_steps(
         );
         return Err(e);
     }
-    Ok(PreplanOutcome::Steps { steps, dropped })
+    Ok(PreplanOutcome::Continue { steps, dropped })
 }
 
 fn validate_steps_in_file(steps: &[EditPlanStep], total_lines: usize) -> Result<()> {
@@ -2132,136 +2175,47 @@ fn validate_steps_in_file(steps: &[EditPlanStep], total_lines: usize) -> Result<
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PatchOp {
-    InsertBefore {
-        line: usize,
-        content: Vec<String>,
-    },
-    InsertAfter {
-        line: usize,
-        content: Vec<String>,
-    },
-    ReplaceAt {
-        start: usize,
-        old: Vec<String>,
-        new: Vec<String>,
-    },
-    DeleteAt {
-        start: usize,
-        old: Vec<String>,
-    },
-}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EditRegion {
-    pub start: usize,
-    pub end: usize,
-    pub task: String,
-}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EditPlanStep {
-    SmartEdit(EditRegion),
-    LiteralReplace {
-        scope_start: usize,
-        scope_end: usize,
-        all: bool,
-        old: Vec<String>,
-        new: Vec<String>,
-    },
-}
-
-impl EditPlanStep {
-    fn start_line(&self) -> usize {
-        match self {
-            Self::SmartEdit(region) => region.start,
-            Self::LiteralReplace { scope_start, .. } => *scope_start,
-        }
-    }
-
-    fn end_line(&self) -> usize {
-        match self {
-            Self::SmartEdit(region) => region.end,
-            Self::LiteralReplace { scope_end, .. } => *scope_end,
-        }
-    }
-}
-
-fn format_edit_plan_steps(steps: &[EditPlanStep]) -> String {
-    let mut out = String::new();
-    for step in steps {
-        match step {
-            EditPlanStep::SmartEdit(region) => {
-                out.push_str("SMART_EDIT\n");
-                out.push_str(&format!("REGION {} {}\n", region.start, region.end));
-                out.push_str(&format!("TASK: {}\n\n", region.task));
-            }
-            EditPlanStep::LiteralReplace {
-                scope_start,
-                scope_end,
-                all,
-                old,
-                new,
-            } => {
-                out.push_str("LITERAL_REPLACE\n");
-                out.push_str(&format!("SCOPE {scope_start} {scope_end}\n"));
-                out.push_str(&format!("ALL {all}\n"));
-                out.push_str("OLD:\n");
-                out.push_str(&old.join("\n"));
-                out.push_str("\nEND_OLD\nNEW:\n");
-                out.push_str(&new.join("\n"));
-                out.push_str("\nEND_NEW\n\n");
-            }
-        }
-    }
-    out
-}
-
-fn format_preplan_log(label: &str, steps: &[EditPlanStep]) -> String {
-    let plan = format_edit_plan_steps(steps);
-    let plan = truncate_multiline(&plan, MAX_PREPLAN_LOG_CHARS);
-    format!("Raw {label} ({} step(s), parsed):\n{plan}\n", steps.len())
-}
-
-/// Detect a finalize-phase `NO_CHANGES` sentinel — the explicit signal
-/// from the planner that the task is already satisfied. We tolerate
-/// surrounding whitespace and code fences so a model that wraps its
-/// answer in ```` ``` ```` still works.
-fn looks_like_no_changes(text: &str) -> bool {
-    let unfenced = strip_code_fences(text);
-    unfenced.trim() == "NO_CHANGES"
-}
-
-/// Detect a `NEEDS_CLARIFICATION: <question>` sentinel. Returns
-/// `Some(question)` if the response opens with `NEEDS_CLARIFICATION`
-/// (optionally followed by `:` and a question), and `None` otherwise. The
-/// question is trimmed and may be empty if the model omits one — the
-/// caller substitutes a placeholder at render time.
-///
-/// Guards against lookalikes like `NEEDS_CLARIFICATIONS` or
-/// `NEEDS_CLARIFICATIONAL` by requiring end-of-string, whitespace, or `:`
-/// immediately after the keyword.
-fn parse_needs_clarification(text: &str) -> Option<String> {
-    let trimmed = text.trim_start();
-    let rest = trimmed.strip_prefix("NEEDS_CLARIFICATION")?;
-    let after = match rest.chars().next() {
-        None => "",
-        Some(':') => &rest[1..],
-        Some(c) if c.is_whitespace() => rest,
-        Some(_) => return None,
-    };
-    // If there's a trailing newline after the question, keep only the
-    // first line — the sentinel is single-line by contract.
-    let first_line = after.lines().next().unwrap_or("");
-    Some(first_line.trim().to_string())
-}
 
 /// Render a `RepairContext` into a planner-facing block. Used at the top
 /// of both the windowed pre-plan prompts and the finalize prompt so the
-/// model can see exactly what the previous attempt did, what survived,
-/// what failed, and the failure reason.
+/// model can see exactly what the previous iteration tried and how it
+/// landed. The shape differs for cleanly-applied vs failed attempts —
+/// see `format_prior_applied` and `format_prior_failed` below.
 fn format_repair_context(ctx: &RepairContext) -> String {
+    if ctx.cleanly_applied {
+        format_prior_applied(ctx)
+    } else {
+        format_prior_failed(ctx)
+    }
+}
+
+/// Render a cleanly-applied previous iteration so the model knows
+/// exactly which steps it just ran and can decide the next verdict.
+/// No "failed" language, no recovery framing — the file view already
+/// reflects the applied steps, and the model is being asked to judge
+/// whether the task is done now (COMPLETE), needs more work (edit-plan
+/// blocks), or hit a wall (FAILED).
+fn format_prior_applied(ctx: &RepairContext) -> String {
+    let applied = if ctx.completed_steps.is_empty() {
+        "(no steps — the previous round was a no-op)\n".to_string()
+    } else {
+        format_edit_plan_steps(&ctx.completed_steps)
+    };
+    format!(
+        "The previous iteration applied the following steps cleanly (they are ALREADY reflected in the file content shown below):\n{applied}\n\
+         Decide the next verdict against the current file state. If those steps already accomplished the task, return `COMPLETE`. \
+         If more edits are still needed to finish the task, emit `LITERAL_REPLACE`/`SMART_EDIT` blocks for the remaining work. \
+         If the task cannot be completed even with more edits (e.g. it needs cross-file changes), return `FAILED: <reason>`.\n\n",
+    )
+}
+
+/// Render a failed previous iteration (step blew up, LSP regressed,
+/// parse error, or empty response) so the planner can reason about the
+/// obstacle and pick a recovery strategy — or declare FAILED if the
+/// obstacle is unrecoverable.
+fn format_prior_failed(ctx: &RepairContext) -> String {
     let previous_plan = if ctx.previous_plan.is_empty() {
         "(empty)\n".to_string()
     } else {
@@ -2285,13 +2239,12 @@ fn format_repair_context(ctx: &RepairContext) -> String {
     };
 
     format!(
-        "A previous edit plan was attempted and failed. Use the structured information below to plan a better recovery.\n\n\
+        "The previous iteration failed. Use the structured information below to decide the next verdict.\n\n\
          Previous edit plan (as tried):\n{previous_plan}\n\
          Steps that succeeded and have ALREADY been applied to the file shown below:\n{completed}\n\
          Step that FAILED:\n{failed}\n\
          Failure reason:\n{failure_block}\n\n\
-         Plan the remaining work needed to complete the original task against the current file content. \
-         If the task already appears complete, return NO_CHANGES.\n\n",
+         Decide against the current file state: plan recovery edits if you can, return `COMPLETE` if the task is already done despite the failure, or return `FAILED: <reason>` if the obstacle is unrecoverable in this file.\n\n",
     )
 }
 
@@ -2355,1052 +2308,8 @@ fn format_lsp_regression_for_planner(reg: &LspRegression) -> String {
     out
 }
 
-fn truncate_multiline(text: &str, max_chars: usize) -> String {
-    let char_count = text.chars().count();
-    if char_count <= max_chars {
-        return text.to_string();
-    }
 
-    let truncated: String = text.chars().take(max_chars).collect();
-    format!("{truncated}\n...({char_count} chars total, truncated)\n")
-}
 
-/// Strip a single outer ```...``` markdown fence from `text`, if present.
-///
-/// The finalize prompt explicitly says "no markdown", but smaller models
-/// sometimes wrap their entire structured response in a ``` fence anyway
-/// (often with a language tag like ```rust). When that happens the parser
-/// fails on the leading backticks even though the body is otherwise
-/// well-formed. This helper detects that one common shape and returns the
-/// inner body so parsing can proceed.
-///
-/// Behaviour:
-/// - If the leading non-whitespace characters are not ``` we return the
-///   input unchanged (no fence to strip).
-/// - If a leading ``` is present we drop everything from the start through
-///   the first newline (i.e. the fence line, including any language tag).
-/// - If there is *also* a trailing ``` (anywhere later in the text) we drop
-///   it and everything after it. If the response was truncated mid-output
-///   and never closed the fence, we still strip the opener and keep the
-///   rest — that gives us the best shot at parsing a partial reply.
-fn strip_code_fences(text: &str) -> String {
-    let trimmed = text.trim_start();
-    let Some(rest) = trimmed.strip_prefix("```") else {
-        return text.to_string();
-    };
-    let Some(newline_pos) = rest.find('\n') else {
-        return text.to_string();
-    };
-    let body = &rest[newline_pos + 1..];
-    let inner = match body.rfind("```") {
-        Some(pos) => &body[..pos],
-        None => body,
-    };
-    inner.to_string()
-}
-
-pub fn parse_edit_plan(text: &str) -> Result<Vec<EditPlanStep>> {
-    // Empty input parses to zero steps. The finalize caller now detects
-    // empty responses and `NO_CHANGES` up-front and routes them into
-    // dedicated `PreplanOutcome` variants, so this code path is only
-    // reached when some caller passes a body that turned out to be empty
-    // (e.g. after fence stripping) or on a stray NO_CHANGES token mixed
-    // in with real steps — we tolerate those below rather than failing
-    // the parse.
-    if text.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let unfenced = strip_code_fences(text);
-    let text = unfenced.as_str();
-    if text.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
-    let mut steps = Vec::new();
-
-    while i < lines.len() {
-        let line = lines[i];
-        if line.trim().is_empty() {
-            i += 1;
-            continue;
-        }
-
-        // Tolerate a stray NO_CHANGES token from older prompts or
-        // confused models — treat it as a no-op separator.
-        if line.trim() == "NO_CHANGES" {
-            i += 1;
-            continue;
-        }
-
-        // Tolerate a stray END terminator. The current DSL no longer
-        // uses END as a step terminator (END_OLD/END_NEW are enough),
-        // but older models trained on the prior format may still emit
-        // it. Skip it instead of failing the parse.
-        if line.trim() == "END" {
-            i += 1;
-            continue;
-        }
-
-        if line == "SMART_EDIT" {
-            i += 1;
-            let (region, next) = parse_region_at(&lines, i)?;
-            i = next;
-            steps.push(EditPlanStep::SmartEdit(region));
-            continue;
-        }
-
-        if line.starts_with("REGION ") {
-            let (region, next) = parse_region_at(&lines, i)?;
-            i = next;
-            steps.push(EditPlanStep::SmartEdit(region));
-            continue;
-        }
-
-        if line == "LITERAL_REPLACE" {
-            i += 1;
-            let scope_line = lines
-                .get(i)
-                .ok_or_else(|| anyhow::anyhow!("missing SCOPE line for literal replace"))?;
-            let Some(rest) = scope_line.strip_prefix("SCOPE ") else {
-                bail!("expected SCOPE line but found '{scope_line}'");
-            };
-            let (scope_start, scope_end) = parse_two_line_numbers(rest, scope_line, "scope")?;
-            i += 1;
-
-            let all_line = lines
-                .get(i)
-                .ok_or_else(|| anyhow::anyhow!("missing ALL line for literal replace"))?;
-            let all = match all_line.strip_prefix("ALL ") {
-                Some("true") => true,
-                Some("false") => false,
-                Some(other) => bail!("invalid ALL value '{other}' in line '{all_line}'"),
-                None => bail!("expected ALL line but found '{all_line}'"),
-            };
-            i += 1;
-
-            // Reject the old "NEW: without OLD:" shortcut. It let the
-            // model regenerate the replacement text without cross-checking
-            // the scope it was editing, which was the root cause of most
-            // hallucination failures (inventing `&self` on a free fn,
-            // dropping `pub struct Foo {` off the start of a scope, etc).
-            // OLD: is now unconditional so we can verify at parse/apply
-            // time that the model knows what it's replacing.
-            let mut peek = i;
-            while peek < lines.len() && lines[peek].trim().is_empty() {
-                peek += 1;
-            }
-            let head = lines.get(peek).copied().unwrap_or("");
-            if head == "NEW:" {
-                bail!(
-                    "LITERAL_REPLACE now requires an OLD: block — copy the exact current text of L{scope_start}-L{scope_end} into OLD:, then put the replacement in NEW:. If the region is too large to echo verbatim, use SMART_EDIT instead (its execution phase will see the region content)."
-                );
-            }
-
-            expect_line(&lines, i, "OLD:")?;
-            i += 1;
-            let (old, next) = collect_until(&lines, i, "END_OLD")?;
-            if old.is_empty() {
-                bail!("literal OLD block must not be empty");
-            }
-            if old.iter().all(|line| line.trim().is_empty()) {
-                bail!("literal OLD block must contain non-whitespace text");
-            }
-            i = next + 1;
-
-            expect_line(&lines, i, "NEW:")?;
-            i += 1;
-            let (new, next) = collect_until(&lines, i, "END_NEW")?;
-            i = next + 1;
-
-            steps.push(EditPlanStep::LiteralReplace {
-                scope_start,
-                scope_end,
-                all,
-                old,
-                new,
-            });
-            continue;
-        }
-
-        bail!("unexpected text in edit plan: {line}");
-    }
-
-    if steps.len() > MAX_PREPLAN_STEPS {
-        bail!(
-            "edit plan returned {} steps, maximum is {MAX_PREPLAN_STEPS}",
-            steps.len()
-        );
-    }
-    // Overlap is *not* a parse error: the planner caller resolves overlaps
-    // by keeping the first step in source order and reporting the rest as
-    // dropped steps in the per-step output. See `partition_overlapping_steps`.
-    Ok(steps)
-}
-
-fn parse_region_at(lines: &[&str], idx: usize) -> Result<(EditRegion, usize)> {
-    let line = lines
-        .get(idx)
-        .ok_or_else(|| anyhow::anyhow!("missing REGION header"))?;
-    let Some(rest) = line.strip_prefix("REGION ") else {
-        bail!("unexpected text in region plan: {line}");
-    };
-    let rest = rest.trim();
-    let (start, end) = if let Some((start, end)) = rest.split_once('-') {
-        let start = start.trim().parse::<usize>().map_err(|e| {
-            anyhow::anyhow!("invalid region start '{start}' in header '{line}': {e}")
-        })?;
-        let end = end
-            .trim()
-            .parse::<usize>()
-            .map_err(|e| anyhow::anyhow!("invalid region end '{end}' in header '{line}': {e}"))?;
-        (start, end)
-    } else {
-        let parts: Vec<_> = rest.split_whitespace().collect();
-        match parts.as_slice() {
-            [single] => {
-                let value = single.parse::<usize>().map_err(|e| {
-                    anyhow::anyhow!("invalid region line '{single}' in header '{line}': {e}")
-                })?;
-                (value, value)
-            }
-            [_, _] => parse_two_line_numbers(rest, line, "region")?,
-            _ => bail!("invalid REGION header: {line}"),
-        }
-    };
-
-    let task_line = lines
-        .get(idx + 1)
-        .ok_or_else(|| anyhow::anyhow!("missing TASK line for region"))?;
-    let task = task_line
-        .strip_prefix("TASK:")
-        .ok_or_else(|| anyhow::anyhow!("expected TASK line but found '{task_line}'"))?
-        .trim()
-        .to_string();
-    if task.is_empty() {
-        bail!("region task must not be empty");
-    }
-
-    Ok((EditRegion { start, end, task }, idx + 2))
-}
-
-fn parse_two_line_numbers(rest: &str, header: &str, label: &str) -> Result<(usize, usize)> {
-    let mut parts = rest.split_whitespace();
-    let start_token = parts
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("missing {label} start in header: {header}"))?;
-    let start = start_token.parse::<usize>().map_err(|e| {
-        anyhow::anyhow!("invalid {label} start '{start_token}' in header '{header}': {e}")
-    })?;
-    let end_token = parts
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("missing {label} end in header: {header}"))?;
-    let end = end_token.parse::<usize>().map_err(|e| {
-        anyhow::anyhow!("invalid {label} end '{end_token}' in header '{header}': {e}")
-    })?;
-    if parts.next().is_some() {
-        bail!("too many fields in {label} header: {header}");
-    }
-    if start == 0 || end < start {
-        bail!("invalid {label} L{start}-L{end}");
-    }
-    Ok((start, end))
-}
-
-fn reject_overlapping_regions(regions: &[EditRegion]) -> Result<()> {
-    let mut sorted: Vec<&EditRegion> = regions.iter().collect();
-    sorted.sort_unstable_by(|a, b| a.start.cmp(&b.start).then_with(|| a.end.cmp(&b.end)));
-
-    for pair in sorted.windows(2) {
-        let prev = pair[0];
-        let next = pair[1];
-        if next.start <= prev.end {
-            bail!(
-                "region plan has overlapping regions: L{}-L{} overlaps L{}-L{}",
-                prev.start,
-                prev.end,
-                next.start,
-                next.end
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Partition planned steps into "kept" (first occurrence wins, by source
-/// order) and "dropped" (overlaps an earlier step). The kept set keeps
-/// original emission order so downstream logging stays intuitive. The
-/// dropped set carries the original step plus a human-readable reason
-/// pointing at the kept step that caused the conflict, so the executor
-/// can report each one as a failed step in the per-step output.
-fn partition_overlapping_steps(steps: Vec<EditPlanStep>) -> (Vec<EditPlanStep>, Vec<DroppedStep>) {
-    // Sort by source position so "first wins" is deterministic and matches
-    // file order rather than emission order.
-    let mut indexed: Vec<(usize, EditPlanStep)> = steps.into_iter().enumerate().collect();
-    indexed.sort_by(|a, b| {
-        a.1.start_line()
-            .cmp(&b.1.start_line())
-            .then_with(|| a.1.end_line().cmp(&b.1.end_line()))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-
-    let mut kept: Vec<(usize, EditPlanStep)> = Vec::with_capacity(indexed.len());
-    let mut dropped: Vec<(usize, DroppedStep)> = Vec::new();
-    for (orig_idx, step) in indexed {
-        let conflict = kept.iter().find(|(_, prev)| {
-            // [a,b] overlaps [c,d] iff a <= d && c <= b
-            step.start_line() <= prev.end_line() && prev.start_line() <= step.end_line()
-        });
-        if let Some((_, prev)) = conflict {
-            let reason = format!(
-                "overlaps earlier step L{}-L{}",
-                prev.start_line(),
-                prev.end_line()
-            );
-            dropped.push((orig_idx, DroppedStep { step, reason }));
-        } else {
-            kept.push((orig_idx, step));
-        }
-    }
-
-    // Restore original emission order so downstream "in order" logging stays
-    // intuitive for the agent.
-    kept.sort_by_key(|(idx, _)| *idx);
-    dropped.sort_by_key(|(idx, _)| *idx);
-    (
-        kept.into_iter().map(|(_, s)| s).collect(),
-        dropped.into_iter().map(|(_, d)| d).collect(),
-    )
-}
-
-/// Parse strict patch DSL blocks.
-pub fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
-    let unfenced = strip_code_fences(text);
-    let text = unfenced.as_str();
-    if text.trim() == "NO_CHANGES" {
-        return Ok(Vec::new());
-    }
-    if text.trim().is_empty() {
-        bail!("empty patch");
-    }
-
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
-    let mut ops = Vec::new();
-
-    while i < lines.len() {
-        let line = lines[i];
-        if line.trim().is_empty() {
-            i += 1;
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("INSERT_BEFORE ") {
-            let line_num = parse_line_number(rest)?;
-            i += 1;
-            expect_line(&lines, i, "CONTENT:")?;
-            i += 1;
-            let (content, next) = collect_until(&lines, i, "END")?;
-            i = next + 1;
-            ops.push(PatchOp::InsertBefore {
-                line: line_num,
-                content,
-            });
-        } else if let Some(rest) = line.strip_prefix("INSERT_AFTER ") {
-            let line_num = parse_line_number(rest)?;
-            i += 1;
-            expect_line(&lines, i, "CONTENT:")?;
-            i += 1;
-            let (content, next) = collect_until(&lines, i, "END")?;
-            i = next + 1;
-            ops.push(PatchOp::InsertAfter {
-                line: line_num,
-                content,
-            });
-        } else if let Some(rest) = line.strip_prefix("REPLACE_AT ") {
-            let start = parse_line_number(rest)?;
-            i += 1;
-            expect_line(&lines, i, "OLD:")?;
-            i += 1;
-            let (old, next) = collect_until(&lines, i, "END_OLD")?;
-            i = next + 1;
-            expect_line(&lines, i, "NEW:")?;
-            i += 1;
-            let (new, next) = collect_until(&lines, i, "END_NEW")?;
-            i = next + 1;
-            ops.push(PatchOp::ReplaceAt { start, old, new });
-        } else if let Some(rest) = line.strip_prefix("DELETE_AT ") {
-            let start = parse_line_number(rest)?;
-            i += 1;
-            expect_line(&lines, i, "OLD:")?;
-            i += 1;
-            let (old, next) = collect_until(&lines, i, "END_OLD")?;
-            i = next + 1;
-            ops.push(PatchOp::DeleteAt { start, old });
-        } else {
-            bail!("unexpected text in patch: {line}");
-        }
-    }
-
-    Ok(ops)
-}
-
-fn parse_line_number(text: &str) -> Result<usize> {
-    let raw = text.trim();
-    let line = raw
-        .parse::<usize>()
-        .map_err(|e| anyhow::anyhow!("invalid line number '{raw}': {e}"))?;
-    if line == 0 {
-        bail!("line numbers are 1-based");
-    }
-    Ok(line)
-}
-
-fn expect_line(lines: &[&str], idx: usize, expected: &str) -> Result<()> {
-    match lines.get(idx) {
-        Some(line) if *line == expected => Ok(()),
-        Some(line) => bail!("expected '{expected}' but found '{line}'"),
-        None => bail!("expected '{expected}' but reached end of patch"),
-    }
-}
-
-fn collect_until(lines: &[&str], start: usize, sentinel: &str) -> Result<(Vec<String>, usize)> {
-    let mut collected = Vec::new();
-    for (idx, line) in lines.iter().enumerate().skip(start) {
-        if *line == sentinel {
-            return Ok((collected, idx));
-        }
-        collected.push((*line).to_string());
-    }
-    bail!("missing sentinel '{sentinel}'");
-}
-
-/// Apply all operations to memory only. If any operation fails, returns an
-/// error and the original file on disk remains untouched.
-pub fn apply_patch_dry_run(content: &str, ops: &[PatchOp]) -> Result<String> {
-    let lines: Vec<String> = content.lines().map(str::to_string).collect();
-    let resolved = resolve_ops(&lines, ops)?;
-    apply_resolved_patch(content, resolved)
-}
-
-fn apply_patch_dry_run_in_region(
-    content: &str,
-    ops: &[PatchOp],
-    start_line: usize,
-    end_line: usize,
-) -> Result<String> {
-    let lines: Vec<String> = content.lines().map(str::to_string).collect();
-    if start_line == 0 || end_line < start_line || end_line > lines.len() {
-        bail!(
-            "invalid edit region L{start_line}-L{end_line} for {} line file",
-            lines.len()
-        );
-    }
-
-    let resolved = resolve_ops(&lines, ops)?;
-    let allowed_start = start_line - 1;
-    let allowed_end = end_line;
-
-    for op in &resolved {
-        if op.start < allowed_start || op.end > allowed_end {
-            bail!(
-                "{} resolves to {}, outside allowed region L{}-L{}",
-                op.label,
-                display_span(op.start, op.end),
-                start_line,
-                end_line
-            );
-        }
-    }
-
-    apply_resolved_patch(content, resolved)
-}
-
-pub fn apply_literal_replace_in_scope(
-    content: &str,
-    scope_start: usize,
-    scope_end: usize,
-    old: &[String],
-    new: &[String],
-    all: bool,
-) -> Result<(String, usize)> {
-    if scope_start == 0 || scope_end < scope_start {
-        bail!("invalid literal scope L{scope_start}-L{scope_end}");
-    }
-    if old.is_empty() {
-        bail!("literal OLD block must not be empty");
-    }
-
-    let line_count = content.lines().count();
-    if scope_end > line_count {
-        bail!("literal scope L{scope_start}-L{scope_end} outside {line_count} line file");
-    }
-
-    let parts: Vec<&str> = content.split_inclusive('\n').collect();
-    let start_byte: usize = parts[..scope_start - 1].iter().map(|part| part.len()).sum();
-    let end_byte: usize = parts[..scope_end].iter().map(|part| part.len()).sum();
-
-    let old_text = old.join("\n");
-    let new_text = new.join("\n");
-    let scoped = &content[start_byte..end_byte];
-    let count = scoped.matches(&old_text).count();
-
-    if all {
-        if count == 0 {
-            bail!(
-                "literal OLD block was not found in scope L{scope_start}-L{scope_end}\nOLD block:\n{}",
-                preview_block(old, None)
-            );
-        }
-    } else if count != 1 {
-        bail!(
-            "literal OLD block matched {count} occurrence(s) in scope L{scope_start}-L{scope_end}; expected exactly 1"
-        );
-    }
-
-    let replaced_scope = if all {
-        scoped.replace(&old_text, &new_text)
-    } else {
-        scoped.replacen(&old_text, &new_text, 1)
-    };
-
-    let mut out = String::with_capacity(content.len() + replaced_scope.len());
-    out.push_str(&content[..start_byte]);
-    out.push_str(&replaced_scope);
-    out.push_str(&content[end_byte..]);
-    Ok((out, count))
-}
-
-/// Outcome of a whitespace-tolerant literal-replace fallback attempt.
-///
-/// The planner sometimes hallucinates trivial whitespace inside an OLD
-/// block (extra space, tab vs spaces, stray newline). When the byte-exact
-/// matcher rejects such a block we strip all whitespace from both the
-/// OLD text and the scoped slice, look for the OLD as a substring, and —
-/// if found — ask the planner via a single round-trip whether the
-/// candidate is the intended target.
-enum WhitespaceOutcome {
-    /// Candidate found, planner confirmed, replacement applied. Carries
-    /// the new file content ready to swap into `current`.
-    Applied(String),
-    /// Candidate found but the planner rejected it. The caller should
-    /// bubble straight up to plan-level repair instead of running the
-    /// smart-edit fallback (which has no new information to work with).
-    Rejected,
-    /// No whitespace-tolerant candidate exists in the scope, or the
-    /// confirmation request itself failed. The caller should fall through
-    /// to the existing smart-edit fallback.
-    NoCandidate,
-}
-
-/// Walk `scoped` looking for the first whitespace-tolerant occurrence of
-/// `old_text`. Returns the byte range in `scoped` (relative to the slice
-/// start, not the whole file) of that match, or `None` if no match
-/// exists.
-///
-/// "Whitespace-tolerant" means: strip every whitespace character from
-/// both `old_text` and `scoped`, find `old_text` as a substring, then
-/// map the match position back to the original byte range in `scoped`.
-/// This rescues hallucinations like `</div >` (extra space inside an
-/// HTML tag) and tab/space drift in indented code.
-///
-/// Multiple candidates: returns the first occurrence only. We could
-/// disambiguate by asking the model which one it meant, but in practice
-/// the first match is almost always right and the planner round-trip
-/// already filters out wrong picks.
-fn find_whitespace_tolerant_match(scoped: &str, old_text: &str) -> Option<(usize, usize)> {
-    let old_squashed: String = old_text.chars().filter(|c| !c.is_whitespace()).collect();
-    if old_squashed.is_empty() {
-        return None;
-    }
-
-    // Build a parallel byte-index map so a match position in the squashed
-    // string can be translated back to the byte range it occupied in the
-    // original `scoped` slice. `starts[i]` and `ends[i]` are the start and
-    // end byte offsets in `scoped` of the source character whose first
-    // (squashed) byte is at squashed-index `i`. Multiple squashed bytes
-    // share the same source range when the source character is multibyte.
-    let mut squashed = String::with_capacity(scoped.len());
-    let mut starts: Vec<usize> = Vec::with_capacity(scoped.len());
-    let mut ends: Vec<usize> = Vec::with_capacity(scoped.len());
-    for (byte_idx, c) in scoped.char_indices() {
-        if c.is_whitespace() {
-            continue;
-        }
-        let char_end = byte_idx + c.len_utf8();
-        for _ in 0..c.len_utf8() {
-            starts.push(byte_idx);
-            ends.push(char_end);
-        }
-        squashed.push(c);
-    }
-
-    let match_start = squashed.find(&old_squashed)?;
-    let match_end = match_start + old_squashed.len();
-    if match_end == 0 || match_end > starts.len() {
-        return None;
-    }
-
-    let scoped_start = starts[match_start];
-    let scoped_end = ends[match_end - 1];
-    Some((scoped_start, scoped_end))
-}
-
-/// Try to rescue a failed literal replace by locating a whitespace-
-/// tolerant candidate in scope and asking the planner to confirm it.
-/// See [`WhitespaceOutcome`] for the three possible results.
-#[allow(clippy::too_many_arguments)]
-async fn try_whitespace_tolerant_replace(
-    path_str: &str,
-    content: &str,
-    scope_start: usize,
-    scope_end: usize,
-    old: &[String],
-    new: &[String],
-    router: &ModelRouter,
-    cancelled: Option<&AtomicBool>,
-    log: Option<&SessionLog>,
-) -> WhitespaceOutcome {
-    let parts: Vec<&str> = content.split_inclusive('\n').collect();
-    if scope_start == 0 || scope_end < scope_start || scope_end > parts.len() {
-        return WhitespaceOutcome::NoCandidate;
-    }
-    let scope_byte_start: usize = parts[..scope_start - 1].iter().map(|p| p.len()).sum();
-    let scope_byte_end: usize = parts[..scope_end].iter().map(|p| p.len()).sum();
-    let scoped = &content[scope_byte_start..scope_byte_end];
-    let old_text = old.join("\n");
-
-    let Some((rel_start, rel_end)) = find_whitespace_tolerant_match(scoped, &old_text) else {
-        return WhitespaceOutcome::NoCandidate;
-    };
-    let actual_match = scoped[rel_start..rel_end].to_string();
-
-    log_debug(
-        log,
-        path_str,
-        &format!(
-            "literal:whitespace_drift L{scope_start}-L{scope_end} candidate found, asking planner to confirm\n  planner OLD: {}\n  actual:      {}",
-            truncate_multiline(&old_text, 400),
-            truncate_multiline(&actual_match, 400)
-        ),
-    );
-
-    let confirmed = match request_whitespace_drift_confirmation(
-        path_str,
-        scope_start,
-        scope_end,
-        &old_text,
-        &actual_match,
-        router,
-        cancelled,
-        log,
-    )
-    .await
-    {
-        Ok(yes) => yes,
-        Err(e) => {
-            // Confirmation request itself failed (network, timeout,
-            // cancellation). Don't treat that as a "rejection" — fall
-            // through to the existing smart-edit fallback so a transient
-            // transport hiccup doesn't bypass that recovery path.
-            log_debug(
-                log,
-                path_str,
-                &format!(
-                    "literal:whitespace_confirm L{scope_start}-L{scope_end} request failed: {e}"
-                ),
-            );
-            return WhitespaceOutcome::NoCandidate;
-        }
-    };
-
-    if !confirmed {
-        log_debug(
-            log,
-            path_str,
-            &format!(
-                "literal:whitespace_confirm L{scope_start}-L{scope_end} planner rejected candidate"
-            ),
-        );
-        return WhitespaceOutcome::Rejected;
-    }
-
-    let new_text = new.join("\n");
-    let abs_start = scope_byte_start + rel_start;
-    let abs_end = scope_byte_start + rel_end;
-    let mut spliced = String::with_capacity(content.len() + new_text.len());
-    spliced.push_str(&content[..abs_start]);
-    spliced.push_str(&new_text);
-    spliced.push_str(&content[abs_end..]);
-    log_debug(
-        log,
-        path_str,
-        &format!("literal:whitespace_confirm L{scope_start}-L{scope_end} planner confirmed, applied"),
-    );
-    WhitespaceOutcome::Applied(spliced)
-}
-
-/// Ask the planner model whether a whitespace-normalized candidate is
-/// the same edit target it intended to write. Single round-trip, single
-/// word reply expected (`YES` / `NO`).
-#[allow(clippy::too_many_arguments)]
-async fn request_whitespace_drift_confirmation(
-    path_str: &str,
-    scope_start: usize,
-    scope_end: usize,
-    planner_old: &str,
-    actual_match: &str,
-    router: &ModelRouter,
-    cancelled: Option<&AtomicBool>,
-    log: Option<&SessionLog>,
-) -> Result<bool> {
-    ensure_not_cancelled(cancelled)?;
-    let prompt = format!(
-        "An edit-plan step for {path_str} (lines {scope_start}-{scope_end}) emitted an OLD \
-         block that does not byte-exactly match the file, but after ignoring whitespace \
-         differences a near-match was found in the same scope. Confirm whether this near-match \
-         is the same edit target you intended.\n\n\
-         OLD as written by the planner:\n\
-         ----\n{planner_old}\n----\n\n\
-         Actual matching text from the file:\n\
-         ----\n{actual_match}\n----\n\n\
-         Reply with exactly `YES` if this is the intended target, or `NO` if it isn't. \
-         Output only the single word, no other text."
-    );
-
-    let request = ChatRequest {
-        messages: vec![
-            Message::system(
-                "You answer with exactly `YES` or `NO`. No other output, no markdown.",
-            ),
-            Message::user(&prompt),
-        ],
-        tools: None,
-        tool_choice: None,
-    };
-
-    log_stage(
-        log,
-        path_str,
-        &format!("literal:whitespace_confirm:L{scope_start}-L{scope_end}"),
-    );
-    let response = router
-        .chat_with_cancel(ModelRole::Fast, &request, cancelled)
-        .await?;
-    let text = response
-        .choices
-        .first()
-        .and_then(|c| c.message.content.as_deref())
-        .unwrap_or("");
-    log_debug(
-        log,
-        path_str,
-        &format!(
-            "literal:whitespace_confirm:L{scope_start}-L{scope_end} reply: {}",
-            truncate_multiline(text, 400)
-        ),
-    );
-
-    // Tolerate trailing punctuation, mixed case, and a leading word like
-    // "Yes." or "yes,". Reject anything that doesn't have "yes" as its
-    // first alphabetic token.
-    let first_word: String = text
-        .trim()
-        .chars()
-        .take_while(|c| c.is_alphabetic())
-        .flat_map(|c| c.to_lowercase())
-        .collect();
-    Ok(first_word == "yes")
-}
-
-fn apply_resolved_patch(content: &str, mut resolved: Vec<ResolvedOp>) -> Result<String> {
-    let had_trailing_newline = content.ends_with('\n');
-    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-
-    resolved.sort_by(|a, b| b.start.cmp(&a.start).then_with(|| b.end.cmp(&a.end)));
-
-    for op in &resolved {
-        match &op.kind {
-            ResolvedKind::Insert { content } => {
-                lines.splice(op.start..op.start, content.clone());
-            }
-            ResolvedKind::Replace { content } => {
-                lines.splice(op.start..op.end, content.clone());
-            }
-            ResolvedKind::Delete => {
-                lines.splice(op.start..op.end, Vec::<String>::new());
-            }
-        }
-    }
-
-    let mut out = lines.join("\n");
-    if had_trailing_newline && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    Ok(out)
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedOp {
-    label: String,
-    start: usize,
-    end: usize,
-    kind: ResolvedKind,
-}
-
-#[derive(Debug, Clone)]
-enum ResolvedKind {
-    Insert { content: Vec<String> },
-    Replace { content: Vec<String> },
-    Delete,
-}
-
-fn resolve_ops(original: &[String], ops: &[PatchOp]) -> Result<Vec<ResolvedOp>> {
-    let mut resolved = Vec::new();
-
-    for (idx, op) in ops.iter().enumerate() {
-        let label = op_label(idx + 1, op);
-        match op {
-            PatchOp::InsertBefore { line, content } => {
-                validate_insert_line(*line, original.len())?;
-                resolved.push(ResolvedOp {
-                    label,
-                    start: *line - 1,
-                    end: *line - 1,
-                    kind: ResolvedKind::Insert {
-                        content: content.clone(),
-                    },
-                });
-            }
-            PatchOp::InsertAfter { line, content } => {
-                validate_insert_line(*line, original.len())?;
-                resolved.push(ResolvedOp {
-                    label,
-                    start: *line,
-                    end: *line,
-                    kind: ResolvedKind::Insert {
-                        content: content.clone(),
-                    },
-                });
-            }
-            PatchOp::ReplaceAt { start, old, new } => {
-                let start_idx = resolve_old_anchor(original, *start, old, "REPLACE_AT")?;
-                resolved.push(ResolvedOp {
-                    label,
-                    start: start_idx,
-                    end: start_idx + old.len(),
-                    kind: ResolvedKind::Replace {
-                        content: new.clone(),
-                    },
-                });
-            }
-            PatchOp::DeleteAt { start, old } => {
-                let start_idx = resolve_old_anchor(original, *start, old, "DELETE_AT")?;
-                resolved.push(ResolvedOp {
-                    label,
-                    start: start_idx,
-                    end: start_idx + old.len(),
-                    kind: ResolvedKind::Delete,
-                });
-            }
-        }
-    }
-
-    reject_overlapping_spans(&resolved)?;
-    Ok(resolved)
-}
-
-fn op_label(ordinal: usize, op: &PatchOp) -> String {
-    match op {
-        PatchOp::InsertBefore { line, .. } => format!("op {ordinal} INSERT_BEFORE {line}"),
-        PatchOp::InsertAfter { line, .. } => format!("op {ordinal} INSERT_AFTER {line}"),
-        PatchOp::ReplaceAt { start, old, .. } => {
-            format!(
-                "op {ordinal} REPLACE_AT {start} ({} OLD line(s))",
-                old.len()
-            )
-        }
-        PatchOp::DeleteAt { start, old } => {
-            format!("op {ordinal} DELETE_AT {start} ({} OLD line(s))", old.len())
-        }
-    }
-}
-
-fn resolve_old_anchor(
-    original: &[String],
-    start_line: usize,
-    old: &[String],
-    op_name: &str,
-) -> Result<usize> {
-    if old.is_empty() {
-        bail!("{op_name} OLD block must not be empty");
-    }
-    if start_line == 0 {
-        bail!("line numbers are 1-based");
-    }
-
-    let hinted = start_line - 1;
-    if hinted + old.len() <= original.len() && original[hinted..hinted + old.len()] == *old {
-        return Ok(hinted);
-    }
-
-    let matches = find_exact_block_matches(original, old);
-    match matches.as_slice() {
-        [idx] => Ok(*idx),
-        [] => {
-            let mut msg = format!(
-                "OLD mismatch for {op_name} {start_line}: OLD block was not found at the anchor or elsewhere"
-            );
-            msg.push_str(&format!(
-                "\nOLD block ({} line(s)):\n{}",
-                old.len(),
-                preview_block(old, None)
-            ));
-            msg.push_str(&format!(
-                "\nActual text at anchor:\n{}",
-                preview_anchor(original, hinted, old.len())
-            ));
-            let trimmed_matches = find_trimmed_block_matches(original, old);
-            match trimmed_matches.as_slice() {
-                [] => {}
-                [idx] => msg.push_str(&format!(
-                    "\nWhitespace-trimmed OLD would match at L{}; preserve exact indentation/spacing in OLD.",
-                    idx + 1
-                )),
-                many => msg.push_str(&format!(
-                    "\nWhitespace-trimmed OLD would match {} locations: {}. Use a more specific OLD block.",
-                    many.len(),
-                    format_line_list(many)
-                )),
-            }
-            bail!("{msg}");
-        }
-        _ => bail!(
-            "OLD mismatch for {op_name} {start_line}: OLD block matched {} locations: {}. Use a more specific OLD block.\nOLD block:\n{}",
-            matches.len(),
-            format_line_list(&matches),
-            preview_block(old, None)
-        ),
-    }
-}
-
-fn find_exact_block_matches(haystack: &[String], needle: &[String]) -> Vec<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return Vec::new();
-    }
-
-    let mut matches = Vec::new();
-    for start in 0..=haystack.len() - needle.len() {
-        if haystack[start..start + needle.len()] == *needle {
-            matches.push(start);
-        }
-    }
-    matches
-}
-
-fn find_trimmed_block_matches(haystack: &[String], needle: &[String]) -> Vec<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return Vec::new();
-    }
-
-    let mut matches = Vec::new();
-    for start in 0..=haystack.len() - needle.len() {
-        if haystack[start..start + needle.len()]
-            .iter()
-            .zip(needle)
-            .all(|(left, right)| left.trim() == right.trim())
-        {
-            matches.push(start);
-        }
-    }
-    matches
-}
-
-fn preview_anchor(original: &[String], start_idx: usize, desired_len: usize) -> String {
-    if start_idx >= original.len() {
-        return format!(
-            "anchor L{} is beyond end of file ({} line(s))",
-            start_idx + 1,
-            original.len()
-        );
-    }
-
-    let len = desired_len.max(1);
-    let end = (start_idx + len).min(original.len());
-    preview_block(&original[start_idx..end], Some(start_idx + 1))
-}
-
-fn preview_block(lines: &[String], first_line: Option<usize>) -> String {
-    const MAX_PREVIEW_LINES: usize = 6;
-    let mut out = String::new();
-    for (idx, line) in lines.iter().take(MAX_PREVIEW_LINES).enumerate() {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        match first_line {
-            Some(first) => out.push_str(&format!("L{}: {:?}", first + idx, line)),
-            None => out.push_str(&format!("OLD{}: {:?}", idx + 1, line)),
-        }
-    }
-    if lines.len() > MAX_PREVIEW_LINES {
-        out.push_str(&format!(
-            "\n... {} more line(s)",
-            lines.len() - MAX_PREVIEW_LINES
-        ));
-    }
-    out
-}
-
-fn format_line_list(indices: &[usize]) -> String {
-    const MAX_LINES: usize = 8;
-    let mut parts: Vec<String> = indices
-        .iter()
-        .take(MAX_LINES)
-        .map(|idx| format!("L{}", idx + 1))
-        .collect();
-    if indices.len() > MAX_LINES {
-        parts.push(format!("...{} more", indices.len() - MAX_LINES));
-    }
-    parts.join(", ")
-}
-
-fn reject_overlapping_spans(ops: &[ResolvedOp]) -> Result<()> {
-    let mut spans: Vec<&ResolvedOp> = ops.iter().filter(|op| op.start != op.end).collect();
-    spans.sort_unstable_by(|a, b| a.start.cmp(&b.start).then_with(|| a.end.cmp(&b.end)));
-
-    for pair in spans.windows(2) {
-        let prev = pair[0];
-        let next = pair[1];
-        if next.start < prev.end {
-            bail!(
-                "patch operations have overlapping replacement/delete spans: {} covers {}, overlaps {} covers {}. Use the smallest enclosing REPLACE_AT block for the overlap, split the patch into non-overlapping regions, or retry with a narrower edit_file task for one region/function.",
-                prev.label,
-                display_span(prev.start, prev.end),
-                next.label,
-                display_span(next.start, next.end),
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn display_span(start: usize, end: usize) -> String {
-    if end <= start + 1 {
-        format!("L{}", start + 1)
-    } else {
-        format!("L{}-L{}", start + 1, end)
-    }
-}
-
-fn validate_insert_line(line: usize, total_lines: usize) -> Result<()> {
-    if line == 0 || line > total_lines {
-        bail!("insert line {line} out of range for {total_lines} line file");
-    }
-    Ok(())
-}
 
 fn validate_candidate(original: &str, candidate: &str) -> Result<()> {
     if !original.is_empty() && candidate.is_empty() {
@@ -3465,6 +2374,13 @@ pub fn build_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::apply::{
+        find_all_exact_line_matches, find_all_ws_tolerant_line_matches, pick_best_candidate,
+    };
+    use super::parse::{
+        MAX_FAILED_REASON_CHARS, looks_like_complete, parse_edit_plan, parse_failed,
+        parse_needs_clarification, parse_patch, partition_overlapping_steps, strip_code_fences,
+    };
     #[test]
     fn retry_feedback_adds_signature_guidance_for_lsp_arity_errors() {
         let feedback = build_retry_feedback(
@@ -3573,72 +2489,98 @@ mod tests {
         assert!(err.to_string().contains("truncates"));
     }
 
-    #[test]
-    fn find_whitespace_tolerant_match_finds_exact_substring() {
-        // Sanity check: a byte-exact substring is still found.
-        let scoped = "let foo = bar();\n";
-        let (start, end) = find_whitespace_tolerant_match(scoped, "foo = bar").unwrap();
-        assert_eq!(&scoped[start..end], "foo = bar");
+    fn s(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| l.to_string()).collect()
     }
 
     #[test]
-    fn find_whitespace_tolerant_match_rescues_extra_whitespace_in_old() {
-        // The Gemma `</div >` pathology: the model emitted an extra
-        // space inside an HTML tag. The actual file has `</div>` and
-        // we want the matcher to map back to those bytes.
-        let scoped = "<div>hello</div>\n";
-        let (start, end) = find_whitespace_tolerant_match(scoped, "<div >hello</div >").unwrap();
-        assert_eq!(&scoped[start..end], "<div>hello</div>");
+    fn find_all_exact_line_matches_finds_single_hit() {
+        let content = "alpha\nbeta\ngamma\n";
+        let hits = find_all_exact_line_matches(content, &s(&["beta", "gamma"]));
+        assert_eq!(hits, vec![(2, 3)]);
     }
 
     #[test]
-    fn find_whitespace_tolerant_match_rescues_tab_vs_space_drift() {
-        // Indented code where the planner used spaces but the file uses
-        // a tab (or vice-versa).
-        let scoped = "\tif x {\n\t\treturn 1;\n\t}\n";
-        let (start, end) = find_whitespace_tolerant_match(scoped, "if x { return 1; }").unwrap();
-        assert_eq!(&scoped[start..end], "if x {\n\t\treturn 1;\n\t}");
+    fn find_all_exact_line_matches_finds_multiple_hits() {
+        let content = "foo\nfoo\nfoo\n";
+        let hits = find_all_exact_line_matches(content, &s(&["foo"]));
+        assert_eq!(hits, vec![(1, 1), (2, 2), (3, 3)]);
     }
 
     #[test]
-    fn find_whitespace_tolerant_match_rescues_newline_drift() {
-        // Multi-line OLD where the planner ran two lines together.
-        let scoped = "first\nsecond\nthird\n";
-        let (start, end) = find_whitespace_tolerant_match(scoped, "firstsecond").unwrap();
-        assert_eq!(&scoped[start..end], "first\nsecond");
+    fn find_all_exact_line_matches_returns_empty_when_needle_longer_than_haystack() {
+        let content = "one\n";
+        let hits = find_all_exact_line_matches(content, &s(&["one", "two"]));
+        assert!(hits.is_empty());
     }
 
     #[test]
-    fn find_whitespace_tolerant_match_returns_none_when_no_candidate() {
-        let scoped = "let foo = bar();\n";
-        assert_eq!(find_whitespace_tolerant_match(scoped, "qux"), None);
+    fn find_all_exact_line_matches_empty_needle_returns_empty() {
+        let content = "one\ntwo\n";
+        let hits = find_all_exact_line_matches(content, &[]);
+        assert!(hits.is_empty());
     }
 
     #[test]
-    fn find_whitespace_tolerant_match_rejects_empty_old_text() {
-        // An OLD that's all whitespace squashes to nothing — we can't
-        // anchor anywhere, so return None instead of pretending to match.
-        assert_eq!(find_whitespace_tolerant_match("foo bar\n", ""), None);
-        assert_eq!(find_whitespace_tolerant_match("foo bar\n", "  \n\t"), None);
+    fn find_all_ws_tolerant_ignores_indentation_drift() {
+        // Planner used spaces, file uses tabs.
+        let content = "\tif x {\n\t\treturn 1;\n\t}\n";
+        let hits = find_all_ws_tolerant_line_matches(
+            content,
+            &s(&["if x {", "    return 1;", "}"]),
+            &[],
+        );
+        assert_eq!(hits, vec![(1, 3)]);
     }
 
     #[test]
-    fn find_whitespace_tolerant_match_returns_first_when_multiple_candidates() {
-        // Two non-overlapping candidates → first wins. The user accepted
-        // this simplification: "show first only for now."
-        let scoped = "x = 1;\nx = 1;\n";
-        let (start, end) = find_whitespace_tolerant_match(scoped, "x=1").unwrap();
-        assert_eq!(&scoped[start..end], "x = 1");
-        // The match is at the very beginning, not the second occurrence.
-        assert_eq!(start, 0);
+    fn find_all_ws_tolerant_skips_excluded_ranges() {
+        // Byte-exact hit already present — whitespace search should not
+        // re-add the same range.
+        let content = "foo\nbar\n";
+        let exclude = vec![(1, 1)];
+        let hits = find_all_ws_tolerant_line_matches(content, &s(&["foo"]), &exclude);
+        assert!(hits.is_empty());
     }
 
     #[test]
-    fn find_whitespace_tolerant_match_handles_multibyte_characters() {
-        // Make sure char_indices accounting doesn't panic on multibyte chars.
-        let scoped = "let s = \"héllo\";\n";
-        let (start, end) = find_whitespace_tolerant_match(scoped, "\"héllo\"").unwrap();
-        assert_eq!(&scoped[start..end], "\"héllo\"");
+    fn find_all_ws_tolerant_rejects_all_blank_old() {
+        // An OLD block that squashes to nothing would otherwise match
+        // every stretch of blank lines.
+        let content = "\n\n\nfoo\n\n\n";
+        let hits = find_all_ws_tolerant_line_matches(content, &s(&["   ", "\t"]), &[]);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn pick_best_candidate_prefers_overlap() {
+        // Two candidates: (5, 10) overlaps declared (8, 12); (20, 25)
+        // does not. Overlap wins even if it's further from the endpoints.
+        let candidates = vec![(5, 10), (20, 25)];
+        let picked = pick_best_candidate(&candidates, 8, 12).unwrap();
+        assert_eq!(picked, (5, 10));
+    }
+
+    #[test]
+    fn pick_best_candidate_picks_nearest_when_no_overlap() {
+        let candidates = vec![(1, 5), (30, 35), (100, 105)];
+        let picked = pick_best_candidate(&candidates, 28, 34).unwrap();
+        assert_eq!(picked, (30, 35));
+    }
+
+    #[test]
+    fn pick_best_candidate_tie_break_prefers_earlier_insertion() {
+        // Two candidates equidistant from the scope — the first one
+        // inserted wins. This lets the caller front-load byte-exact
+        // hits ahead of whitespace-tolerant ones.
+        let candidates = vec![(10, 14), (20, 24)];
+        let picked = pick_best_candidate(&candidates, 15, 19).unwrap();
+        assert_eq!(picked, (10, 14));
+    }
+
+    #[test]
+    fn pick_best_candidate_returns_none_for_empty_list() {
+        assert_eq!(pick_best_candidate(&[], 1, 5), None);
     }
 
     #[test]
@@ -3892,51 +2834,92 @@ mod tests {
     }
 
     #[test]
-    fn looks_like_no_changes_accepts_bare_sentinel() {
-        assert!(looks_like_no_changes("NO_CHANGES"));
+    fn looks_like_complete_accepts_bare_sentinel() {
+        assert!(looks_like_complete("COMPLETE"));
+        // Legacy spelling preserved for back-compat during rollout.
+        assert!(looks_like_complete("NO_CHANGES"));
     }
 
     #[test]
-    fn looks_like_no_changes_tolerates_surrounding_whitespace() {
-        assert!(looks_like_no_changes("  NO_CHANGES  "));
-        assert!(looks_like_no_changes("\n\nNO_CHANGES\n"));
-        assert!(looks_like_no_changes("\tNO_CHANGES\n\n"));
+    fn looks_like_complete_tolerates_surrounding_whitespace() {
+        assert!(looks_like_complete("  COMPLETE  "));
+        assert!(looks_like_complete("\n\nCOMPLETE\n"));
+        assert!(looks_like_complete("\tCOMPLETE\n\n"));
     }
 
     #[test]
-    fn looks_like_no_changes_tolerates_code_fences() {
+    fn looks_like_complete_tolerates_code_fences() {
         // Smaller models sometimes wrap everything in a fence, and
         // `strip_code_fences` already handles that shape — we just need
-        // to make sure the NO_CHANGES recognizer composes with it.
-        assert!(looks_like_no_changes("```\nNO_CHANGES\n```"));
-        assert!(looks_like_no_changes("```text\nNO_CHANGES\n```"));
+        // to make sure the sentinel recognizer composes with it.
+        assert!(looks_like_complete("```\nCOMPLETE\n```"));
+        assert!(looks_like_complete("```text\nCOMPLETE\n```"));
     }
 
     #[test]
-    fn looks_like_no_changes_rejects_empty() {
-        // Empty response is the pathology case, not the legitimate
-        // "nothing to do" case — it must NOT be treated as NO_CHANGES.
-        assert!(!looks_like_no_changes(""));
-        assert!(!looks_like_no_changes("   "));
-        assert!(!looks_like_no_changes("\n\n"));
+    fn looks_like_complete_rejects_empty() {
+        // Empty response is the pathology case, not a verdict — it
+        // must NOT be treated as COMPLETE.
+        assert!(!looks_like_complete(""));
+        assert!(!looks_like_complete("   "));
+        assert!(!looks_like_complete("\n\n"));
     }
 
     #[test]
-    fn looks_like_no_changes_rejects_content_alongside_sentinel() {
-        // A plan with steps is NOT NO_CHANGES, even if the model
-        // sprinkled a stray NO_CHANGES somewhere. (The fall-through
-        // parser tolerates stray sentinels mid-plan; this helper only
-        // recognizes the pure, unambiguous signal.)
-        assert!(!looks_like_no_changes("NO_CHANGES\nLITERAL_REPLACE\nSCOPE 1 1"));
-        assert!(!looks_like_no_changes("LITERAL_REPLACE\nSCOPE 1 1\nNO_CHANGES"));
-        assert!(!looks_like_no_changes("NEEDS_CLARIFICATION: which field?"));
+    fn looks_like_complete_rejects_content_alongside_sentinel() {
+        assert!(!looks_like_complete("COMPLETE\nLITERAL_REPLACE\nSCOPE 1 1"));
+        assert!(!looks_like_complete("LITERAL_REPLACE\nSCOPE 1 1\nCOMPLETE"));
+        assert!(!looks_like_complete("NEEDS_CLARIFICATION: which field?"));
     }
 
     #[test]
-    fn looks_like_no_changes_rejects_lookalikes() {
-        assert!(!looks_like_no_changes("NO_CHANGE"));
-        assert!(!looks_like_no_changes("NO_CHANGES_NEEDED"));
-        assert!(!looks_like_no_changes("no_changes")); // case-sensitive on purpose
+    fn looks_like_complete_rejects_lookalikes() {
+        assert!(!looks_like_complete("COMPLETED"));
+        assert!(!looks_like_complete("COMPLETELY_DONE"));
+        assert!(!looks_like_complete("complete")); // case-sensitive on purpose
+    }
+
+    #[test]
+    fn parse_failed_accepts_reason_with_colon() {
+        let r = parse_failed("FAILED: signature change breaks 3 callers in tests/");
+        assert_eq!(
+            r,
+            Some("signature change breaks 3 callers in tests/".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_failed_accepts_reason_with_whitespace() {
+        let r = parse_failed("FAILED  region too large to replace verbatim");
+        assert_eq!(r, Some("region too large to replace verbatim".to_string()));
+    }
+
+    #[test]
+    fn parse_failed_accepts_bare_keyword() {
+        // Reasonless failure still parses, caller substitutes placeholder.
+        assert_eq!(parse_failed("FAILED"), Some(String::new()));
+    }
+
+    #[test]
+    fn parse_failed_rejects_lookalikes() {
+        assert!(parse_failed("FAILURE: whatever").is_none());
+        assert!(parse_failed("failed: lower").is_none());
+    }
+
+    #[test]
+    fn parse_failed_keeps_only_first_line() {
+        let r = parse_failed("FAILED: top line\nsecond line");
+        assert_eq!(r, Some("top line".to_string()));
+    }
+
+    #[test]
+    fn parse_failed_caps_reason_length() {
+        let long: String = "x".repeat(MAX_FAILED_REASON_CHARS + 50);
+        let input = format!("FAILED: {long}");
+        let r = parse_failed(&input).expect("should parse");
+        // The returned reason is capped + ellipsis, so <= max+1 chars.
+        assert!(r.chars().count() <= MAX_FAILED_REASON_CHARS + 1);
+        assert!(r.ends_with('…'));
     }
 
     #[test]
@@ -3955,10 +2938,11 @@ mod tests {
             })),
             failure_reason: "region missing anchor".into(),
             lsp_regression: None,
+            cleanly_applied: false,
         };
 
         let block = format_repair_context(&ctx);
-        assert!(block.contains("A previous edit plan was attempted and failed."));
+        assert!(block.contains("The previous iteration failed."));
         assert!(block.contains("Previous edit plan (as tried):"));
         assert!(block.contains("rewrite header"));
         assert!(block.contains(
@@ -3966,7 +2950,7 @@ mod tests {
         ));
         assert!(block.contains("Step that FAILED:"));
         assert!(block.contains("Failure reason:\nregion missing anchor"));
-        assert!(block.contains("If the task already appears complete, return NO_CHANGES."));
+        assert!(block.contains("`FAILED: <reason>`"));
     }
 
     #[test]
@@ -3987,6 +2971,7 @@ mod tests {
             failed_step: None,
             failure_reason: "LSP diagnostics worsened: 0 -> 4 errors".into(),
             lsp_regression: None,
+            cleanly_applied: false,
         };
 
         let block = format_repair_context(&ctx);
@@ -4019,6 +3004,7 @@ mod tests {
             failed_step: Some(failed_step),
             failure_reason: "smart edit returned no diff".into(),
             lsp_regression: None,
+            cleanly_applied: false,
         };
 
         let block = format_repair_context(&ctx);
@@ -4030,6 +3016,33 @@ mod tests {
         assert!(block.contains("smart edit returned no diff"));
         // The "first step failed" stub must NOT appear when partial success exists.
         assert!(!block.contains("(none — the first step failed"));
+    }
+
+    #[test]
+    fn format_repair_context_cleanly_applied_uses_soft_language() {
+        let step = EditPlanStep::LiteralReplace {
+            scope_start: 5,
+            scope_end: 10,
+            all: false,
+            old: vec!["old text".into()],
+            new: vec!["new text".into()],
+        };
+        let ctx = RepairContext {
+            previous_plan: vec![step.clone()],
+            completed_steps: vec![step],
+            failed_step: None,
+            failure_reason: String::new(),
+            lsp_regression: None,
+            cleanly_applied: true,
+        };
+
+        let block = format_repair_context(&ctx);
+        // Success framing — no "failed" language.
+        assert!(!block.contains("failed"));
+        assert!(!block.contains("FAILED") || block.contains("`FAILED:"));
+        assert!(block.contains("applied the following steps cleanly"));
+        assert!(block.contains("`COMPLETE`"));
+        assert!(block.contains("LITERAL_REPLACE"));
     }
 
     #[test]
