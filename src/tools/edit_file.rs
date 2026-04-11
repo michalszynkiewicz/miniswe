@@ -115,16 +115,18 @@ pub async fn execute(
         Ok(PreplanResult::NoChanges) => Ok(ToolResult::ok(format!(
             "No changes needed in {path_str} for task: {task}"
         ))),
-        Ok(PreplanResult::InvalidTask(reason)) => {
-            let reason = if reason.is_empty() {
-                "no reason provided".to_string()
+        Ok(PreplanResult::NeedsClarification(question)) => {
+            let question = if question.is_empty() {
+                "no question provided".to_string()
             } else {
-                reason
+                question
             };
             Ok(ToolResult::err(format!(
-                "edit_file rejected task as invalid: {reason}\n\
-                 The pre-plan model determined this task is incoherent, malformed, \
-                 or impossible to satisfy from {path_str} alone. The file was not modified."
+                "edit_file needs clarification before it can apply edits.\n\n\
+                 Original task: {task}\n\
+                 Question: {question}\n\n\
+                 Re-run edit_file with a task that addresses the question, \
+                 or split the work into more specific steps. The file was not modified."
             )))
         }
         Err(e) => Ok(ToolResult::err(format!(
@@ -148,11 +150,12 @@ struct DroppedStep {
     reason: String,
 }
 
-/// What one planning attempt produced. The model can return either a
-/// concrete edit plan or, at the finalize phase, reject the task as
-/// invalid via `INVALID_TASK: <reason>`. The escape hatch is meant for
-/// genuinely incoherent or impossible tasks — not "this is hard" — and
-/// short-circuits the entire repair retry loop.
+/// What one planning attempt produced. The model can return a concrete
+/// edit plan, or at any phase ask for clarification via
+/// `NEEDS_CLARIFICATION: <question>` when the task is too vague or
+/// contradicts the file to execute without guessing. Clarification
+/// requests short-circuit the entire repair retry loop — the whole point
+/// is to stop burning attempts on guesses.
 ///
 /// `Steps` carries `dropped` so the executor can report overlapping
 /// steps as failed steps in the per-step output instead of as opaque
@@ -162,14 +165,10 @@ enum PreplanOutcome {
         steps: Vec<EditPlanStep>,
         dropped: Vec<DroppedStep>,
     },
-    InvalidTask(String),
-    /// The model emitted `INVALID_TASK` but its reason looks like it just
-    /// didn't find the target in the *current* file state — which is a
-    /// missing prerequisite, not an incoherent task. We suppress the
-    /// rejection and ask the loop to retry with a hint.
-    OverreachedRejection {
-        suppressed_reason: String,
-    },
+    /// The pre-plan model decided the task is too ambiguous, under-specified,
+    /// or contradictory to act on. Carries the model's question back to the
+    /// caller so the outer agent can rephrase or split the task.
+    NeedsClarification(String),
     /// The model explicitly emitted the `NO_CHANGES` sentinel, meaning the
     /// task is already satisfied in the current file state. This is the
     /// legitimate "nothing to do" signal, distinct from an empty response
@@ -190,12 +189,13 @@ enum PreplanOutcome {
 }
 
 /// What the whole pre-plan retry loop produced. Distinguishes "applied
-/// edits", "no edits needed", and "model rejected the task as invalid"
-/// so the caller can render an appropriate tool result for each.
+/// edits", "no edits needed", and "model needs the task clarified before
+/// it can act" so the caller can render an appropriate tool result for
+/// each.
 enum PreplanResult {
     Applied(SplitResult),
     NoChanges,
-    InvalidTask(String),
+    NeedsClarification(String),
 }
 
 struct PlannedExecutionFailure {
@@ -409,45 +409,17 @@ async fn execute_preplanned_steps(
 
         let (steps, dropped) = match outcome {
             PreplanOutcome::Steps { steps, dropped } => (steps, dropped),
-            PreplanOutcome::InvalidTask(reason) => {
-                // The model rejected the task as fundamentally invalid.
-                // Short-circuit the entire retry loop and surface the
-                // rejection — no point repairing a malformed task.
+            PreplanOutcome::NeedsClarification(question) => {
+                // The pre-plan model decided the task is too vague or
+                // contradictory to act on. Short-circuit the entire retry
+                // loop and surface the question — repairing a guess won't
+                // recover a task whose intent we don't know.
                 log_debug(
                     log,
                     path_str,
-                    &format!("preplan:invalid_task attempt={attempt} reason={reason}"),
+                    &format!("preplan:needs_clarification attempt={attempt} question={question}"),
                 );
-                return Ok(PreplanResult::InvalidTask(reason));
-            }
-            PreplanOutcome::OverreachedRejection { suppressed_reason } => {
-                // The model said INVALID_TASK but the reason was about a
-                // missing target, not an incoherent task. Set up a repair
-                // context that explicitly tells it to plan the edit
-                // instead, and continue the retry loop.
-                log_debug(
-                    log,
-                    path_str,
-                    &format!(
-                        "preplan:overreached_rejection attempt={attempt} suppressed_reason={suppressed_reason}"
-                    ),
-                );
-                progress_log.push_str(&format!(
-                    "{label}; suppressed false-positive INVALID_TASK ({suppressed_reason}) and will retry\n"
-                ));
-                repair_context = Some(RepairContext {
-                    previous_plan: Vec::new(),
-                    completed_steps: Vec::new(),
-                    failed_step: None,
-                    failure_reason: format!(
-                        "The previous attempt rejected this task with `INVALID_TASK: {suppressed_reason}`. \
-                         That reason describes a missing target in the *current* file state, which is exactly what an edit is for — \
-                         it does NOT make the task incoherent. Plan the edit that creates or updates the target. \
-                         Reserve INVALID_TASK only for tasks that contradict reality (wrong language, internally inconsistent goals)."
-                    ),
-                    lsp_regression: None,
-                });
-                continue;
+                return Ok(PreplanResult::NeedsClarification(question));
             }
             PreplanOutcome::NothingToDo => {
                 // Explicit `NO_CHANGES` sentinel — the legitimate "task is
@@ -486,7 +458,7 @@ async fn execute_preplanned_steps(
                         "The previous attempt returned an empty response, which is not a valid output. \
                          Either emit valid edit-plan blocks for the changes needed, \
                          or output exactly `NO_CHANGES` on its own line if the task is already satisfied, \
-                         or output `INVALID_TASK: <reason>` if the task is incoherent. \
+                         or output `NEEDS_CLARIFICATION: <question>` if the task is too vague to act on. \
                          Do not return an empty response.",
                     ),
                     lsp_regression: None,
@@ -1251,6 +1223,11 @@ fn is_signature_mismatch_error(error: &str) -> bool {
 struct PreplanWindowResponse {
     notes: Vec<String>,
     commands: Vec<InspectionCommand>,
+    /// Set to `Some(question)` if any line in the response is a
+    /// `NEEDS_CLARIFICATION:` sentinel. Short-circuits the windowed pass:
+    /// the model already knows the task is ambiguous and there's no point
+    /// scanning more slices.
+    clarification: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1265,17 +1242,31 @@ enum InspectionCommand {
 /// *collected* across all windows and batch-executed once the full pass
 /// is complete; the model doesn't see results until the finalize prompt.
 ///
-/// The parser is liberal: anything that isn't a recognizable NOTE or
-/// SEARCH/READ line is silently ignored. An empty response is fine — the
-/// model may have nothing useful to say about a particular slice.
+/// If the model decides the task itself is too vague or contradictory to
+/// act on, it can emit `NEEDS_CLARIFICATION: <question>` on any line. The
+/// first such line short-circuits the windowed pass via the `clarification`
+/// field so the caller can surface the question immediately instead of
+/// burning the rest of the scan on a task with unknown intent.
+///
+/// The parser is liberal: anything that isn't a recognizable NOTE,
+/// SEARCH/READ, or NEEDS_CLARIFICATION line is silently ignored. An empty
+/// response is fine — the model may have nothing useful to say about a
+/// particular slice.
 fn parse_preplan_window_response(text: &str) -> PreplanWindowResponse {
     let mut notes = Vec::new();
     let mut commands = Vec::new();
+    let mut clarification: Option<String> = None;
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
         if line.is_empty() {
             continue;
+        }
+        if clarification.is_none() {
+            if let Some(question) = parse_needs_clarification(line) {
+                clarification = Some(question);
+                continue;
+            }
         }
         if let Some(rest) = strip_case_insensitive_prefix(line, "NOTE ") {
             let note = rest.trim();
@@ -1316,7 +1307,7 @@ fn parse_preplan_window_response(text: &str) -> PreplanWindowResponse {
         // without erroring out.
     }
 
-    PreplanWindowResponse { notes, commands }
+    PreplanWindowResponse { notes, commands, clarification }
 }
 
 fn has_case_insensitive_prefix(text: &str, prefix: &str) -> bool {
@@ -1839,6 +1830,9 @@ async fn request_preplan_steps(
              READ: <start>-<end>\n\n\
              SEARCH/READ commands are collected across ALL slices and batch-executed before the finalize phase — their results will reach the planner. Don't repeat commands; the finalize phase already sees every result.\n\n\
              Reference line numbers from the slice. Skip vague observations and anything the planner can derive itself.\n\n\
+             If the task is genuinely too vague, underspecified, or contradictory to execute — e.g. it names no target, it asks for an outcome the file can't support, or it requires information only the outer agent has — output exactly one line:\n\
+             NEEDS_CLARIFICATION: <one specific question>\n\
+             Use this only when you would otherwise have to guess. Prefer specific questions over vague ones. Do NOT use it for tasks where the target doesn't exist yet — that's what the edit is for; plan the edit that creates it.\n\n\
              Slice:\n{slice}",
             current_slice = idx + 1,
             total_slices = windows.len(),
@@ -1849,7 +1843,7 @@ async fn request_preplan_steps(
         let request = ChatRequest {
             messages: vec![
                 Message::system(
-                    "Observation phase. Output only NOTE lines and/or SEARCH:/READ: commands. No edits, no markdown.",
+                    "Observation phase. Output only NOTE lines, SEARCH:/READ: commands, or a NEEDS_CLARIFICATION: <question> line. No edits, no markdown.",
                 ),
                 Message::user(&prompt),
             ],
@@ -1884,6 +1878,20 @@ async fn request_preplan_steps(
         );
 
         let parsed = parse_preplan_window_response(text);
+        if let Some(question) = parsed.clarification {
+            log_debug(
+                log,
+                path_str,
+                &format!(
+                    "preplan:window:{}/{}:{}-{} needs_clarification question={question}",
+                    idx + 1,
+                    windows.len(),
+                    start + 1,
+                    end,
+                ),
+            );
+            return Ok(PreplanOutcome::NeedsClarification(question));
+        }
         extend_unique_notes(&mut notes, parsed.notes);
         for command in parsed.commands {
             if !collected_commands.contains(&command) {
@@ -1974,15 +1982,15 @@ async fn request_preplan_steps(
          SMART_EDIT\n\
          REGION <start> <end>\n\
          TASK: <specific edit for this region>\n\n\
-         INVALID_TASK is ONLY for tasks that contradict reality — e.g. \"rename function X\" when X does not appear anywhere in the file, or a task that requires syntax from a different language than this file (the file path above shows the extension). It is NOT for missing prerequisites: if the task says \"update the call to f() to pass arg Y\" and Y isn't a parameter of f yet, that's the task — add Y to the call. Plan the edit. Do not reject because something the task wants doesn't exist yet; that's what the edit is for.\n\
-         Only if the task is genuinely incoherent, reject with exactly one line:\n\
-         INVALID_TASK: <one short sentence>"
+         If the task is genuinely too vague, underspecified, or contradictory to plan without guessing — e.g. it names no concrete target, it asks for an outcome the file can't support, or it requires information only the outer agent has — output exactly one line:\n\
+         NEEDS_CLARIFICATION: <one specific question>\n\
+         Use this only when you would otherwise have to guess. Do NOT use it just because a target the task wants to add doesn't exist yet — that's what the edit is for; plan the edit that creates it. Prefer specific questions over vague ones."
     );
 
     let request = ChatRequest {
         messages: vec![
             Message::system(
-                "Final planning phase. Output only edit-plan blocks, or `NO_CHANGES` if the task is already satisfied, or `INVALID_TASK: <reason>` for incoherent tasks. No markdown. Empty responses are not valid and will be retried.",
+                "Final planning phase. Output only edit-plan blocks, or `NO_CHANGES` if the task is already satisfied, or `NEEDS_CLARIFICATION: <question>` if the task is too vague to act on. No markdown. Empty responses are not valid and will be retried.",
             ),
             Message::user(&finalize_prompt),
         ],
@@ -2034,27 +2042,15 @@ async fn request_preplan_steps(
         return Ok(PreplanOutcome::NothingToDo);
     }
 
-    if let Some(reason) = parse_invalid_task(text) {
-        if is_likely_missing_target_reason(&reason) {
-            log_debug(
-                log,
-                path_str,
-                &format!(
-                    "preplan:finalize:file:1-{total_lines} invalid_task SUPPRESSED (looks like missing prerequisite, not incoherent task) reason={reason}"
-                ),
-            );
-            return Ok(PreplanOutcome::OverreachedRejection {
-                suppressed_reason: reason,
-            });
-        }
+    if let Some(question) = parse_needs_clarification(text) {
         log_debug(
             log,
             path_str,
             &format!(
-                "preplan:finalize:file:1-{total_lines} invalid_task reason={reason}"
+                "preplan:finalize:file:1-{total_lines} needs_clarification question={question}"
             ),
         );
-        return Ok(PreplanOutcome::InvalidTask(reason));
+        return Ok(PreplanOutcome::NeedsClarification(question));
     }
 
     let parsed = match parse_edit_plan(text) {
@@ -2237,66 +2233,28 @@ fn looks_like_no_changes(text: &str) -> bool {
     unfenced.trim() == "NO_CHANGES"
 }
 
-/// Detect a finalize-phase `INVALID_TASK` rejection. Returns `Some(reason)`
-/// if the response opens with `INVALID_TASK` (optionally followed by `:`
-/// and a reason), and `None` otherwise. The reason is trimmed and may be
-/// empty if the model omits one.
-fn parse_invalid_task(text: &str) -> Option<String> {
+/// Detect a `NEEDS_CLARIFICATION: <question>` sentinel. Returns
+/// `Some(question)` if the response opens with `NEEDS_CLARIFICATION`
+/// (optionally followed by `:` and a question), and `None` otherwise. The
+/// question is trimmed and may be empty if the model omits one — the
+/// caller substitutes a placeholder at render time.
+///
+/// Guards against lookalikes like `NEEDS_CLARIFICATIONS` or
+/// `NEEDS_CLARIFICATIONAL` by requiring end-of-string, whitespace, or `:`
+/// immediately after the keyword.
+fn parse_needs_clarification(text: &str) -> Option<String> {
     let trimmed = text.trim_start();
-    let rest = trimmed.strip_prefix("INVALID_TASK")?;
-    // Require either end-of-string, whitespace, or ':' immediately after
-    // the keyword so we don't false-match on something like
-    // `INVALID_TASKLIST` that a model might invent.
+    let rest = trimmed.strip_prefix("NEEDS_CLARIFICATION")?;
     let after = match rest.chars().next() {
         None => "",
         Some(':') => &rest[1..],
         Some(c) if c.is_whitespace() => rest,
         Some(_) => return None,
     };
-    Some(after.trim().to_string())
-}
-
-/// Decide whether an `INVALID_TASK` reason from the model is actually a
-/// false positive — i.e. the model couldn't find the *target* of the edit
-/// in the current file state and treated that as the task being incoherent.
-/// In reality, "the thing the task wants to change isn't there yet" is
-/// exactly what edits are for: the planner should plan the edit, not
-/// reject the task.
-///
-/// We match on a small set of phrases that have shown up in real benches.
-/// The check is intentionally conservative — we only suppress when the
-/// reason is unambiguously about missing/absent state.
-fn is_likely_missing_target_reason(reason: &str) -> bool {
-    let r = reason.to_lowercase();
-    // Phrases that describe a missing target in the current file state.
-    const MISSING_PHRASES: &[&str] = &[
-        "not found",
-        "no match",
-        "no matches",
-        "not present",
-        "isn't present",
-        "is not present",
-        "doesn't exist",
-        "does not exist",
-        "doesn't appear",
-        "does not appear",
-        "isn't in the file",
-        "is not in the file",
-        "not in the file",
-        "no such",
-        "cannot find",
-        "can't find",
-        "could not find",
-        "couldn't find",
-        "missing from",
-        "missing in",
-        "absent from",
-        "not yet present",
-        "not yet exist",
-        "not yet defined",
-        "undefined",
-    ];
-    MISSING_PHRASES.iter().any(|p| r.contains(p))
+    // If there's a trailing newline after the question, keep only the
+    // first line — the sentinel is single-line by contract.
+    let first_line = after.lines().next().unwrap_or("");
+    Some(first_line.trim().to_string())
 }
 
 /// Render a `RepairContext` into a planner-facing block. Used at the top
@@ -3754,6 +3712,37 @@ mod tests {
         let response = parse_preplan_window_response("");
         assert!(response.notes.is_empty());
         assert!(response.commands.is_empty());
+        assert!(response.clarification.is_none());
+    }
+
+    #[test]
+    fn parse_preplan_window_response_captures_clarification() {
+        // A bare NEEDS_CLARIFICATION line sets the clarification field and
+        // does not pollute notes/commands.
+        let response = parse_preplan_window_response(
+            "NEEDS_CLARIFICATION: which run() function should accept the override?\n",
+        );
+        assert_eq!(
+            response.clarification,
+            Some("which run() function should accept the override?".to_string())
+        );
+        assert!(response.notes.is_empty());
+        assert!(response.commands.is_empty());
+    }
+
+    #[test]
+    fn parse_preplan_window_response_clarification_coexists_with_notes() {
+        // A confused model might emit a NOTE and also hedge with a
+        // clarification — we keep both, and the caller short-circuits on
+        // the clarification regardless.
+        let response = parse_preplan_window_response(
+            "NOTE run() at L12\nNEEDS_CLARIFICATION: which module owns this?\n",
+        );
+        assert_eq!(response.notes, vec!["run() at L12".to_string()]);
+        assert_eq!(
+            response.clarification,
+            Some("which module owns this?".to_string())
+        );
     }
 
     #[test]
@@ -3850,41 +3839,56 @@ mod tests {
     }
 
     #[test]
-    fn parse_invalid_task_accepts_keyword_with_reason() {
-        let r = parse_invalid_task("INVALID_TASK: file does not contain any auth code\n");
-        assert_eq!(r, Some("file does not contain any auth code".to_string()));
+    fn parse_needs_clarification_accepts_keyword_with_question() {
+        let r = parse_needs_clarification(
+            "NEEDS_CLARIFICATION: which of the two run() functions should accept the override?\n",
+        );
+        assert_eq!(
+            r,
+            Some("which of the two run() functions should accept the override?".to_string())
+        );
     }
 
     #[test]
-    fn parse_invalid_task_accepts_keyword_with_whitespace_reason() {
-        let r = parse_invalid_task("INVALID_TASK   the request is contradictory\n");
-        assert_eq!(r, Some("the request is contradictory".to_string()));
+    fn parse_needs_clarification_accepts_keyword_with_whitespace_question() {
+        let r = parse_needs_clarification(
+            "NEEDS_CLARIFICATION   what should the new parameter default to?\n",
+        );
+        assert_eq!(r, Some("what should the new parameter default to?".to_string()));
     }
 
     #[test]
-    fn parse_invalid_task_accepts_keyword_alone() {
-        let r = parse_invalid_task("INVALID_TASK");
+    fn parse_needs_clarification_accepts_keyword_alone() {
+        let r = parse_needs_clarification("NEEDS_CLARIFICATION");
         assert_eq!(r, Some(String::new()));
     }
 
     #[test]
-    fn parse_invalid_task_tolerates_leading_whitespace() {
-        let r = parse_invalid_task("  \n  INVALID_TASK: oops\n");
-        assert_eq!(r, Some("oops".to_string()));
+    fn parse_needs_clarification_tolerates_leading_whitespace() {
+        let r = parse_needs_clarification("  \n  NEEDS_CLARIFICATION: which field?\n");
+        assert_eq!(r, Some("which field?".to_string()));
     }
 
     #[test]
-    fn parse_invalid_task_rejects_lookalikes() {
-        // Don't false-match on a word that just starts with INVALID_TASK.
-        assert_eq!(parse_invalid_task("INVALID_TASKLIST"), None);
-        assert_eq!(parse_invalid_task("INVALID_TASKING: foo"), None);
+    fn parse_needs_clarification_rejects_lookalikes() {
+        // Don't false-match on a word that just starts with NEEDS_CLARIFICATION.
+        assert_eq!(parse_needs_clarification("NEEDS_CLARIFICATIONS"), None);
+        assert_eq!(parse_needs_clarification("NEEDS_CLARIFICATIONAL: foo"), None);
     }
 
     #[test]
-    fn parse_invalid_task_rejects_unrelated_text() {
-        assert_eq!(parse_invalid_task("NO_CHANGES"), None);
-        assert_eq!(parse_invalid_task("LITERAL_REPLACE\nSCOPE 1 1\n"), None);
-        assert_eq!(parse_invalid_task(""), None);
+    fn parse_needs_clarification_rejects_unrelated_text() {
+        assert_eq!(parse_needs_clarification("NO_CHANGES"), None);
+        assert_eq!(parse_needs_clarification("LITERAL_REPLACE\nSCOPE 1 1\n"), None);
+        assert_eq!(parse_needs_clarification(""), None);
+    }
+
+    #[test]
+    fn parse_needs_clarification_keeps_only_first_line() {
+        // The sentinel is single-line by contract — any trailing lines
+        // (e.g. stray tokens from a confused model) are dropped.
+        let r = parse_needs_clarification("NEEDS_CLARIFICATION: which file?\nNOTE stray");
+        assert_eq!(r, Some("which file?".to_string()));
     }
 
     #[test]
@@ -3925,7 +3929,7 @@ mod tests {
         // recognizes the pure, unambiguous signal.)
         assert!(!looks_like_no_changes("NO_CHANGES\nLITERAL_REPLACE\nSCOPE 1 1"));
         assert!(!looks_like_no_changes("LITERAL_REPLACE\nSCOPE 1 1\nNO_CHANGES"));
-        assert!(!looks_like_no_changes("INVALID_TASK: foo"));
+        assert!(!looks_like_no_changes("NEEDS_CLARIFICATION: which field?"));
     }
 
     #[test]
@@ -3933,65 +3937,6 @@ mod tests {
         assert!(!looks_like_no_changes("NO_CHANGE"));
         assert!(!looks_like_no_changes("NO_CHANGES_NEEDED"));
         assert!(!looks_like_no_changes("no_changes")); // case-sensitive on purpose
-    }
-
-    #[test]
-    fn missing_target_reasons_are_recognised() {
-        // Phrases that have actually shown up in benches.
-        let cases = [
-            "function `foo` not found in file",
-            "no match for `bar` in current state",
-            "the parameter `Y` does not exist in f's signature",
-            "target identifier doesn't appear in the file",
-            "auth module is not present yet",
-            "type X is not yet defined",
-            "could not find the requested symbol",
-            "couldn't find any matching block",
-            "cannot find region 10-20",
-            "the helper is missing from this file",
-            "import statement absent from current state",
-            "undefined identifier requested",
-            "no such function in this module",
-        ];
-        for case in cases {
-            assert!(
-                is_likely_missing_target_reason(case),
-                "expected missing-target reason: {case}"
-            );
-        }
-    }
-
-    #[test]
-    fn legitimately_incoherent_reasons_are_not_suppressed() {
-        // These describe a real problem with the task itself, not a
-        // missing target — they should NOT be suppressed.
-        let cases = [
-            "the task asks to write Python in this Rust file",
-            "the request is internally contradictory",
-            "task asks to delete the same line twice",
-            "this file is empty and the task is to refactor existing logic",
-            "the requested change would corrupt the file",
-        ];
-        for case in cases {
-            assert!(
-                !is_likely_missing_target_reason(case),
-                "should NOT suppress: {case}"
-            );
-        }
-    }
-
-    #[test]
-    fn missing_target_reason_check_is_case_insensitive() {
-        assert!(is_likely_missing_target_reason("FUNCTION NOT FOUND"));
-        assert!(is_likely_missing_target_reason("Symbol Doesn't Exist"));
-        assert!(is_likely_missing_target_reason("No Match"));
-    }
-
-    #[test]
-    fn missing_target_reason_empty_is_not_suppressed() {
-        // An empty INVALID_TASK reason is still a real (if uninformative)
-        // rejection — let it through.
-        assert!(!is_likely_missing_target_reason(""));
     }
 
     #[test]
