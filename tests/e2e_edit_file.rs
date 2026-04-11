@@ -1393,10 +1393,11 @@ async fn execute_preplan_repair_attempt_includes_structured_repair_context() {
 }
 
 #[tokio::test]
-async fn execute_preplan_invalid_task_short_circuits_with_reason() {
-    // The finalize call returns INVALID_TASK with a reason. The retry loop
-    // must short-circuit after the planning phase, the file must be left
-    // unchanged, and the tool result must surface the rejection reason.
+async fn execute_preplan_needs_clarification_short_circuits_with_question() {
+    // The finalize call returns NEEDS_CLARIFICATION with a specific question.
+    // The retry loop must short-circuit after the planning phase, the file
+    // must be left unchanged, and the tool result must surface the question
+    // plus the original task so the outer agent can rephrase.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -1406,9 +1407,11 @@ async fn execute_preplan_invalid_task_short_circuits_with_reason() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 0 => helpers::mock_text_response(
-                    "INVALID_TASK: file does not contain any auth code to update",
+                    "NEEDS_CLARIFICATION: which module owns the auth middleware you want removed?",
                 ),
-                _ => unreachable!("INVALID_TASK should short-circuit the retry loop"),
+                _ => unreachable!(
+                    "NEEDS_CLARIFICATION should short-circuit the retry loop"
+                ),
             }
         })
         .mount(&mock_server)
@@ -1428,17 +1431,25 @@ async fn execute_preplan_invalid_task_short_circuits_with_reason() {
         .await
         .unwrap();
 
-    assert!(!result.success, "INVALID_TASK should surface as a failure");
     assert!(
-        result.content.contains("rejected task as invalid"),
-        "expected rejection marker, got: {}",
+        !result.success,
+        "NEEDS_CLARIFICATION should surface as a failure"
+    );
+    assert!(
+        result.content.contains("needs clarification"),
+        "expected clarification marker, got: {}",
         result.content
     );
     assert!(
         result
             .content
-            .contains("file does not contain any auth code to update"),
-        "expected reason in tool output, got: {}",
+            .contains("which module owns the auth middleware you want removed?"),
+        "expected question in tool output, got: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("remove the auth middleware"),
+        "expected original task echoed, got: {}",
         result.content
     );
     assert!(
@@ -1446,7 +1457,7 @@ async fn execute_preplan_invalid_task_short_circuits_with_reason() {
         "expected unmodified note, got: {}",
         result.content
     );
-    // finalize only = 1, no retries after INVALID_TASK.
+    // finalize only = 1, no retries after NEEDS_CLARIFICATION.
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     // File on disk unchanged.
     assert_eq!(
@@ -1456,9 +1467,9 @@ async fn execute_preplan_invalid_task_short_circuits_with_reason() {
 }
 
 #[tokio::test]
-async fn execute_preplan_invalid_task_without_reason_uses_placeholder() {
-    // Bare `INVALID_TASK` (no colon, no reason) at the finalize phase
-    // should still short-circuit and surface a "no reason provided"
+async fn execute_preplan_needs_clarification_without_question_uses_placeholder() {
+    // Bare `NEEDS_CLARIFICATION` (no colon, no question) at the finalize phase
+    // should still short-circuit and surface a "no question provided"
     // placeholder rather than an empty string in the user-facing message.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1468,8 +1479,10 @@ async fn execute_preplan_invalid_task_without_reason_uses_placeholder() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                0 => helpers::mock_text_response("INVALID_TASK"),
-                _ => unreachable!("INVALID_TASK should short-circuit the retry loop"),
+                0 => helpers::mock_text_response("NEEDS_CLARIFICATION"),
+                _ => unreachable!(
+                    "NEEDS_CLARIFICATION should short-circuit the retry loop"
+                ),
             }
         })
         .mount(&mock_server)
@@ -1482,7 +1495,7 @@ async fn execute_preplan_invalid_task_without_reason_uses_placeholder() {
     let router = miniswe::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
-        "task": "incoherent task",
+        "task": "ambiguous task",
         "lsp_validation": "off"
     });
     let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
@@ -1490,7 +1503,7 @@ async fn execute_preplan_invalid_task_without_reason_uses_placeholder() {
         .unwrap();
 
     assert!(!result.success);
-    assert!(result.content.contains("no reason provided"));
+    assert!(result.content.contains("no question provided"));
     // finalize only = 1
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -1500,12 +1513,12 @@ async fn execute_preplan_invalid_task_without_reason_uses_placeholder() {
 }
 
 #[tokio::test]
-async fn execute_preplan_invalid_task_during_repair_short_circuits() {
+async fn execute_preplan_needs_clarification_during_repair_short_circuits() {
     // Plan 1 fails to apply (literal OLD doesn't match, smart fallback
     // returns NO_CHANGES once and bubbles up). On the repair attempt,
-    // the model realizes the task is impossible and emits INVALID_TASK.
-    // The retry loop must stop immediately and surface the reason — no
-    // further planning attempts after the rejection.
+    // the model realizes the task is too ambiguous and emits
+    // NEEDS_CLARIFICATION. The retry loop must stop immediately and
+    // surface the question — no further planning attempts after it.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -1520,11 +1533,13 @@ async fn execute_preplan_invalid_task_during_repair_short_circuits() {
                 ),
                 // Smart fallback (single attempt)
                 1 => helpers::mock_text_response("NO_CHANGES"),
-                // Plan attempt 2 (repair) — model decides the task is impossible.
+                // Plan attempt 2 (repair) — model decides the task is ambiguous.
                 2 => helpers::mock_text_response(
-                    "INVALID_TASK: file structure does not match the task description",
+                    "NEEDS_CLARIFICATION: which calls should be updated and what are the new arguments?",
                 ),
-                _ => unreachable!("INVALID_TASK should short-circuit the retry loop"),
+                _ => unreachable!(
+                    "NEEDS_CLARIFICATION should short-circuit the retry loop"
+                ),
             }
         })
         .mount(&mock_server)
@@ -1546,18 +1561,18 @@ async fn execute_preplan_invalid_task_during_repair_short_circuits() {
 
     assert!(!result.success, "{}", result.content);
     assert!(
-        result.content.contains("rejected task as invalid"),
-        "expected rejection marker, got: {}",
+        result.content.contains("needs clarification"),
+        "expected clarification marker, got: {}",
         result.content
     );
     assert!(
         result
             .content
-            .contains("file structure does not match the task description"),
-        "expected reason in tool output, got: {}",
+            .contains("which calls should be updated and what are the new arguments?"),
+        "expected question in tool output, got: {}",
         result.content
     );
-    // plan1: 1 finalize + 1 fallback NO_CHANGES + plan2: 1 finalize (INVALID_TASK) = 3
+    // plan1: 1 finalize + 1 fallback NO_CHANGES + plan2: 1 finalize (NEEDS_CLARIFICATION) = 3
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     // File unchanged — plan 1's literal didn't match, so no edits applied.
     assert_eq!(
@@ -1567,12 +1582,12 @@ async fn execute_preplan_invalid_task_during_repair_short_circuits() {
 }
 
 #[tokio::test]
-async fn execute_preplan_invalid_task_with_missing_target_reason_is_suppressed_and_retries() {
-    // The model rejects with INVALID_TASK but the reason is "target not
-    // found in current state" — that's a missing prerequisite, NOT an
-    // incoherent task. We should suppress the rejection, set up a repair
-    // context with a hint, and retry. On the second attempt the model
-    // produces a valid plan and the edit applies.
+async fn execute_preplan_missing_target_is_not_treated_as_clarification_and_retries() {
+    // The first attempt fails to find the target (plan parses but nothing
+    // applies), but the model must NOT use NEEDS_CLARIFICATION for a
+    // missing target — that's exactly what the edit is for. The second
+    // attempt produces a valid plan and the edit applies. This test
+    // guards the retry flow for "target doesn't exist yet" cases.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -1581,12 +1596,14 @@ async fn execute_preplan_invalid_task_with_missing_target_reason_is_suppressed_a
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                // Plan attempt 1: finalize → false-positive INVALID_TASK
+                // Plan attempt 1: literal whose OLD doesn't match
                 0 => helpers::mock_text_response(
-                    "INVALID_TASK: target function `foo` not found in the file",
+                    "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\nfoo();\nEND_OLD\nNEW:\nbar();\nEND_NEW\nEND\n",
                 ),
-                // Plan attempt 2 (after suppression + repair context): finalize → real plan
-                1 => helpers::mock_text_response(
+                // Smart fallback for the missing match
+                1 => helpers::mock_text_response("NO_CHANGES"),
+                // Plan attempt 2 (repair) — now it reads the file correctly
+                2 => helpers::mock_text_response(
                     "LITERAL_REPLACE\nSCOPE 1 1\nALL false\nOLD:\noriginal();\nEND_OLD\nNEW:\nfoo();\nEND_NEW\nEND\n",
                 ),
                 _ => panic!("unexpected extra call #{n} — repair retry should have succeeded"),
@@ -1611,77 +1628,15 @@ async fn execute_preplan_invalid_task_with_missing_target_reason_is_suppressed_a
 
     assert!(
         result.success,
-        "expected success after suppression+repair, got: {}",
+        "expected success after repair retry, got: {}",
         result.content
     );
-    assert!(
-        result.content.contains("suppressed false-positive INVALID_TASK"),
-        "expected suppression note in tool output, got: {}",
-        result.content
-    );
-    // plan1: 1 finalize (rejected) + plan2: 1 finalize (succeeded) = 2 total
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    // plan1: 1 finalize + 1 fallback + plan2: 1 finalize = 3 total
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
     // File should now contain the renamed call.
     assert_eq!(
         fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
         "foo();\n"
-    );
-}
-
-#[tokio::test]
-async fn execute_preplan_invalid_task_with_real_incoherent_reason_still_short_circuits() {
-    // Counterpoint to the suppression test: a "real" INVALID_TASK reason
-    // that doesn't mention any missing/not-found phrases should still
-    // short-circuit the loop (no retry) and surface the rejection.
-    let mock_server = MockServer::start().await;
-    let calls = Arc::new(AtomicUsize::new(0));
-    let calls_for_mock = calls.clone();
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(move |_req: &wiremock::Request| {
-            let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
-            match n {
-                0 => helpers::mock_text_response(
-                    "INVALID_TASK: the task asks to write Python in this Rust file",
-                ),
-                _ => unreachable!(
-                    "real INVALID_TASK should short-circuit the retry loop without further calls"
-                ),
-            }
-        })
-        .mount(&mock_server)
-        .await;
-
-    let (_tmp, mut config) = helpers::create_test_project();
-    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
-    fs::write(config.project_root.join("main.rs"), "println!(\"hi\");\n").unwrap();
-
-    let router = miniswe::llm::ModelRouter::new(&config);
-    let args = serde_json::json!({
-        "path": "main.rs",
-        "task": "convert this file to Python",
-        "lsp_validation": "off"
-    });
-    let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
-        .await
-        .unwrap();
-
-    assert!(!result.success);
-    assert!(
-        result.content.contains("rejected task as invalid"),
-        "expected rejection marker, got: {}",
-        result.content
-    );
-    assert!(
-        result.content.contains("write Python in this Rust file"),
-        "expected reason in tool output, got: {}",
-        result.content
-    );
-    // finalize only = 1 call, no retry.
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        fs::read_to_string(config.project_root.join("main.rs")).unwrap(),
-        "println!(\"hi\");\n"
     );
 }
 
@@ -1955,8 +1910,9 @@ async fn execute_empty_file_skips_windowed_pass() {
     // the skip, the model would have been called with a degenerate 0-line
     // window slice ("Slice 1/1, lines 1-0 of 0").
     //
-    // We make the planner short-circuit with INVALID_TASK so the test only
-    // exercises the preplan phase pipeline, not downstream edit application.
+    // We make the planner short-circuit with NEEDS_CLARIFICATION so the
+    // test only exercises the preplan phase pipeline, not downstream edit
+    // application.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -1964,7 +1920,9 @@ async fn execute_empty_file_skips_windowed_pass() {
         .and(path("/v1/chat/completions"))
         .respond_with(move |_req: &wiremock::Request| {
             calls_for_mock.fetch_add(1, Ordering::SeqCst);
-            helpers::mock_text_response("INVALID_TASK: empty file, nothing to do")
+            helpers::mock_text_response(
+                "NEEDS_CLARIFICATION: file is empty — what contents should it have?",
+            )
         })
         .mount(&mock_server)
         .await;
@@ -1984,7 +1942,7 @@ async fn execute_empty_file_skips_windowed_pass() {
         .await
         .unwrap();
 
-    // INVALID_TASK short-circuits → exactly one LLM call total.
+    // NEEDS_CLARIFICATION short-circuits → exactly one LLM call total.
     // That single call MUST be the finalize prompt — no windowed pass.
     assert_eq!(
         calls.load(Ordering::SeqCst),
