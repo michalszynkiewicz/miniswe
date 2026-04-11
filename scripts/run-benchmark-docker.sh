@@ -50,6 +50,7 @@ trap cleanup EXIT INT TERM
 # Defaults
 TIMEOUT=1800
 MAX_ROUNDS=50
+MAX_ATTEMPTS=3
 TEMPERATURE=0.0
 MODEL="devstral-small-2"
 TASK="Add a CLI flag --system-prompt-override (short: -s) that takes a string and replaces the default system prompt with the provided text. When this flag is set, skip all context providers and just use the override text as the system message. Make sure it works for both single-shot and interactive modes."
@@ -59,6 +60,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --timeout)      TIMEOUT="$2";      shift 2 ;;
         --max-rounds)   MAX_ROUNDS="$2";   shift 2 ;;
+        --max-attempts) MAX_ATTEMPTS="$2"; shift 2 ;;
         --temperature)  TEMPERATURE="$2";  shift 2 ;;
         --model)        MODEL="$2";        shift 2 ;;
         --task)         TASK="$2";         shift 2 ;;
@@ -75,6 +77,7 @@ echo "SHA:      ${BASELINE_SHA}"
 echo "Model:    ${MODEL}"
 echo "Timeout:  ${TIMEOUT}s"
 echo "Rounds:   ${MAX_ROUNDS}"
+echo "Attempts: ${MAX_ATTEMPTS}"
 echo "Results:  ${RESULTS_DIR}"
 echo "Task:     ${TASK:0:80}..."
 echo ""
@@ -181,7 +184,7 @@ set -uo pipefail
 SHA="$1"
 TASK="$2"
 TIMEOUT="$3"
-MAX_ATTEMPTS=3
+MAX_ATTEMPTS="$4"
 
 # Fresh checkout
 cd /work
@@ -254,9 +257,12 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
         PASS=$((PASS + 1))
     else
         echo "compile:FAIL"
+        COMPILE_ERR_COUNT=$(grep -cE '^error(\[|:)' /output/cargo_check.txt 2>/dev/null || echo 0)
+        COMPILE_ERR_FILES=$(grep -oP '(?<=--> )\S+' /output/cargo_check.txt 2>/dev/null | sort -u | head -5 | tr '\n' ' ')
         ERRORS="${ERRORS}
-COMPILE ERROR:
-$(grep '^error' /output/cargo_check.txt | head -20)"
+COMPILE FAILED (${COMPILE_ERR_COUNT} errors):
+$(grep -E '^error(\[|:)|^\s*-->|^\s*\|' /output/cargo_check.txt | head -60)
+Affected files: ${COMPILE_ERR_FILES}"
     fi
 
     # Check 2: cargo build
@@ -268,6 +274,11 @@ $(grep '^error' /output/cargo_check.txt | head -20)"
             PASS=$((PASS + 1))
         else
             echo "build:FAIL"
+            BUILD_ERR_FILES=$(grep -oP '(?<=--> )\S+' /output/cargo_build.txt 2>/dev/null | sort -u | head -5 | tr '\n' ' ')
+            ERRORS="${ERRORS}
+BUILD FAILED (cargo check passed but cargo build did not — likely a linker or proc-macro error):
+$(grep -E '^error(\[|:)|^\s*-->' /output/cargo_build.txt | head -30)
+Affected files: ${BUILD_ERR_FILES}"
         fi
     else
         echo "build:SKIP"
@@ -285,47 +296,66 @@ $(grep '^error' /output/cargo_check.txt | head -20)"
         else
             echo "help:FAIL"
             ERRORS="${ERRORS}
---help does not show a flag related to 'prompt'."
+HELP FAILED: \`miniswe --help\` output does not contain any flag matching '--*prompt*'. The feature must add a new CLI flag whose long name contains 'prompt' (e.g. --system-prompt-override). Current --help output:
+$(head -40 /output/help_output.txt)"
         fi
     fi
 
     # Check 4: flag parses
     TOTAL=$((TOTAL + 1))
     if [ -f "${BINARY}" ] && [ -n "${FLAG}" ]; then
-        if "${BINARY}" ${FLAG} "test" --help > /dev/null 2>&1; then
+        if "${BINARY}" ${FLAG} "test" --help > /output/parse_output.txt 2>&1; then
             echo "parse:PASS"
             PASS=$((PASS + 1))
         else
             echo "parse:FAIL"
+            ERRORS="${ERRORS}
+PARSE FAILED: the CLI did not accept \`${BINARY} ${FLAG} \"test\" --help\` as a valid invocation. The ${FLAG} flag must take a single string argument. stderr/stdout was:
+$(head -20 /output/parse_output.txt)"
         fi
     fi
 
     # Check 5: cargo test
     TOTAL=$((TOTAL + 1))
     if [ "$PASS" -ge 2 ]; then
-        if RUSTFLAGS="-A warnings" cargo test 2> /output/cargo_test.txt; then
+        if RUSTFLAGS="-A warnings" cargo test > /output/cargo_test.txt 2>&1; then
             echo "test:PASS"
             PASS=$((PASS + 1))
         else
             echo "test:FAIL"
-            # Count errors and extract affected files
-            TEST_ERROR_COUNT=$(grep -c 'error\[E' /output/cargo_test.txt 2>/dev/null || echo 0)
-            TEST_ERROR_FILES=$(grep -oP '(?<=--> )\S+' /output/cargo_test.txt 2>/dev/null | sort -u | head -5)
-            ERRORS="${ERRORS}
-TESTS FAILED (${TEST_ERROR_COUNT} errors):
-$(grep -E 'error\[E|arguments but' /output/cargo_test.txt | head -10)
+            TEST_COMPILE_ERRORS=$(grep -cE '^error(\[|:)' /output/cargo_test.txt 2>/dev/null || echo 0)
+            TEST_RUNTIME_FAILURES=$(grep -cE '^test .* \.\.\. FAILED$' /output/cargo_test.txt 2>/dev/null || echo 0)
+            TEST_PANICS=$(grep -cE 'panicked at|assertion .*failed' /output/cargo_test.txt 2>/dev/null || echo 0)
+            TEST_ERROR_FILES=$(grep -oP '(?<=--> )\S+' /output/cargo_test.txt 2>/dev/null | sort -u | head -5 | tr '\n' ' ')
+            FAILED_TEST_NAMES=$(grep -E '^test .* \.\.\. FAILED$' /output/cargo_test.txt 2>/dev/null | sed 's/^test //;s/ \.\.\. FAILED$//' | head -10 | tr '\n' ' ')
+
+            if [ "${TEST_COMPILE_ERRORS}" -gt 0 ]; then
+                ERRORS="${ERRORS}
+TESTS FAILED TO COMPILE (${TEST_COMPILE_ERRORS} errors):
+$(grep -E '^error(\[|:)|^\s*-->|arguments but' /output/cargo_test.txt | head -20)
 Affected files: ${TEST_ERROR_FILES}
-HINT: If many calls need a new parameter, use shell() with sed to add it in bulk, e.g.:
+HINT: If many call sites need a new parameter, use shell() with sed to add it in bulk, e.g.:
   sed -i 's/old_fn(\\(.*\\));/old_fn(\\1, None);/g' tests/e2e_context.rs"
+            else
+                ERRORS="${ERRORS}
+TESTS FAILED AT RUNTIME (${TEST_RUNTIME_FAILURES} failing tests, ${TEST_PANICS} panics/assertions):
+Failed tests: ${FAILED_TEST_NAMES}
+
+Failure output (first matches):
+$(grep -A5 -E 'panicked at|assertion .*failed|^test .* \.\.\. FAILED$' /output/cargo_test.txt | head -40)
+
+HINT: These tests compiled but their assertions failed. Re-read the failing test source and fix the code (or the test) so the assertions hold. Do NOT just delete or ignore the failing tests."
+            fi
         fi
     fi
 
     # Check 6: smoke test — override prompt to produce predictable output
     TOTAL=$((TOTAL + 1))
     if [ -f "${BINARY}" ] && [ -n "${FLAG}" ] && [ "$PASS" -ge 4 ]; then
+        SMOKE_OVERRIDE='You must respond with exactly the text PONG_42 and nothing else. No explanation, no formatting, just PONG_42.'
         SMOKE_OUTPUT=$(timeout 120 "${BINARY}" \
-            ${FLAG} "You must respond with exactly the text PONG_42 and nothing else. No explanation, no formatting, just PONG_42." \
-            --yes "ping" 2>/dev/null || true)
+            ${FLAG} "${SMOKE_OVERRIDE}" \
+            --yes "ping" 2>/output/smoke_stderr.txt || true)
         echo "${SMOKE_OUTPUT}" > /output/smoke_output.txt
 
         if echo "${SMOKE_OUTPUT}" | grep -q "PONG_42"; then
@@ -334,8 +364,15 @@ HINT: If many calls need a new parameter, use shell() with sed to add it in bulk
         else
             echo "smoke:FAIL"
             ERRORS="${ERRORS}
-SMOKE TEST: override prompt should make model respond with PONG_42 but output was:
-$(echo "${SMOKE_OUTPUT}" | head -5)"
+SMOKE TEST FAILED.
+Invocation:
+  ${BINARY} ${FLAG} \"${SMOKE_OVERRIDE}\" --yes \"ping\"
+Expected: the model's response contains the literal string PONG_42 (because the override instructs it to reply with exactly that).
+Actual stdout (first 5 lines):
+$(echo "${SMOKE_OUTPUT}" | head -5)
+Actual stderr (first 5 lines):
+$(head -5 /output/smoke_stderr.txt 2>/dev/null)
+The override is being silently ignored — the feature is incomplete."
         fi
     fi
 
@@ -394,7 +431,7 @@ SCRIPT
         -v "${tmp_script}:/run.sh:ro" \
         --name "${container_name}" \
         "${IMAGE_NAME}" \
-        bash /run.sh "${BASELINE_SHA}" "${TASK}" "${TIMEOUT}" \
+        bash /run.sh "${BASELINE_SHA}" "${TASK}" "${TIMEOUT}" "${MAX_ATTEMPTS}" \
         2>&1 | tee "${variant_dir}/container.log"
 
     local end_time
