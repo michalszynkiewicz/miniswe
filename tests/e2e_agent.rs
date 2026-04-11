@@ -311,6 +311,175 @@ async fn llm_client_stream_idle_timeout_retries_and_eventually_gives_up() {
     );
 }
 
+#[tokio::test]
+async fn llm_client_chat_stream_idle_timeout_fires_on_hung_connection() {
+    // Same idle-timeout guarantee as `chat()`, but exercised through
+    // the streaming path that the agent loop actually uses. Without
+    // the per-chunk idle wrapper this test would block on the hung
+    // SSE socket until the test runner timed out.
+    let (uri, counter) = start_hanging_sse_server(1).await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &uri);
+    config.model.stream_idle_timeout_secs = 1;
+    config.model.request_timeout_secs = 30;
+    config.model.max_retries = 0;
+
+    let client = LlmClient::new(config.model.clone());
+    let request = ChatRequest {
+        messages: vec![Message::user("hi")],
+        tools: None,
+        tool_choice: None,
+    };
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut tokens = Vec::new();
+    let start = std::time::Instant::now();
+    let result = client
+        .chat_stream(&request, |t| tokens.push(t.to_string()), &cancelled)
+        .await;
+    let elapsed = start.elapsed();
+
+    let err = result.expect_err("expected idle-timeout error from chat_stream, got Ok");
+    assert!(
+        err.to_string().contains("LLM stream idle"),
+        "error should mention idle timeout, got: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "idle timeout should fire quickly, took {elapsed:?}"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "exactly one connection (max_retries=0)"
+    );
+    assert!(
+        tokens.is_empty(),
+        "no tokens should reach the UI before the stall"
+    );
+}
+
+#[tokio::test]
+async fn llm_client_chat_stream_idle_timeout_retries_when_no_progress() {
+    // Two hanging connections; chat_stream should retry once because
+    // no UI tokens were emitted on the first attempt, then bail with
+    // a final "LLM stream idle" error.
+    let (uri, counter) = start_hanging_sse_server(2).await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &uri);
+    config.model.stream_idle_timeout_secs = 1;
+    config.model.request_timeout_secs = 30;
+    config.model.max_retries = 1;
+
+    let client = LlmClient::new(config.model.clone());
+    let request = ChatRequest {
+        messages: vec![Message::user("hi")],
+        tools: None,
+        tool_choice: None,
+    };
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let result = client.chat_stream(&request, |_| {}, &cancelled).await;
+    let err = result.expect_err("expected idle-timeout error after retry");
+    assert!(
+        err.to_string().contains("LLM stream idle"),
+        "error should mention idle timeout, got: {err}"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "should have made initial attempt + 1 retry"
+    );
+}
+
+#[tokio::test]
+async fn llm_client_chat_stream_no_retry_after_partial_progress() {
+    // Server sends one usable SSE event then stalls forever — that
+    // counts as "had progress", so chat_stream must surface the idle
+    // error instead of retrying (a retry would re-stream the same
+    // tokens to the UI and corrupt the rendered conversation).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = Arc::clone(&counter);
+    tokio::spawn(async move {
+        for _ in 0..4 {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let mut read_total = 0usize;
+                while read_total < 4096 {
+                    match socket.read(&mut buf[read_total..]).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            read_total += n;
+                            if buf[..read_total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let headers = b"HTTP/1.1 200 OK\r\n\
+                    Content-Type: text/event-stream\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    Cache-Control: no-cache\r\n\
+                    \r\n";
+                if socket.write_all(headers).await.is_err() {
+                    return;
+                }
+                // One SSE chunk, framed as a chunked-encoding piece.
+                let event = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
+                let chunk = format!("{:x}\r\n{}\r\n", event.len(), event);
+                let _ = socket.write_all(chunk.as_bytes()).await;
+                let _ = socket.flush().await;
+                // Then stall.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+    let uri = format!("http://{addr}");
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &uri);
+    config.model.stream_idle_timeout_secs = 1;
+    config.model.request_timeout_secs = 30;
+    config.model.max_retries = 3; // would retry plenty if not for the guard
+
+    let client = LlmClient::new(config.model.clone());
+    let request = ChatRequest {
+        messages: vec![Message::user("hi")],
+        tools: None,
+        tool_choice: None,
+    };
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut tokens = Vec::new();
+    let result = client
+        .chat_stream(&request, |t| tokens.push(t.to_string()), &cancelled)
+        .await;
+
+    let err = result.expect_err("expected idle-timeout after partial stream");
+    assert!(
+        err.to_string().contains("LLM stream idle"),
+        "error should mention idle timeout, got: {err}"
+    );
+    assert_eq!(
+        tokens, vec!["hi"],
+        "exactly one token should have been delivered to the UI"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "must NOT retry once any progress reached the UI (no duplicate tokens)"
+    );
+}
+
 // ── Single tool call flow ───────────────────────────────────────────
 
 #[tokio::test]
