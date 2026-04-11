@@ -778,13 +778,16 @@ async fn execute_planned_steps(
                         // line at the bottom captures the totals.
                     }
                     Err(literal_error) => {
-                        // Before falling back to smart-edit, try to rescue
-                        // a misplaced OLD block by searching the whole file
-                        // for a candidate (byte-exact first, then
-                        // whitespace-tolerant), picking the best match with
-                        // a locality bias toward the declared scope, and
-                        // asking the planner to confirm the corrected line
-                        // range via a single YES/NO round-trip.
+                        // Try to rescue a misplaced OLD block by searching
+                        // the whole file for a candidate (byte-exact first,
+                        // then whitespace-tolerant), picking the best match
+                        // with a locality bias toward the declared scope,
+                        // and asking the planner to confirm the corrected
+                        // line range via a single YES/NO round-trip. If the
+                        // rescue cannot find a candidate or the planner
+                        // rejects it, bubble straight up to plan-level
+                        // repair — we no longer burn a smart-edit call on
+                        // a LITERAL_REPLACE the planner got wrong.
                         let outcome = try_relocate_and_replace(
                             path_str,
                             &current,
@@ -810,14 +813,8 @@ async fn execute_planned_steps(
                                 message.push_str(&format!(
                                     "literal-replace L{scope_start}-L{scope_end} relocated to L{new_start}-L{new_end} after planner confirmation\n"
                                 ));
-                                continue;
                             }
                             RelocateOutcome::Rejected => {
-                                // Planner confirmed the candidate is wrong.
-                                // Don't burn time on smart-edit (which won't
-                                // have any new information); bubble straight
-                                // up to plan-level repair so the planner
-                                // re-emits a correct OLD with full context.
                                 return Err(PlannedExecutionFailure {
                                     current_content: current.clone(),
                                     message: format!(
@@ -837,61 +834,25 @@ async fn execute_planned_steps(
                                 });
                             }
                             RelocateOutcome::NoCandidate => {
-                                // Fall through to existing smart-edit fallback.
+                                return Err(PlannedExecutionFailure {
+                                    current_content: current.clone(),
+                                    message: format!(
+                                        "{message}Pre-plan step {} literal L{}-L{} failed after {} completed step(s): {literal_error}; no relocation candidate found in file\n",
+                                        idx + 1,
+                                        scope_start,
+                                        scope_end,
+                                        completed_count
+                                    ),
+                                    error: format!(
+                                        "step {} literal replace failed: {literal_error}; no relocation candidate found in file",
+                                        idx + 1
+                                    ),
+                                    completed_steps: completed_records.clone(),
+                                    failed_step: Some(step.clone()),
+                                    lsp_regression: None,
+                                });
                             }
                         }
-
-                        let fallback_task = format!(
-                            "The planned exact literal replacement failed: {literal_error}\n\
-                             Apply the same intended change manually within this region only.\n\n\
-                             Intended OLD:\n{}\n\n\
-                             Intended NEW:\n{}",
-                            old.join("\n"),
-                            new.join("\n")
-                        );
-                        let region = EditRegion {
-                            start: *scope_start,
-                            end: *scope_end,
-                            task: fallback_task,
-                        };
-                        let (candidate, count) = execute_smart_step(
-                            path_str,
-                            &region.task,
-                            &current,
-                            router,
-                            lsp_validation,
-                            &region,
-                            false,
-                            cancelled,
-                            log,
-                        )
-                        .await
-                        .map_err(|e| PlannedExecutionFailure {
-                            current_content: current.clone(),
-                            message: format!(
-                                "{message}Pre-plan step {} literal L{}-L{} failed after {} completed step(s): {literal_error}; smart fallback failed: {e}\n",
-                                idx + 1,
-                                scope_start,
-                                scope_end,
-                                completed_count
-                            ),
-                            error: format!(
-                                "step {} literal replace failed: {literal_error}; smart fallback failed: {e}",
-                                idx + 1
-                            ),
-                            completed_steps: completed_records.clone(),
-                            failed_step: Some(step.clone()),
-                            lsp_regression: None,
-                        })?;
-                        current = candidate;
-                        completed_count += 1;
-                        completed_records.push(step.clone());
-                        // Smart fallback IS interesting — the planner's
-                        // exact OLD didn't match and we had to ask the
-                        // smart executor to redo the region. Surface it.
-                        message.push_str(&format!(
-                            "literal-replace L{scope_start}-L{scope_end} fell back to smart edit ({count} op(s))\n"
-                        ));
                     }
                 }
             }
@@ -1044,7 +1005,7 @@ async fn execute_smart_step(
         if allow_no_changes {
             return Ok((current.to_string(), 0));
         }
-        bail!("smart fallback returned NO_CHANGES");
+        bail!("smart edit returned NO_CHANGES");
     }
 
     let candidate = apply_patch_dry_run_in_region(current, &ops, region.start, region.end)?;
