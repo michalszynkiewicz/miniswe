@@ -567,6 +567,64 @@ async fn execute_planned_steps(
                         // line at the bottom captures the totals.
                     }
                     Err(literal_error) => {
+                        // Before falling back to smart-edit, try to rescue
+                        // the common pathology where the planner hallucinated
+                        // trivial whitespace in the OLD block (extra space,
+                        // tab vs spaces, stray newline). The whitespace-
+                        // tolerant fallback locates a candidate in scope and
+                        // asks the planner via a single round-trip whether
+                        // that candidate is the intended target.
+                        let outcome = try_whitespace_tolerant_replace(
+                            path_str,
+                            &current,
+                            *scope_start,
+                            *scope_end,
+                            old,
+                            new,
+                            router,
+                            cancelled,
+                            log,
+                        )
+                        .await;
+
+                        match outcome {
+                            WhitespaceOutcome::Applied(new_content) => {
+                                current = new_content;
+                                completed_count += 1;
+                                completed_records.push(step.clone());
+                                message.push_str(&format!(
+                                    "literal-replace L{scope_start}-L{scope_end} matched after whitespace normalization\n"
+                                ));
+                                continue;
+                            }
+                            WhitespaceOutcome::Rejected => {
+                                // Planner confirmed the candidate is wrong.
+                                // Don't burn time on smart-edit (which won't
+                                // have any new information); bubble straight
+                                // up to plan-level repair so the planner
+                                // re-emits a correct OLD with full context.
+                                return Err(PlannedExecutionFailure {
+                                    current_content: current.clone(),
+                                    message: format!(
+                                        "{message}Pre-plan step {} literal L{}-L{} failed after {} completed step(s): {literal_error}; whitespace-tolerant candidate rejected by planner\n",
+                                        idx + 1,
+                                        scope_start,
+                                        scope_end,
+                                        completed_count
+                                    ),
+                                    error: format!(
+                                        "step {} literal replace failed: {literal_error}; whitespace-tolerant candidate rejected by planner",
+                                        idx + 1
+                                    ),
+                                    completed_steps: completed_records.clone(),
+                                    failed_step: Some(step.clone()),
+                                });
+                            }
+                            WhitespaceOutcome::NoCandidate => {
+                                // Fall through to existing smart-edit fallback.
+                            }
+                        }
+
                         let fallback_task = format!(
                             "The planned exact literal replacement failed: {literal_error}\n\
                              Apply the same intended change manually within this region only.\n\n\
@@ -2661,6 +2719,248 @@ pub fn apply_literal_replace_in_scope(
     Ok((out, count))
 }
 
+/// Outcome of a whitespace-tolerant literal-replace fallback attempt.
+///
+/// The planner sometimes hallucinates trivial whitespace inside an OLD
+/// block (extra space, tab vs spaces, stray newline). When the byte-exact
+/// matcher rejects such a block we strip all whitespace from both the
+/// OLD text and the scoped slice, look for the OLD as a substring, and —
+/// if found — ask the planner via a single round-trip whether the
+/// candidate is the intended target.
+enum WhitespaceOutcome {
+    /// Candidate found, planner confirmed, replacement applied. Carries
+    /// the new file content ready to swap into `current`.
+    Applied(String),
+    /// Candidate found but the planner rejected it. The caller should
+    /// bubble straight up to plan-level repair instead of running the
+    /// smart-edit fallback (which has no new information to work with).
+    Rejected,
+    /// No whitespace-tolerant candidate exists in the scope, or the
+    /// confirmation request itself failed. The caller should fall through
+    /// to the existing smart-edit fallback.
+    NoCandidate,
+}
+
+/// Walk `scoped` looking for the first whitespace-tolerant occurrence of
+/// `old_text`. Returns the byte range in `scoped` (relative to the slice
+/// start, not the whole file) of that match, or `None` if no match
+/// exists.
+///
+/// "Whitespace-tolerant" means: strip every whitespace character from
+/// both `old_text` and `scoped`, find `old_text` as a substring, then
+/// map the match position back to the original byte range in `scoped`.
+/// This rescues hallucinations like `</div >` (extra space inside an
+/// HTML tag) and tab/space drift in indented code.
+///
+/// Multiple candidates: returns the first occurrence only. We could
+/// disambiguate by asking the model which one it meant, but in practice
+/// the first match is almost always right and the planner round-trip
+/// already filters out wrong picks.
+fn find_whitespace_tolerant_match(scoped: &str, old_text: &str) -> Option<(usize, usize)> {
+    let old_squashed: String = old_text.chars().filter(|c| !c.is_whitespace()).collect();
+    if old_squashed.is_empty() {
+        return None;
+    }
+
+    // Build a parallel byte-index map so a match position in the squashed
+    // string can be translated back to the byte range it occupied in the
+    // original `scoped` slice. `starts[i]` and `ends[i]` are the start and
+    // end byte offsets in `scoped` of the source character whose first
+    // (squashed) byte is at squashed-index `i`. Multiple squashed bytes
+    // share the same source range when the source character is multibyte.
+    let mut squashed = String::with_capacity(scoped.len());
+    let mut starts: Vec<usize> = Vec::with_capacity(scoped.len());
+    let mut ends: Vec<usize> = Vec::with_capacity(scoped.len());
+    for (byte_idx, c) in scoped.char_indices() {
+        if c.is_whitespace() {
+            continue;
+        }
+        let char_end = byte_idx + c.len_utf8();
+        for _ in 0..c.len_utf8() {
+            starts.push(byte_idx);
+            ends.push(char_end);
+        }
+        squashed.push(c);
+    }
+
+    let match_start = squashed.find(&old_squashed)?;
+    let match_end = match_start + old_squashed.len();
+    if match_end == 0 || match_end > starts.len() {
+        return None;
+    }
+
+    let scoped_start = starts[match_start];
+    let scoped_end = ends[match_end - 1];
+    Some((scoped_start, scoped_end))
+}
+
+/// Try to rescue a failed literal replace by locating a whitespace-
+/// tolerant candidate in scope and asking the planner to confirm it.
+/// See [`WhitespaceOutcome`] for the three possible results.
+#[allow(clippy::too_many_arguments)]
+async fn try_whitespace_tolerant_replace(
+    path_str: &str,
+    content: &str,
+    scope_start: usize,
+    scope_end: usize,
+    old: &[String],
+    new: &[String],
+    router: &ModelRouter,
+    cancelled: Option<&AtomicBool>,
+    log: Option<&SessionLog>,
+) -> WhitespaceOutcome {
+    let parts: Vec<&str> = content.split_inclusive('\n').collect();
+    if scope_start == 0 || scope_end < scope_start || scope_end > parts.len() {
+        return WhitespaceOutcome::NoCandidate;
+    }
+    let scope_byte_start: usize = parts[..scope_start - 1].iter().map(|p| p.len()).sum();
+    let scope_byte_end: usize = parts[..scope_end].iter().map(|p| p.len()).sum();
+    let scoped = &content[scope_byte_start..scope_byte_end];
+    let old_text = old.join("\n");
+
+    let Some((rel_start, rel_end)) = find_whitespace_tolerant_match(scoped, &old_text) else {
+        return WhitespaceOutcome::NoCandidate;
+    };
+    let actual_match = scoped[rel_start..rel_end].to_string();
+
+    log_debug(
+        log,
+        path_str,
+        &format!(
+            "literal:whitespace_drift L{scope_start}-L{scope_end} candidate found, asking planner to confirm\n  planner OLD: {}\n  actual:      {}",
+            truncate_multiline(&old_text, 400),
+            truncate_multiline(&actual_match, 400)
+        ),
+    );
+
+    let confirmed = match request_whitespace_drift_confirmation(
+        path_str,
+        scope_start,
+        scope_end,
+        &old_text,
+        &actual_match,
+        router,
+        cancelled,
+        log,
+    )
+    .await
+    {
+        Ok(yes) => yes,
+        Err(e) => {
+            // Confirmation request itself failed (network, timeout,
+            // cancellation). Don't treat that as a "rejection" — fall
+            // through to the existing smart-edit fallback so a transient
+            // transport hiccup doesn't bypass that recovery path.
+            log_debug(
+                log,
+                path_str,
+                &format!(
+                    "literal:whitespace_confirm L{scope_start}-L{scope_end} request failed: {e}"
+                ),
+            );
+            return WhitespaceOutcome::NoCandidate;
+        }
+    };
+
+    if !confirmed {
+        log_debug(
+            log,
+            path_str,
+            &format!(
+                "literal:whitespace_confirm L{scope_start}-L{scope_end} planner rejected candidate"
+            ),
+        );
+        return WhitespaceOutcome::Rejected;
+    }
+
+    let new_text = new.join("\n");
+    let abs_start = scope_byte_start + rel_start;
+    let abs_end = scope_byte_start + rel_end;
+    let mut spliced = String::with_capacity(content.len() + new_text.len());
+    spliced.push_str(&content[..abs_start]);
+    spliced.push_str(&new_text);
+    spliced.push_str(&content[abs_end..]);
+    log_debug(
+        log,
+        path_str,
+        &format!("literal:whitespace_confirm L{scope_start}-L{scope_end} planner confirmed, applied"),
+    );
+    WhitespaceOutcome::Applied(spliced)
+}
+
+/// Ask the planner model whether a whitespace-normalized candidate is
+/// the same edit target it intended to write. Single round-trip, single
+/// word reply expected (`YES` / `NO`).
+#[allow(clippy::too_many_arguments)]
+async fn request_whitespace_drift_confirmation(
+    path_str: &str,
+    scope_start: usize,
+    scope_end: usize,
+    planner_old: &str,
+    actual_match: &str,
+    router: &ModelRouter,
+    cancelled: Option<&AtomicBool>,
+    log: Option<&SessionLog>,
+) -> Result<bool> {
+    ensure_not_cancelled(cancelled)?;
+    let prompt = format!(
+        "An edit-plan step for {path_str} (lines {scope_start}-{scope_end}) emitted an OLD \
+         block that does not byte-exactly match the file, but after ignoring whitespace \
+         differences a near-match was found in the same scope. Confirm whether this near-match \
+         is the same edit target you intended.\n\n\
+         OLD as written by the planner:\n\
+         ----\n{planner_old}\n----\n\n\
+         Actual matching text from the file:\n\
+         ----\n{actual_match}\n----\n\n\
+         Reply with exactly `YES` if this is the intended target, or `NO` if it isn't. \
+         Output only the single word, no other text."
+    );
+
+    let request = ChatRequest {
+        messages: vec![
+            Message::system(
+                "You answer with exactly `YES` or `NO`. No other output, no markdown.",
+            ),
+            Message::user(&prompt),
+        ],
+        tools: None,
+        tool_choice: None,
+    };
+
+    log_stage(
+        log,
+        path_str,
+        &format!("literal:whitespace_confirm:L{scope_start}-L{scope_end}"),
+    );
+    let response = router
+        .chat_with_cancel(ModelRole::Fast, &request, cancelled)
+        .await?;
+    let text = response
+        .choices
+        .first()
+        .and_then(|c| c.message.content.as_deref())
+        .unwrap_or("");
+    log_debug(
+        log,
+        path_str,
+        &format!(
+            "literal:whitespace_confirm:L{scope_start}-L{scope_end} reply: {}",
+            truncate_multiline(text, 400)
+        ),
+    );
+
+    // Tolerate trailing punctuation, mixed case, and a leading word like
+    // "Yes." or "yes,". Reject anything that doesn't have "yes" as its
+    // first alphabetic token.
+    let first_word: String = text
+        .trim()
+        .chars()
+        .take_while(|c| c.is_alphabetic())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    Ok(first_word == "yes")
+}
+
 /// Replace the entire L`scope_start`..=L`scope_end` slice of `content`
 /// with `new`. Unlike `apply_literal_replace_in_scope` there is no OLD
 /// block to anchor against — the caller has decided the *whole* scope
@@ -3164,6 +3464,74 @@ mod tests {
         let candidate: String = (0..10).map(|i| format!("line {i}\n")).collect();
         let err = gate_truncation("big.rs", &original, &candidate, Some(&perms)).unwrap_err();
         assert!(err.to_string().contains("truncates"));
+    }
+
+    #[test]
+    fn find_whitespace_tolerant_match_finds_exact_substring() {
+        // Sanity check: a byte-exact substring is still found.
+        let scoped = "let foo = bar();\n";
+        let (start, end) = find_whitespace_tolerant_match(scoped, "foo = bar").unwrap();
+        assert_eq!(&scoped[start..end], "foo = bar");
+    }
+
+    #[test]
+    fn find_whitespace_tolerant_match_rescues_extra_whitespace_in_old() {
+        // The Gemma `</div >` pathology: the model emitted an extra
+        // space inside an HTML tag. The actual file has `</div>` and
+        // we want the matcher to map back to those bytes.
+        let scoped = "<div>hello</div>\n";
+        let (start, end) = find_whitespace_tolerant_match(scoped, "<div >hello</div >").unwrap();
+        assert_eq!(&scoped[start..end], "<div>hello</div>");
+    }
+
+    #[test]
+    fn find_whitespace_tolerant_match_rescues_tab_vs_space_drift() {
+        // Indented code where the planner used spaces but the file uses
+        // a tab (or vice-versa).
+        let scoped = "\tif x {\n\t\treturn 1;\n\t}\n";
+        let (start, end) = find_whitespace_tolerant_match(scoped, "if x { return 1; }").unwrap();
+        assert_eq!(&scoped[start..end], "if x {\n\t\treturn 1;\n\t}");
+    }
+
+    #[test]
+    fn find_whitespace_tolerant_match_rescues_newline_drift() {
+        // Multi-line OLD where the planner ran two lines together.
+        let scoped = "first\nsecond\nthird\n";
+        let (start, end) = find_whitespace_tolerant_match(scoped, "firstsecond").unwrap();
+        assert_eq!(&scoped[start..end], "first\nsecond");
+    }
+
+    #[test]
+    fn find_whitespace_tolerant_match_returns_none_when_no_candidate() {
+        let scoped = "let foo = bar();\n";
+        assert_eq!(find_whitespace_tolerant_match(scoped, "qux"), None);
+    }
+
+    #[test]
+    fn find_whitespace_tolerant_match_rejects_empty_old_text() {
+        // An OLD that's all whitespace squashes to nothing — we can't
+        // anchor anywhere, so return None instead of pretending to match.
+        assert_eq!(find_whitespace_tolerant_match("foo bar\n", ""), None);
+        assert_eq!(find_whitespace_tolerant_match("foo bar\n", "  \n\t"), None);
+    }
+
+    #[test]
+    fn find_whitespace_tolerant_match_returns_first_when_multiple_candidates() {
+        // Two non-overlapping candidates → first wins. The user accepted
+        // this simplification: "show first only for now."
+        let scoped = "x = 1;\nx = 1;\n";
+        let (start, end) = find_whitespace_tolerant_match(scoped, "x=1").unwrap();
+        assert_eq!(&scoped[start..end], "x = 1");
+        // The match is at the very beginning, not the second occurrence.
+        assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn find_whitespace_tolerant_match_handles_multibyte_characters() {
+        // Make sure char_indices accounting doesn't panic on multibyte chars.
+        let scoped = "let s = \"héllo\";\n";
+        let (start, end) = find_whitespace_tolerant_match(scoped, "\"héllo\"").unwrap();
+        assert_eq!(&scoped[start..end], "\"héllo\"");
     }
 
     #[test]
