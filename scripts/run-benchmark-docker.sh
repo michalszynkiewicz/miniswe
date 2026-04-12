@@ -191,13 +191,21 @@ cd /work
 git -C /repo archive "${SHA}" | tar -x
 rm -rf target .miniswe
 
-# Fix LFS pointer files (git archive doesn't resolve LFS)
+# Fix LFS pointer files (git archive doesn't resolve LFS) and make sure the
+# .miniswe symlink created below is always ignored (git would otherwise try
+# to add it to the baseline commit).
 if grep -q "git-lfs" .gitignore 2>/dev/null; then
-    echo -e "target/\n.miniswe/\n*.log" > .gitignore
+    echo -e "target/\n.miniswe\n*.log" > .gitignore
+else
+    echo ".miniswe" >> .gitignore
 fi
 
-# Write config and init
-mkdir -p .miniswe
+# Route .miniswe through the bind-mounted /output volume. Every log line,
+# scratchpad write, session file, and index update lands on the host
+# filesystem as it is written. If the container is killed mid-run,
+# everything up to that point already survives — no post-run cp needed.
+mkdir -p /output/miniswe_state
+ln -sfn /output/miniswe_state .miniswe
 cp /config/config.toml .miniswe/config.toml
 if ! miniswe init 2>/output/miniswe_init.txt; then
     echo "ERROR: miniswe init failed:"
@@ -226,8 +234,9 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
 
     echo "=== ATTEMPT ${ATTEMPT}/${MAX_ATTEMPTS} (${REMAINING}s remaining) ==="
 
-    # Clear logs from previous attempt
-    rm -f .miniswe/logs/*.log
+    # Keep prior-attempt logs around: every miniswe run opens a fresh
+    # timestamped log file under .miniswe/logs/, so accumulation is natural
+    # and lets us inspect a killed attempt alongside completed ones.
 
     # Run miniswe (keep modified code from previous attempts)
     timeout "${REMAINING}" miniswe --yes "${CURRENT_TASK}" \
@@ -235,15 +244,13 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
         2> /output/stderr_attempt${ATTEMPT}.txt \
         || true
 
-    # Copy logs and scratchpad
-    cp .miniswe/logs/*.log /output/ 2>/dev/null || true
-    cp .miniswe/scratchpad.md /output/ 2>/dev/null || true
-    cp .miniswe/tool_history.md /output/ 2>/dev/null || true
-
-    # Capture changes
+    # Logs, scratchpad, tool_history, sessions, and index are all already on
+    # the host volume via the .miniswe → /output/miniswe_state symlink.
+    # Only git state needs an explicit capture here.
     git diff --name-only > /output/changed_files.txt 2>/dev/null || true
     git ls-files --others --exclude-standard >> /output/changed_files.txt 2>/dev/null || true
     git diff > /output/diff.patch 2>/dev/null || true
+    git diff > /output/diff_after_attempt${ATTEMPT}.patch 2>/dev/null || true
 
     # === Validate ===
     PASS=0
@@ -450,9 +457,10 @@ SCRIPT
     local final_line
     final_line=$(grep "=== FINAL:" "${variant_dir}/container.log" 2>/dev/null || echo "FINAL: ?/? after ? attempt(s)")
 
-    # Count total rounds across all attempt logs
+    # Count total rounds across all attempt logs. Logs now live under
+    # miniswe_state/logs/ thanks to the in-container symlink.
     local rounds=0
-    for logfile in "${variant_dir}"/*.log; do
+    for logfile in "${variant_dir}"/miniswe_state/logs/*.log; do
         [ -f "${logfile}" ] || continue
         local r
         r=$(grep -c '\[round ' "${logfile}" 2>/dev/null || true)
@@ -488,7 +496,7 @@ echo "-----------------------------------------------------------------"
 for d in "${RESULTS_DIR}"/*/; do
     name=$(basename "$d")
     local_rounds=0
-    for logfile in "$d"/*.log; do
+    for logfile in "$d"/miniswe_state/logs/*.log; do
         [ -f "${logfile}" ] || continue
         local_r=$(grep -c '\[round ' "${logfile}" 2>/dev/null || true)
         local_rounds=$((local_rounds + ${local_r:-0}))
