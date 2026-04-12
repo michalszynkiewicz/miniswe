@@ -2073,7 +2073,8 @@ async fn request_preplan_steps(
          TASK: <specific edit for this region>\n\n\
          (C) TASK CANNOT BE COMPLETED in this file. Output exactly one line:\n\
          FAILED: <one-line reason, under {MAX_FAILED_REASON_CHARS} chars>\n\
-         Use this when the task requires changes outside this file (e.g. signature change breaks callers elsewhere), contradicts file invariants, or prior attempts kept regressing and you have no better idea. Be concrete: name the obstacle. Not \"LSP errors\" but \"changing parameter N of function F breaks 3 call sites in tests/\". This is a terminal verdict; no further edits will run.\n\n\
+         Use this when the task contradicts file invariants, or prior attempts kept regressing and you have no better idea. Be concrete: name the obstacle.\n\
+         Do NOT use FAILED just because the edit will cause cross-file compilation errors (e.g. adding a parameter to a call when the callee hasn't been updated yet). An outer agent handles other files — just make the edit to THIS file and let the caller deal with cascading changes. This is a terminal verdict; no further edits will run.\n\n\
          (D) TASK TOO VAGUE to act on. Output exactly one line:\n\
          NEEDS_CLARIFICATION: <one specific question>\n\
          This is RARE — use only when the task truly names no target or contradicts the file. Do NOT use it for implementation decisions you can make yourself (parameter placement, types, naming, defaults). Do NOT ask about file content already shown above — read it. If the task tells you WHAT to do, just choose HOW and proceed with (B).\n\n\
