@@ -103,6 +103,53 @@ pub(super) fn format_edit_plan_steps(steps: &[EditPlanStep]) -> String {
     out
 }
 
+/// Compact one-liner per step for repair context — shows what changed
+/// without dumping full OLD/NEW blocks that overwhelm small models.
+pub(super) fn format_completed_steps_compact(steps: &[EditPlanStep]) -> String {
+    let mut out = String::new();
+    for step in steps {
+        match step {
+            EditPlanStep::SmartEdit(region) => {
+                let task_preview = if region.task.len() > 80 {
+                    format!("{}…", &region.task[..77])
+                } else {
+                    region.task.clone()
+                };
+                out.push_str(&format!(
+                    "  ✓ L{}-L{}: SMART_EDIT applied ({task_preview})\n",
+                    region.start, region.end
+                ));
+            }
+            EditPlanStep::LiteralReplace {
+                scope_start,
+                scope_end,
+                old,
+                new,
+                ..
+            } => {
+                let old_preview: String = old.first().map(|l| l.trim().to_string()).unwrap_or_default();
+                let old_preview = if old_preview.len() > 60 {
+                    format!("{}…", &old_preview[..57])
+                } else {
+                    old_preview
+                };
+                let delta = new.len() as isize - old.len() as isize;
+                let delta_str = if delta > 0 {
+                    format!("+{delta} lines")
+                } else if delta < 0 {
+                    format!("{delta} lines")
+                } else {
+                    "same line count".to_string()
+                };
+                out.push_str(&format!(
+                    "  ✓ L{scope_start}-L{scope_end}: LITERAL_REPLACE applied ({delta_str}): {old_preview}\n",
+                ));
+            }
+        }
+    }
+    out
+}
+
 pub(super) fn format_preplan_log(label: &str, steps: &[EditPlanStep]) -> String {
     let plan = format_edit_plan_steps(steps);
     let plan = truncate_multiline(&plan, MAX_PREPLAN_LOG_CHARS);
