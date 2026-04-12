@@ -1294,6 +1294,84 @@ fn parse_preplan_window_response(text: &str) -> PreplanWindowResponse {
     PreplanWindowResponse { notes, commands, clarification }
 }
 
+/// Extract `(start, end)` line ranges from a note string.
+///
+/// Recognizes patterns like `L283-290`, `283-290`, `L41`, `line 137`.
+/// Single-line references are expanded to a 5-line window around the
+/// noted line so the finalize phase sees enough surrounding context.
+fn extract_line_ranges_from_note(note: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    // Work on chars to avoid multibyte boundary issues.
+    let chars: Vec<char> = note.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        let prefix_start = i;
+        // Optional 'L'/'l' prefix or "line "/"Line " prefix
+        if chars[i] == 'L' || chars[i] == 'l' {
+            if i + 4 < len
+                && (chars[i + 1] == 'i' || chars[i + 1] == 'I')
+                && (chars[i + 2] == 'n' || chars[i + 2] == 'N')
+                && (chars[i + 3] == 'e' || chars[i + 3] == 'E')
+                && chars[i + 4] == ' '
+            {
+                i += 5; // "line "
+            } else {
+                i += 1; // bare "L"
+            }
+        }
+        // Must be at a digit now
+        if i >= len || !chars[i].is_ascii_digit() {
+            i = prefix_start + 1;
+            continue;
+        }
+        // Reject mid-word: char before prefix must not be alphanumeric
+        if prefix_start > 0 && (chars[prefix_start - 1].is_alphanumeric() || chars[prefix_start - 1] == '_') {
+            i = prefix_start + 1;
+            continue;
+        }
+        // Parse start number
+        let num_start = i;
+        while i < len && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        let start_str: String = chars[num_start..i].iter().collect();
+        let start: usize = match start_str.parse() {
+            Ok(n) if n > 0 => n,
+            _ => continue,
+        };
+        // Check for range separator (optional spaces around '-')
+        let saved = i;
+        if i < len && chars[i] == ' ' {
+            i += 1;
+        }
+        if i < len && chars[i] == '-' {
+            i += 1;
+            if i < len && chars[i] == ' ' {
+                i += 1;
+            }
+            let end_start = i;
+            while i < len && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > end_start {
+                let end_str: String = chars[end_start..i].iter().collect();
+                if let Ok(end) = end_str.parse::<usize>() {
+                    if end >= start {
+                        ranges.push((start, end));
+                        continue;
+                    }
+                }
+            }
+            // Dash but no valid end number — fall through to single-line
+            i = saved;
+        }
+        // Single line reference — expand to ±2 line window
+        ranges.push((start.saturating_sub(2).max(1), start + 2));
+    }
+    ranges
+}
+
 fn has_case_insensitive_prefix(text: &str, prefix: &str) -> bool {
     text.get(..prefix.len())
         .map(|head| head.eq_ignore_ascii_case(prefix))
@@ -1884,6 +1962,29 @@ async fn request_preplan_steps(
         }
     }
 
+    // ── Phase 1b: auto-READ line ranges mentioned in notes ─────────────
+    // The observation phase produces notes like "NOTE 283-290 — assemble
+    // fn signature" but the finalize phase for large files only sees the
+    // note text, not the actual file lines. Without the code, the planner
+    // can't write LITERAL_REPLACE (needs verbatim OLD) and often falls
+    // back to NEEDS_CLARIFICATION asking "what is the exact signature?"
+    //
+    // Fix: extract line-range patterns from notes and inject READ commands
+    // so the finalize phase automatically sees the code at noted locations.
+    if !small_file {
+        for note in &notes {
+            for range in extract_line_ranges_from_note(note) {
+                let cmd = InspectionCommand::Read {
+                    start: range.0,
+                    end: range.1,
+                };
+                if !collected_commands.contains(&cmd) {
+                    collected_commands.push(cmd);
+                }
+            }
+        }
+    }
+
     // ── Phase 2: batch-execute the collected inspection commands ───────
     // Small files never reach this with anything in collected_commands
     // because the window loop was skipped; large files may have any
@@ -1989,6 +2090,16 @@ async fn request_preplan_steps(
     };
 
     log_stage(log, path_str, &format!("preplan:finalize:file:1-{total_lines}"));
+    log_debug(
+        log,
+        path_str,
+        &format!(
+            "preplan:finalize:prompt_len={} notes={} inspection_results={} small_file={small_file}",
+            finalize_prompt.len(),
+            notes.len(),
+            if extra_context.is_empty() { 0 } else { extra_context.lines().count() },
+        ),
+    );
     let response = router
         .chat_with_cancel(ModelRole::Fast, &request, cancelled)
         .await?;
@@ -2543,6 +2654,47 @@ mod tests {
     #[test]
     fn pick_best_candidate_returns_none_for_empty_list() {
         assert_eq!(pick_best_candidate(&[], 1, 5), None);
+    }
+
+    #[test]
+    fn extract_line_ranges_parses_range_with_l_prefix() {
+        let ranges = extract_line_ranges_from_note("L283-290 — assemble fn signature");
+        assert_eq!(ranges, vec![(283, 290)]);
+    }
+
+    #[test]
+    fn extract_line_ranges_parses_bare_range() {
+        let ranges = extract_line_ranges_from_note("132-138 — context::assemble call");
+        assert_eq!(ranges, vec![(132, 138)]);
+    }
+
+    #[test]
+    fn extract_line_ranges_parses_single_line_to_window() {
+        // Single line reference expands to ±2 window
+        let ranges = extract_line_ranges_from_note("L41 — run function signature");
+        assert_eq!(ranges, vec![(39, 43)]);
+    }
+
+    #[test]
+    fn extract_line_ranges_parses_multiple_ranges() {
+        let ranges = extract_line_ranges_from_note(
+            "L10-20 foo, L30-40 bar",
+        );
+        assert_eq!(ranges, vec![(10, 20), (30, 40)]);
+    }
+
+    #[test]
+    fn extract_line_ranges_ignores_mid_word_numbers() {
+        // "v2" or "utf8" shouldn't parse as line references
+        let ranges = extract_line_ranges_from_note("uses utf8 encoding and v2 protocol");
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn extract_line_ranges_single_line_near_start_clamps() {
+        // Line 1 expanded ±2 should clamp start to 1
+        let ranges = extract_line_ranges_from_note("L1 — first line");
+        assert_eq!(ranges, vec![(1, 3)]);
     }
 
     #[test]
