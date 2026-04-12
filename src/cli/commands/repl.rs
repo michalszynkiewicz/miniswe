@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use crate::config::{Config, ModelRole};
 use crate::context;
 use crate::context::compress;
-use crate::llm::{ChatRequest, Message, ModelRouter};
+use crate::llm::{ChatRequest, Message, ModelRouter, is_truncated_tool_call_error};
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
 use crate::mcp::{McpConfig, McpRegistry};
@@ -37,6 +37,19 @@ const PLAN_CHECKPOINT_WARNING: &str = "\
 PLAN CHECKPOINT: You have made 5 edits since the last successful plan action. Before making many more edits, review the plan: use plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet. Further edits may be blocked if you continue without any plan action.";
 const PLAN_CHECKPOINT_BLOCK_MESSAGE: &str = "\
 Plan checkpoint required before more edits. You have continued editing after the checkpoint warning. Use any successful plan action now: plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet.";
+
+/// Injected as a user-role message after the server rejects the model's
+/// tool call with "Failed to parse tool call arguments as JSON" (see
+/// `crate::llm::TRUNCATED_TOOL_CALL_MARKER`). The previous assistant
+/// turn was streamed but never committed to history (the server dropped
+/// it), so we push this hint instead of a tool_result and let the agent
+/// try again with a smaller operation.
+const TRUNCATED_TOOL_CALL_HINT: &str = "\
+Your previous tool call was rejected because the server could not parse its arguments as JSON — \
+most likely the generation hit max_tokens mid-string and the JSON got truncated. \
+Try a smaller operation: prefer edit_file over write_file for existing files, \
+break large writes into multiple smaller tool calls, \
+and avoid embedding very long literals in a single argument.";
 
 struct ReplTerminalGuard;
 
@@ -492,6 +505,11 @@ async fn run_agent_loop(
 
         // Call LLM with streaming — render on each token
         let mut rendered_assistant_text = String::new();
+        // Set when the server rejected the model's tool call as
+        // truncated JSON. In that case we inject a synthetic user-role
+        // hint and continue the outer loop so the agent can recover
+        // with a smaller operation, instead of aborting the session.
+        let mut truncated_tool_call_hint_pushed = false;
         let response = {
             let mut token_count = 0u32;
             let mut llm_events =
@@ -513,6 +531,26 @@ async fn run_agent_loop(
                                 if err_str.contains("Interrupted") {
                                     cancelled.store(false, Ordering::Relaxed);
                                     app.push_output("Generation interrupted.", LineStyle::Status);
+                                } else if is_truncated_tool_call_error(&err_str) {
+                                    // Model hit max_tokens mid tool-call — the
+                                    // JSON couldn't be parsed server-side, so
+                                    // no tool_call_id was issued. Clear the
+                                    // partial UI text (don't persist the
+                                    // half-streamed output) and push a
+                                    // user-role hint so the agent retries
+                                    // with a smaller operation.
+                                    log.llm_error(
+                                        "tool call JSON truncated (max_tokens) — \
+                                         injecting hint and continuing",
+                                    );
+                                    app.push_output(
+                                        "Previous tool call truncated — retrying with guidance.",
+                                        LineStyle::Status,
+                                    );
+                                    let hint = Message::user(TRUNCATED_TOOL_CALL_HINT);
+                                    messages.push(hint.clone());
+                                    conversation_history.push(hint);
+                                    truncated_tool_call_hint_pushed = true;
                                 } else {
                                     let clean = if err_str.contains('<') {
                                         err_str
@@ -574,6 +612,11 @@ async fn run_agent_loop(
         let _ = terminal.draw(|frame| ui::draw(frame, app));
 
         let Some(response) = response else {
+            if truncated_tool_call_hint_pushed {
+                // Hint was injected into `messages`; loop back and let
+                // the agent try again with smaller operations.
+                continue;
+            }
             break;
         };
 
