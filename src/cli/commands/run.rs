@@ -16,7 +16,7 @@ use anyhow::Result;
 
 use crate::config::{Config, ModelRole};
 use crate::context;
-use crate::llm::{ChatRequest, Message, ModelRouter};
+use crate::llm::{ChatRequest, Message, ModelRouter, is_truncated_tool_call_error};
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
 use crate::mcp::{McpConfig, McpRegistry};
@@ -35,6 +35,19 @@ const PLAN_CHECKPOINT_WARNING: &str = "\
 PLAN CHECKPOINT: You have made 5 edits since the last successful plan action. Before making many more edits, review the plan: use plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet. Further edits may be blocked if you continue without any plan action.";
 const PLAN_CHECKPOINT_BLOCK_MESSAGE: &str = "\
 Plan checkpoint required before more edits. You have continued editing after the checkpoint warning. Use any successful plan action now: plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet.";
+
+/// Injected as a user-role message after the server rejects the model's
+/// tool call with "Failed to parse tool call arguments as JSON" (see
+/// `crate::llm::TRUNCATED_TOOL_CALL_MARKER`). The previous assistant
+/// turn was streamed but never committed to history (the server dropped
+/// it), so we push this hint instead of a tool_result and let the agent
+/// try again with a smaller operation.
+const TRUNCATED_TOOL_CALL_HINT: &str = "\
+Your previous tool call was rejected because the server could not parse its arguments as JSON — \
+most likely the generation hit max_tokens mid-string and the JSON got truncated. \
+Try a smaller operation: prefer edit_file over write_file for existing files, \
+break large writes into multiple smaller tool calls, \
+and avoid embedding very long literals in a single argument.";
 
 /// Run the agent for a single message.
 pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()> {
@@ -300,6 +313,20 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 if err_str.contains("Interrupted") {
                     tui::print_status("Generation interrupted.");
                     break;
+                }
+                if is_truncated_tool_call_error(&err_str) {
+                    // Model hit max_tokens mid tool-call — the server
+                    // dropped the assistant turn, no tool_call_id was
+                    // issued. Push a user-role hint and let the agent
+                    // retry with a smaller operation.
+                    log.llm_error(
+                        "tool call JSON truncated (max_tokens) — injecting hint and continuing",
+                    );
+                    tui::print_status("Previous tool call truncated — retrying with guidance.");
+                    let hint = Message::user(TRUNCATED_TOOL_CALL_HINT);
+                    messages.push(hint.clone());
+                    conversation_history.push(hint);
+                    continue;
                 }
                 let clean = if err_str.contains('<') {
                     err_str

@@ -13,7 +13,9 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use miniswe::config::Config;
-use miniswe::llm::{ChatRequest, LlmClient, Message};
+use miniswe::llm::{
+    ChatRequest, LlmClient, Message, TRUNCATED_TOOL_CALL_MARKER, is_truncated_tool_call_error,
+};
 use miniswe::tools::{self, PermissionManager};
 
 fn perms(config: &Config) -> PermissionManager {
@@ -689,6 +691,64 @@ async fn llm_api_error_returns_error() {
 
     let result = client.chat(&request).await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn llm_chat_does_not_retry_truncated_tool_call_500() {
+    // llama.cpp returns 500 + "Failed to parse tool call arguments as JSON"
+    // when the model hits max_tokens mid tool-call. Retrying with the same
+    // prompt would just reproduce the same truncated output, so we must
+    // surface the error on the first attempt rather than burning the
+    // retry budget.
+    let mock_server = MockServer::start().await;
+
+    let body = format!(
+        r#"{{"error":{{"message":"{TRUNCATED_TOOL_CALL_MARKER}: Unexpected EOF","type":"server_error"}}}}"#
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .insert_header("Content-Type", "application/json")
+                .set_body_string(body),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+    // Give the client a generous retry budget — the classifier should
+    // veto retries regardless, and this proves it.
+    config.model.max_retries = 5;
+
+    let client = LlmClient::new(config.model.clone());
+    let request = ChatRequest {
+        messages: vec![Message::user("hi")],
+        tools: Some(tools::tool_definitions()),
+        tool_choice: None,
+    };
+
+    let err = client
+        .chat(&request)
+        .await
+        .expect_err("truncated tool call 500 should surface as error");
+    let err_msg = err.to_string();
+    assert!(
+        is_truncated_tool_call_error(&err_msg),
+        "classifier must recognize the error, got: {err_msg}"
+    );
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("mock server should record requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "truncated tool-call 500 must not be retried (max_retries=5), \
+         got {} requests",
+        requests.len()
+    );
 }
 
 #[tokio::test]

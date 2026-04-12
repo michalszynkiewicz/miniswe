@@ -445,8 +445,33 @@ async fn wait_for_cancel(cancelled: &AtomicBool) {
     }
 }
 
+/// Marker text llama.cpp includes in its 500 response when the model's
+/// tool-call arguments couldn't be parsed as JSON — typically because the
+/// model hit `max_tokens` mid-generation and the string was truncated.
+///
+/// Source: llama.cpp's server emits this in `common_chat_parse` when the
+/// OAI tool-call path fails to parse arguments. If llama.cpp rewords this
+/// in a future version, the detection here falls back to "retryable 500"
+/// and the REPL will surface the raw error — adjust the marker if you
+/// see the behavior regress.
+pub const TRUNCATED_TOOL_CALL_MARKER: &str = "Failed to parse tool call arguments as JSON";
+
+/// True if the LLM error came back as "Failed to parse tool call arguments
+/// as JSON" (see [`TRUNCATED_TOOL_CALL_MARKER`]). Same prompt + same model
+/// would re-emit the same truncated output, so this is *not* retryable —
+/// the caller should surface a hint to the agent instead.
+pub fn is_truncated_tool_call_error(err_msg: &str) -> bool {
+    err_msg.contains(TRUNCATED_TOOL_CALL_MARKER)
+}
+
 fn is_retryable_llm_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
+    if is_truncated_tool_call_error(&msg) {
+        // Retrying with the same prompt will just produce the same
+        // truncated tool call. Bubble the error up so the caller can
+        // synthesize a hint and let the agent try a different approach.
+        return false;
+    }
     msg.contains("Failed to connect to LLM")
         || msg.contains("LLM request timed out")
         || msg.contains("LLM stream idle")
@@ -468,4 +493,41 @@ fn retryable_status_from_message(msg: &str) -> Option<StatusCode> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncated_tool_call_error_detected() {
+        let msg = r#"LLM API error (500 Internal Server Error): {"error":{"message":"Failed to parse tool call arguments as JSON: Unexpected EOF","type":"server_error"}}"#;
+        assert!(is_truncated_tool_call_error(msg));
+    }
+
+    #[test]
+    fn truncated_tool_call_error_not_retryable() {
+        let err = anyhow::anyhow!(
+            "LLM API error (500 Internal Server Error): Failed to parse tool call arguments as JSON"
+        );
+        assert!(!is_retryable_llm_error(&err));
+    }
+
+    #[test]
+    fn plain_500_still_retryable() {
+        let err = anyhow::anyhow!(
+            "LLM API error (500 Internal Server Error): upstream unavailable"
+        );
+        assert!(is_retryable_llm_error(&err));
+        assert!(!is_truncated_tool_call_error(&err.to_string()));
+    }
+
+    #[test]
+    fn other_llm_errors_unaffected() {
+        let err = anyhow::anyhow!("LLM request timed out after 60s");
+        assert!(is_retryable_llm_error(&err));
+
+        let err = anyhow::anyhow!("Failed to connect to LLM at http://localhost:8080");
+        assert!(is_retryable_llm_error(&err));
+    }
 }
