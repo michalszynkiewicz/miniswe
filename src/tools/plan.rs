@@ -117,6 +117,8 @@ const ARCHITECTURE_REVIEW_HINT: &str = "\
 Architecture check before editing:
 - Check whether the plan changes the right abstraction level.
 - If a change affects a function/API, plan the call-site and test updates too.
+- Order steps so definitions are edited before callers (e.g. update a function signature before updating its call sites). This avoids intermediate compile errors that block edit_file's LSP validation.
+- If a step must temporarily break compilation (e.g. updating a caller before the callee), pass lsp_validation='off' to edit_file and mention the expected error in the task description so the inner planner doesn't bail.
 - If the plan edits many similar components, consider plan(action='refine') before editing.";
 
 /// Validate plan invariants:
