@@ -71,8 +71,9 @@ async fn execute_preplan_repair_after_failed_plan() {
 async fn execute_preplan_repair_can_inspect_with_search_and_read() {
     // Large file (>200 lines). Each plan attempt runs the windowed
     // observation pass (1 window because the file fits under WINDOW_SIZE)
-    // followed by finalize. The repair attempt's window emits SEARCH/READ
-    // commands that get batch-executed before its finalize call.
+    // followed by finalize. On repair, the window prompt includes step
+    // outcomes (✓/✗) for the slice so the model knows what was already
+    // handled and can emit SEARCH/READ for targeted re-inspection.
     let mock_server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = calls.clone();
@@ -89,8 +90,9 @@ async fn execute_preplan_repair_can_inspect_with_search_and_read() {
                 2 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n\nREPLACE_AT 2\nOLD:\nb\nEND_OLD\nNEW:\ny\nEND_NEW\n",
                 ),
-                // Plan attempt 2 (repair): window emits NOTE + SEARCH/READ
-                // in a single response; inspection results feed into finalize.
+                // Plan attempt 2 (repair): window (with step outcomes) +
+                // finalize. The window prompt now shows which steps
+                // succeeded/failed in this slice.
                 3 => helpers::mock_text_response(
                     "NOTE revisit first block\nSEARCH: a\nREAD: 1-2",
                 ),
@@ -100,7 +102,7 @@ async fn execute_preplan_repair_can_inspect_with_search_and_read() {
                 5 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\na\nb\nEND_OLD\nNEW:\nx\nEND_NEW\n",
                 ),
-                // Terminal verdict round — large file still does window + finalize.
+                // Terminal verdict round — window + finalize.
                 6 => helpers::mock_text_response(""),
                 _ => helpers::mock_text_response("COMPLETE\n"),
             }

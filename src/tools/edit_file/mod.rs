@@ -28,8 +28,9 @@ pub use parse::{EditPlanStep, EditRegion, PatchOp, parse_edit_plan, parse_patch}
 
 use apply::{RelocateOutcome, apply_patch_dry_run_in_region, try_relocate_and_replace};
 use parse::{
-    MAX_FAILED_REASON_CHARS, format_edit_plan_steps, format_preplan_log, looks_like_complete,
-    parse_failed, parse_needs_clarification, partition_overlapping_steps, truncate_multiline,
+    MAX_FAILED_REASON_CHARS, format_completed_steps_compact, format_edit_plan_steps,
+    format_preplan_log, looks_like_complete, parse_failed, parse_needs_clarification,
+    partition_overlapping_steps, truncate_multiline,
 };
 
 /// Max lines per window for reliable LLM recall.
@@ -1844,6 +1845,7 @@ async fn request_preplan_steps(
     // planner will want answered before finalize. Commands are *collected*,
     // not executed — they're batch-executed once the full pass completes
     // so the model sees everything at finalize time.
+    //
     let windows = if small_file {
         Vec::new()
     } else {
@@ -1878,10 +1880,14 @@ async fn request_preplan_steps(
                     .join("\n"),
             )
         };
+        let repair_steps_block = repair
+            .map(|ctx| format_repair_steps_for_window(ctx, start + 1, end))
+            .unwrap_or_default();
         let prompt = format!(
             "File: {path_str}\n\
              Task: {task}\n\n\
              {feedback_block}\
+             {repair_steps_block}\
              {notes_block}\
              {pending_block}\
              Slice {current_slice}/{total_slices}, lines {start_line}-{end_line} of {total_lines}.\n\n\
@@ -2276,10 +2282,10 @@ fn format_prior_applied(ctx: &RepairContext) -> String {
     let applied = if ctx.completed_steps.is_empty() {
         "(no steps — the previous round was a no-op)\n".to_string()
     } else {
-        format_edit_plan_steps(&ctx.completed_steps)
+        format_completed_steps_compact(&ctx.completed_steps)
     };
     format!(
-        "The previous iteration applied the following steps cleanly (they are ALREADY reflected in the file content shown below):\n{applied}\n\
+        "The previous iteration applied the following steps cleanly (they are ALREADY reflected in the file content below):\n{applied}\n\
          Decide the next verdict against the current file state. If those steps already accomplished the task, return `COMPLETE`. \
          If more edits are still needed to finish the task, emit `LITERAL_REPLACE`/`SMART_EDIT` blocks for the remaining work. \
          If the task cannot be completed even with more edits (e.g. it needs cross-file changes), return `FAILED: <reason>`.\n\n",
@@ -2300,7 +2306,7 @@ fn format_prior_failed(ctx: &RepairContext) -> String {
     let completed = if ctx.completed_steps.is_empty() {
         "(none — the first step failed, file is unchanged from the initial state)\n".to_string()
     } else {
-        format_edit_plan_steps(&ctx.completed_steps)
+        format_completed_steps_compact(&ctx.completed_steps)
     };
 
     let failed = match &ctx.failed_step {
@@ -2321,6 +2327,54 @@ fn format_prior_failed(ctx: &RepairContext) -> String {
          Failure reason:\n{failure_block}\n\n\
          Decide against the current file state: plan recovery edits if you can, return `COMPLETE` if the task is already done despite the failure, or return `FAILED: <reason>` if the obstacle is unrecoverable in this file.\n\n",
     )
+}
+
+/// Format repair step outcomes that overlap a given line range, for
+/// injection into the windowed observation prompt. Shows which steps
+/// in this slice succeeded (✓), which failed (✗), and which are still
+/// pending, so the model can reason about what remains to be done
+/// without re-proposing edits for already-handled locations.
+fn format_repair_steps_for_window(ctx: &RepairContext, win_start: usize, win_end: usize) -> String {
+    let overlaps = |step: &EditPlanStep| -> bool {
+        step.start_line() <= win_end && step.end_line() >= win_start
+    };
+    let mut out = String::new();
+    let mut any = false;
+
+    for step in &ctx.completed_steps {
+        if overlaps(step) {
+            if !any {
+                out.push_str("Previous edit attempt — steps in this slice:\n");
+                any = true;
+            }
+            out.push_str(&format_completed_steps_compact(std::slice::from_ref(step)));
+        }
+    }
+
+    if let Some(ref step) = ctx.failed_step {
+        if overlaps(step) {
+            if !any {
+                out.push_str("Previous edit attempt — steps in this slice:\n");
+                any = true;
+            }
+            let reason_preview = if ctx.failure_reason.len() > 120 {
+                format!("{}…", &ctx.failure_reason[..117])
+            } else {
+                ctx.failure_reason.clone()
+            };
+            out.push_str(&format!(
+                "  ✗ L{}-L{}: FAILED ({})\n",
+                step.start_line(),
+                step.end_line(),
+                reason_preview,
+            ));
+        }
+    }
+
+    if any {
+        out.push('\n');
+    }
+    out
 }
 
 /// Render an `LspRegression` with per-error post-edit source snippets so
@@ -3215,6 +3269,53 @@ mod tests {
         assert!(block.contains("applied the following steps cleanly"));
         assert!(block.contains("`COMPLETE`"));
         assert!(block.contains("LITERAL_REPLACE"));
+    }
+
+    #[test]
+    fn format_repair_steps_for_window_shows_overlapping_steps() {
+        let completed = EditPlanStep::LiteralReplace {
+            scope_start: 17,
+            scope_end: 17,
+            all: true,
+            old: vec!["    let x = assemble(&config, None);".into()],
+            new: vec!["    let x = assemble(&config, None, None);".into()],
+        };
+        let failed = EditPlanStep::LiteralReplace {
+            scope_start: 54,
+            scope_end: 54,
+            all: true,
+            old: vec!["    let y = assemble(&config, None);".into()],
+            new: vec!["    let y = assemble(&config, None, None);".into()],
+        };
+        let ctx = RepairContext {
+            previous_plan: vec![completed.clone(), failed.clone()],
+            completed_steps: vec![completed],
+            failed_step: Some(failed),
+            failure_reason: "literal OLD block was not found".into(),
+            lsp_regression: None,
+            cleanly_applied: false,
+        };
+
+        // Window 1-30: only the completed step overlaps
+        let block = format_repair_steps_for_window(&ctx, 1, 30);
+        assert!(block.contains("✓ L17"));
+        assert!(block.contains("LITERAL_REPLACE applied"));
+        assert!(!block.contains("✗"), "failed step at L54 should not appear in window 1-30");
+
+        // Window 40-70: only the failed step overlaps
+        let block = format_repair_steps_for_window(&ctx, 40, 70);
+        assert!(block.contains("✗ L54"));
+        assert!(block.contains("FAILED"));
+        assert!(!block.contains("✓"), "completed step at L17 should not appear in window 40-70");
+
+        // Window 1-100: both steps overlap
+        let block = format_repair_steps_for_window(&ctx, 1, 100);
+        assert!(block.contains("✓ L17"));
+        assert!(block.contains("✗ L54"));
+
+        // Window 200-300: neither step overlaps
+        let block = format_repair_steps_for_window(&ctx, 200, 300);
+        assert!(block.is_empty());
     }
 
     #[test]
