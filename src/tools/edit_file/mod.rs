@@ -1814,9 +1814,9 @@ async fn request_preplan_steps(
              READ: <start>-<end>\n\n\
              SEARCH/READ commands are collected across ALL slices and batch-executed before the finalize phase — their results will reach the planner. Don't repeat commands; the finalize phase already sees every result.\n\n\
              Reference line numbers from the slice. Skip vague observations and anything the planner can derive itself.\n\n\
-             If the task is genuinely too vague, underspecified, or contradictory to execute — e.g. it names no target, it asks for an outcome the file can't support, or it requires information only the outer agent has — output exactly one line:\n\
+             If the task is genuinely too vague, underspecified, or contradictory to execute — e.g. it names no target, or it requires information only the outer agent has — output exactly one line:\n\
              NEEDS_CLARIFICATION: <one specific question>\n\
-             Use this only when you would otherwise have to guess. Prefer specific questions over vague ones. Do NOT use it for tasks where the target doesn't exist yet — that's what the edit is for; plan the edit that creates it.\n\n\
+             This is RARE. Do NOT use it for implementation decisions you can make yourself (parameter order, types, naming). Do NOT ask about information visible in the file content above — read it. Do NOT use it for tasks where the target doesn't exist yet — that's what the edit is for; plan the edit that creates it. If the task tells you WHAT to do but not HOW, just choose a reasonable approach.\n\n\
              Slice:\n{slice}",
             current_slice = idx + 1,
             total_slices = windows.len(),
@@ -1973,7 +1973,7 @@ async fn request_preplan_steps(
          Use this when the task requires changes outside this file (e.g. signature change breaks callers elsewhere), contradicts file invariants, or prior attempts kept regressing and you have no better idea. Be concrete: name the obstacle. Not \"LSP errors\" but \"changing parameter N of function F breaks 3 call sites in tests/\". This is a terminal verdict; no further edits will run.\n\n\
          (D) TASK TOO VAGUE to act on. Output exactly one line:\n\
          NEEDS_CLARIFICATION: <one specific question>\n\
-         Use this only when you would otherwise have to guess. Do NOT use it just because a target the task wants to add doesn't exist yet — that's what the edit is for; plan the edit that creates it. Prefer specific questions over vague ones.\n\n\
+         This is RARE — use only when the task truly names no target or contradicts the file. Do NOT use it for implementation decisions you can make yourself (parameter placement, types, naming, defaults). Do NOT ask about file content already shown above — read it. If the task tells you WHAT to do, just choose HOW and proceed with (B).\n\n\
          Output only one of (A)/(B)/(C)/(D). No markdown, no explanation, no empty responses."
     );
 
