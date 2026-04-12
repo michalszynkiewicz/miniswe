@@ -30,7 +30,8 @@ use crate::context::compress;
 use crate::knowledge::graph::DependencyGraph;
 use crate::knowledge::indexer;
 use crate::knowledge::{ProjectIndex, repo_map};
-use crate::llm::ModelRouter;
+use crate::config::ModelRole;
+use crate::llm::{ChatRequest, Message, ModelRouter};
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
 
@@ -163,7 +164,7 @@ async fn execute_write_file_tool(
     let baseline = capture_edit_baseline(path, config, lsp).await;
     let mut result = write_file::execute(args, config).await?;
     if result.success {
-        finalize_file_edit(path, config, &mut result, lsp, baseline).await;
+        finalize_file_edit(path, config, &mut result, lsp, baseline, None).await;
     }
     Ok(result)
 }
@@ -301,7 +302,7 @@ pub async fn execute_edit_file_tool(
     )
     .await?;
     if result.success {
-        finalize_file_edit(path, config, &mut result, lsp, baseline).await;
+        finalize_file_edit(path, config, &mut result, lsp, baseline, Some(router)).await;
     }
     Ok(result)
 }
@@ -310,7 +311,7 @@ pub async fn execute_edit_file_tool(
 /// to distinguish errors the edit *introduced* from errors that were
 /// already there (or that the file is brand new and we have no baseline
 /// at all).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct EditBaseline {
     /// LSP error count for the file before the edit. 0 if LSP is
     /// unavailable, the file is new, or the count couldn't be obtained.
@@ -318,6 +319,9 @@ pub(crate) struct EditBaseline {
     /// Whether the file existed on disk before the edit. False for files
     /// being created by write_file or by edit_file's new-file path.
     pub existed_before: bool,
+    /// Original file content before the edit. Used to rollback if the
+    /// outer model rejects an LSP-regressed edit.
+    pub original_content: Option<String>,
 }
 
 impl EditBaseline {
@@ -325,6 +329,7 @@ impl EditBaseline {
         Self {
             lsp_errors: 0,
             existed_before: false,
+            original_content: None,
         }
     }
 }
@@ -340,6 +345,11 @@ async fn capture_edit_baseline(
 ) -> EditBaseline {
     let abs_path = config.project_root.join(path);
     let existed_before = abs_path.exists();
+    let original_content = if existed_before {
+        std::fs::read_to_string(&abs_path).ok()
+    } else {
+        None
+    };
     let lsp_errors = if existed_before {
         lsp_error_count_inner(&abs_path, config, lsp).await
     } else {
@@ -348,6 +358,7 @@ async fn capture_edit_baseline(
     EditBaseline {
         lsp_errors,
         existed_before,
+        original_content,
     }
 }
 
@@ -357,9 +368,10 @@ async fn finalize_file_edit(
     result: &mut ToolResult,
     lsp: Option<&LspClient>,
     baseline: EditBaseline,
+    router: Option<&ModelRouter>,
 ) {
     reindex_changed_file(path, config);
-    auto_check(path, config, result, lsp, baseline).await;
+    auto_check(path, config, result, lsp, baseline, router).await;
 }
 
 /// Inner: query the LSP error count for an existing file path. Returns 0
@@ -418,6 +430,7 @@ async fn auto_check(
     result: &mut ToolResult,
     lsp: Option<&LspClient>,
     baseline: EditBaseline,
+    router: Option<&ModelRouter>,
 ) {
     let baseline_errors = baseline.lsp_errors;
     let is_new_file = !baseline.existed_before;
@@ -472,35 +485,53 @@ async fn auto_check(
                                 errors.len()
                             ));
                         } else {
-                            let capped = errors.len().min(5);
-                            result.content.push_str(&format!(
-                                "\n[lsp] {} error(s) in {path} (was {} before this edit):\n",
+                            // LSP regression: errors increased after this edit.
+                            // Build an error report and ask the outer model
+                            // whether to keep or revert the changes.
+                            let capped = errors.len().min(20);
+                            let mut error_report = format!(
+                                "{} error(s) in {path} (was {} before this edit):\n",
                                 errors.len(),
                                 baseline_errors
-                            ));
+                            );
                             for diag in &errors[..capped] {
                                 let line = diag.range.start.line + 1;
                                 let col = diag.range.start.character + 1;
-                                result.content.push_str(&format!(
-                                    "{}:{}:{}: error: {}\n",
+                                error_report.push_str(&format!(
+                                    "  {}:{}:{}: error: {}\n",
                                     path, line, col, diag.message
                                 ));
                             }
                             if errors.len() > capped {
-                                result.content.push_str(&format!(
-                                    "... and {} more errors\n",
+                                error_report.push_str(&format!(
+                                    "  ... and {} more errors\n",
                                     errors.len() - capped
                                 ));
                             }
-                            // Add source context around errors
-                            let project_root = config.project_root.clone();
-                            for diag in &errors {
-                                let line = (diag.range.start.line + 1) as usize;
-                                if let Some(ctx) = read_source_context(path, line, &project_root) {
-                                    result.content.push_str(&ctx);
+
+                            let accepted = if let Some(router) = router {
+                                ask_accept_lsp_regression(router, path, &error_report).await
+                            } else {
+                                false
+                            };
+
+                            if accepted {
+                                result.content.push_str(&format!(
+                                    "\n[lsp] WARNING: {error_report}Changes kept (accepted by model)."
+                                ));
+                            } else {
+                                // Revert the file to its pre-edit content.
+                                if let Some(ref original) = baseline.original_content {
+                                    let abs = config.project_root.join(path);
+                                    let _ = std::fs::write(&abs, original);
+                                    // Re-notify LSP so it sees the reverted state.
+                                    let _ = lsp.notify_file_changed(&abs);
                                 }
+                                result.content.push_str(&format!(
+                                    "\n[lsp] {error_report}Edit reverted."
+                                ));
+                                result.success = false;
                             }
-                            result.success = false;
                         }
                         return;
                     }
@@ -640,6 +671,47 @@ async fn auto_check(
     }
 
     result.success = false;
+}
+
+/// Ask the outer model whether to accept an edit that increased LSP errors.
+/// Returns `true` for YES (keep changes), `false` for NO (revert).
+async fn ask_accept_lsp_regression(
+    router: &ModelRouter,
+    path: &str,
+    error_report: &str,
+) -> bool {
+    let prompt = format!(
+        "edit_file wrote changes to {path}.\n\
+         LSP diagnostics show new errors:\n\
+         {error_report}\n\
+         Are these errors expected (e.g. a callee/dependency updated in a later step), \
+         or are they mistakes in the edit?\n\
+         Answer YES to keep the changes, NO to revert them."
+    );
+    let request = ChatRequest {
+        messages: vec![
+            Message::system(
+                "You are reviewing an edit. Answer YES or NO only. \
+                 YES means the errors are expected and the edit should be kept. \
+                 NO means the errors are unexpected and the edit should be reverted.",
+            ),
+            Message::user(&prompt),
+        ],
+        tools: None,
+        tool_choice: None,
+    };
+    match router.chat(ModelRole::Fast, &request).await {
+        Ok(response) => {
+            let text = response
+                .choices
+                .first()
+                .and_then(|c| c.message.content.as_deref())
+                .unwrap_or("");
+            let first_line = text.lines().next().unwrap_or("").trim().to_uppercase();
+            first_line.contains("YES")
+        }
+        Err(_) => false, // On error, default to revert (safe choice)
+    }
 }
 
 /// Run a check command with a timeout, draining pipes to prevent deadlock.
