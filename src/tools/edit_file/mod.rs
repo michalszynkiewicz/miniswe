@@ -1885,12 +1885,14 @@ async fn request_preplan_steps(
              {notes_block}\
              {pending_block}\
              Slice {current_slice}/{total_slices}, lines {start_line}-{end_line} of {total_lines}.\n\n\
+             IMPORTANT: The planning phase will NOT see the full file — only your NOTEs and inspection results. Your notes are the planner's only window into file content.\n\n\
              Output zero or more of these lines about landmarks the planner will need:\n\
-             NOTE <fact with line number> — function/struct spans, signatures the task touches, the line where a relevant block starts.\n\n\
+             NOTE <fact with line number> — function/struct spans, signatures the task touches, the line where a relevant block starts.\n\
+             Include enough verbatim detail (e.g. exact function signatures, parameter lists) that the planner can write LITERAL_REPLACE patches without seeing the file. Line ranges in NOTEs (e.g. L283-290) are automatically READ for the planner.\n\n\
              You may also request extra context before finalize with:\n\
              SEARCH: <exact text to find>\n\
              READ: <start>-<end>\n\n\
-             SEARCH/READ commands are collected across ALL slices and batch-executed before the finalize phase — their results will reach the planner. Don't repeat commands; the finalize phase already sees every result.\n\n\
+             SEARCH/READ commands are collected across ALL slices and batch-executed before the finalize phase — their results will reach the planner. Line ranges in your NOTEs also auto-trigger READs, so you only need explicit READ for ranges NOT mentioned in a NOTE. Don't repeat commands.\n\n\
              Reference line numbers from the slice. Skip vague observations and anything the planner can derive itself.\n\n\
              If the task is genuinely too vague, underspecified, or contradictory to execute — e.g. it names no target, or it requires information only the outer agent has — output exactly one line:\n\
              NEEDS_CLARIFICATION: <one specific question>\n\
