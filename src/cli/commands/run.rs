@@ -42,12 +42,29 @@ Plan checkpoint required before more edits. You have continued editing after the
 /// turn was streamed but never committed to history (the server dropped
 /// it), so we push this hint instead of a tool_result and let the agent
 /// try again with a smaller operation.
-const TRUNCATED_TOOL_CALL_HINT: &str = "\
+fn loop_detected_hint(edit_mode: EditMode) -> &'static str {
+    match edit_mode {
+        EditMode::Smart => "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits.",
+        EditMode::Fast => "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or replace_range / insert_at for targeted edits.",
+    }
+}
+
+fn truncated_tool_call_hint(edit_mode: EditMode) -> &'static str {
+    match edit_mode {
+        EditMode::Smart => "\
 Your previous tool call was rejected because the server could not parse its arguments as JSON — \
 most likely the generation hit max_tokens mid-string and the JSON got truncated. \
 Try a smaller operation: prefer edit_file over write_file for existing files, \
 break large writes into multiple smaller tool calls, \
-and avoid embedding very long literals in a single argument.";
+and avoid embedding very long literals in a single argument.",
+        EditMode::Fast => "\
+Your previous tool call was rejected because the server could not parse its arguments as JSON — \
+most likely the generation hit max_tokens mid-string and the JSON got truncated. \
+Try a smaller operation: prefer replace_range or insert_at over write_file for existing files, \
+break large writes into multiple smaller tool calls, \
+and avoid embedding very long literals in a single argument.",
+    }
+}
 
 /// Run the agent for a single message.
 pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()> {
@@ -62,7 +79,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         PermissionManager::new(&config)
     });
     let tool_pool = ToolWorkerPool::new(config.runtime.tool_worker_pool_size);
-    let mut tool_defs = tools::tool_definitions();
+    let mut tool_defs = tools::tool_definitions(config.tools.edit_mode);
     // Filter tools based on config
     {
         let mut disabled = Vec::new();
@@ -353,7 +370,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                         "tool call JSON truncated (max_tokens) — injecting hint and continuing",
                     );
                     tui::print_status("Previous tool call truncated — retrying with guidance.");
-                    let hint = Message::user(TRUNCATED_TOOL_CALL_HINT);
+                    let hint = Message::user(truncated_tool_call_hint(config.tools.edit_mode));
                     messages.push(hint.clone());
                     conversation_history.push(hint);
                     continue;
@@ -453,10 +470,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                         tc.function.name, args_summary
                     ));
                 }
-                let result_msg = Message::tool_result(
-                    &tc.id,
-                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits.",
-                );
+                let result_msg = Message::tool_result(&tc.id, loop_detected_hint(config.tools.edit_mode));
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
                 had_error = true;
@@ -769,12 +783,16 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
         // Stall detection: too many tool calls without any edits
         if calls_since_last_edit >= 20 && calls_since_last_edit % 20 == 0 {
-            messages.push(Message::user(
+            let edit_hint = match config.tools.edit_mode {
+                EditMode::Smart => "Use edit_file for semantic file edits.",
+                EditMode::Fast => "Use replace_range or insert_at to land targeted edits.",
+            };
+            messages.push(Message::user(&format!(
                 "[WARNING: You have used 20+ tool calls without making any edits. \
                  You likely have enough information. Start making changes now. \
-                 Use edit_file for semantic file edits. \
-                 If you're stuck, explain what's blocking you.]",
-            ));
+                 {edit_hint} \
+                 If you're stuck, explain what's blocking you.]"
+            )));
         }
     }
 

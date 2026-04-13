@@ -4,18 +4,35 @@
 //! size for small models. Each grouped tool uses an `action` parameter
 //! to dispatch to sub-tools. Use `action="help"` to list available actions.
 
+use crate::config::EditMode;
 use crate::llm::{FunctionDefinition, ToolDefinition};
 use serde_json::json;
 
 /// Return all tool definitions for the LLM.
-pub fn tool_definitions() -> Vec<ToolDefinition> {
+///
+/// `edit_mode` controls which edit tool the descriptions point at: Smart mode
+/// references `edit_file` (the LLM-driven planner); Fast mode references the
+/// `replace_range` / `insert_at` primitives. Pointing the model at a tool that
+/// isn't in its list wastes rounds, so the strings have to match the actual
+/// surface — see `cli/commands/{run,repl}.rs` for how the list is filtered.
+pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
+    let (file_edit_hint, write_partial_hint) = match edit_mode {
+        EditMode::Smart => (
+            "For code edits use edit_file; for full-file overwrites use write_file.",
+            "Do not use for partial edits to existing code; use edit_file instead.",
+        ),
+        EditMode::Fast => (
+            "For partial code edits use replace_range or insert_at; for full-file overwrites use write_file.",
+            "Do not use for partial edits to existing code; use replace_range or insert_at instead.",
+        ),
+    };
     vec![
         // ── file: core file I/O and shell ─────────────────────────────
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "file".into(),
-                description: "File operations: read, search, shell, delete, revert. Use action='help' for details. For code edits use edit_file; for full-file overwrites use write_file.".into(),
+                description: format!("File operations: read, search, shell, delete, revert. Use action='help' for details. {file_edit_hint}"),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -162,7 +179,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "write_file".into(),
-                description: "Create or overwrite a file. Provide complete file contents in `content`, or omit `content` to create a new empty file. Do not use for partial edits to existing code; use edit_file instead.".into(),
+                description: format!("Create or overwrite a file. Provide complete file contents in `content`, or omit `content` to create a new empty file. {write_partial_hint}"),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -295,8 +312,9 @@ pub fn mcp_tool_definition() -> ToolDefinition {
 }
 
 /// Help text for the `file` tool group.
-pub fn file_help() -> &'static str {
-    "\
+pub fn file_help(edit_mode: EditMode) -> &'static str {
+    match edit_mode {
+        EditMode::Smart => "\
 Available actions for `file`:
 
 - read: Read a file. Params: path (required), start_line, end_line
@@ -308,7 +326,22 @@ Available actions for `file`:
 - revert: Revert files to a previous round. Params: to_round, path (both optional)
 
 For text edits use edit_file (semantic, planner-driven). For full-file overwrites \
-use write_file. There is no longer a deterministic search-and-replace action."
+use write_file. There is no longer a deterministic search-and-replace action.",
+        EditMode::Fast => "\
+Available actions for `file`:
+
+- read: Read a file. Params: path (required), start_line, end_line
+- delete: Delete an existing file. Params: path (required)
+  Example: {\"action\":\"delete\",\"path\":\"src/bin/old.rs\"}
+- search: Search codebase. Params: query or pattern (one required), scope, max_results
+- shell: Run a command. Params: command (required), timeout
+  Example: {\"action\":\"shell\",\"command\":\"cargo check\",\"timeout\":30}
+- revert: Revert files to a previous round. Params: to_round, path (both optional)
+
+For partial edits use replace_range or insert_at; if an edit regresses, \
+revert that revision instead of layering more edits. For full-file overwrites \
+use write_file.",
+    }
 }
 
 /// Help text for the `code` tool group.

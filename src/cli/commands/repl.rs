@@ -44,12 +44,29 @@ Plan checkpoint required before more edits. You have continued editing after the
 /// turn was streamed but never committed to history (the server dropped
 /// it), so we push this hint instead of a tool_result and let the agent
 /// try again with a smaller operation.
-const TRUNCATED_TOOL_CALL_HINT: &str = "\
+fn loop_detected_hint(edit_mode: EditMode) -> &'static str {
+    match edit_mode {
+        EditMode::Smart => "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits.",
+        EditMode::Fast => "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or replace_range / insert_at for targeted edits.",
+    }
+}
+
+fn truncated_tool_call_hint(edit_mode: EditMode) -> &'static str {
+    match edit_mode {
+        EditMode::Smart => "\
 Your previous tool call was rejected because the server could not parse its arguments as JSON — \
 most likely the generation hit max_tokens mid-string and the JSON got truncated. \
 Try a smaller operation: prefer edit_file over write_file for existing files, \
 break large writes into multiple smaller tool calls, \
-and avoid embedding very long literals in a single argument.";
+and avoid embedding very long literals in a single argument.",
+        EditMode::Fast => "\
+Your previous tool call was rejected because the server could not parse its arguments as JSON — \
+most likely the generation hit max_tokens mid-string and the JSON got truncated. \
+Try a smaller operation: prefer replace_range or insert_at over write_file for existing files, \
+break large writes into multiple smaller tool calls, \
+and avoid embedding very long literals in a single argument.",
+    }
+}
 
 struct ReplTerminalGuard;
 
@@ -80,7 +97,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         PermissionManager::new(&config)
     });
     let tool_pool = ToolWorkerPool::new(config.runtime.tool_worker_pool_size);
-    let mut tool_defs = tools::tool_definitions();
+    let mut tool_defs = tools::tool_definitions(config.tools.edit_mode);
     // Filter tools based on config
     {
         let mut disabled = Vec::new();
@@ -572,7 +589,8 @@ async fn run_agent_loop(
                                         "Previous tool call truncated — retrying with guidance.",
                                         LineStyle::Status,
                                     );
-                                    let hint = Message::user(TRUNCATED_TOOL_CALL_HINT);
+                                    let hint =
+                                        Message::user(truncated_tool_call_hint(config.tools.edit_mode));
                                     messages.push(hint.clone());
                                     conversation_history.push(hint);
                                     truncated_tool_call_hint_pushed = true;
@@ -720,10 +738,8 @@ async fn run_agent_loop(
                         LineStyle::Error,
                     );
                 }
-                let result_msg = Message::tool_result(
-                    &tc.id,
-                    "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits.",
-                );
+                let result_msg =
+                    Message::tool_result(&tc.id, loop_detected_hint(config.tools.edit_mode));
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
                 return;

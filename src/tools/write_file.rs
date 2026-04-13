@@ -1,8 +1,8 @@
 //! write_file — Create, overwrite, or touch a file.
 //!
-//! If `content` is omitted, this creates a new empty file. For semantic edits
-//! to existing code, prefer edit_file unless the model is deliberately
-//! rewriting the entire file.
+//! If `content` is omitted, this creates a new empty file. For partial edits
+//! to existing code, prefer edit_file (Smart mode) or replace_range/insert_at
+//! (Fast mode) unless the model is deliberately rewriting the entire file.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -42,11 +42,16 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         0
     };
 
+    let partial_edit_hint = match config.tools.edit_mode {
+        crate::config::EditMode::Smart => "use edit_file",
+        crate::config::EditMode::Fast => "use replace_range or insert_at",
+    };
+
     // Block writes that would truncate >50% of an existing file.
     // This prevents catastrophic data loss when the model sends partial content.
     if !is_new && !has_content {
         return Ok(ToolResult::err(format!(
-            "{path_str} already exists. Omit content only when creating a new empty file. For edits to an existing file, use edit_file or provide the complete replacement content."
+            "{path_str} already exists. Omit content only when creating a new empty file. For edits to an existing file, {partial_edit_hint} or provide the complete replacement content."
         )));
     }
 
@@ -57,7 +62,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
              (losing {} lines). This is almost certainly accidental — you probably forgot to \
              include the complete file content.\n\
              Options:\n\
-             1. Use edit_file for any partial edit to an existing file\n\
+             1. For a partial edit to an existing file, {partial_edit_hint}\n\
              2. Use file(action='read') first, then write_file with the COMPLETE content\n\
              3. If the file is already corrupted, use file(action='revert') to restore it",
             old_lines - new_lines

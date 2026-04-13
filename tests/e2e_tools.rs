@@ -865,7 +865,7 @@ async fn get_architecture_notes_returns_content() {
 
 #[test]
 fn tools_config_disables_web() {
-    let mut defs = miniswe::tools::tool_definitions();
+    let mut defs = miniswe::tools::tool_definitions(miniswe::config::EditMode::Smart);
     // Filter like run.rs does
     defs.retain(|t| t.function.name != "web");
 
@@ -884,7 +884,7 @@ fn tools_config_all_enabled_by_default() {
 
 #[test]
 fn tools_has_grouped_tools() {
-    let defs = miniswe::tools::tool_definitions();
+    let defs = miniswe::tools::tool_definitions(miniswe::config::EditMode::Smart);
     let names: Vec<&str> = defs.iter().map(|t| t.function.name.as_str()).collect();
     assert!(names.contains(&"file"), "should have file");
     assert!(names.contains(&"code"), "should have code");

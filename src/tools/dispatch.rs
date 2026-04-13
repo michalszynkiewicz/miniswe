@@ -61,7 +61,9 @@ async fn execute_file_tool(
     let action = args["action"].as_str().unwrap_or("");
 
     match action {
-        "help" => Ok(ToolResult::ok(definitions::file_help().into())),
+        "help" => Ok(ToolResult::ok(
+            definitions::file_help(config.tools.edit_mode).into(),
+        )),
 
         "read" => {
             let path = args["path"].as_str().unwrap_or("");
@@ -83,13 +85,21 @@ async fn execute_file_tool(
             delete_file::execute(args, config).await
         }
 
-        "replace" => Ok(ToolResult::err(
-            "file(action='replace') is no longer supported. For partial edits, call \
-             edit_file with {\"path\":\"<file>\",\"task\":\"<what to change and why>\"} \
-             and let the planner produce the patch. For full-file overwrites use \
-             write_file(path, content)."
-                .into(),
-        )),
+        "replace" => {
+            let partial_hint = match config.tools.edit_mode {
+                crate::config::EditMode::Smart => {
+                    "call edit_file with {\"path\":\"<file>\",\"task\":\"<what to change and why>\"} \
+                     and let the planner produce the patch"
+                }
+                crate::config::EditMode::Fast => {
+                    "use replace_range(path,start,end,content) or insert_at(path,after_line,content)"
+                }
+            };
+            Ok(ToolResult::err(format!(
+                "file(action='replace') is no longer supported. For partial edits, {partial_hint}. \
+                 For full-file overwrites use write_file(path, content)."
+            )))
+        }
 
         "search" => search::execute(args, config).await,
 

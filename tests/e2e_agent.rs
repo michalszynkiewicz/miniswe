@@ -71,7 +71,7 @@ async fn llm_client_chat_tool_call() {
     let client = LlmClient::new(config.model.clone());
     let request = ChatRequest {
         messages: vec![Message::user("read main.rs")],
-        tools: Some(tools::tool_definitions()),
+        tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
         tool_choice: None,
     };
 
@@ -142,7 +142,7 @@ async fn llm_client_stream_tool_call() {
     let client = LlmClient::new(config.model.clone());
     let request = ChatRequest {
         messages: vec![Message::user("write a file")],
-        tools: Some(tools::tool_definitions()),
+        tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
         tool_choice: None,
     };
 
@@ -531,7 +531,7 @@ async fn single_tool_call_flow_reads_file() {
             Message::system("You are a test agent."),
             Message::user("Read hello.txt"),
         ],
-        tools: Some(tools::tool_definitions()),
+        tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
         tool_choice: None,
     };
 
@@ -573,7 +573,7 @@ async fn write_file_flow_creates_file_on_disk() {
 
     let request = ChatRequest {
         messages: vec![Message::user("create output.txt")],
-        tools: Some(tools::tool_definitions()),
+        tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
         tool_choice: None,
     };
 
@@ -631,7 +631,7 @@ async fn invalid_json_args_from_llm() {
 
     let request = ChatRequest {
         messages: vec![Message::user("do something")],
-        tools: Some(tools::tool_definitions()),
+        tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
         tool_choice: None,
     };
 
@@ -724,7 +724,7 @@ async fn llm_chat_does_not_retry_truncated_tool_call_500() {
     let client = LlmClient::new(config.model.clone());
     let request = ChatRequest {
         messages: vec![Message::user("hi")],
-        tools: Some(tools::tool_definitions()),
+        tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
         tool_choice: None,
     };
 
@@ -915,7 +915,7 @@ fn message_factories_produce_correct_roles() {
 
 #[test]
 fn tool_definitions_are_valid() {
-    let defs = tools::tool_definitions();
+    let defs = tools::tool_definitions(miniswe::config::EditMode::Smart);
 
     // Should have the expected grouped tools
     let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
