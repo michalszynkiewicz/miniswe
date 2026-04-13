@@ -87,7 +87,7 @@ async fn insert_at_top_and_append_both_work() {
 }
 
 #[tokio::test]
-async fn revert_restores_pristine_and_truncates_history() {
+async fn revert_restores_pristine_and_tombstones_history() {
     let (_tmp, config, store) = setup();
     fs::write(helpers::project_path(&config, "f.rs"), "original\n").unwrap();
     let perms = PermissionManager::headless(&config);
@@ -134,9 +134,182 @@ async fn revert_restores_pristine_and_truncates_history() {
         fs::read_to_string(helpers::project_path(&config, "f.rs")).unwrap(),
         "original\n"
     );
-    // History truncated to rev_0
-    let nums: Vec<usize> = store.list("f.rs").iter().map(|r| r.number).collect();
-    assert_eq!(nums, vec![0]);
+    // rev_1 and rev_2 remain as tombstones; only rev_0 is live.
+    let rows: Vec<(usize, bool)> = store
+        .list("f.rs")
+        .iter()
+        .map(|r| (r.number, r.reverted))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(0, false), (1, true), (2, true)],
+        "tombstones should remain visible after revert"
+    );
+    assert_eq!(store.current("f.rs"), Some(0));
+    // The revert tool's feedback block should reflect the new state.
+    assert!(
+        r.content.contains("[reverted"),
+        "feedback should show tombstones after revert:\n{}",
+        r.content
+    );
+}
+
+#[tokio::test]
+async fn replay_of_reverted_edit_coexists_as_fresh_rev_with_tombstone() {
+    let (_tmp, config, store) = setup();
+    fs::write(helpers::project_path(&config, "f.rs"), "original\n").unwrap();
+    let perms = PermissionManager::headless(&config);
+
+    // Apply an edit, revert it, then apply the SAME edit again.
+    let args = json!({
+        "path": "f.rs", "start": 1, "end": 1, "content": "CHANGED"
+    });
+    tools::execute_fast_tool(
+        "replace_range", &args, &config, &perms, None, &store, 0,
+    )
+    .await
+    .unwrap();
+    tools::execute_fast_tool(
+        "revert",
+        &json!({ "path": "f.rs", "rev": 0 }),
+        &config,
+        &perms,
+        None,
+        &store,
+        0,
+    )
+    .await
+    .unwrap();
+    // Same args as before — this is the loop pathology we're guarding
+    // against.
+    let replay = tools::execute_fast_tool(
+        "replace_range", &args, &config, &perms, None, &store, 0,
+    )
+    .await
+    .unwrap();
+    assert!(replay.success, "{}", replay.content);
+
+    // The replay should have gotten a FRESH number (rev_2), not recycled
+    // rev_1. And rev_1 must still be visible as a tombstone.
+    let rows: Vec<(usize, bool)> = store
+        .list("f.rs")
+        .iter()
+        .map(|r| (r.number, r.reverted))
+        .collect();
+    assert_eq!(rows, vec![(0, false), (1, true), (2, false)]);
+
+    // The replay's feedback should carry the tombstone row so the model
+    // can see its own prior identical attempt.
+    assert!(
+        replay.content.contains("rev_1")
+            && replay.content.contains("[reverted"),
+        "replay feedback should surface the tombstone:\n{}",
+        replay.content
+    );
+    // And the payload preview in the tombstone should match the replay
+    // (lets the model recognize the byte-identical attempt).
+    assert!(
+        replay.content.contains("CHANGED"),
+        "tombstone preview should show the replayed payload:\n{}",
+        replay.content
+    );
+}
+
+#[tokio::test]
+async fn show_rev_returns_payload_for_tombstone() {
+    let (_tmp, config, store) = setup();
+    fs::write(helpers::project_path(&config, "f.rs"), "orig\n").unwrap();
+    let perms = PermissionManager::headless(&config);
+
+    tools::execute_fast_tool(
+        "replace_range",
+        &json!({ "path": "f.rs", "start": 1, "end": 1, "content": "PAYLOAD_TEXT" }),
+        &config,
+        &perms,
+        None,
+        &store,
+        0,
+    )
+    .await
+    .unwrap();
+    tools::execute_fast_tool(
+        "revert",
+        &json!({ "path": "f.rs", "rev": 0 }),
+        &config,
+        &perms,
+        None,
+        &store,
+        0,
+    )
+    .await
+    .unwrap();
+
+    let r = tools::execute_fast_tool(
+        "show_rev",
+        &json!({ "path": "f.rs", "rev": 1 }),
+        &config,
+        &perms,
+        None,
+        &store,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(r.success, "{}", r.content);
+    assert!(r.content.contains("PAYLOAD_TEXT"));
+    assert!(r.content.contains("(reverted"));
+    assert!(r.content.contains("new_text: |"));
+}
+
+#[tokio::test]
+async fn revert_onto_tombstone_is_rejected() {
+    let (_tmp, config, store) = setup();
+    fs::write(helpers::project_path(&config, "f.rs"), "orig\n").unwrap();
+    let perms = PermissionManager::headless(&config);
+
+    // rev_1 edit, revert to rev_0 — rev_1 becomes a tombstone.
+    tools::execute_fast_tool(
+        "replace_range",
+        &json!({ "path": "f.rs", "start": 1, "end": 1, "content": "v1" }),
+        &config,
+        &perms,
+        None,
+        &store,
+        0,
+    )
+    .await
+    .unwrap();
+    tools::execute_fast_tool(
+        "revert",
+        &json!({ "path": "f.rs", "rev": 0 }),
+        &config,
+        &perms,
+        None,
+        &store,
+        0,
+    )
+    .await
+    .unwrap();
+
+    // Trying to revert *onto* the tombstoned rev_1 must fail cleanly.
+    let r = tools::execute_fast_tool(
+        "revert",
+        &json!({ "path": "f.rs", "rev": 1 }),
+        &config,
+        &perms,
+        None,
+        &store,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(!r.success, "should reject reverting onto tombstone");
+    assert!(r.content.contains("tombstone"));
+    // Disk should still be the pristine content, not the tombstoned state.
+    assert_eq!(
+        fs::read_to_string(helpers::project_path(&config, "f.rs")).unwrap(),
+        "orig\n"
+    );
 }
 
 #[tokio::test]
@@ -185,6 +358,7 @@ async fn fast_definitions_cover_all_primitives() {
     assert!(names.contains(&"replace_range"));
     assert!(names.contains(&"insert_at"));
     assert!(names.contains(&"revert"));
+    assert!(names.contains(&"show_rev"));
     assert!(names.contains(&"check"));
-    assert_eq!(defs.len(), 4);
+    assert_eq!(defs.len(), 5);
 }

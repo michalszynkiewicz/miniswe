@@ -14,6 +14,7 @@
 //! - [`replace_range`] — replace lines `[start..=end]`
 //! - [`insert_at`] — insert after a line (0 = top of file)
 //! - [`revert`] — restore a named prior revision
+//! - [`show_rev`] — inspect a specific (live or reverted) revision
 //! - [`check`] — explicit cargo check / project-wide diagnostics
 //!
 //! No OLD-block confirmation on any edit. Mistakes surface as broken AST
@@ -35,6 +36,7 @@ mod check;
 mod insert_at;
 mod replace_range;
 mod revert;
+mod show_rev;
 
 pub use dispatch::execute_fast_tool;
 pub use feedback::project_error_count;

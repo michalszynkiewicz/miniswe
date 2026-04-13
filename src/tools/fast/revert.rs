@@ -60,8 +60,10 @@ pub async fn execute(
         )));
     }
 
-    // Truncate history: drop rev+1..latest. The next edit becomes rev+1.
-    if let Err(e) = revisions.truncate_to(path, rev) {
+    // Mark rev+1..latest as tombstones so the model can still see what it
+    // just undid. The next edit uses a fresh monotonic number, not a
+    // recycled one.
+    if let Err(e) = revisions.mark_reverted_to(path, rev) {
         return Ok(ToolResult::err(format!("revert: {e}")));
     }
 
@@ -85,6 +87,7 @@ pub async fn execute(
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::tools::fast::revisions::RecordArgs;
     use crate::tools::permissions::PermissionManager;
 
     fn scratch_config(dir: &std::path::Path) -> Config {
@@ -102,8 +105,23 @@ mod tests {
         execute(&args, cfg, &perms, None, store, 0).await
     }
 
+    fn rec_args<'a>(op: &'a str, label: &'a str) -> RecordArgs<'a> {
+        RecordArgs {
+            operation: op,
+            label,
+            range: None,
+            payload: None,
+            added: 1,
+            removed: 1,
+            ast_ok: true,
+            ast_error: None,
+            file_errors: 0,
+            project_errors: 0,
+        }
+    }
+
     #[tokio::test]
-    async fn revert_to_pristine_restores_rev0_and_truncates() {
+    async fn revert_to_pristine_restores_rev0_and_tombstones_rest() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = scratch_config(tmp.path());
         let p = tmp.path().join("f.rs");
@@ -112,8 +130,20 @@ mod tests {
 
         // Seed pristine and two edits
         store.ensure_pristine("f.rs", "a\nb\n").unwrap();
-        store.record("f.rs", "A\nb\n", "replace_range L1", 1, 1, true, 0, 0).unwrap();
-        store.record("f.rs", "A\nB\n", "replace_range L2", 1, 1, true, 0, 0).unwrap();
+        store
+            .record(
+                "f.rs",
+                "A\nb\n",
+                rec_args("replace_range", "replace_range L1-1"),
+            )
+            .unwrap();
+        store
+            .record(
+                "f.rs",
+                "A\nB\n",
+                rec_args("replace_range", "replace_range L2-2"),
+            )
+            .unwrap();
         std::fs::write(&p, "A\nB\n").unwrap();
 
         let r = run(
@@ -126,8 +156,17 @@ mod tests {
         assert!(r.success, "{}", r.content);
         let disk = std::fs::read_to_string(&p).unwrap();
         assert_eq!(disk, "a\nb\n", "disk should be rev_0 content");
-        let nums: Vec<usize> = store.list("f.rs").iter().map(|x| x.number).collect();
-        assert_eq!(nums, vec![0], "history should be truncated to rev_0");
+        let rows: Vec<(usize, bool)> = store
+            .list("f.rs")
+            .iter()
+            .map(|x| (x.number, x.reverted))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(0, false), (1, true), (2, true)],
+            "reverted revs should remain as tombstones"
+        );
+        assert_eq!(store.current("f.rs"), Some(0));
     }
 
     #[tokio::test]
@@ -139,9 +178,15 @@ mod tests {
         let store = RevisionStore::with_cap(20);
 
         store.ensure_pristine("f.rs", "a\n").unwrap();
-        store.record("f.rs", "v1\n", "r1", 1, 1, true, 0, 0).unwrap();
-        store.record("f.rs", "v2\n", "r2", 1, 1, true, 0, 0).unwrap();
-        store.record("f.rs", "v3\n", "r3", 1, 1, true, 0, 0).unwrap();
+        store
+            .record("f.rs", "v1\n", rec_args("replace_range", "r1"))
+            .unwrap();
+        store
+            .record("f.rs", "v2\n", rec_args("replace_range", "r2"))
+            .unwrap();
+        store
+            .record("f.rs", "v3\n", rec_args("replace_range", "r3"))
+            .unwrap();
         std::fs::write(&p, "v3\n").unwrap();
 
         let r = run(
@@ -154,8 +199,17 @@ mod tests {
         assert!(r.success, "{}", r.content);
         let disk = std::fs::read_to_string(&p).unwrap();
         assert_eq!(disk, "v1\n");
-        let nums: Vec<usize> = store.list("f.rs").iter().map(|x| x.number).collect();
-        assert_eq!(nums, vec![0, 1]);
+        let rows: Vec<(usize, bool)> = store
+            .list("f.rs")
+            .iter()
+            .map(|x| (x.number, x.reverted))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(0, false), (1, false), (2, true), (3, true)],
+            "rev_2 and rev_3 should be tombstones after revert"
+        );
+        assert_eq!(store.current("f.rs"), Some(1));
     }
 
     #[tokio::test]
@@ -198,7 +252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_edit_after_revert_becomes_next_rev_number() {
+    async fn next_edit_after_revert_uses_monotonic_number() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = scratch_config(tmp.path());
         let p = tmp.path().join("f.rs");
@@ -206,8 +260,12 @@ mod tests {
         let store = RevisionStore::with_cap(20);
 
         store.ensure_pristine("f.rs", "a\n").unwrap();
-        store.record("f.rs", "b\n", "r1", 1, 1, true, 0, 0).unwrap();
-        store.record("f.rs", "c\n", "r2", 1, 1, true, 0, 0).unwrap();
+        store
+            .record("f.rs", "b\n", rec_args("replace_range", "r1"))
+            .unwrap();
+        store
+            .record("f.rs", "c\n", rec_args("replace_range", "r2"))
+            .unwrap();
 
         let _ = run(
             serde_json::json!({ "path": "f.rs", "rev": 1 }),
@@ -216,8 +274,12 @@ mod tests {
         )
         .await
         .unwrap();
-        // After truncating to rev_1, the next record should assign rev_2.
-        let n = store.record("f.rs", "d\n", "next", 1, 1, true, 0, 0).unwrap();
-        assert_eq!(n, 2);
+        // After reverting to rev_1, rev_2 is now a tombstone. The next
+        // record must NOT recycle number 2 — it should assign rev_3
+        // (monotonic across the full history).
+        let n = store
+            .record("f.rs", "d\n", rec_args("replace_range", "next"))
+            .unwrap();
+        assert_eq!(n, 3);
     }
 }
