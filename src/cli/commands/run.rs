@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
-use crate::config::{Config, ModelRole};
+use crate::config::{Config, EditMode, ModelRole};
 use crate::context;
 use crate::llm::{ChatRequest, Message, ModelRouter, is_truncated_tool_call_error};
 use crate::logging::SessionLog;
@@ -72,7 +72,14 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         if !config.tools.plan {
             disabled.push("plan");
         }
+        if config.tools.edit_mode == EditMode::Fast {
+            // Fast mode replaces edit_file with the primitive surface.
+            disabled.push("edit_file");
+        }
         tool_defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
+        if config.tools.edit_mode == EditMode::Fast {
+            tool_defs.extend(tools::fast_mode_tool_definitions());
+        }
     }
 
     // Clear stale scratchpad/plan from previous sessions
@@ -183,6 +190,29 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let snapshots = tools::snapshots::SnapshotManager::init(&config.project_root)
         .ok()
         .map(|s| Arc::new(Mutex::new(s)));
+
+    // Fast-mode state: per-file revision store (in-memory, session-scoped)
+    // + the project-wide LSP error count captured at session start. The
+    // baseline lets each edit's feedback line report `(+N from baseline)`
+    // so regressions jump out.
+    let fast_revisions: Option<Arc<tools::RevisionStore>> =
+        if config.tools.edit_mode == EditMode::Fast {
+            let miniswe_dir = config.miniswe_path("revisions");
+            match tools::RevisionStore::new(&miniswe_dir) {
+                Ok(s) => Some(Arc::new(s)),
+                Err(e) => {
+                    tui::print_status(&format!("fast mode: revision store init failed ({e})"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let fast_baseline_errors: usize = if config.tools.edit_mode == EditMode::Fast {
+        tools::fast::project_error_count(lsp_client.as_deref()).await
+    } else {
+        0
+    };
 
     // Initial context assembly
     let assembled = context::assemble(
@@ -574,6 +604,52 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     cancelled.as_ref(),
                 )
                 .await
+            } else if matches!(
+                tc.function.name.as_str(),
+                "replace_range" | "insert_at" | "revert" | "check"
+            ) && config.tools.edit_mode == EditMode::Fast
+            {
+                let tool_name = tc.function.name.clone();
+                let args = args.clone();
+                let config = config.clone();
+                let perms = perms.clone();
+                let lsp = lsp_client.clone();
+                let revisions = fast_revisions.clone();
+                let baseline = fast_baseline_errors;
+                match tool_pool
+                    .submit(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| e.to_string())?;
+                        let Some(revisions) = revisions else {
+                            return Ok(crate::tools::ToolResult::err(
+                                "fast mode: revision store unavailable".into(),
+                            ));
+                        };
+                        runtime
+                            .block_on(async move {
+                                tools::execute_fast_tool(
+                                    &tool_name,
+                                    &args,
+                                    &config,
+                                    perms.as_ref(),
+                                    lsp.as_deref(),
+                                    revisions.as_ref(),
+                                    baseline,
+                                )
+                                .await
+                            })
+                            .map_err(|e| format!("fast tool error: {e}"))
+                    })
+                    .await
+                {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => crate::tools::ToolResult::err(e),
+                    Err(_) => {
+                        crate::tools::ToolResult::err("Tool worker dropped fast tool job".into())
+                    }
+                }
             } else if tc.function.name == "mcp_use" {
                 let server = args["server"].as_str().unwrap_or("").to_string();
                 let tool = args["tool"].as_str().unwrap_or("").to_string();
