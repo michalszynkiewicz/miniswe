@@ -14,11 +14,12 @@ use crate::lsp::LspClient;
 use super::super::ToolResult;
 use super::super::permissions::PermissionManager;
 use super::revisions::RevisionStore;
-use super::{check, insert_at, replace_range, revert};
+use super::{check, insert_at, replace_range, revert, show_rev};
 
 /// Dispatch a fast-mode tool by name. Valid names:
-/// `"replace_range"`, `"insert_at"`, `"revert"`, `"check"`. `write_file`
-/// is not fast-mode-specific and is handled by the main dispatcher.
+/// `"replace_range"`, `"insert_at"`, `"revert"`, `"show_rev"`, `"check"`.
+/// `write_file` is not fast-mode-specific and is handled by the main
+/// dispatcher.
 ///
 /// `project_baseline_errors` is captured once at session start and
 /// threaded through so each feedback block can report the delta.
@@ -42,6 +43,7 @@ pub async fn execute_fast_tool(
         "revert" => {
             revert::execute(args, config, perms, lsp, revisions, project_baseline_errors).await
         }
+        "show_rev" => show_rev::execute(args, perms, revisions).await,
         "check" => check::execute(args, config).await,
         _ => bail!("Unknown fast-mode tool: {name}"),
     }

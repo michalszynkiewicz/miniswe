@@ -20,7 +20,7 @@ use super::lines::{
     join_with_trailing_nl, split_preserving_trailing_nl, split_replacement,
     validate_insertion_anchor,
 };
-use super::revisions::RevisionStore;
+use super::revisions::{RecordArgs, RevisionStore};
 
 pub async fn execute(
     args: &Value,
@@ -98,12 +98,18 @@ pub async fn execute(
     let rev = revisions.record(
         path,
         &new_content,
-        &format!("insert_at after L{after_line}"),
-        added,
-        0,
-        fb.ast_ok,
-        fb.file_errors,
-        fb.project_errors,
+        RecordArgs {
+            operation: "insert_at",
+            label: &format!("insert_at after L{after_line}"),
+            range: None,
+            payload: Some(content.to_string()),
+            added,
+            removed: 0,
+            ast_ok: fb.ast_ok,
+            ast_error: fb.ast_error.clone(),
+            file_errors: fb.file_errors,
+            project_errors: fb.project_errors,
+        },
     )?;
 
     let fb = build_feedback(

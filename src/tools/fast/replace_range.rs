@@ -18,7 +18,7 @@ use super::feedback::build_feedback;
 use super::lines::{
     join_with_trailing_nl, split_preserving_trailing_nl, split_replacement, validate_range,
 };
-use super::revisions::RevisionStore;
+use super::revisions::{RecordArgs, RevisionStore};
 
 pub async fn execute(
     args: &Value,
@@ -122,12 +122,18 @@ pub async fn execute(
     let rev = revisions.record(
         path,
         &new_content,
-        &format!("replace_range L{start}-{end}"),
-        added,
-        removed,
-        fb.ast_ok,
-        fb.file_errors,
-        fb.project_errors,
+        RecordArgs {
+            operation: "replace_range",
+            label: &format!("replace_range L{start}-{end}"),
+            range: Some((start, end)),
+            payload: Some(content.to_string()),
+            added,
+            removed,
+            ast_ok: fb.ast_ok,
+            ast_error: fb.ast_error.clone(),
+            file_errors: fb.file_errors,
+            project_errors: fb.project_errors,
+        },
     )?;
 
     // Re-render feedback so the revision table includes the row we just

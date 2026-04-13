@@ -183,8 +183,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
 }
 
 /// Return the fast-mode tool definitions (`replace_range`, `insert_at`,
-/// `revert`, `check`). Fed to the router when `tools.edit_mode = "fast"`,
-/// replacing `edit_file`. See `docs/fast-mode-design.md`.
+/// `revert`, `show_rev`, `check`). Fed to the router when
+/// `tools.edit_mode = "fast"`, replacing `edit_file`. See
+/// `docs/fast-mode-design.md`.
 pub fn fast_mode_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -224,12 +225,27 @@ pub fn fast_mode_tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "revert".into(),
-                description: "Restore `path` to a named prior revision. Pick the rev number from the revision table attached to every edit's feedback. Linear history: reverting to rev_N truncates rev_{N+1}.. and the next edit becomes rev_{N+1}.".into(),
+                description: "Restore `path` to a named prior revision. Pick the rev number from the revision table attached to every edit's feedback. Reverting to rev_N marks rev_{N+1}.. as tombstones (`[reverted]` rows that stay in the table so you can see what you undid — use `show_rev` for details). The next edit gets a fresh monotonic number, never a recycled one. Tombstones cannot be the target of another revert.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "File path relative to project root" },
-                        "rev": { "type": "integer", "description": "Revision number to restore (0 = original / pristine)" }
+                        "rev": { "type": "integer", "description": "Revision number to restore (0 = original / pristine). Must be a live rev, not a tombstone." }
+                    },
+                    "required": ["path", "rev"]
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "show_rev".into(),
+                description: "Show the full stored details for a specific revision of `path`: operation, arguments, outcome, and the verbatim payload (new_text / inserted text) capped at 2 KB. Works for both live revs and tombstones — useful for deciding whether your next edit would be a byte-identical replay of an edit you already reverted.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path relative to project root" },
+                        "rev": { "type": "integer", "description": "Revision number to inspect (0 = pristine)" }
                     },
                     "required": ["path", "rev"]
                 }),

@@ -825,7 +825,7 @@ async fn run_agent_loop(
             // Execute tool (permissions already checked above for shell/web/mcp)
             let mut result = if matches!(
                 tc.function.name.as_str(),
-                "replace_range" | "insert_at" | "revert" | "check"
+                "replace_range" | "insert_at" | "revert" | "show_rev" | "check"
             ) && config.tools.edit_mode == EditMode::Fast
             {
                 let tool_name = tc.function.name.clone();
