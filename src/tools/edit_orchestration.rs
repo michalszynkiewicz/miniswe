@@ -417,7 +417,10 @@ async fn auto_check(
         hints.push("ACTION: A symbol was renamed/removed but references remain. Search for the old name and update.");
     }
     if joined.contains("unclosed delimiter") || joined.contains("unexpected closing") {
-        hints.push("ACTION: Broken syntax (missing/extra bracket). Use edit_file for the structural repair; replace is unreliable for structural fixes.");
+        hints.push(match config.tools.edit_mode {
+            crate::config::EditMode::Smart => "ACTION: Broken syntax (missing/extra bracket). Use edit_file for the structural repair; replace is unreliable for structural fixes.",
+            crate::config::EditMode::Fast => "ACTION: Broken syntax (missing/extra bracket). Revert the offending rev and land the structural repair as a tighter replace_range over the enclosing block.",
+        });
     }
     if joined.contains("mismatched types") {
         hints.push("ACTION: Type mismatch. Check the function signature and update the caller to pass the correct type.");

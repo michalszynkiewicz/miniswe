@@ -83,18 +83,33 @@ pub struct AssembledContext {
 }
 
 /// Build the system prompt in compressed structured format.
-fn build_system_prompt() -> String {
-    // Compressed format per design section 13.3 — ~40% shorter than prose
-    String::from(
+///
+/// The edit-tool guidance varies by `edit_mode`: Smart mode points the model
+/// at `edit_file`; Fast mode points at the primitive surface
+/// (`replace_range` / `insert_at` / `revert` / `show_rev`). Telling the model
+/// to use a tool that isn't in its tool list wastes rounds, so we branch here.
+fn build_system_prompt(edit_mode: crate::config::EditMode) -> String {
+    let edit_contract = match edit_mode {
+        crate::config::EditMode::Smart => "\
+edit_file applies a semantic patch to one file: {\"path\":\"src/lib.rs\",\"task\":\"rename foo to bar throughout the file\"}\n\
+write_file with content replaces the whole file: {\"path\":\"notes/todo.txt\",\"content\":\"first line\\nsecond line\\n\"}\n\
+write_file without content creates a new empty file: {\"path\":\"tmp/placeholder.txt\"}\n\
+file shell: {\"action\":\"shell\",\"command\":\"ls\",\"timeout\":60}\n\
+For any partial file edit (single line or multi-line), use edit_file with a clear task description.",
+        crate::config::EditMode::Fast => "\
+replace_range replaces lines [start..=end] (1-based, inclusive) with content: {\"path\":\"src/lib.rs\",\"start\":10,\"end\":15,\"content\":\"...\"}\n\
+insert_at inserts content after a line (0=top, last line = append): {\"path\":\"src/lib.rs\",\"after_line\":0,\"content\":\"use std::fs;\\n\"}\n\
+write_file with content replaces the whole file: {\"path\":\"notes/todo.txt\",\"content\":\"first line\\nsecond line\\n\"}\n\
+write_file without content creates a new empty file: {\"path\":\"tmp/placeholder.txt\"}\n\
+file shell: {\"action\":\"shell\",\"command\":\"ls\",\"timeout\":60}\n\
+Every edit returns a revision table; if an edit regresses, call revert {\"path\":...,\"rev\":N} to roll back — do not layer more edits on top.",
+    };
+    format!(
         "You are miniswe, a coding agent. Use your tools to complete the task.\n\
          Tool contract: grouped tools require action plus action-specific params.\n\
-         file read: {\"action\":\"read\",\"path\":\"README.md\"}\n\
-         edit_file applies a semantic patch to one file: {\"path\":\"src/lib.rs\",\"task\":\"rename foo to bar throughout the file\"}\n\
-         write_file with content replaces the whole file: {\"path\":\"notes/todo.txt\",\"content\":\"first line\\nsecond line\\n\"}\n\
-         write_file without content creates a new empty file: {\"path\":\"tmp/placeholder.txt\"}\n\
-         file shell: {\"action\":\"shell\",\"command\":\"ls\",\"timeout\":60}\n\
-         For any partial file edit (single line or multi-line), use edit_file with a clear task description.\n\
-         If a tool says a parameter is missing, retry with the exact required parameter names.\n",
+         file read: {{\"action\":\"read\",\"path\":\"README.md\"}}\n\
+         {edit_contract}\n\
+         If a tool says a parameter is missing, retry with the exact required parameter names.\n"
     )
 }
 
@@ -293,7 +308,7 @@ pub fn assemble(
     let mut used_tokens = 0;
 
     // 1. System prompt (always present)
-    let mut system_context = build_system_prompt();
+    let mut system_context = build_system_prompt(config.tools.edit_mode);
 
     // 1b. Project root (always present)
     system_context.push_str(&format!(
