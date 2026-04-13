@@ -182,6 +182,73 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Return the fast-mode tool definitions (`replace_range`, `insert_at`,
+/// `revert`, `check`). Fed to the router when `tools.edit_mode = "fast"`,
+/// replacing `edit_file`. See `docs/fast-mode-design.md`.
+pub fn fast_mode_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "replace_range".into(),
+                description: "Replace lines [start..=end] (1-based, inclusive) with `content`. Empty content deletes the range. After each call you receive per-edit AST + LSP feedback and the file's revision table; if you see a regression, call `revert` with the prior rev number.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path relative to project root" },
+                        "start": { "type": "integer", "description": "First line to replace (1-based, inclusive)" },
+                        "end": { "type": "integer", "description": "Last line to replace (1-based, inclusive)" },
+                        "content": { "type": "string", "description": "Replacement text. Empty string deletes [start..=end]." }
+                    },
+                    "required": ["path", "start", "end", "content"]
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "insert_at".into(),
+                description: "Insert `content` after line `after_line` (1-based). Use after_line=0 to insert at the top of the file, after_line=<last line> to append. Use `replace_range` when you need to replace or delete existing lines.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path relative to project root" },
+                        "after_line": { "type": "integer", "description": "Line to insert after (0 = top of file, N = after current line N)" },
+                        "content": { "type": "string", "description": "Text to insert. Cannot be empty." }
+                    },
+                    "required": ["path", "after_line", "content"]
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "revert".into(),
+                description: "Restore `path` to a named prior revision. Pick the rev number from the revision table attached to every edit's feedback. Linear history: reverting to rev_N truncates rev_{N+1}.. and the next edit becomes rev_{N+1}.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path relative to project root" },
+                        "rev": { "type": "integer", "description": "Revision number to restore (0 = original / pristine)" }
+                    },
+                    "required": ["path", "rev"]
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "check".into(),
+                description: "Run the project's compiler (cargo / tsc / go vet / mvn / gradle) and report errors. Per-edit feedback already shows LSP state; reach for this when you want a deeper, synchronous confirmation that the whole project builds.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+        },
+    ]
+}
+
 /// Return the mcp_use tool definition (only added when MCP servers are configured).
 pub fn mcp_tool_definition() -> ToolDefinition {
     ToolDefinition {

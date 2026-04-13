@@ -33,9 +33,10 @@ mod write_file;
 pub mod definitions;
 pub mod permissions;
 pub use cargo_check::run_check_with_timeout;
-pub use definitions::tool_definitions;
+pub use definitions::{fast_mode_tool_definitions, tool_definitions};
 pub use dispatch::execute_tool;
 pub use edit_orchestration::execute_edit_file_tool;
+pub use fast::{RevisionStore, execute_fast_tool};
 pub use permissions::PermissionManager;
 
 /// Result of executing a tool.

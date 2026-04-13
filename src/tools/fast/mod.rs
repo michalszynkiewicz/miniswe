@@ -21,11 +21,14 @@
 //!
 //! ## Status
 //!
-//! Skeleton only — all public entry points are `todo!()`. Not yet wired
-//! into `execute_tool`. Tracked by task #82.
+//! Fully implemented. Wired into the run loop when `tools.edit_mode = "fast"`.
+//! `edit_file` is dropped from the tool list in fast mode; the four
+//! primitives above are offered instead.
 
+mod ast;
 mod dispatch;
 mod feedback;
+mod lines;
 mod revisions;
 
 mod check;
@@ -34,4 +37,5 @@ mod replace_range;
 mod revert;
 
 pub use dispatch::execute_fast_tool;
+pub use feedback::project_error_count;
 pub use revisions::RevisionStore;

@@ -13,7 +13,7 @@ use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
-use crate::config::{Config, ModelRole};
+use crate::config::{Config, EditMode, ModelRole};
 use crate::context;
 use crate::context::compress;
 use crate::llm::{ChatRequest, Message, ModelRouter, is_truncated_tool_call_error};
@@ -90,7 +90,13 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         if !config.tools.plan {
             disabled.push("plan");
         }
+        if config.tools.edit_mode == EditMode::Fast {
+            disabled.push("edit_file");
+        }
         tool_defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
+        if config.tools.edit_mode == EditMode::Fast {
+            tool_defs.extend(tools::fast_mode_tool_definitions());
+        }
     }
 
     // Spawn LSP client (non-blocking)
@@ -101,6 +107,21 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         }
     } else {
         None
+    };
+
+    // Fast-mode state: per-file revisions + project-wide LSP baseline.
+    // Same structure as the one in run.rs — see its comment for rationale.
+    let fast_revisions: Option<Arc<tools::RevisionStore>> =
+        if config.tools.edit_mode == EditMode::Fast {
+            let miniswe_dir = config.miniswe_path("revisions");
+            tools::RevisionStore::new(&miniswe_dir).ok().map(Arc::new)
+        } else {
+            None
+        };
+    let fast_baseline_errors: usize = if config.tools.edit_mode == EditMode::Fast {
+        tools::fast::project_error_count(lsp_client.as_deref()).await
+    } else {
+        0
     };
 
     // Clear stale scratchpad/plan
@@ -326,6 +347,8 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                     max_rounds,
                                     log.clone(),
                                     &lsp_client,
+                                    &fast_revisions,
+                                    fast_baseline_errors,
                                 )
                                 .await;
 
@@ -453,6 +476,8 @@ async fn run_agent_loop(
     max_rounds: usize,
     log: Arc<SessionLog>,
     lsp: &Option<Arc<LspClient>>,
+    fast_revisions: &Option<Arc<tools::RevisionStore>>,
+    fast_baseline_errors: usize,
 ) {
     let mut round = 0;
     let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
@@ -798,7 +823,53 @@ async fn run_agent_loop(
             }
 
             // Execute tool (permissions already checked above for shell/web/mcp)
-            let mut result = if tc.function.name == "mcp_use" {
+            let mut result = if matches!(
+                tc.function.name.as_str(),
+                "replace_range" | "insert_at" | "revert" | "check"
+            ) && config.tools.edit_mode == EditMode::Fast
+            {
+                let tool_name = tc.function.name.clone();
+                let args = args.clone();
+                let config = config.clone();
+                let perms = perms.clone();
+                let lsp = lsp.clone();
+                let revisions = fast_revisions.clone();
+                let baseline = fast_baseline_errors;
+                let mut result_rx = tool_pool.submit(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    let Some(revisions) = revisions else {
+                        return Ok(crate::tools::ToolResult::err(
+                            "fast mode: revision store unavailable".into(),
+                        ));
+                    };
+                    runtime
+                        .block_on(async move {
+                            tools::execute_fast_tool(
+                                &tool_name,
+                                &args,
+                                &config,
+                                perms.as_ref(),
+                                lsp.as_deref(),
+                                revisions.as_ref(),
+                                baseline,
+                            )
+                            .await
+                        })
+                        .map_err(|e| format!("fast tool error: {e}"))
+                });
+                await_tool_job_ui(
+                    rx,
+                    terminal,
+                    app,
+                    &tc.function.name,
+                    &mut result_rx,
+                    cancelled,
+                )
+                .await
+            } else if tc.function.name == "mcp_use" {
                 let server = args["server"].as_str().unwrap_or("").to_string();
                 let tool = args["tool"].as_str().unwrap_or("").to_string();
                 let tool_args = args.get("arguments").cloned().unwrap_or_default();

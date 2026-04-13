@@ -265,6 +265,22 @@ pub struct ToolsConfig {
     pub plan: bool,
     /// Scratchpad (task_update)
     pub scratchpad: bool,
+    /// Edit-tool surface: `"smart"` (default) exposes `edit_file` which
+    /// delegates to an inner-model planner; `"fast"` replaces it with the
+    /// primitive `replace_range` / `insert_at` / `revert` / `check` surface
+    /// from `src/tools/fast/`. See `docs/fast-mode-design.md`.
+    pub edit_mode: EditMode,
+}
+
+/// Which edit-tool surface to expose to the outer model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EditMode {
+    /// `edit_file` + inner-model planner (current behavior).
+    #[default]
+    Smart,
+    /// Fast-mode primitives: `replace_range`, `insert_at`, `revert`, `check`.
+    Fast,
 }
 
 impl Default for ToolsConfig {
@@ -275,6 +291,7 @@ impl Default for ToolsConfig {
             web_tools: true,
             plan: true,
             scratchpad: true,
+            edit_mode: EditMode::Smart,
         }
     }
 }
