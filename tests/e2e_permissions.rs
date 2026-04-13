@@ -170,6 +170,42 @@ fn resolve_path_allows_new_file_in_existing_dir() {
     assert!(result.is_ok());
 }
 
+/// Regression: paths that resolve through a symlink inside the project root
+/// (e.g. docker benches where `.miniswe/` is a symlink to a bind-mounted
+/// volume, or users who alias `.miniswe/` onto a different disk) must not be
+/// rejected. The jail check cares about `..` traversal, not about whether the
+/// model followed a symlink the operator placed.
+#[test]
+fn resolve_path_allows_read_through_symlinked_subdir() {
+    use std::os::unix::fs::symlink;
+
+    let (_tmp, config) = helpers::create_test_project();
+    let perms = PermissionManager::headless(&config);
+
+    // External dir that holds the real data.
+    let external = tempfile::TempDir::new().unwrap();
+    fs::write(external.path().join("state.md"), "from-outside").unwrap();
+
+    // Create `.state` inside the project as a symlink to the external dir.
+    let link_inside_project = config.project_root.join(".state");
+    symlink(external.path(), &link_inside_project).unwrap();
+
+    // Reading through the symlink must be allowed — no `..` in the path,
+    // so no jail violation.
+    let result = perms.resolve_and_check_path(".state/state.md");
+    assert!(
+        result.is_ok(),
+        "symlinked subdir should be readable: {result:?}"
+    );
+
+    // And writing a new file under the symlinked subdir must also work.
+    let result = perms.resolve_and_check_path(".state/new.md");
+    assert!(
+        result.is_ok(),
+        "writing through symlinked subdir should be allowed: {result:?}"
+    );
+}
+
 // ── Shell permission checks ─────────────────────────────────────────
 
 #[test]

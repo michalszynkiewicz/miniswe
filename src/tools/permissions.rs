@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::sync::Mutex;
 
 use crate::config::Config;
@@ -127,6 +127,18 @@ impl PermissionManager {
         }
 
         let joined = self.project_root.join(path_str);
+
+        // Fast path: if the path has no `..` components, it cannot escape the
+        // jail via traversal. Skip canonicalize() so we don't follow symlinks
+        // the user (or our own setup — e.g. docker's `.miniswe/` → /output
+        // symlink) has explicitly placed inside the project tree. Following
+        // them would resolve to an out-of-tree path and get wrongly rejected.
+        let has_parent_dir = std::path::Path::new(path_str)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir));
+        if !has_parent_dir {
+            return Ok(joined);
+        }
 
         // Canonicalize to resolve ../
         // For new files that don't exist yet, canonicalize the parent
