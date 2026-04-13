@@ -44,12 +44,8 @@ Plan checkpoint required before more edits. You have continued editing after the
 /// turn was streamed but never committed to history (the server dropped
 /// it), so we push this hint instead of a tool_result and let the agent
 /// try again with a smaller operation.
-fn loop_detected_hint(edit_mode: EditMode) -> &'static str {
-    match edit_mode {
-        EditMode::Smart => "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits.",
-        EditMode::Fast => "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or replace_range / insert_at for targeted edits.",
-    }
-}
+/// Only fires in `EditMode::Smart`. See `run.rs` for the reasoning.
+const LOOP_DETECTED_HINT_SMART: &str = "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits.";
 
 fn truncated_tool_call_hint(edit_mode: EditMode) -> &'static str {
     match edit_mode {
@@ -720,29 +716,37 @@ async fn run_agent_loop(
             let args_summary = summarize_args(&tc.function.name, &args);
 
             // Detect tool call loops: only identical calls repeated consecutively.
-            let call_key = loop_call_key(&tc.function.name, &args);
-            if last_call_key.as_ref() == Some(&call_key) {
-                same_call_streak += 1;
-            } else {
-                last_call_key = Some(call_key.clone());
-                same_call_streak = 1;
-            }
-            if same_call_streak >= 3 {
-                if same_call_streak == 3 {
-                    log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
-                    app.push_output(
-                        &format!(
-                            "  ✗ Loop detected: {}({}) repeated 3 times in a row — stopping this turn",
-                            tc.function.name, args_summary
-                        ),
-                        LineStyle::Error,
-                    );
+            // Fast mode opts out — tombstones + per-edit AST/LSP feedback already
+            // handle file-edit loops, and hard-stopping the turn on a shell retry
+            // (e.g. a sed with a bad regex) removes the model's chance to fix it.
+            if enforce_loop_detection(config.tools.edit_mode) {
+                let call_key = loop_call_key(&tc.function.name, &args);
+                if last_call_key.as_ref() == Some(&call_key) {
+                    same_call_streak += 1;
+                } else {
+                    last_call_key = Some(call_key.clone());
+                    same_call_streak = 1;
                 }
-                let result_msg =
-                    Message::tool_result(&tc.id, loop_detected_hint(config.tools.edit_mode));
-                messages.push(result_msg.clone());
-                conversation_history.push(result_msg);
-                return;
+                if same_call_streak >= 3 {
+                    if same_call_streak == 3 {
+                        log.loop_detected(
+                            &tc.function.name,
+                            &args_summary,
+                            same_call_streak as usize,
+                        );
+                        app.push_output(
+                            &format!(
+                                "  ✗ Loop detected: {}({}) repeated 3 times in a row — stopping this turn",
+                                tc.function.name, args_summary
+                            ),
+                            LineStyle::Error,
+                        );
+                    }
+                    let result_msg = Message::tool_result(&tc.id, LOOP_DETECTED_HINT_SMART);
+                    messages.push(result_msg.clone());
+                    conversation_history.push(result_msg);
+                    return;
+                }
             }
 
             log.tool_call_detail(&tc.function.name, &args);
@@ -1217,6 +1221,14 @@ fn loop_call_key(tool_name: &str, args: &serde_json::Value) -> String {
     format!("{tool_name}:{}", canonical_json(args))
 }
 
+/// Whether the agent loop should hard-stop the turn after 3 consecutive
+/// identical tool calls. Fast mode opts out (tombstones + explicit `revert`
+/// already cover file-edit loops, and other tools can legitimately recover
+/// on a 4th try).
+fn enforce_loop_detection(edit_mode: EditMode) -> bool {
+    matches!(edit_mode, EditMode::Smart)
+}
+
 fn permission_action(tool_name: &str, args: &serde_json::Value) -> Option<Action> {
     match tool_name {
         "shell" => Some(Action::Shell(args["command"].as_str().unwrap_or("").into())),
@@ -1441,6 +1453,16 @@ mod tests {
             Some(Action::Shell(cmd)) => assert_eq!(cmd, "python -m http.server"),
             _ => panic!("expected grouped file shell to require shell permission"),
         }
+    }
+
+    #[test]
+    fn loop_detection_enforced_in_smart_mode() {
+        assert!(enforce_loop_detection(EditMode::Smart));
+    }
+
+    #[test]
+    fn loop_detection_disabled_in_fast_mode() {
+        assert!(!enforce_loop_detection(EditMode::Fast));
     }
 
     #[test]
