@@ -81,7 +81,7 @@ petgraph = "0.7"
 notify = "7"
 
 # TUI
-ratatui = "0.29"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
 
 # Misc

@@ -151,16 +151,6 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
 
-    // Calculate scroll: we want to show the bottom of the output by default
-    let total = lines.len();
-    let scroll = if app.scroll_offset == 0 {
-        total.saturating_sub(inner_height)
-    } else {
-        total
-            .saturating_sub(inner_height)
-            .saturating_sub(app.scroll_offset as usize)
-    };
-
     let title = if app.scroll_offset > 0 {
         " transcript (scrolled) ".to_string()
     } else if let Some(active_job) = &app.active_job {
@@ -171,7 +161,14 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
         " transcript ".to_string()
     };
 
-    let output_widget = Paragraph::new(lines)
+    // Build the paragraph first so we can ask it for the true wrapped-row
+    // count. Using `lines.len()` here would count *logical* lines — but with
+    // `Wrap { trim: false }` a single long logical line spans multiple
+    // visual rows, and `Paragraph::scroll()` operates on visual rows. Feeding
+    // it a logical-line count pushes content below the viewport whenever any
+    // line wraps (long LLM output, long tool-result first-line, user prompt
+    // on a narrow pane).
+    let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -181,9 +178,26 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
                 .style(Style::default().bg(BG_PANEL)),
         )
         .wrap(Wrap { trim: false })
-        .style(Style::default().bg(BG_PANEL))
-        .scroll((scroll as u16, 0));
+        .style(Style::default().bg(BG_PANEL));
 
+    // Ask ratatui how many visual rows the wrapped text actually occupies.
+    // `line_count(width)` wraps at the content width (area.width − 2 for the
+    // left/right borders) and adds top+bottom border space (+2) to the
+    // result, so we subtract it back out to get pure content rows.
+    let inner_width = area.width.saturating_sub(2);
+    let total = paragraph
+        .line_count(inner_width)
+        .saturating_sub(2);
+
+    let scroll = if app.scroll_offset == 0 {
+        total.saturating_sub(inner_height)
+    } else {
+        total
+            .saturating_sub(inner_height)
+            .saturating_sub(app.scroll_offset as usize)
+    };
+
+    let output_widget = paragraph.scroll((scroll as u16, 0));
     frame.render_widget(output_widget, area);
 
     // Scrollbar
@@ -392,6 +406,68 @@ mod tests {
     fn centered_rect_is_centered_and_bounded() {
         let modal = centered_rect(Rect::new(0, 0, 100, 30), 80, 7);
         assert_eq!(modal, Rect::new(10, 11, 80, 7));
+    }
+
+    #[test]
+    fn wrapped_lines_do_not_push_tail_below_viewport() {
+        // Narrow terminal: 30 cols total → ~28 cols content width.
+        // Output pane gets ~14 rows in this layout (3 topbar, 3 input).
+        // Push a mix of short lines and a long one that wraps. The last
+        // logical line ("TAIL_MARKER") must stay visible at the bottom.
+        let backend = TestBackend::new(30, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = crate::tui::app::App::new();
+
+        // Fill the output with enough short lines that the tail would sit at
+        // the boundary, then add a long wrapped line, then the marker.
+        for i in 0..10 {
+            app.push_output(&format!("line {i}"), crate::tui::app::LineStyle::Normal);
+        }
+        // This line is ~90 chars → wraps to 3-4 visual rows at width ~28.
+        // Under the old scroll math the marker gets pushed off-screen.
+        app.push_output(
+            "this is a very long logical line that definitely wraps across several visual rows when rendered in a narrow pane",
+            crate::tui::app::LineStyle::Normal,
+        );
+        app.push_output("TAIL_MARKER", crate::tui::app::LineStyle::Normal);
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let text = buffer_text(&buffer);
+        assert!(
+            text.contains("TAIL_MARKER"),
+            "tail marker hidden below viewport — wrapped-line scroll regression:\n{text}"
+        );
+    }
+
+    #[test]
+    fn wide_terminal_no_wrap_tail_stays_visible() {
+        // Reproduce user's 148-col session: no lines wrap, but many logical
+        // lines accumulate and the tail should still be visible with
+        // scroll_offset == 0. If this test fails, the bug isn't in wrap math.
+        let backend = TestBackend::new(148, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = crate::tui::app::App::new();
+
+        // Simulate ~50 output lines — none wrap at 146-col content width.
+        for i in 0..30 {
+            app.push_output(&format!("  → file(shell step {i})"), crate::tui::app::LineStyle::ToolCall);
+            app.push_output(&format!("  ✓ file: [shell: exit 0]"), crate::tui::app::LineStyle::ToolOk);
+        }
+        // Tail marker — if the math is right, this is the last thing on screen.
+        app.push_output("FINAL_TAIL_MARKER", crate::tui::app::LineStyle::Normal);
+
+        assert_eq!(app.scroll_offset, 0, "push_output should reset scroll");
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let text = buffer_text(&buffer);
+        assert!(
+            text.contains("FINAL_TAIL_MARKER"),
+            "tail marker hidden at 148-col/no-wrap — math is wrong even without wrapping:\n{text}"
+        );
     }
 
     #[test]
