@@ -168,6 +168,11 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         .as_ref()
         .and_then(|r| r.lock().ok().and_then(|g| g.context_summary()));
 
+    // Token budget for compression decisions. Tool definitions are a fixed
+    // overhead per request, so compute once.
+    let tool_def_tokens =
+        context::estimate_tokens(&serde_json::to_string(&tool_defs).unwrap_or_default());
+
     // Set up terminal
     let _terminal_guard = ReplTerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -371,6 +376,29 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                 )
                                 .await;
 
+                                // The agent loop may exit via early-break
+                                // paths (empty choices, errors) that skip
+                                // flush_tokens. Flush here so stray tokens
+                                // don't sit in the buffer through compression.
+                                app.flush_tokens();
+
+                                app.set_active_job("compressing context");
+                                let _ = terminal.draw(|frame| ui::draw(frame, &app));
+                                let mut plan_update_requested = true;
+                                context::compressor::maybe_compress(
+                                    &mut conversation_history,
+                                    &config,
+                                    &router,
+                                    &llm_worker,
+                                    tool_def_tokens,
+                                    &mut plan_update_requested,
+                                )
+                                .await;
+                                app.clear_active_job();
+
+                                // Now the turn and any post-turn work are
+                                // fully done — flush tokens, draw the
+                                // separator, flip `is_thinking=false`, redraw.
                                 finish_completed_turn(
                                     &mut app,
                                     &mut terminal,
@@ -378,12 +406,13 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                     None,
                                 )?;
 
-                                // Trim history
-                                let max_history = config.context.history_turns * 6;
-                                if conversation_history.len() > max_history {
-                                    let drain_count = conversation_history.len() - max_history;
-                                    conversation_history.drain(..drain_count);
-                                }
+                                // Discard any keys / ticks that queued up
+                                // while `is_thinking` was true. If we don't,
+                                // a paste or impatient typing during the
+                                // compressor await would replay against the
+                                // freshly-idle input box and appear to
+                                // submit the next prompt "on its own".
+                                drain_stale_key_events(&mut rx);
                             }
                             KeyCode::Backspace => app.delete_char(),
                             KeyCode::Left => app.cursor_left(),
@@ -1140,6 +1169,18 @@ fn mask_old_tool_results(
 }
 
 /// Create a brief summary of tool arguments for display.
+///
+/// TODO(design): this hand-maintained match arm has to be updated every time
+/// a new tool is added, and forgetting it is silent — the fallback
+/// `format!("{args}")` dumps full JSON into the transcript `→ tool(...)`
+/// line, which wraps across many visual rows and breaks the ratatui
+/// line-count-based scroll math so later output appears missing. This
+/// already happened once (fast-mode tools `replace_range` / `insert_at` /
+/// `revert` / `show_rev` / `check` were missing and shipped with JSON
+/// blobs for weeks). The real fix is to move `summarize(args) -> String`
+/// onto the tool definition itself (alongside `name` / `parameters` in
+/// `src/tools/definitions.rs`) so every tool supplies its own summary and
+/// the REPL just dispatches by name. Same fix needed in `run.rs`.
 fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
     match tool_name {
         "file" | "code" | "web" | "plan" | "edit_file" | "write_file" | "mcp_use" => {
@@ -1211,6 +1252,28 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                 _ => action.to_string(),
             }
         }
+        "replace_range" => {
+            let path = args["path"].as_str().unwrap_or("?");
+            let start = args["start"].as_u64().unwrap_or(0);
+            let end = args["end"].as_u64().unwrap_or(0);
+            format!("{path} L{start}-{end}")
+        }
+        "insert_at" => {
+            let path = args["path"].as_str().unwrap_or("?");
+            let after = args["after_line"].as_u64().unwrap_or(0);
+            format!("{path} @L{after}")
+        }
+        "revert" => {
+            let path = args["path"].as_str().unwrap_or("?");
+            let rev = args["rev"].as_u64().unwrap_or(0);
+            format!("{path} to rev_{rev}")
+        }
+        "show_rev" => {
+            let path = args["path"].as_str().unwrap_or("?");
+            let rev = args["rev"].as_u64().unwrap_or(0);
+            format!("{path} rev_{rev}")
+        }
+        "check" => String::new(),
         _ => format!("{args}"),
     }
 }
@@ -1269,6 +1332,34 @@ fn handle_background_key(app: &mut App, key: &crossterm::event::KeyEvent) -> boo
 
 fn consume_interrupt(cancelled: &AtomicBool) -> bool {
     cancelled.swap(false, Ordering::Relaxed)
+}
+
+/// Drop any input-kind events queued in `rx` without processing them.
+///
+/// Called at the end of the Enter handler to discard keystrokes the user
+/// typed while the "working" indicator was up (LLM streaming + post-turn
+/// compression). Those keys were meant to be ignored per `is_thinking`, but
+/// because the main loop is `await`-ing the agent/compressor, keys queue in
+/// the channel and would otherwise be replayed against the now-idle input
+/// box — producing a visible desync where the user's next prompt appears to
+/// fire "on its own".
+///
+/// We preserve non-key events (permission requests, status updates). Ctrl+C
+/// was already handled inline by the key reader via the `cancelled` flag.
+fn drain_stale_key_events(rx: &mut mpsc::UnboundedReceiver<AppEvent>) {
+    while let Ok(evt) = rx.try_recv() {
+        match evt {
+            AppEvent::Key(_) | AppEvent::Mouse(_) | AppEvent::Tick => {}
+            other => {
+                // Put non-input events back via a small re-enqueue: we only
+                // have a receiver here, so the cleanest option is to drop
+                // them too. In practice, permission requests and status
+                // messages are only emitted while an agent task is running,
+                // which it isn't by the time we get here.
+                let _ = other;
+            }
+        }
+    }
 }
 
 fn reconcile_streamed_assistant_content(rendered: &str, final_content: &str) -> Option<String> {

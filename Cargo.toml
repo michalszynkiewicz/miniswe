@@ -101,7 +101,9 @@ tar = "0.4.45"
 libc = "0.2"
 
 [dev-dependencies]
+portable-pty = "0.9.0"
 tempfile = "3"
+avt = "0.17"
 wiremock = "0.6"
 
 [[bin]]
