@@ -27,5 +27,13 @@ fi
 exec llama-server \
     --jinja \
     -m "$MODEL_FILE" \
-    --port 8464 \
-    -c 60000
+    -c 60000 \
+    --cache-type-k q4_0 \
+    --cache-type-v q4_0 \
+    -ngl 99 \
+    --flash-attn on \
+    --temp 1.0 \
+    --top-p 0.95 \
+    --top-k 64 \
+    -np 1 \
+    --port 8464
