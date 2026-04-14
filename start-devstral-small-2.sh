@@ -45,5 +45,7 @@ exec llama-server \
     --n-gpu-layers 99 \
     --flash-attn on \
     --threads "$THREADS" \
+    --temp 0.15 \
+    -np 1 \
     --port "$PORT" \
     --metrics
