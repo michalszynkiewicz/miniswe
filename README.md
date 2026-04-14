@@ -4,34 +4,60 @@ A lightweight CLI coding agent for local LLMs.
 
 Optimized for quantized small LLMs running locally via llama.cpp, Ollama, or vLLM. Works with any OpenAI-compatible API.
 
-> **Tested with:** Devstral Small 2 (24B, Q4_K_XL and Q6_K) via llama.cpp on RTX 3090.
-> Multi-model support (Qwen, Llama, etc.) is planned but not yet validated — different models have different chat template constraints that may require adjustments to message formatting and role handling.
+> **Tested with:** Devstral Small 2 (24B, Q4_K_XL and Q6_K) and Gemma-family 26B MoE (`unsloth/gemma-4-26B-A4B-it-GGUF`) via llama.cpp on RTX 3090.
+> Other models (Qwen, Llama, etc.) should work via the OpenAI-compatible API but aren't validated yet — chat-template differences may require adjustments.
 
-## Quick Start
+## Prerequisites
+
+- **Rust 1.85+** (edition 2024). Install via [rustup](https://rustup.rs/).
+- **An OpenAI-compatible LLM endpoint.** The provided `start-*.sh` scripts use [llama.cpp](https://github.com/ggerganov/llama.cpp) — install `llama-server` from your package manager or build from source.
+- **Hugging Face CLI** (`pip install -U "huggingface_hub[cli]"`) if you plan to use the bundled `start-*.sh` scripts to download models.
+- **GPU with ≥16 GB VRAM** recommended for the models listed above (RTX 3090/4090 class). CPU-only works but is slow.
+- Linux or macOS. Windows is untested.
+
+## Build
 
 ```bash
-# Build (default: Rust, Python, JS, TS, Go tree-sitter grammars)
+# Clone the repo
+git clone https://github.com/michalszynkiewicz/miniswe.git
+cd miniswe
+
+# Release build (default: Rust, Python, JS, TS, Go tree-sitter grammars)
 cargo build --release
 
-# Start the LLM server
-./start-devstral-small-2.sh
+# Run straight from the build output:
+./target/release/miniswe --help
 
-# In another terminal: initialize in your project
+# Or install into ~/.cargo/bin (make sure it's on your PATH):
+cargo install --path .
+miniswe --help
+```
+
+All tier-2 languages (Java, C/C++, Ruby, PHP, etc.) — add `--features all-languages`:
+
+```bash
+cargo build --release --features all-languages
+```
+
+## Run
+
+```bash
+# 1. Download a model + start the LLM server (pick one)
+./start-devstral-small-2.sh       # Devstral Small 2 (24B)
+./start-gemma4.sh                 # Gemma 26B MoE
+
+# 2. In another terminal, initialize miniswe in your project
 cd /path/to/your/project
 miniswe init
 
-# Run interactively
-miniswe
-
-# Run with a single message
-miniswe "fix the bug in auth.rs"
-
-# Headless mode (auto-approve all permissions, for CI/scripts)
-miniswe -y "add error handling to main.rs"
-
-# Plan mode (read-only exploration)
-miniswe plan "how should I refactor the auth module?"
+# 3. Use it
+miniswe                                      # interactive REPL
+miniswe "fix the bug in auth.rs"             # single-shot
+miniswe -y "add error handling to main.rs"   # headless (auto-approve permissions)
+miniswe plan "how should I refactor auth?"   # plan mode (read-only)
 ```
+
+The start scripts print the `hf download` command you need to pull the GGUF on first run.
 
 ## Architecture
 
@@ -230,7 +256,7 @@ cargo build --release --features all-languages
 
 ```bash
 cargo build                     # debug build
-cargo test                      # run 140+ tests
+cargo test                      # run 400+ tests
 cargo clippy                    # lint
 cargo test --test e2e_lsp       # LSP integration tests (needs rust-analyzer)
 cargo test --test e2e_snapshots # Snapshot/revert tests
