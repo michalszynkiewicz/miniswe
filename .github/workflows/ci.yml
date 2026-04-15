@@ -88,12 +88,12 @@ jobs:
         run: cargo build --locked --all-targets
 
       - name: cargo test
-        # `--nocapture`: surface eprintln! breadcrumbs (e.g. `[trace]` lines
-        #   in tests/e2e_lsp.rs) in-flight so hangs are diagnosable from
-        #   the workflow log, not only on failure.
-        # `--report-time`: print per-test duration so we can spot a slow
-        #   vs. stuck test at a glance.
-        run: cargo test --locked -- --nocapture --report-time
+        # `--nocapture` surfaces eprintln! breadcrumbs (e.g. `[trace]` lines
+        # in tests/e2e_lsp.rs) in-flight, so hangs are diagnosable from the
+        # workflow log rather than only on failure.
+        # (`--report-time` would also be handy here but is nightly-only —
+        # available via cargo-nextest if we want per-test timing later.)
+        run: cargo test --locked -- --nocapture
 
   check-all-languages:
     name: cargo check --features all-languages
