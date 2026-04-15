@@ -1,18 +1,35 @@
-//! search tool — ripgrep-based code search.
+//! search tool — regex code search backed by the `grep-*` crates.
+//!
+//! Uses the same search kernel as ripgrep (matcher + searcher + regex
+//! engine) so we don't depend on any external `rg` / `grep` binary being
+//! present. Directory walking goes through `ignore`, which respects
+//! `.gitignore`, `.ignore`, and hidden-file rules the same way ripgrep
+//! does by default.
 
 use anyhow::Result;
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
+use ignore::WalkBuilder;
 use serde_json::Value;
-use std::process::Command;
+use std::path::Path;
 
 use super::ToolResult;
 use crate::config::Config;
+
+/// File extensions we search by default. Matches the historical
+/// `--type-add code:*.{…}` list from the shell-out implementation.
+const CODE_EXTENSIONS: &[&str] = &[
+    "rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "php",
+    "swift", "kt", "scala", "zig", "hs", "ml", "ex", "exs", "clj", "sh", "bash", "zsh", "toml",
+    "yaml", "yml", "json", "md",
+];
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let query = args["query"].as_str().unwrap_or("");
     let pattern = args["pattern"].as_str().unwrap_or("");
 
-    // Exactly one of query (literal) or pattern (regex) must be provided
-    let (search_term, use_fixed_strings) = if !query.is_empty() {
+    // Exactly one of query (literal) or pattern (regex) must be provided.
+    let (search_term, literal) = if !query.is_empty() {
         (query, true)
     } else if !pattern.is_empty() {
         (pattern, false)
@@ -23,121 +40,132 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     };
 
     let max_results = args["max_results"].as_u64().unwrap_or(20) as usize;
-
     let scope = args["scope"].as_str().unwrap_or("project");
 
     let search_dir = match scope {
-        "project" | "symbols" => config.project_root.to_string_lossy().to_string(),
+        "project" | "symbols" => config.project_root.clone(),
         dir => {
             let path = config.project_root.join(dir);
             if path.is_dir() {
-                path.to_string_lossy().to_string()
+                path
             } else {
-                config.project_root.to_string_lossy().to_string()
+                config.project_root.clone()
             }
         }
     };
 
-    // Use ripgrep (rg) for fast search
-    let mut rg_args = vec![
-        "--line-number",
-        "--no-heading",
-        "--color=never",
-        "--max-columns",
-        "200",
-    ];
-    if use_fixed_strings {
-        rg_args.push("--fixed-strings");
-    }
-    let max_str = max_results.to_string();
-    rg_args.extend_from_slice(&["--max-count", &max_str]);
-    let type_spec = "code:*.{rs,py,js,ts,tsx,jsx,go,java,c,cpp,h,hpp,rb,php,swift,kt,scala,zig,hs,ml,ex,exs,clj,sh,bash,zsh,toml,yaml,yml,json,md}";
-    rg_args.extend_from_slice(&["--type-add", type_spec, "-t", "code"]);
-    rg_args.push(search_term);
-    rg_args.push(&search_dir);
-
-    let output = Command::new("rg").args(&rg_args).output();
-
-    match output {
-        Ok(result) => {
-            let stdout = String::from_utf8_lossy(&result.stdout);
-            let stderr = String::from_utf8_lossy(&result.stderr);
-
-            if stdout.is_empty() && result.status.code() == Some(1) {
-                return Ok(ToolResult::ok(format!(
-                    "No matches found for: {search_term}"
-                )));
-            }
-
-            if !result.status.success() && !stderr.is_empty() {
-                // rg error (bad regex, not installed, etc.) — fall back to grep
-                return fallback_grep(search_term, &search_dir, max_results).await;
-            }
-
-            // Strip the project root prefix from paths for cleaner output
-            let root_prefix = format!("{}/", config.project_root.display());
-            let cleaned: String = stdout
-                .lines()
-                .take(max_results)
-                .map(|line| line.strip_prefix(&root_prefix).unwrap_or(line))
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            let match_count = cleaned.lines().count();
-            let mut output = format!("[search \"{search_term}\": {match_count} matches]\n");
-            output.push_str(&cleaned);
-            Ok(ToolResult::ok(output))
+    let matcher = match build_matcher(search_term, literal) {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(ToolResult::err(format!(
+                "Invalid {} '{}': {e}",
+                if literal { "query" } else { "pattern" },
+                search_term
+            )));
         }
-        Err(_) => fallback_grep(search_term, &search_dir, max_results).await,
+    };
+
+    // Searching is a synchronous, I/O-bound walk — push it onto a blocking
+    // pool so we don't stall the tokio runtime on large trees.
+    let search_term_owned = search_term.to_string();
+    let hits = tokio::task::spawn_blocking(move || run_search(&search_dir, &matcher, max_results))
+        .await
+        .map_err(|e| anyhow::anyhow!("search task panicked: {e}"))?;
+
+    if hits.is_empty() {
+        return Ok(ToolResult::ok(format!(
+            "No matches found for: {search_term_owned}"
+        )));
+    }
+
+    let match_count = hits.len();
+    let mut output = format!("[search \"{search_term_owned}\": {match_count} matches]\n");
+    for (i, line) in hits.iter().enumerate() {
+        if i > 0 {
+            output.push('\n');
+        }
+        output.push_str(line);
+    }
+    Ok(ToolResult::ok(output))
+}
+
+fn build_matcher(
+    term: &str,
+    literal: bool,
+) -> std::result::Result<RegexMatcher, grep_regex::Error> {
+    if literal {
+        RegexMatcherBuilder::new().fixed_strings(true).build(term)
+    } else {
+        RegexMatcher::new(term)
     }
 }
 
-/// Fallback to grep if rg is not available.
-async fn fallback_grep(query: &str, dir: &str, max_results: usize) -> Result<ToolResult> {
-    let output = Command::new("grep")
-        .args([
-            "-rn",
-            "--include=*.rs",
-            "--include=*.py",
-            "--include=*.js",
-            "--include=*.ts",
-            "--include=*.tsx",
-            "--include=*.jsx",
-            "--include=*.go",
-            "--include=*.java",
-            "--include=*.c",
-            "--include=*.cpp",
-            "--include=*.h",
-            "--include=*.hpp",
-            "--include=*.rb",
-            "--include=*.php",
-            "--include=*.swift",
-            "--include=*.kt",
-            "--include=*.scala",
-            "--include=*.zig",
-            "--include=*.sh",
-            "--include=*.bash",
-            "-m",
-            &max_results.to_string(),
-            query,
-            dir,
-        ])
-        .output();
+/// Walk the search dir and collect up to `max_results` matches as
+/// `relative_path:line_number:line_text` strings.
+fn run_search(root: &Path, matcher: &RegexMatcher, max_results: usize) -> Vec<String> {
+    let mut hits: Vec<String> = Vec::new();
+    let mut searcher = SearcherBuilder::new().line_number(true).build();
 
-    match output {
-        Ok(result) => {
-            let stdout = String::from_utf8_lossy(&result.stdout);
-            if stdout.is_empty() {
-                Ok(ToolResult::ok(format!("No matches found for: {query}")))
-            } else {
-                let match_count = stdout.lines().count();
-                Ok(ToolResult::ok(format!(
-                    "[search \"{query}\": {match_count} matches]\n{stdout}"
-                )))
-            }
+    let walker = WalkBuilder::new(root).build();
+    for entry in walker {
+        if hits.len() >= max_results {
+            break;
         }
-        Err(e) => Ok(ToolResult::err(format!(
-            "Neither rg nor grep available: {e}"
-        ))),
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !CODE_EXTENSIONS.contains(&ext) {
+            continue;
+        }
+
+        let rel_path = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
+        let sink = FileSink {
+            rel_path,
+            hits: &mut hits,
+            max_results,
+        };
+        // Errors on individual files (binary file, permission denied, bad
+        // UTF-8) aren't fatal — skip and keep going.
+        let _ = searcher.search_path(matcher, path, sink);
+    }
+
+    hits
+}
+
+struct FileSink<'a> {
+    rel_path: String,
+    hits: &'a mut Vec<String>,
+    max_results: usize,
+}
+
+impl Sink for FileSink<'_> {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &Searcher,
+        m: &SinkMatch<'_>,
+    ) -> std::result::Result<bool, Self::Error> {
+        if self.hits.len() >= self.max_results {
+            return Ok(false);
+        }
+        let line_number = m.line_number().unwrap_or(0);
+        let text = std::str::from_utf8(m.bytes())
+            .unwrap_or("")
+            .trim_end_matches('\n')
+            .trim_end_matches('\r');
+        self.hits
+            .push(format!("{}:{}:{}", self.rel_path, line_number, text));
+        // Keep searching this file unless the global cap was reached.
+        Ok(self.hits.len() < self.max_results)
     }
 }
