@@ -97,12 +97,18 @@ impl LspClient {
         let stdout = child.stdout.take().context("No stdout")?;
         let stderr = child.stderr.take();
 
-        // Log stderr in background for debugging
+        // Log stderr in background for debugging. The drainer keeps
+        // running until rust-analyzer exits and closes the pipe; on
+        // Drop we kill the child, which ends the loop. (Earlier this
+        // capped at 20 lines, which made it impossible to see what
+        // rust-analyzer was doing past the initial config dump —
+        // exactly the data we needed to diagnose the CI failures of
+        // `lsp_auto_check_integration`.)
         if let Some(stderr) = stderr {
             std::thread::spawn(move || {
                 use std::io::BufRead;
                 let reader = std::io::BufReader::new(stderr);
-                for line in reader.lines().take(20) {
+                for line in reader.lines() {
                     if let Ok(line) = line
                         && !line.trim().is_empty()
                     {
