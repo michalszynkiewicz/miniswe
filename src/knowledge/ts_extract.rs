@@ -96,28 +96,22 @@ fn get_tags_config(ext: &str) -> Option<TagsConfiguration> {
             tree_sitter_c_sharp::TAGS_QUERY,
         ),
 
-        #[cfg(feature = "lang-kotlin")]
-        "kt" | "kts" => make_config(
-            tree_sitter_kotlin::LANGUAGE.into(),
-            tree_sitter_kotlin::TAGS_QUERY,
-        ),
-
         #[cfg(feature = "lang-swift")]
         "swift" => make_config(
             tree_sitter_swift::LANGUAGE.into(),
             tree_sitter_swift::TAGS_QUERY,
         ),
 
+        // Scala ships a tags.scm in the crate but doesn't expose it as a
+        // TAGS_QUERY constant (tree-sitter-scala 0.25.0). We vendor the
+        // query file under `src/knowledge/queries/scala_tags.scm` and
+        // embed it at compile time via include_str!. Drop this branch in
+        // favour of `tree_sitter_scala::TAGS_QUERY` once a newer crate
+        // release exposes the constant.
         #[cfg(feature = "lang-scala")]
         "scala" | "sc" => make_config(
             tree_sitter_scala::LANGUAGE.into(),
-            tree_sitter_scala::TAGS_QUERY,
-        ),
-
-        #[cfg(feature = "lang-zig")]
-        "zig" => make_config(
-            tree_sitter_zig::LANGUAGE.into(),
-            tree_sitter_zig::TAGS_QUERY,
+            include_str!("queries/scala_tags.scm"),
         ),
 
         #[cfg(feature = "lang-elixir")]
@@ -126,12 +120,17 @@ fn get_tags_config(ext: &str) -> Option<TagsConfiguration> {
             tree_sitter_elixir::TAGS_QUERY,
         ),
 
-        #[cfg(feature = "lang-haskell")]
-        "hs" => make_config(
-            tree_sitter_haskell::LANGUAGE.into(),
-            tree_sitter_haskell::TAGS_QUERY,
-        ),
-
+        // TODO: restore tree-sitter extraction for Kotlin / Zig / Haskell
+        // once their crates expose LANGUAGE + TAGS_QUERY constants.
+        //
+        //   tree-sitter-kotlin  0.3.8: old API (fn language()), no tags.scm
+        //   tree-sitter-zig     1.1.2: LANGUAGE ok, no tags.scm in crate
+        //   tree-sitter-haskell 0.23.1: LANGUAGE ok, no tags.scm in crate
+        //
+        // Until then these extensions fall through to `None` — they get
+        // no structured symbol extraction and no LSP coverage
+        // (src/lsp/servers.rs has no server for them either), so the
+        // indexer sees them as opaque text.
         #[cfg(feature = "lang-lua")]
         "lua" => make_config(
             tree_sitter_lua::LANGUAGE.into(),
