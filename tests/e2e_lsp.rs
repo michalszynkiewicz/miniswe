@@ -180,23 +180,43 @@ async fn lsp_diagnostics_clear_on_fix() {
 
 #[tokio::test]
 async fn lsp_auto_check_integration() {
+    // Breadcrumb-style instrumentation: every phase of this test prints a
+    // [trace] line and is wrapped in a `tokio::time::timeout`. On CI this
+    // test has been hanging for the full 28-minute workflow budget — the
+    // breadcrumbs tell us which phase is stuck (vs. all phases being slow),
+    // and the timeouts convert a hang into a clean panic with a backtrace
+    // instead of a silent 28-minute kill.
+    eprintln!("[trace] lsp_auto_check_integration: start");
+
     if !ensure_rust_analyzer().await {
         eprintln!("skipping: rust-analyzer not available");
         return;
     }
+    eprintln!("[trace] rust-analyzer available");
 
     let (_tmp, mut config) = helpers::create_test_project();
     create_rust_project(&config.project_root);
     config.lsp.enabled = true;
     config.lsp.diagnostic_timeout_ms = 5000; // 5s for tests
+    eprintln!(
+        "[trace] test project created at {}",
+        config.project_root.display()
+    );
 
-    let client = match LspClient::spawn(config.project_root.clone()).await {
-        Ok(c) => c,
-        Err(e) => {
+    let client = match tokio::time::timeout(
+        Duration::from_secs(30),
+        LspClient::spawn(config.project_root.clone()),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             eprintln!("skipping: LSP spawn failed: {e}");
             return;
         }
+        Err(_) => panic!("[trace] HUNG: LspClient::spawn did not return within 30s"),
     };
+    eprintln!("[trace] LSP spawned");
 
     // Wait for ready (max 30s)
     let start = std::time::Instant::now();
@@ -208,6 +228,11 @@ async fn lsp_auto_check_integration() {
         client.shutdown().await;
         return;
     }
+    eprintln!(
+        "[trace] LSP ready (crashed={}) after {}ms",
+        client.has_crashed(),
+        start.elapsed().as_millis()
+    );
 
     let perms = miniswe::tools::permissions::PermissionManager::headless(&config);
 
@@ -216,9 +241,17 @@ async fn lsp_auto_check_integration() {
         "path": "src/main.rs",
         "content": "fn main() {\n    let x: u32 = \"type error\";\n}\n"
     });
-    let result = miniswe::tools::execute_tool("write_file", &args, &config, &perms, Some(&client))
-        .await
-        .unwrap();
+    eprintln!("[trace] calling execute_tool(write_file) with LSP client");
+    let result = match tokio::time::timeout(
+        Duration::from_secs(60),
+        miniswe::tools::execute_tool("write_file", &args, &config, &perms, Some(&client)),
+    )
+    .await
+    {
+        Ok(r) => r.unwrap(),
+        Err(_) => panic!("[trace] HUNG: execute_tool(write_file) did not return within 60s"),
+    };
+    eprintln!("[trace] execute_tool returned, success={}", result.success);
 
     // auto_check should use LSP and report the error
     assert!(
@@ -237,7 +270,9 @@ async fn lsp_auto_check_integration() {
         result.content
     );
 
+    eprintln!("[trace] shutting down client");
     client.shutdown().await;
+    eprintln!("[trace] done");
 }
 
 // ── Server detection tests (no network needed) ────────────────────────
