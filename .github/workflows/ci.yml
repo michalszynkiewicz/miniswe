@@ -20,6 +20,9 @@ env:
   RUSTFLAGS: "-D warnings"
   # Belt-and-braces: keep network downloads bounded if a test misbehaves.
   CARGO_NET_RETRY: "2"
+  # Panics in tests should always carry a backtrace — essential for
+  # diagnosing the LSP test hangs.
+  RUST_BACKTRACE: "1"
 
 jobs:
   test:
@@ -63,7 +66,10 @@ jobs:
         run: cargo build --locked --all-targets
 
       - name: cargo test
-        run: cargo test --locked
+        # `--nocapture` surfaces eprintln! breadcrumbs in-flight, so a hang
+        # in the LSP tests tells us which phase is stuck instead of silently
+        # timing out the whole workflow.
+        run: cargo test --locked -- --nocapture
 
       # Make sure the optional language features still compile, without paying
       # for a full build of all of them. `cargo check` is enough to catch
