@@ -89,7 +89,11 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ignore = "0.4"          # respects .gitignore
+ignore = "0.4"          # respects .gitignore (used by the indexer and search)
+# Embedded ripgrep for the file-search tool — same regex engine as rg, no
+# external binary required.
+grep-searcher = "0.1"
+grep-regex = "0.1"
 futures = "0.3"
 dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
