@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref. On PRs this cancels prior runs when
+# new commits land; on main it serialises by ref so noisy pushes don't pile up.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  # Belt-and-braces: keep network downloads bounded if a test misbehaves.
+  CARGO_NET_RETRY: "2"
+
+jobs:
+  test:
+    name: Build, lint, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry, index, and target/
+        uses: Swatinem/rust-cache@v2
+
+      # rust-analyzer is auto-downloaded by the LSP tests into
+      # ~/.miniswe/lsp-servers/. Cache it so we don't re-pull ~30MB every run.
+      - name: Cache LSP servers (rust-analyzer)
+        uses: actions/cache@v4
+        with:
+          path: ~/.miniswe/lsp-servers
+          key: lsp-servers-${{ runner.os }}-v1
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo build
+        run: cargo build --locked --all-targets
+
+      - name: cargo test
+        run: cargo test --locked
+
+      # Make sure the optional language features still compile, without paying
+      # for a full build of all of them. `cargo check` is enough to catch
+      # breakage in the tree-sitter-* dependency graph.
+      - name: cargo check --features all-languages
+        run: cargo check --locked --features all-languages
