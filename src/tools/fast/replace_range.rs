@@ -52,7 +52,10 @@ pub async fn execute(
 
     let (mut lines_owned, had_nl) = {
         let (lines, had_nl) = split_preserving_trailing_nl(&original);
-        (lines.into_iter().map(|s| s.to_string()).collect::<Vec<_>>(), had_nl)
+        (
+            lines.into_iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            had_nl,
+        )
     };
     let line_count = lines_owned.len();
 
@@ -80,9 +83,12 @@ pub async fn execute(
         // Replace [start..=end] with nothing — remove the placeholder
         // empty string that split_replacement inserted.
         let mut trimmed = Vec::with_capacity(new_lines.len().saturating_sub(1));
-        trimmed.extend(new_lines.into_iter().enumerate().filter_map(|(i, l)| {
-            if i == start - 1 { None } else { Some(l) }
-        }));
+        trimmed.extend(
+            new_lines
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, l)| if i == start - 1 { None } else { Some(l) }),
+        );
         trimmed
     } else {
         new_lines
@@ -149,9 +155,8 @@ pub async fn execute(
     )
     .await;
 
-    let header = format!(
-        "replace_range {path} L{start}-{end}: rev_{rev} applied (+{added} -{removed})"
-    );
+    let header =
+        format!("replace_range {path} L{start}-{end}: rev_{rev} applied (+{added} -{removed})");
     let mut out = String::from(&header);
     out.push_str(&fb.text);
     Ok(ToolResult::ok(out))
@@ -255,7 +260,11 @@ mod tests {
         assert!(!r.success);
         let disk = std::fs::read_to_string(tmp.path().join("f.rs")).unwrap();
         assert_eq!(disk, "a\nb\n");
-        assert_eq!(store.current("f.rs"), None, "no rev should be recorded on failure");
+        assert_eq!(
+            store.current("f.rs"),
+            None,
+            "no rev should be recorded on failure"
+        );
     }
 
     #[tokio::test]

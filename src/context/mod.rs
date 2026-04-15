@@ -90,19 +90,23 @@ pub struct AssembledContext {
 /// to use a tool that isn't in its tool list wastes rounds, so we branch here.
 fn build_system_prompt(edit_mode: crate::config::EditMode) -> String {
     let edit_contract = match edit_mode {
-        crate::config::EditMode::Smart => "\
+        crate::config::EditMode::Smart => {
+            "\
 edit_file applies a semantic patch to one file: {\"path\":\"src/lib.rs\",\"task\":\"rename foo to bar throughout the file\"}\n\
 write_file with content replaces the whole file: {\"path\":\"notes/todo.txt\",\"content\":\"first line\\nsecond line\\n\"}\n\
 write_file without content creates a new empty file: {\"path\":\"tmp/placeholder.txt\"}\n\
 file shell: {\"action\":\"shell\",\"command\":\"ls\",\"timeout\":60}\n\
-For any partial file edit (single line or multi-line), use edit_file with a clear task description.",
-        crate::config::EditMode::Fast => "\
+For any partial file edit (single line or multi-line), use edit_file with a clear task description."
+        }
+        crate::config::EditMode::Fast => {
+            "\
 replace_range replaces lines [start..=end] (1-based, inclusive) with content: {\"path\":\"src/lib.rs\",\"start\":10,\"end\":15,\"content\":\"...\"}\n\
 insert_at inserts content after a line (0=top, last line = append): {\"path\":\"src/lib.rs\",\"after_line\":0,\"content\":\"use std::fs;\\n\"}\n\
 write_file with content replaces the whole file: {\"path\":\"notes/todo.txt\",\"content\":\"first line\\nsecond line\\n\"}\n\
 write_file without content creates a new empty file: {\"path\":\"tmp/placeholder.txt\"}\n\
 file shell: {\"action\":\"shell\",\"command\":\"ls\",\"timeout\":60}\n\
-Every edit returns a revision table; if an edit regresses, call revert {\"path\":...,\"rev\":N} to roll back — do not layer more edits on top.",
+Every edit returns a revision table; if an edit regresses, call revert {\"path\":...,\"rev\":N} to roll back — do not layer more edits on top."
+        }
     };
     format!(
         "You are miniswe, a coding agent. Use your tools to complete the task.\n\

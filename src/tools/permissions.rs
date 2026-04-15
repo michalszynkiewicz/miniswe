@@ -435,10 +435,7 @@ impl PermissionManager {
         if let Some(tx) = self.prompt_events.lock().unwrap().clone() {
             let (response_tx, response_rx) = std::sync::mpsc::channel();
             if tx
-                .send(AppEvent::PermissionRequest(
-                    prompt.to_string(),
-                    response_tx,
-                ))
+                .send(AppEvent::PermissionRequest(prompt.to_string(), response_tx))
                 .is_ok()
             {
                 return response_rx.recv().unwrap_or_else(|_| "n".into());

@@ -157,9 +157,7 @@ fn render_file_diagnostics(diags: &[lsp_types::Diagnostic]) -> String {
     let mut out = if count <= MAX_FILE_ERRORS_INLINE {
         format!("[lsp file] {count} error(s)\n")
     } else {
-        format!(
-            "[lsp file] {count} error(s) (showing top {TOP_FILE_ERRORS_WHEN_TRUNCATED})\n"
-        )
+        format!("[lsp file] {count} error(s) (showing top {TOP_FILE_ERRORS_WHEN_TRUNCATED})\n")
     };
     let shown = if count <= MAX_FILE_ERRORS_INLINE {
         count
@@ -279,9 +277,16 @@ fn render_tombstone_expanded(r: &Revision, label_width: usize) -> String {
             ));
         }
         (_, Some(payload)) => {
-            let key = if r.operation == "insert_at" { "text" } else { "new_text" };
-            let (preview, extra_lines, extra_bytes) =
-                truncate_preview(payload, TOMBSTONE_PAYLOAD_PREVIEW_LINES, TOMBSTONE_PAYLOAD_PREVIEW_BYTES);
+            let key = if r.operation == "insert_at" {
+                "text"
+            } else {
+                "new_text"
+            };
+            let (preview, extra_lines, extra_bytes) = truncate_preview(
+                payload,
+                TOMBSTONE_PAYLOAD_PREVIEW_LINES,
+                TOMBSTONE_PAYLOAD_PREVIEW_BYTES,
+            );
             out.push_str(&format!("\n         {key}: |"));
             for line in preview.lines() {
                 out.push_str("\n           ");
@@ -325,11 +330,7 @@ fn outcome_tag(r: &Revision) -> String {
 /// first). Returns `(preview, extra_lines, extra_bytes)` where `extra_*`
 /// describe what was dropped (one of the two is zero — we pick the more
 /// informative hint).
-fn truncate_preview(
-    text: &str,
-    max_lines: usize,
-    max_bytes: usize,
-) -> (String, usize, usize) {
+fn truncate_preview(text: &str, max_lines: usize, max_bytes: usize) -> (String, usize, usize) {
     let total_lines = text.lines().count();
     let total_bytes = text.len();
 
@@ -370,7 +371,11 @@ mod tests {
     fn rev(n: usize, label: &str, added: usize, removed: usize, fe: usize, pe: usize) -> Revision {
         Revision {
             number: n,
-            operation: if n == 0 { "initial".into() } else { "replace_range".into() },
+            operation: if n == 0 {
+                "initial".into()
+            } else {
+                "replace_range".into()
+            },
             label: label.into(),
             range: None,
             payload: None,
@@ -395,11 +400,17 @@ mod tests {
         let table = render_revision_table("src/x.rs", &revs);
         assert!(table.contains("[revisions] src/x.rs"));
         let last = table.lines().last().unwrap();
-        assert!(last.starts_with('*'), "last row should be marked current: {last}");
+        assert!(
+            last.starts_with('*'),
+            "last row should be marked current: {last}"
+        );
         assert!(last.contains("<- current"));
         // Earlier rows unmarked
         for l in table.lines().skip(1).take(2) {
-            assert!(l.starts_with(' '), "non-current row should not be marked: {l}");
+            assert!(
+                l.starts_with(' '),
+                "non-current row should not be marked: {l}"
+            );
         }
     }
 
@@ -421,17 +432,21 @@ mod tests {
 
     #[test]
     fn file_diagnostics_under_cap_show_inline() {
-        let diags = vec![
-            lsp_types::Diagnostic {
-                range: lsp_types::Range {
-                    start: lsp_types::Position { line: 4, character: 2 },
-                    end: lsp_types::Position { line: 4, character: 8 },
+        let diags = vec![lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: 4,
+                    character: 2,
                 },
-                severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-                message: "bad thing".into(),
-                ..Default::default()
+                end: lsp_types::Position {
+                    line: 4,
+                    character: 8,
+                },
             },
-        ];
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            message: "bad thing".into(),
+            ..Default::default()
+        }];
         let out = render_file_diagnostics(&diags);
         assert!(out.contains("1 error(s)"));
         assert!(out.contains("L5:3: bad thing"));
@@ -442,8 +457,14 @@ mod tests {
         let many: Vec<_> = (0..15)
             .map(|i| lsp_types::Diagnostic {
                 range: lsp_types::Range {
-                    start: lsp_types::Position { line: i, character: 0 },
-                    end: lsp_types::Position { line: i, character: 1 },
+                    start: lsp_types::Position {
+                        line: i,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: i,
+                        character: 1,
+                    },
                 },
                 severity: Some(lsp_types::DiagnosticSeverity::ERROR),
                 message: format!("err {i}"),
@@ -478,7 +499,12 @@ mod tests {
     fn tombstone_row_shows_reverted_tag_and_ast_error() {
         let revs = vec![
             rev(0, "initial", 0, 0, 0, 0),
-            tomb(1, "replace_range L42-42", "bad()", Some("L42:5: syntax error")),
+            tomb(
+                1,
+                "replace_range L42-42",
+                "bad()",
+                Some("L42:5: syntax error"),
+            ),
         ];
         let table = render_revision_table("a.rs", &revs);
         assert!(
@@ -506,7 +532,10 @@ mod tests {
         let table = render_revision_table("a.rs", &revs);
 
         // Last 3 (rev_3, rev_4, rev_5) should have expanded payload
-        assert!(table.contains("payload_3"), "rev_3 should be expanded:\n{table}");
+        assert!(
+            table.contains("payload_3"),
+            "rev_3 should be expanded:\n{table}"
+        );
         assert!(table.contains("payload_4"));
         assert!(table.contains("payload_5"));
         // First 2 (rev_1, rev_2) should NOT show payload
@@ -548,7 +577,10 @@ mod tests {
         t.range = None;
         let revs = vec![rev(0, "initial", 0, 0, 0, 0), t];
         let table = render_revision_table("a.rs", &revs);
-        assert!(table.contains("text: |"), "insert_at should use 'text:' key:\n{table}");
+        assert!(
+            table.contains("text: |"),
+            "insert_at should use 'text:' key:\n{table}"
+        );
         assert!(!table.contains("new_text: |"));
     }
 

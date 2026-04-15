@@ -405,9 +405,7 @@ async fn execute_valid_patch_writes_file() {
                 0 => helpers::mock_text_response(
                     "SMART_EDIT\nREGION 1 2\nTASK: add setup call\nEND\n",
                 ),
-                1 => helpers::mock_text_response(
-                    "INSERT_AFTER 1\nCONTENT:\n    added();\nEND\n",
-                ),
+                1 => helpers::mock_text_response("INSERT_AFTER 1\nCONTENT:\n    added();\nEND\n"),
                 _ => helpers::mock_text_response("COMPLETE\n"),
             }
         })
@@ -447,9 +445,7 @@ async fn execute_failed_patch_writes_nothing() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n % 2 {
-                0 => helpers::mock_text_response(
-                    "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
-                ),
+                0 => helpers::mock_text_response("SMART_EDIT\nREGION 1\nTASK: change line\nEND\n"),
                 _ => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\nwrong\nEND_OLD\nNEW:\nnew\nEND_NEW\n",
                 ),
@@ -503,16 +499,12 @@ async fn execute_repairs_failed_first_patch() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 // Plan attempt 1
-                0 => helpers::mock_text_response(
-                    "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
-                ),
+                0 => helpers::mock_text_response("SMART_EDIT\nREGION 1\nTASK: change line\nEND\n"),
                 1 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\nwrong\nEND_OLD\nNEW:\nfixed\nEND_NEW\n",
                 ),
                 // Plan attempt 2 (repair)
-                2 => helpers::mock_text_response(
-                    "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
-                ),
+                2 => helpers::mock_text_response("SMART_EDIT\nREGION 1\nTASK: change line\nEND\n"),
                 3 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\noriginal\nEND_OLD\nNEW:\nfixed\nEND_NEW\n",
                 ),
@@ -559,9 +551,9 @@ async fn execute_repairs_until_third_patch() {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 // Per-attempt preplan: just the finalize call in the small-file fast path.
-                0 | 2 | 4 => helpers::mock_text_response(
-                    "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
-                ),
+                0 | 2 | 4 => {
+                    helpers::mock_text_response("SMART_EDIT\nREGION 1\nTASK: change line\nEND\n")
+                }
                 // Plans 1 and 2 fail their single patch attempt.
                 1 | 3 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\nwrong\nEND_OLD\nNEW:\nfixed\nEND_NEW\n",
@@ -836,9 +828,7 @@ async fn execute_lsp_off_succeeds_without_lsp_client() {
         .respond_with(move |_req: &wiremock::Request| {
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
-                0 => helpers::mock_text_response(
-                    "SMART_EDIT\nREGION 1\nTASK: change line\nEND\n",
-                ),
+                0 => helpers::mock_text_response("SMART_EDIT\nREGION 1\nTASK: change line\nEND\n"),
                 1 => helpers::mock_text_response(
                     "REPLACE_AT 1\nOLD:\noriginal\nEND_OLD\nNEW:\nfixed\nEND_NEW\n",
                 ),
@@ -943,8 +933,7 @@ async fn execute_edit_file_tool_reindexes_successful_edit() {
         "task": "rename original to replacement",
         "lsp_validation": "off"
     });
-    let result =
-        tools::execute_edit_file_tool(&args, &config, &perms, &router, None, None, None)
+    let result = tools::execute_edit_file_tool(&args, &config, &perms, &router, None, None, None)
         .await
         .unwrap();
 

@@ -264,8 +264,7 @@ async fn write_file_new_python_file_with_syntax_error_is_warning_not_failure() {
         result.content
     );
     // File exists on disk with the requested content.
-    let disk =
-        fs::read_to_string(helpers::project_path(&config, "new_helper.py")).unwrap();
+    let disk = fs::read_to_string(helpers::project_path(&config, "new_helper.py")).unwrap();
     assert_eq!(disk, "def helper(\n    return 42\n");
 }
 
@@ -331,7 +330,11 @@ async fn write_file_new_python_file_with_valid_content_succeeds_silently() {
         .await
         .unwrap();
 
-    assert!(result.success, "valid python file should succeed: {}", result.content);
+    assert!(
+        result.success,
+        "valid python file should succeed: {}",
+        result.content
+    );
     assert!(
         result.content.contains("[py_compile] OK"),
         "expected py_compile OK marker, got: {}",

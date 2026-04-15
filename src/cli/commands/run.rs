@@ -48,25 +48,33 @@ Plan checkpoint required before more edits. You have continued editing after the
 /// than the smart-mode edit surface.
 fn loop_detected_hint(edit_mode: EditMode) -> &'static str {
     match edit_mode {
-        EditMode::Smart => "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits.",
-        EditMode::Fast => "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. If you were repeating replace_range/insert_at with the same args, the edit already landed (or was rejected) — inspect the revision table with show_rev before trying again. If you were repeating revert to the same rev, pick a different live rev or move on. Use file(action='read') to re-check current state.",
+        EditMode::Smart => {
+            "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits."
+        }
+        EditMode::Fast => {
+            "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. If you were repeating replace_range/insert_at with the same args, the edit already landed (or was rejected) — inspect the revision table with show_rev before trying again. If you were repeating revert to the same rev, pick a different live rev or move on. Use file(action='read') to re-check current state."
+        }
     }
 }
 
 fn truncated_tool_call_hint(edit_mode: EditMode) -> &'static str {
     match edit_mode {
-        EditMode::Smart => "\
+        EditMode::Smart => {
+            "\
 Your previous tool call was rejected because the server could not parse its arguments as JSON — \
 most likely the generation hit max_tokens mid-string and the JSON got truncated. \
 Try a smaller operation: prefer edit_file over write_file for existing files, \
 break large writes into multiple smaller tool calls, \
-and avoid embedding very long literals in a single argument.",
-        EditMode::Fast => "\
+and avoid embedding very long literals in a single argument."
+        }
+        EditMode::Fast => {
+            "\
 Your previous tool call was rejected because the server could not parse its arguments as JSON — \
 most likely the generation hit max_tokens mid-string and the JSON got truncated. \
 Try a smaller operation: prefer replace_range or insert_at over write_file for existing files, \
 break large writes into multiple smaller tool calls, \
-and avoid embedding very long literals in a single argument.",
+and avoid embedding very long literals in a single argument."
+        }
     }
 }
 

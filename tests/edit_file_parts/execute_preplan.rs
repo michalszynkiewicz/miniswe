@@ -829,9 +829,7 @@ async fn execute_preplan_needs_clarification_short_circuits_with_question() {
                 0 => helpers::mock_text_response(
                     "NEEDS_CLARIFICATION: which module owns the auth middleware you want removed?",
                 ),
-                _ => unreachable!(
-                    "NEEDS_CLARIFICATION should short-circuit the retry loop"
-                ),
+                _ => unreachable!("NEEDS_CLARIFICATION should short-circuit the retry loop"),
             }
         })
         .mount(&mock_server)
@@ -900,9 +898,7 @@ async fn execute_preplan_needs_clarification_without_question_uses_placeholder()
             let n = calls_for_mock.fetch_add(1, Ordering::SeqCst);
             match n {
                 0 => helpers::mock_text_response("NEEDS_CLARIFICATION"),
-                _ => unreachable!(
-                    "NEEDS_CLARIFICATION should short-circuit the retry loop"
-                ),
+                _ => unreachable!("NEEDS_CLARIFICATION should short-circuit the retry loop"),
             }
         })
         .mount(&mock_server)
@@ -1152,4 +1148,3 @@ async fn execute_preplan_overlapping_steps_apply_first_and_report_rest_failed() 
         "ALPHA\nBETA\nGAMMA\ndelta\nepsilon\n"
     );
 }
-

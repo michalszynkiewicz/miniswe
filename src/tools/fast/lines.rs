@@ -9,7 +9,11 @@
 /// re-emit the file in its original shape.
 pub fn split_preserving_trailing_nl(content: &str) -> (Vec<&str>, bool) {
     let had_nl = content.ends_with('\n');
-    let body = if had_nl { &content[..content.len() - 1] } else { content };
+    let body = if had_nl {
+        &content[..content.len() - 1]
+    } else {
+        content
+    };
     // str::split on empty string yields `[""]`; that matches the intent
     // (a zero-byte file has one "line" that is empty).
     let lines: Vec<&str> = if body.is_empty() {

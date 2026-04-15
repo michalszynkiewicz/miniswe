@@ -29,9 +29,7 @@ struct VtReader {
 
 impl VtReader {
     fn spawn(mut reader: Box<dyn std::io::Read + Send>, cols: usize, rows: usize) -> Self {
-        let vt = Arc::new(Mutex::new(
-            avt::Vt::builder().size(cols, rows).build(),
-        ));
+        let vt = Arc::new(Mutex::new(avt::Vt::builder().size(cols, rows).build()));
         let vt_clone = vt.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -93,8 +91,7 @@ fn tui_hidden_output_across_multiple_turns() {
 
     let vt_reader = VtReader::spawn(reader, COLS as usize, ROWS as usize);
 
-    wait_for_idle(&vt_reader, TURN_TIMEOUT)
-        .expect("initial banner never settled to idle");
+    wait_for_idle(&vt_reader, TURN_TIMEOUT).expect("initial banner never settled to idle");
 
     let mut hidden_count = 0;
     for (i, (prompt, marker)) in PROMPTS.iter().enumerate() {
@@ -113,9 +110,7 @@ fn tui_hidden_output_across_multiple_turns() {
 
         wait_for_idle(&vt_reader, TURN_TIMEOUT).unwrap_or_else(|e| {
             let screen = vt_reader.screen_text();
-            panic!(
-                "turn {prompt:?} did not complete: {e}\n--- screen ---\n{screen}"
-            )
+            panic!("turn {prompt:?} did not complete: {e}\n--- screen ---\n{screen}")
         });
 
         std::thread::sleep(Duration::from_millis(300));
@@ -126,11 +121,9 @@ fn tui_hidden_output_across_multiple_turns() {
         // input box). The transcript contains the LLM's response text.
         // We look for the marker after a "│" prefix (transcript pane border)
         // but NOT in a "you>" line (user input).
-        let marker_in_transcript = screen.lines().any(|l| {
-            l.contains(marker)
-                && !l.contains("you>")
-                && !l.contains("print the word")
-        });
+        let marker_in_transcript = screen
+            .lines()
+            .any(|l| l.contains(marker) && !l.contains("you>") && !l.contains("print the word"));
 
         eprintln!(
             "  turn {} marker_in_transcript={marker_in_transcript}",
@@ -152,7 +145,14 @@ fn tui_hidden_output_across_multiple_turns() {
                     if entry.path().extension().map_or(false, |e| e == "log") {
                         let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
                         eprintln!("\n=== SESSION LOG (turn {} failure) ===", i + 1);
-                        for line in content.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev() {
+                        for line in content
+                            .lines()
+                            .rev()
+                            .take(20)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                        {
                             eprintln!("  {line}");
                         }
                     }
@@ -170,9 +170,12 @@ fn tui_hidden_output_across_multiple_turns() {
                 let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
                 eprintln!("\n=== SESSION LOG ({}) ===", entry.path().display());
                 for line in content.lines() {
-                    if line.contains("llm_response") || line.contains("APPLE")
-                        || line.contains("BANANA") || line.contains("CHERRY")
-                        || line.contains("DURIAN") || line.contains("ELDERBERRY")
+                    if line.contains("llm_response")
+                        || line.contains("APPLE")
+                        || line.contains("BANANA")
+                        || line.contains("CHERRY")
+                        || line.contains("DURIAN")
+                        || line.contains("ELDERBERRY")
                         || line.contains("FIG")
                     {
                         eprintln!("  {line}");
@@ -278,15 +281,8 @@ fn wait_for_idle(vt_reader: &VtReader, timeout: Duration) -> Result<(), String> 
         std::thread::sleep(Duration::from_millis(200));
         let screen = vt_reader.screen_text();
 
-        let bottom_has_prompt = screen
-            .lines()
-            .rev()
-            .take(3)
-            .any(|l| l.contains("you>"));
-        let topbar_ready = screen
-            .lines()
-            .take(3)
-            .any(|l| l.contains(" ready "));
+        let bottom_has_prompt = screen.lines().rev().take(3).any(|l| l.contains("you>"));
+        let topbar_ready = screen.lines().take(3).any(|l| l.contains(" ready "));
 
         if bottom_has_prompt && topbar_ready {
             if idle_since.is_none() {

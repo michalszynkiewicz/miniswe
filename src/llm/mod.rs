@@ -147,7 +147,12 @@ impl LlmClient {
             }
             None => tokio::time::timeout(connect_timeout, connect_future)
                 .await
-                .map_err(|_| anyhow::anyhow!("LLM request timed out after {}s", self.config.request_timeout_secs))??,
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "LLM request timed out after {}s",
+                        self.config.request_timeout_secs
+                    )
+                })??,
         };
 
         if !response.status().is_success() {
@@ -355,8 +360,8 @@ impl LlmClient {
             buf.extend_from_slice(&chunk);
         }
 
-        let resp: ChatResponse = serde_json::from_slice(&buf)
-            .context("Failed to parse LLM response")?;
+        let resp: ChatResponse =
+            serde_json::from_slice(&buf).context("Failed to parse LLM response")?;
         if let Some(content) = resp
             .choices
             .first()
@@ -422,9 +427,7 @@ impl LlmClient {
             match result {
                 Ok(resp) => return Ok(resp),
                 Err(err)
-                    if !had_progress
-                        && attempt < max_retries
-                        && is_retryable_llm_error(&err) =>
+                    if !had_progress && attempt < max_retries && is_retryable_llm_error(&err) =>
                 {
                     let delay = retry_delays[attempt];
                     attempt += 1;
@@ -515,9 +518,8 @@ mod tests {
 
     #[test]
     fn plain_500_still_retryable() {
-        let err = anyhow::anyhow!(
-            "LLM API error (500 Internal Server Error): upstream unavailable"
-        );
+        let err =
+            anyhow::anyhow!("LLM API error (500 Internal Server Error): upstream unavailable");
         assert!(is_retryable_llm_error(&err));
         assert!(!is_truncated_tool_call_error(&err.to_string()));
     }
