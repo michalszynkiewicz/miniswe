@@ -425,8 +425,16 @@ async fn file_replace_action_returns_deprecation_redirect() {
 
     assert!(!result.success, "replace should be deprecated");
     assert!(
-        result.content.contains("edit_file") && result.content.contains("write_file"),
-        "deprecation must redirect to edit_file/write_file: {}",
+        result.content.contains("no longer supported"),
+        "must declare deprecation: {}",
+        result.content
+    );
+    // The deprecation hint points at whichever edit surface is active:
+    // `edit_file` in smart mode, `replace_range` / `insert_at` in fast mode.
+    assert!(
+        result.content.contains("write_file")
+            && (result.content.contains("edit_file") || result.content.contains("replace_range")),
+        "deprecation must redirect to write_file and an edit primitive: {}",
         result.content
     );
 
@@ -700,9 +708,13 @@ async fn file_help_returns_action_list() {
         "file help should no longer advertise replace: {}",
         result.content
     );
+    // The help text points at whichever edit surface is active:
+    // `edit_file` in smart mode, `replace_range` / `insert_at` in fast mode.
     assert!(
-        result.content.contains("edit_file"),
-        "help should redirect to edit_file: {}",
+        result.content.contains("edit_file")
+            || result.content.contains("replace_range")
+            || result.content.contains("insert_at"),
+        "help should advertise an edit primitive: {}",
         result.content
     );
 }

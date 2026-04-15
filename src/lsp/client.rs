@@ -368,6 +368,27 @@ impl LspClient {
     }
 }
 
+impl Drop for LspClient {
+    /// Last-resort cleanup: if `shutdown()` wasn't awaited (typically
+    /// because a caller panicked or `?`-returned), kill the rust-analyzer
+    /// child so it doesn't outlive us.
+    ///
+    /// Without this, the reader task spawned in `try_spawn` stays blocked
+    /// on the server's stdout pipe forever — which keeps the tokio runtime
+    /// alive and hangs the whole process on exit. On CI this manifested
+    /// as a test-binary panic followed by 28 minutes of silence until the
+    /// workflow timeout.
+    ///
+    /// Idempotent: calling `kill` on an already-reaped child is a no-op
+    /// we swallow, so the graceful `shutdown()` path is unaffected.
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Send initialize request and wait for response.
 async fn initialize(transport: &LspTransport, project_root: &Path) -> Result<()> {
     let root_uri = path_to_uri(project_root);

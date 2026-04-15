@@ -197,7 +197,12 @@ async fn lsp_auto_check_integration() {
     let (_tmp, mut config) = helpers::create_test_project();
     create_rust_project(&config.project_root);
     config.lsp.enabled = true;
-    config.lsp.diagnostic_timeout_ms = 5000; // 5s for tests
+    // 30s matches the budget the other LSP tests in this file give
+    // `get_diagnostics`. 5s was tight enough that rust-analyzer on a
+    // fresh CI runner occasionally failed to publish diagnostics in
+    // time, which made the test's assertion fail silently (write_file
+    // reported success with no error list).
+    config.lsp.diagnostic_timeout_ms = 30_000;
     eprintln!(
         "[trace] test project created at {}",
         config.project_root.display()
