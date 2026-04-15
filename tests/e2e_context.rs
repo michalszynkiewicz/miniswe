@@ -397,7 +397,7 @@ fn token_estimate_roughly_correct() {
     // ~4 chars per token
     let tokens = context::estimate_tokens("hello world"); // 11 chars
     assert!(
-        tokens >= 2 && tokens <= 4,
+        (2..=4).contains(&tokens),
         "should be ~2-3 tokens, got {tokens}"
     );
 

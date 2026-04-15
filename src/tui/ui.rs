@@ -451,7 +451,7 @@ mod tests {
                 crate::tui::app::LineStyle::ToolCall,
             );
             app.push_output(
-                &format!("  ✓ file: [shell: exit 0]"),
+                "  ✓ file: [shell: exit 0]",
                 crate::tui::app::LineStyle::ToolOk,
             );
         }

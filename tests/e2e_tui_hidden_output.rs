@@ -142,7 +142,7 @@ fn tui_hidden_output_across_multiple_turns() {
             let log_dir = temp.path().join(".miniswe").join("logs");
             if let Ok(entries) = std::fs::read_dir(&log_dir) {
                 for entry in entries.flatten() {
-                    if entry.path().extension().map_or(false, |e| e == "log") {
+                    if entry.path().extension().is_some_and(|e| e == "log") {
                         let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
                         eprintln!("\n=== SESSION LOG (turn {} failure) ===", i + 1);
                         for line in content
@@ -166,7 +166,7 @@ fn tui_hidden_output_across_multiple_turns() {
     let log_dir = temp.path().join(".miniswe").join("logs");
     if let Ok(entries) = std::fs::read_dir(&log_dir) {
         for entry in entries.flatten() {
-            if entry.path().extension().map_or(false, |e| e == "log") {
+            if entry.path().extension().is_some_and(|e| e == "log") {
                 let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
                 eprintln!("\n=== SESSION LOG ({}) ===", entry.path().display());
                 for line in content.lines() {
@@ -288,10 +288,10 @@ fn wait_for_idle(vt_reader: &VtReader, timeout: Duration) -> Result<(), String> 
             if idle_since.is_none() {
                 idle_since = Some(Instant::now());
             }
-            if let Some(since) = idle_since {
-                if since.elapsed() >= Duration::from_millis(500) {
-                    return Ok(());
-                }
+            if let Some(since) = idle_since
+                && since.elapsed() >= Duration::from_millis(500)
+            {
+                return Ok(());
             }
         } else {
             idle_since = None;

@@ -601,15 +601,15 @@ fn extract_symbol_names_from_content(content: &str) -> Vec<String> {
             "function ",
             "export function ",
         ] {
-            if trimmed.contains(keyword) {
-                if let Some(after) = trimmed.split(keyword).nth(1) {
-                    let name: String = after
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .collect();
-                    if !name.is_empty() && name.len() > 1 {
-                        names.push(name);
-                    }
+            if trimmed.contains(keyword)
+                && let Some(after) = trimmed.split(keyword).nth(1)
+            {
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() && name.len() > 1 {
+                    names.push(name);
                 }
             }
         }

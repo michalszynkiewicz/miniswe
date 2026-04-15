@@ -170,12 +170,12 @@ async fn execute_code_tool(
         }
 
         "diagnostics" => {
-            if let Some(lsp) = lsp {
-                if lsp.is_ready() && !lsp.has_crashed() {
-                    if let Some(result) = lsp_project_diagnostics(config, lsp).await {
-                        return Ok(result);
-                    }
-                }
+            if let Some(lsp) = lsp
+                && lsp.is_ready()
+                && !lsp.has_crashed()
+                && let Some(result) = lsp_project_diagnostics(config, lsp).await
+            {
+                return Ok(result);
             }
             // Fallback: cargo check
             let shell_args = serde_json::json!({

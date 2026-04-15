@@ -114,7 +114,7 @@ async fn execute_preplan_repair_can_inspect_with_search_and_read() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(
         config.project_root.join("main.rs"),
-        &large_file_with_block_at_top("a\nb\nc"),
+        large_file_with_block_at_top("a\nb\nc"),
     )
     .unwrap();
 
@@ -245,7 +245,7 @@ async fn execute_preplan_can_inspect_with_search_and_read() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(
         config.project_root.join("main.rs"),
-        &large_file_with_block_at_top("call_a();\nkeep();\ncall_c();"),
+        large_file_with_block_at_top("call_a();\nkeep();\ncall_c();"),
     )
     .unwrap();
 
@@ -306,7 +306,7 @@ async fn execute_preplan_can_handle_multiple_inspection_commands_in_one_response
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(
         config.project_root.join("main.rs"),
-        &large_file_with_block_at_top("call_a();\nkeep();\ncall_c();"),
+        large_file_with_block_at_top("call_a();\nkeep();\ncall_c();"),
     )
     .unwrap();
 

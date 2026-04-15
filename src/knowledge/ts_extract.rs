@@ -278,6 +278,7 @@ pub fn is_supported(ext: &str) -> bool {
 }
 
 /// List all enabled language features.
+#[allow(clippy::vec_init_then_push)] // cfg-gated pushes can't use the vec! macro
 pub fn enabled_languages() -> Vec<&'static str> {
     let mut langs = Vec::new();
     #[cfg(feature = "lang-rust")]
@@ -348,8 +349,8 @@ fn enrich_rust_impl_blocks(file: &str, content: &str, result: &mut ExtractionRes
         // Find the closing brace by tracking depth
         let mut depth = 0;
         let mut end = i;
-        for j in i..lines.len() {
-            for ch in lines[j].chars() {
+        for (j, line) in lines.iter().enumerate().skip(i) {
+            for ch in line.chars() {
                 if ch == '{' {
                     depth += 1;
                 }

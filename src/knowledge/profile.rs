@@ -28,113 +28,110 @@ pub fn detect_project(root: &Path) -> Result<ProjectInfo> {
 
     // Detect from Cargo.toml (Rust)
     let cargo_toml = root.join("Cargo.toml");
-    if cargo_toml.exists() {
-        if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
-            if let Ok(parsed) = content.parse::<toml::Table>() {
-                if let Some(pkg) = parsed.get("package").and_then(|v| v.as_table()) {
-                    info.name = pkg
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    info.description = pkg
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                }
-                info.languages.push(("Rust".into(), 100.0));
-                info.package_manager = Some("cargo".into());
-                info.build_cmd = Some("cargo build".into());
-                info.test_cmd = Some("cargo test".into());
-                info.lint_cmd = Some("cargo clippy".into());
-            }
+    if cargo_toml.exists()
+        && let Ok(content) = std::fs::read_to_string(&cargo_toml)
+        && let Ok(parsed) = content.parse::<toml::Table>()
+    {
+        if let Some(pkg) = parsed.get("package").and_then(|v| v.as_table()) {
+            info.name = pkg
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            info.description = pkg
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
         }
+        info.languages.push(("Rust".into(), 100.0));
+        info.package_manager = Some("cargo".into());
+        info.build_cmd = Some("cargo build".into());
+        info.test_cmd = Some("cargo test".into());
+        info.lint_cmd = Some("cargo clippy".into());
     }
 
     // Detect from package.json (JavaScript/TypeScript)
     let package_json = root.join("package.json");
-    if package_json.exists() {
-        if let Ok(content) = std::fs::read_to_string(&package_json) {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-                info.name = parsed["name"].as_str().unwrap_or("unknown").to_string();
-                info.description = parsed["description"].as_str().map(|s| s.to_string());
+    if package_json.exists()
+        && let Ok(content) = std::fs::read_to_string(&package_json)
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content)
+    {
+        info.name = parsed["name"].as_str().unwrap_or("unknown").to_string();
+        info.description = parsed["description"].as_str().map(|s| s.to_string());
 
-                // Detect package manager
-                if root.join("pnpm-lock.yaml").exists() {
-                    info.package_manager = Some("pnpm".into());
-                } else if root.join("yarn.lock").exists() {
-                    info.package_manager = Some("yarn".into());
-                } else {
-                    info.package_manager = Some("npm".into());
-                }
+        // Detect package manager
+        if root.join("pnpm-lock.yaml").exists() {
+            info.package_manager = Some("pnpm".into());
+        } else if root.join("yarn.lock").exists() {
+            info.package_manager = Some("yarn".into());
+        } else {
+            info.package_manager = Some("npm".into());
+        }
 
-                // Detect scripts
-                if let Some(scripts) = parsed["scripts"].as_object() {
-                    let pm = info.package_manager.as_deref().unwrap_or("npm");
-                    if scripts.contains_key("build") {
-                        info.build_cmd = Some(format!("{pm} run build"));
-                    }
-                    if scripts.contains_key("test") {
-                        info.test_cmd = Some(format!("{pm} test"));
-                    }
-                    if scripts.contains_key("lint") {
-                        info.lint_cmd = Some(format!("{pm} run lint"));
-                    }
-                }
-
-                // Detect TypeScript
-                if root.join("tsconfig.json").exists() {
-                    info.languages.push(("TypeScript".into(), 90.0));
-                    info.languages.push(("JavaScript".into(), 10.0));
-                } else {
-                    info.languages.push(("JavaScript".into(), 100.0));
-                }
+        // Detect scripts
+        if let Some(scripts) = parsed["scripts"].as_object() {
+            let pm = info.package_manager.as_deref().unwrap_or("npm");
+            if scripts.contains_key("build") {
+                info.build_cmd = Some(format!("{pm} run build"));
             }
+            if scripts.contains_key("test") {
+                info.test_cmd = Some(format!("{pm} test"));
+            }
+            if scripts.contains_key("lint") {
+                info.lint_cmd = Some(format!("{pm} run lint"));
+            }
+        }
+
+        // Detect TypeScript
+        if root.join("tsconfig.json").exists() {
+            info.languages.push(("TypeScript".into(), 90.0));
+            info.languages.push(("JavaScript".into(), 10.0));
+        } else {
+            info.languages.push(("JavaScript".into(), 100.0));
         }
     }
 
     // Detect from go.mod (Go)
     let go_mod = root.join("go.mod");
-    if go_mod.exists() {
-        if let Ok(content) = std::fs::read_to_string(&go_mod) {
-            for line in content.lines() {
-                if line.starts_with("module ") {
-                    info.name = line
-                        .strip_prefix("module ")
-                        .unwrap_or("unknown")
-                        .trim()
-                        .to_string();
-                    break;
-                }
+    if go_mod.exists()
+        && let Ok(content) = std::fs::read_to_string(&go_mod)
+    {
+        for line in content.lines() {
+            if line.starts_with("module ") {
+                info.name = line
+                    .strip_prefix("module ")
+                    .unwrap_or("unknown")
+                    .trim()
+                    .to_string();
+                break;
             }
-            info.languages.push(("Go".into(), 100.0));
-            info.build_cmd = Some("go build ./...".into());
-            info.test_cmd = Some("go test ./...".into());
-            info.lint_cmd = Some("golangci-lint run".into());
         }
+        info.languages.push(("Go".into(), 100.0));
+        info.build_cmd = Some("go build ./...".into());
+        info.test_cmd = Some("go test ./...".into());
+        info.lint_cmd = Some("golangci-lint run".into());
     }
 
     // Detect from pyproject.toml (Python)
     let pyproject = root.join("pyproject.toml");
-    if pyproject.exists() {
-        if let Ok(content) = std::fs::read_to_string(&pyproject) {
-            if let Ok(parsed) = content.parse::<toml::Table>() {
-                if let Some(project) = parsed.get("project").and_then(|v| v.as_table()) {
-                    info.name = project
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    info.description = project
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                }
-                info.languages.push(("Python".into(), 100.0));
-                info.test_cmd = Some("pytest".into());
-                info.lint_cmd = Some("ruff check".into());
-            }
+    if pyproject.exists()
+        && let Ok(content) = std::fs::read_to_string(&pyproject)
+        && let Ok(parsed) = content.parse::<toml::Table>()
+    {
+        if let Some(project) = parsed.get("project").and_then(|v| v.as_table()) {
+            info.name = project
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            info.description = project
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
         }
+        info.languages.push(("Python".into(), 100.0));
+        info.test_cmd = Some("pytest".into());
+        info.lint_cmd = Some("ruff check".into());
     }
 
     // Fallback name from directory

@@ -124,9 +124,9 @@ pub(super) fn read_source_context(
     let end = (line_num + 5).min(lines.len());
 
     let mut output = format!("  {file_path}:{line_num}:\n");
-    for i in start..end {
+    for (i, line) in lines.iter().enumerate().take(end).skip(start) {
         let marker = if i + 1 == line_num { ">" } else { " " };
-        output.push_str(&format!("  {marker}{:>4}│{}\n", i + 1, lines[i]));
+        output.push_str(&format!("  {marker}{:>4}│{}\n", i + 1, line));
     }
     Some(output)
 }

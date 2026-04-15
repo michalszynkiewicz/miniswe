@@ -78,6 +78,12 @@ pub struct App {
     pub permission_response: Option<String>,
 }
 
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl App {
     pub fn new() -> Self {
         Self {
@@ -206,18 +212,15 @@ impl App {
 
     /// Navigate down in history.
     pub fn history_down(&mut self) {
-        match self.history_pos {
-            Some(pos) => {
-                if pos + 1 < self.history.len() {
-                    self.history_pos = Some(pos + 1);
-                    self.input = self.history[pos + 1].clone();
-                } else {
-                    self.history_pos = None;
-                    self.input = self.saved_input.clone();
-                }
-                self.cursor = self.input.len();
+        if let Some(pos) = self.history_pos {
+            if pos + 1 < self.history.len() {
+                self.history_pos = Some(pos + 1);
+                self.input = self.history[pos + 1].clone();
+            } else {
+                self.history_pos = None;
+                self.input = self.saved_input.clone();
             }
-            None => {}
+            self.cursor = self.input.len();
         }
     }
 

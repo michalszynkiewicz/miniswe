@@ -85,7 +85,7 @@ impl DependencyGraph {
             }
         } else {
             // Regex fallback: use signature-substring matching (heuristic)
-            for (file, _summary) in &index.summaries {
+            for file in index.summaries.keys() {
                 let file_symbols: Vec<&Symbol> = index
                     .symbols
                     .values()
@@ -93,7 +93,7 @@ impl DependencyGraph {
                     .filter(|s| s.file == *file)
                     .collect();
 
-                for (other_file, _) in &index.summaries {
+                for other_file in index.summaries.keys() {
                     if other_file == file {
                         continue;
                     }

@@ -1028,7 +1028,7 @@ async fn shell_large_output_saved_to_file() {
 fn compressor_no_op_when_under_budget() {
     let config = Config::default();
     // Small conversation — should not compress
-    let messages = vec![
+    let messages = [
         Message::system("You are a coding agent."),
         Message::user("Hello"),
         Message::assistant("Hi! How can I help?"),

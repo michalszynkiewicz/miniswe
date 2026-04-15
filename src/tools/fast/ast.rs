@@ -70,10 +70,10 @@ fn has_missing(node: tree_sitter::Node) -> bool {
         return true;
     }
     for i in 0..node.child_count() as u32 {
-        if let Some(child) = node.child(i) {
-            if has_missing(child) {
-                return true;
-            }
+        if let Some(child) = node.child(i)
+            && has_missing(child)
+        {
+            return true;
         }
     }
     false
@@ -85,10 +85,10 @@ fn first_error(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
         return Some(node);
     }
     for i in 0..node.child_count() as u32 {
-        if let Some(child) = node.child(i) {
-            if let Some(err) = first_error(child) {
-                return Some(err);
-            }
+        if let Some(child) = node.child(i)
+            && let Some(err) = first_error(child)
+        {
+            return Some(err);
         }
     }
     None
