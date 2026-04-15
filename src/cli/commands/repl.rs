@@ -13,6 +13,13 @@ use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
+use crate::cli::commands::agent::display::summarize_args;
+use crate::cli::commands::agent::hints::{
+    PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_BLOCK_MESSAGE, PLAN_CHECKPOINT_WARNING,
+    PLAN_HARD_BLOCK_AFTER_EDITS, PLAN_PROGRESS_NUDGE, loop_detected_hint, truncated_tool_call_hint,
+};
+use crate::cli::commands::agent::loop_detector::loop_call_key;
+use crate::cli::commands::agent::permissions::permission_action;
 use crate::config::{Config, EditMode, ModelRole};
 use crate::context;
 use crate::context::compress;
@@ -28,55 +35,6 @@ use crate::tools::permissions::{Action, PermissionManager};
 use crate::tui::app::{App, AppMode, LineStyle};
 use crate::tui::event::{self, AppEvent};
 use crate::tui::ui;
-
-const PLAN_CHECKPOINT_AFTER_EDITS: u32 = 5;
-const PLAN_HARD_BLOCK_AFTER_EDITS: u32 = 8;
-const PLAN_PROGRESS_NUDGE: &str = "\
-PLAN STATUS: If this edit completed one of your current plan steps, mark it now with plan(action='check', step=N). If the work split changed, use plan(action='refine') or plan(action='set').";
-const PLAN_CHECKPOINT_WARNING: &str = "\
-PLAN CHECKPOINT: You have made 5 edits since the last successful plan action. Before making many more edits, review the plan: use plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet. Further edits may be blocked if you continue without any plan action.";
-const PLAN_CHECKPOINT_BLOCK_MESSAGE: &str = "\
-Plan checkpoint required before more edits. You have continued editing after the checkpoint warning. Use any successful plan action now: plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet.";
-
-/// Injected as a user-role message after the server rejects the model's
-/// tool call with "Failed to parse tool call arguments as JSON" (see
-/// `crate::llm::TRUNCATED_TOOL_CALL_MARKER`). The previous assistant
-/// turn was streamed but never committed to history (the server dropped
-/// it), so we push this hint instead of a tool_result and let the agent
-/// try again with a smaller operation.
-/// See `run.rs` for why the fast-mode variant points at `show_rev` / `revert`
-/// instead of `edit_file`.
-fn loop_detected_hint(edit_mode: EditMode) -> &'static str {
-    match edit_mode {
-        EditMode::Smart => {
-            "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. Try a different approach: use file(action='search'), file(action='read'), code(action='repo_map'), code(action='diagnostics'), or edit_file for semantic edits."
-        }
-        EditMode::Fast => {
-            "ERROR: You are in a loop — this exact tool call has been repeated 3 times in a row. Stop retrying it in this turn. If you were repeating replace_range/insert_at with the same args, the edit already landed (or was rejected) — inspect the revision table with show_rev before trying again. If you were repeating revert to the same rev, pick a different live rev or move on. Use file(action='read') to re-check current state."
-        }
-    }
-}
-
-fn truncated_tool_call_hint(edit_mode: EditMode) -> &'static str {
-    match edit_mode {
-        EditMode::Smart => {
-            "\
-Your previous tool call was rejected because the server could not parse its arguments as JSON — \
-most likely the generation hit max_tokens mid-string and the JSON got truncated. \
-Try a smaller operation: prefer edit_file over write_file for existing files, \
-break large writes into multiple smaller tool calls, \
-and avoid embedding very long literals in a single argument."
-        }
-        EditMode::Fast => {
-            "\
-Your previous tool call was rejected because the server could not parse its arguments as JSON — \
-most likely the generation hit max_tokens mid-string and the JSON got truncated. \
-Try a smaller operation: prefer replace_range or insert_at over write_file for existing files, \
-break large writes into multiple smaller tool calls, \
-and avoid embedding very long literals in a single argument."
-        }
-    }
-}
 
 struct ReplTerminalGuard;
 
@@ -1169,138 +1127,6 @@ fn mask_old_tool_results(
     }
 }
 
-/// Create a brief summary of tool arguments for display.
-///
-/// TODO(design): this hand-maintained match arm has to be updated every time
-/// a new tool is added, and forgetting it is silent — the fallback
-/// `format!("{args}")` dumps full JSON into the transcript `→ tool(...)`
-/// line, which wraps across many visual rows and breaks the ratatui
-/// line-count-based scroll math so later output appears missing. This
-/// already happened once (fast-mode tools `replace_range` / `insert_at` /
-/// `revert` / `show_rev` / `check` were missing and shipped with JSON
-/// blobs for weeks). The real fix is to move `summarize(args) -> String`
-/// onto the tool definition itself (alongside `name` / `parameters` in
-/// `src/tools/definitions.rs`) so every tool supplies its own summary and
-/// the REPL just dispatches by name. Same fix needed in `run.rs`.
-fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
-    match tool_name {
-        "file" | "code" | "web" | "plan" | "edit_file" | "write_file" | "mcp_use" => {
-            // Delegate to run.rs summarize_args pattern
-            let action = args["action"].as_str().unwrap_or("");
-            match (tool_name, action) {
-                ("file", "read") => {
-                    let path = args["path"].as_str().unwrap_or("?");
-                    format!("read {path}")
-                }
-                ("file", "search") => {
-                    let query = args["query"]
-                        .as_str()
-                        .or_else(|| args["pattern"].as_str())
-                        .unwrap_or("?");
-                    let scope = args["scope"]
-                        .as_str()
-                        .or_else(|| args["path"].as_str())
-                        .unwrap_or("project");
-                    format!("search \"{query}\" in {scope}")
-                }
-                ("file", "delete") => {
-                    let path = args["path"].as_str().unwrap_or("?");
-                    format!("delete {path}")
-                }
-                ("file", "shell") => {
-                    let cmd = args["command"].as_str().unwrap_or("?");
-                    let timeout = args["timeout"].as_u64();
-                    match timeout {
-                        Some(t) => {
-                            format!("shell {} [timeout={t}]", crate::truncate_chars(cmd, 40))
-                        }
-                        None => format!("shell {}", crate::truncate_chars(cmd, 40)),
-                    }
-                }
-                ("plan", "check") => {
-                    format!("check step {}", args["step"].as_u64().unwrap_or(0))
-                }
-                ("plan", "refine") => {
-                    format!("refine step {}", args["step"].as_u64().unwrap_or(0))
-                }
-                ("plan", "scratchpad") => "scratchpad".to_string(),
-                ("web", "search") => {
-                    let query = args["query"].as_str().unwrap_or("?");
-                    format!("search \"{query}\"")
-                }
-                ("web", "fetch") => args["url"].as_str().unwrap_or("?").to_string(),
-                ("edit_file", _) => {
-                    let path = args["path"].as_str().unwrap_or("?");
-                    let task = args["task"].as_str().unwrap_or("");
-                    let lsp = args["lsp_validation"].as_str().unwrap_or("auto");
-                    if task.is_empty() {
-                        path.to_string()
-                    } else if lsp == "auto" {
-                        format!("{path}: {}", crate::truncate_chars(task, 70))
-                    } else {
-                        format!("{path}: {} [lsp={lsp}]", crate::truncate_chars(task, 58))
-                    }
-                }
-                ("write_file", _) => {
-                    let path = args["path"].as_str().unwrap_or("?");
-                    format!("write {path}")
-                }
-                ("mcp_use", _) => {
-                    let server = args["server"].as_str().unwrap_or("?");
-                    let tool = args["tool"].as_str().unwrap_or("?");
-                    format!("{server}/{tool}")
-                }
-                _ => action.to_string(),
-            }
-        }
-        "replace_range" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            let start = args["start"].as_u64().unwrap_or(0);
-            let end = args["end"].as_u64().unwrap_or(0);
-            format!("{path} L{start}-{end}")
-        }
-        "insert_at" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            let after = args["after_line"].as_u64().unwrap_or(0);
-            format!("{path} @L{after}")
-        }
-        "revert" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            let rev = args["rev"].as_u64().unwrap_or(0);
-            format!("{path} to rev_{rev}")
-        }
-        "show_rev" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            let rev = args["rev"].as_u64().unwrap_or(0);
-            format!("{path} rev_{rev}")
-        }
-        "check" => String::new(),
-        _ => format!("{args}"),
-    }
-}
-
-fn loop_call_key(tool_name: &str, args: &serde_json::Value) -> String {
-    format!("{tool_name}:{}", canonical_json(args))
-}
-
-fn permission_action(tool_name: &str, args: &serde_json::Value) -> Option<Action> {
-    match tool_name {
-        "shell" => Some(Action::Shell(args["command"].as_str().unwrap_or("").into())),
-        "file" if args["action"].as_str().unwrap_or("") == "shell" => {
-            Some(Action::Shell(args["command"].as_str().unwrap_or("").into()))
-        }
-        "web_search" => Some(Action::WebSearch(
-            args["query"].as_str().unwrap_or("").into(),
-        )),
-        "web_fetch" => Some(Action::WebFetch(args["url"].as_str().unwrap_or("").into())),
-        "mcp_use" => Some(Action::McpUse(
-            args["server"].as_str().unwrap_or("").into(),
-            args["tool"].as_str().unwrap_or("").into(),
-        )),
-        _ => None,
-    }
-}
-
 fn handle_background_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
     match key.code {
         KeyCode::PageUp => {
@@ -1398,36 +1224,6 @@ fn finish_completed_turn(
     );
     terminal.draw(|frame| ui::draw(frame, app))?;
     Ok(())
-}
-
-fn canonical_json(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => "null".to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into()),
-        serde_json::Value::Array(items) => {
-            let inner = items
-                .iter()
-                .map(canonical_json)
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("[{inner}]")
-        }
-        serde_json::Value::Object(map) => {
-            let mut entries = map.iter().collect::<Vec<_>>();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-            let inner = entries
-                .into_iter()
-                .map(|(k, v)| {
-                    let key = serde_json::to_string(k).unwrap_or_else(|_| "\"\"".into());
-                    format!("{key}:{}", canonical_json(v))
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{{{inner}}}")
-        }
-    }
 }
 
 async fn await_tool_job_ui(
