@@ -20,15 +20,12 @@ env:
   RUSTFLAGS: "-D warnings"
   # Belt-and-braces: keep network downloads bounded if a test misbehaves.
   CARGO_NET_RETRY: "2"
-  # Panics in tests should always carry a backtrace — essential for
-  # diagnosing the LSP test hangs.
-  RUST_BACKTRACE: "1"
 
 jobs:
-  test:
-    name: Build, lint, test
+  lint:
+    name: fmt + clippy
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +36,37 @@ jobs:
 
       - name: Cache cargo registry, index, and target/
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Full backtraces on any panic (e.g. the LSP watchdog timeouts in
+      # tests/e2e_lsp.rs).
+      RUST_BACKTRACE: "full"
+      # Let rust-analyzer log what it's doing. Our LSP transport captures
+      # its stderr verbatim via `[lsp:stderr] …` lines, so this surfaces
+      # in the cargo test output and makes any LSP hang diagnosable.
+      RA_LOG: "info"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry, index, and target/
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
 
       # rust-analyzer is auto-downloaded by the LSP tests into
       # ~/.miniswe/lsp-servers/. Cache it so we don't re-pull ~30MB every run.
@@ -56,23 +84,34 @@ jobs:
           restore-keys: |
             lsp-servers-${{ runner.os }}-
 
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
-
       - name: cargo build
         run: cargo build --locked --all-targets
 
       - name: cargo test
-        # `--nocapture` surfaces eprintln! breadcrumbs in-flight, so a hang
-        # in the LSP tests tells us which phase is stuck instead of silently
-        # timing out the whole workflow.
-        run: cargo test --locked -- --nocapture
+        # `--nocapture`: surface eprintln! breadcrumbs (e.g. `[trace]` lines
+        #   in tests/e2e_lsp.rs) in-flight so hangs are diagnosable from
+        #   the workflow log, not only on failure.
+        # `--report-time`: print per-test duration so we can spot a slow
+        #   vs. stuck test at a glance.
+        run: cargo test --locked -- --nocapture --report-time
 
-      # Make sure the optional language features still compile, without paying
-      # for a full build of all of them. `cargo check` is enough to catch
-      # breakage in the tree-sitter-* dependency graph.
+  check-all-languages:
+    name: cargo check --features all-languages
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry, index, and target/
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check-all-languages
+
+      # Validate that the optional language features still compile. `cargo
+      # check` is enough to catch breakage in the tree-sitter-* dependency
+      # graph without paying for a full build of all ~18 grammars.
       - name: cargo check --features all-languages
         run: cargo check --locked --features all-languages
