@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # required to create releases and upload assets
+
+# Don't cancel a release in flight, but don't let two releases for the same
+# tag race either.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux-x86_64:
+    name: Build linux-x86_64 (all-languages)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Keyed off the tag so releases get a fresh cache slot but rebuilds
+          # of the same tag (e.g. retries) are fast.
+          key: release-${{ github.ref_name }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --features all-languages
+
+      - name: Strip binary
+        run: strip target/release/miniswe
+
+      - name: Package tarball + checksum
+        id: package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          name="miniswe-${{ github.ref_name }}-x86_64-unknown-linux-gnu"
+          tar -czf "dist/${name}.tar.gz" -C target/release miniswe
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          ls -lh dist
+
+      - name: Upload artifact (for debugging if release step fails)
+        uses: actions/upload-artifact@v4
+        with:
+          name: miniswe-linux-x86_64
+          path: dist/*
+          retention-days: 7
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            --verify-tag \
+            dist/*
