@@ -12,7 +12,7 @@
 //! - Caps are applied separately:
 //!     * live chain (non-reverted, non-rev_0): `DEFAULT_LIVE_CAP` (20)
 //!     * tombstones: `DEFAULT_TOMBSTONE_CAP` (20), oldest evicted first
-//!   `rev_0` never counts toward either cap and is never dropped.
+//!     * `rev_0` never counts toward either cap and is never dropped.
 //! - Only *successful* writes create revisions.
 //!
 //! V1 storage is in-memory and session-scoped: revisions live in a

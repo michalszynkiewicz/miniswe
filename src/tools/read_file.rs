@@ -12,8 +12,6 @@ use super::ToolResult;
 use crate::config::Config;
 use crate::context::compress;
 
-/// Fallback max lines if config is not available.
-
 /// File extensions that get compression applied.
 const COMPRESSIBLE: &[&str] = &[
     "rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh", "bash",
@@ -43,13 +41,13 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 
     // Check file size before reading (reject files > 10MB to avoid OOM)
     const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
-    if let Ok(meta) = fs::metadata(&path) {
-        if meta.len() > MAX_FILE_SIZE {
-            return Ok(ToolResult::err(format!(
-                "{path_str} is too large ({:.1}MB). Use shell(\"head -n 200 {path_str}\") instead.",
-                meta.len() as f64 / 1_048_576.0
-            )));
-        }
+    if let Ok(meta) = fs::metadata(&path)
+        && meta.len() > MAX_FILE_SIZE
+    {
+        return Ok(ToolResult::err(format!(
+            "{path_str} is too large ({:.1}MB). Use shell(\"head -n 200 {path_str}\") instead.",
+            meta.len() as f64 / 1_048_576.0
+        )));
     }
 
     let content = match fs::read_to_string(&path) {

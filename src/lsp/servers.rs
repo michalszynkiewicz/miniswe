@@ -265,10 +265,10 @@ fn has_c_sources(root: &Path) -> bool {
     let c_exts = ["c", "cc", "cpp", "cxx", "h", "hpp"];
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
-            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
-                if c_exts.contains(&ext) {
-                    return true;
-                }
+            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str())
+                && c_exts.contains(&ext)
+            {
+                return true;
             }
         }
     }
@@ -276,10 +276,10 @@ fn has_c_sources(root: &Path) -> bool {
     let src = root.join("src");
     if let Ok(entries) = std::fs::read_dir(&src) {
         for entry in entries.flatten() {
-            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
-                if c_exts.contains(&ext) {
-                    return true;
-                }
+            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str())
+                && c_exts.contains(&ext)
+            {
+                return true;
             }
         }
     }

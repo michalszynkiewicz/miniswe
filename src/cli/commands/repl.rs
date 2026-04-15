@@ -201,19 +201,18 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
             LineStyle::Status,
         );
     }
-    if let Some(ref mcp) = mcp_registry {
-        if let Ok(guard) = mcp.lock() {
-            if guard.has_servers() {
-                app.push_output(
-                    &format!(
-                        "MCP: {} servers, {} tools",
-                        guard.servers.len(),
-                        guard.tool_count()
-                    ),
-                    LineStyle::Status,
-                );
-            }
-        }
+    if let Some(ref mcp) = mcp_registry
+        && let Ok(guard) = mcp.lock()
+        && guard.has_servers()
+    {
+        app.push_output(
+            &format!(
+                "MCP: {} servers, {} tools",
+                guard.servers.len(),
+                guard.tool_count()
+            ),
+            LineStyle::Status,
+        );
     }
     app.push_output(
         "Type your message. Ctrl+O: details, Ctrl+C: interrupt, Ctrl+D: quit",
@@ -499,10 +498,10 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
     app.save_history(&history_file);
 
     // Shut down LSP
-    if let Some(lsp) = lsp_client {
-        if let Ok(lsp) = Arc::try_unwrap(lsp) {
-            lsp.shutdown().await;
-        }
+    if let Some(lsp) = lsp_client
+        && let Ok(lsp) = Arc::try_unwrap(lsp)
+    {
+        lsp.shutdown().await;
     }
 
     Ok(())
@@ -598,7 +597,7 @@ async fn run_agent_loop(
                                 app.push_token(&token);
                                 rendered_assistant_text.push_str(&token);
                                 token_count += 1;
-                                if token_count % 3 == 0 {
+                                if token_count.is_multiple_of(3) {
                                     let _ = terminal.draw(|frame| ui::draw(frame, app));
                                 }
                             }
@@ -1024,11 +1023,11 @@ async fn run_agent_loop(
                 .await
             };
 
-            if !result.success {
-                if let Some(hint) = tools::plan::failure_hint(config) {
-                    result.content.push_str("\n");
-                    result.content.push_str(&hint);
-                }
+            if !result.success
+                && let Some(hint) = tools::plan::failure_hint(config)
+            {
+                result.content.push('\n');
+                result.content.push_str(&hint);
             }
 
             let first_line = result.content.lines().next().unwrap_or("(empty)");
@@ -1058,7 +1057,7 @@ async fn run_agent_loop(
                 same_call_streak = 0;
                 if config.tools.plan {
                     if tools::plan::plan_exists(config) {
-                        result.content.push_str("\n");
+                        result.content.push('\n');
                         result.content.push_str(PLAN_PROGRESS_NUDGE);
                     }
                     successful_edits_since_plan_update += 1;
@@ -1066,7 +1065,7 @@ async fn run_agent_loop(
                         plan_checkpoint_pending = true;
                     }
                     if successful_edits_since_plan_update == PLAN_CHECKPOINT_AFTER_EDITS {
-                        result.content.push_str("\n");
+                        result.content.push('\n');
                         result.content.push_str(PLAN_CHECKPOINT_WARNING);
                     }
                 }
@@ -1136,12 +1135,12 @@ fn mask_old_tool_results(
         let excess = summary_count - keep_count;
         let mut archived = 0;
         for s in &summaries {
-            if let Some(s) = s {
-                if archived < excess {
-                    archive.push_str(s);
-                    archive.push('\n');
-                    archived += 1;
-                }
+            if let Some(s) = s
+                && archived < excess
+            {
+                archive.push_str(s);
+                archive.push('\n');
+                archived += 1;
             }
         }
         let _ = std::fs::write(&archive_path, &archive);

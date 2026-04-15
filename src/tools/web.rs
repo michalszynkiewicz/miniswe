@@ -207,7 +207,7 @@ async fn search_github(
             if resp.status() == 403 || resp.status() == 429 {
                 let mut msg = "GitHub search rate limited (10/min unauthenticated).".to_string();
                 if let Some(hint) = missing_key_hint {
-                    msg.push_str("\n");
+                    msg.push('\n');
                     msg.push_str(hint);
                 } else {
                     msg.push_str(" Wait a minute or configure another search backend.");
@@ -242,7 +242,7 @@ async fn search_github(
                      GitHub search only finds repositories, not general web content."
                 );
                 if let Some(hint) = missing_key_hint {
-                    output.push_str("\n");
+                    output.push('\n');
                     output.push_str(hint);
                 }
                 output.push_str(

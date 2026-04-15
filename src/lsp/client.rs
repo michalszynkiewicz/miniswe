@@ -103,10 +103,10 @@ impl LspClient {
                 use std::io::BufRead;
                 let reader = std::io::BufReader::new(stderr);
                 for line in reader.lines().take(20) {
-                    if let Ok(line) = line {
-                        if !line.trim().is_empty() {
-                            eprintln!("[lsp:stderr] {}", crate::truncate_chars(&line, 200));
-                        }
+                    if let Ok(line) = line
+                        && !line.trim().is_empty()
+                    {
+                        eprintln!("[lsp:stderr] {}", crate::truncate_chars(&line, 200));
                     }
                 }
             });
@@ -426,11 +426,7 @@ fn path_to_uri(path: &Path) -> String {
 /// Convert a file:// URI back to a path.
 pub fn uri_to_path(uri: &lsp_types::Uri) -> Option<PathBuf> {
     let s = uri.as_str();
-    if let Some(path_str) = s.strip_prefix("file://") {
-        Some(PathBuf::from(path_str))
-    } else {
-        None
-    }
+    s.strip_prefix("file://").map(PathBuf::from)
 }
 
 /// Detect language ID from file extension.

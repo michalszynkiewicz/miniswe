@@ -138,14 +138,13 @@ impl LspTransport {
             } else if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
                 match method {
                     "textDocument/publishDiagnostics" => {
-                        if let Some(params) = msg.get("params") {
-                            if let Ok(diag_params) = serde_json::from_value::<
+                        if let Some(params) = msg.get("params")
+                            && let Ok(diag_params) = serde_json::from_value::<
                                 lsp_types::PublishDiagnosticsParams,
                             >(params.clone())
-                            {
-                                let uri = diag_params.uri.as_str().to_string();
-                                transport.diagnostics.insert(uri, diag_params.diagnostics);
-                            }
+                        {
+                            let uri = diag_params.uri.as_str().to_string();
+                            transport.diagnostics.insert(uri, diag_params.diagnostics);
                         }
                     }
                     "$/progress" => {

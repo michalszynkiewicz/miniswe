@@ -355,9 +355,7 @@ fn truncate_preview(text: &str, max_lines: usize, max_bytes: usize) -> (String, 
 }
 
 fn render_label(r: &Revision) -> String {
-    if r.number == 0 {
-        r.label.clone()
-    } else if r.added == 0 && r.removed == 0 {
+    if r.number == 0 || (r.added == 0 && r.removed == 0) {
         r.label.clone()
     } else {
         format!("{} (+{} -{})", r.label, r.added, r.removed)

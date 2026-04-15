@@ -47,24 +47,25 @@ impl Step {
             return None;
         }
 
-        let (checked, checked_round, rest) = if trimmed.starts_with("- [x]") {
-            // Parse optional round: "- [x] (round 5) description"
-            let after_check = &trimmed[5..].trim_start();
-            if let Some(rp) = after_check.strip_prefix("(round ") {
-                if let Some(end) = rp.find(')') {
-                    let round = rp[..end].parse().ok();
-                    (true, round, rp[end + 1..].trim_start().to_string())
+        let (checked, checked_round, rest) =
+            if let Some(after_check) = trimmed.strip_prefix("- [x]") {
+                // Parse optional round: "- [x] (round 5) description"
+                let after_check = after_check.trim_start();
+                if let Some(rp) = after_check.strip_prefix("(round ") {
+                    if let Some(end) = rp.find(')') {
+                        let round = rp[..end].parse().ok();
+                        (true, round, rp[end + 1..].trim_start().to_string())
+                    } else {
+                        (true, None, after_check.to_string())
+                    }
                 } else {
                     (true, None, after_check.to_string())
                 }
+            } else if let Some(after_check) = trimmed.strip_prefix("- [ ]") {
+                (false, None, after_check.trim_start().to_string())
             } else {
-                (true, None, after_check.to_string())
-            }
-        } else if trimmed.starts_with("- [ ]") {
-            (false, None, trimmed[5..].trim_start().to_string())
-        } else {
-            return None;
-        };
+                return None;
+            };
 
         // Parse compile tag from end
         let (description, compile, reason) = if let Some(idx) = rest.rfind(" [compile]") {
@@ -156,7 +157,7 @@ fn validate_steps(steps: &[Step]) -> Result<(), String> {
     for (i, step) in steps.iter().enumerate() {
         if !step.compile {
             // Must have reason
-            if step.reason.as_ref().map_or(true, |r| r.trim().is_empty()) {
+            if step.reason.as_ref().is_none_or(|r| r.trim().is_empty()) {
                 return Err(format!(
                     "Step {} has compile: false but no reason. Explain why the tree will be broken.",
                     i + 1
@@ -285,11 +286,11 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
                     {
                         // Bare checkbox without compile tag — parse as compile: true
                         let trimmed = line.trim_start();
-                        let desc = if trimmed.starts_with("- [ ]") {
-                            trimmed[5..].trim().to_string()
-                        } else {
-                            trimmed[5..].trim().to_string()
-                        };
+                        let desc = trimmed
+                            .strip_prefix("- [ ]")
+                            .or_else(|| trimmed.strip_prefix("- [x]"))
+                            .map(|rest| rest.trim().to_string())
+                            .unwrap_or_default();
                         steps.push(Step {
                             checked: trimmed.starts_with("- [x]"),
                             checked_round: None,

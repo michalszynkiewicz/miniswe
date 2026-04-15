@@ -99,14 +99,14 @@ pub fn spawn_key_reader(
                     }
                 }
             } else {
-                if let EscapeState::SawEsc(saved_esc, started_at) = &escape_state {
-                    if started_at.elapsed() >= Duration::from_millis(25) {
-                        if tx.send(AppEvent::Key(*saved_esc)).is_err() {
-                            break;
-                        }
-                        escape_state = EscapeState::None;
-                        continue;
+                if let EscapeState::SawEsc(saved_esc, started_at) = &escape_state
+                    && started_at.elapsed() >= Duration::from_millis(25)
+                {
+                    if tx.send(AppEvent::Key(*saved_esc)).is_err() {
+                        break;
                     }
+                    escape_state = EscapeState::None;
+                    continue;
                 }
                 if tx.send(AppEvent::Tick).is_err() {
                     break;

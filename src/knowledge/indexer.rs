@@ -68,28 +68,28 @@ pub fn index_project(root: &Path, previous: Option<&ProjectIndex>) -> Result<Pro
                 let mtime = file_mtime(path);
 
                 // Incremental: reuse previous index if file hasn't changed
-                if let Some(prev) = previous {
-                    if !prev.is_stale(&rel_str, mtime) {
-                        // Copy symbols from previous index
-                        for (name, syms) in &prev.symbols {
-                            for sym in syms {
-                                if sym.file == rel_str {
-                                    index
-                                        .symbols
-                                        .entry(name.clone())
-                                        .or_default()
-                                        .push(sym.clone());
-                                    index.total_symbols += 1;
-                                }
+                if let Some(prev) = previous
+                    && !prev.is_stale(&rel_str, mtime)
+                {
+                    // Copy symbols from previous index
+                    for (name, syms) in &prev.symbols {
+                        for sym in syms {
+                            if sym.file == rel_str {
+                                index
+                                    .symbols
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .push(sym.clone());
+                                index.total_symbols += 1;
                             }
                         }
-                        if let Some(summary) = prev.summaries.get(&rel_str) {
-                            index.summaries.insert(rel_str.clone(), summary.clone());
-                        }
-                        index.mtimes.insert(rel_str, mtime);
-                        reused += 1;
-                        continue;
                     }
+                    if let Some(summary) = prev.summaries.get(&rel_str) {
+                        index.summaries.insert(rel_str.clone(), summary.clone());
+                    }
+                    index.mtimes.insert(rel_str, mtime);
+                    reused += 1;
+                    continue;
                 }
 
                 // (Re-)index this file
@@ -307,12 +307,12 @@ fn compute_end_lines(symbols: &mut Vec<Symbol>, content: &str) {
         let start_line = lines[start];
         let start_indent = start_line.len() - start_line.trim_start().len();
 
+        let scan_end = upper_bound.min(total);
         // For brace-delimited languages: track depth
         if start_line.contains('{') || lines.get(start + 1).is_some_and(|l| l.trim() == "{") {
             let mut depth = 0;
-            for j in start..upper_bound.min(total) {
-                let brace_delta = count_braces_outside_strings(lines[j]);
-                depth += brace_delta;
+            for (j, line) in lines.iter().enumerate().take(scan_end).skip(start) {
+                depth += count_braces_outside_strings(line);
                 if depth <= 0 && j > start {
                     symbols[i].end_line = j + 1;
                     break;
@@ -323,8 +323,7 @@ fn compute_end_lines(symbols: &mut Vec<Symbol>, content: &str) {
             }
         } else {
             // For indent-delimited (Python): find where indent returns to start level
-            for j in (start + 1)..upper_bound.min(total) {
-                let line = lines[j];
+            for (j, line) in lines.iter().enumerate().take(scan_end).skip(start + 1) {
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -431,19 +430,19 @@ fn extract_rust_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
             }
         }
         // Impl blocks
-        else if trimmed.starts_with("impl ") {
-            if let Some(name) = extract_name_after(trimmed, "impl ") {
-                symbols.push(Symbol {
-                    name: format!("impl {name}"),
-                    file: file.into(),
-                    line: line_num + 1,
-                    kind: "impl".into(),
-                    signature: trimmed.trim_end_matches('{').trim().to_string(),
-                    end_line: 0,
-                    deps: Vec::new(),
-                    parent_impl: None,
-                });
-            }
+        else if trimmed.starts_with("impl ")
+            && let Some(name) = extract_name_after(trimmed, "impl ")
+        {
+            symbols.push(Symbol {
+                name: format!("impl {name}"),
+                file: file.into(),
+                line: line_num + 1,
+                kind: "impl".into(),
+                signature: trimmed.trim_end_matches('{').trim().to_string(),
+                end_line: 0,
+                deps: Vec::new(),
+                parent_impl: None,
+            });
         }
     }
 }
@@ -453,11 +452,8 @@ fn extract_python_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) 
         let trimmed = line.trim();
 
         if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
-            let keyword = if trimmed.starts_with("async") {
-                "def "
-            } else {
-                "def "
-            };
+            // `extract_name_after` searches for "def " in either form.
+            let keyword = "def ";
             if let Some(name) = extract_name_after(trimmed, keyword) {
                 symbols.push(Symbol {
                     name,
@@ -470,19 +466,19 @@ fn extract_python_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) 
                     parent_impl: None,
                 });
             }
-        } else if trimmed.starts_with("class ") {
-            if let Some(name) = extract_name_after(trimmed, "class ") {
-                symbols.push(Symbol {
-                    name,
-                    file: file.into(),
-                    line: line_num + 1,
-                    kind: "class".into(),
-                    signature: trimmed.trim_end_matches(':').to_string(),
-                    end_line: 0,
-                    deps: Vec::new(),
-                    parent_impl: None,
-                });
-            }
+        } else if trimmed.starts_with("class ")
+            && let Some(name) = extract_name_after(trimmed, "class ")
+        {
+            symbols.push(Symbol {
+                name,
+                file: file.into(),
+                line: line_num + 1,
+                kind: "class".into(),
+                signature: trimmed.trim_end_matches(':').to_string(),
+                end_line: 0,
+                deps: Vec::new(),
+                parent_impl: None,
+            });
         }
     }
 }
@@ -538,19 +534,19 @@ fn extract_js_ts_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
             }
         }
         // type alias
-        else if trimmed.starts_with("export type ") || trimmed.starts_with("type ") {
-            if let Some(name) = extract_name_after(trimmed, "type ") {
-                symbols.push(Symbol {
-                    name,
-                    file: file.into(),
-                    line: line_num + 1,
-                    kind: "type".into(),
-                    signature: trimmed.to_string(),
-                    end_line: 0,
-                    deps: Vec::new(),
-                    parent_impl: None,
-                });
-            }
+        else if (trimmed.starts_with("export type ") || trimmed.starts_with("type "))
+            && let Some(name) = extract_name_after(trimmed, "type ")
+        {
+            symbols.push(Symbol {
+                name,
+                file: file.into(),
+                line: line_num + 1,
+                kind: "type".into(),
+                signature: trimmed.to_string(),
+                end_line: 0,
+                deps: Vec::new(),
+                parent_impl: None,
+            });
         }
     }
 }
@@ -583,26 +579,26 @@ fn extract_go_symbols(file: &str, content: &str, symbols: &mut Vec<Symbol>) {
                     parent_impl: None,
                 });
             }
-        } else if trimmed.starts_with("type ") {
-            if let Some(name) = extract_name_after(trimmed, "type ") {
-                let kind = if trimmed.contains("struct") {
-                    "struct"
-                } else if trimmed.contains("interface") {
-                    "interface"
-                } else {
-                    "type"
-                };
-                symbols.push(Symbol {
-                    name,
-                    file: file.into(),
-                    line: line_num + 1,
-                    kind: kind.into(),
-                    signature: trimmed.trim_end_matches('{').trim().to_string(),
-                    end_line: 0,
-                    deps: Vec::new(),
-                    parent_impl: None,
-                });
-            }
+        } else if trimmed.starts_with("type ")
+            && let Some(name) = extract_name_after(trimmed, "type ")
+        {
+            let kind = if trimmed.contains("struct") {
+                "struct"
+            } else if trimmed.contains("interface") {
+                "interface"
+            } else {
+                "type"
+            };
+            symbols.push(Symbol {
+                name,
+                file: file.into(),
+                line: line_num + 1,
+                kind: kind.into(),
+                signature: trimmed.trim_end_matches('{').trim().to_string(),
+                end_line: 0,
+                deps: Vec::new(),
+                parent_impl: None,
+            });
         }
     }
 }

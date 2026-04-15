@@ -747,7 +747,7 @@ async fn execute_planned_steps(
     }
 
     let mut steps_desc = steps;
-    steps_desc.sort_by(|a, b| b.start_line().cmp(&a.start_line()));
+    steps_desc.sort_by_key(|s| std::cmp::Reverse(s.start_line()));
 
     for (idx, step) in steps_desc.iter().enumerate() {
         match step {
@@ -1243,11 +1243,11 @@ fn parse_preplan_window_response(text: &str) -> PreplanWindowResponse {
         if line.is_empty() {
             continue;
         }
-        if clarification.is_none() {
-            if let Some(question) = parse_needs_clarification(line) {
-                clarification = Some(question);
-                continue;
-            }
+        if clarification.is_none()
+            && let Some(question) = parse_needs_clarification(line)
+        {
+            clarification = Some(question);
+            continue;
         }
         if let Some(rest) = strip_case_insensitive_prefix(line, "NOTE ") {
             let note = rest.trim();
@@ -1272,15 +1272,15 @@ fn parse_preplan_window_response(text: &str) -> PreplanWindowResponse {
         }
         if let Some(rest) = strip_case_insensitive_prefix(line, "READ:") {
             let rest = rest.trim();
-            if let Some((start_s, end_s)) = rest.split_once('-') {
-                if let (Ok(start), Ok(end)) = (
+            if let Some((start_s, end_s)) = rest.split_once('-')
+                && let (Ok(start), Ok(end)) = (
                     start_s.trim().parse::<usize>(),
                     end_s.trim().parse::<usize>(),
-                ) {
-                    if start > 0 && end >= start {
-                        commands.push(InspectionCommand::Read { start, end });
-                    }
-                }
+                )
+                && start > 0
+                && end >= start
+            {
+                commands.push(InspectionCommand::Read { start, end });
             }
             continue;
         }
@@ -1360,11 +1360,11 @@ fn extract_line_ranges_from_note(note: &str) -> Vec<(usize, usize)> {
             }
             if i > end_start {
                 let end_str: String = chars[end_start..i].iter().collect();
-                if let Ok(end) = end_str.parse::<usize>() {
-                    if end >= start {
-                        ranges.push((start, end));
-                        continue;
-                    }
+                if let Ok(end) = end_str.parse::<usize>()
+                    && end >= start
+                {
+                    ranges.push((start, end));
+                    continue;
                 }
             }
             // Dash but no valid end number — fall through to single-line
@@ -2373,24 +2373,24 @@ fn format_repair_steps_for_window(ctx: &RepairContext, win_start: usize, win_end
         }
     }
 
-    if let Some(ref step) = ctx.failed_step {
-        if overlaps(step) {
-            if !any {
-                out.push_str("Previous edit attempt — steps in this slice:\n");
-                any = true;
-            }
-            let reason_preview = if ctx.failure_reason.len() > 120 {
-                format!("{}…", &ctx.failure_reason[..117])
-            } else {
-                ctx.failure_reason.clone()
-            };
-            out.push_str(&format!(
-                "  ✗ L{}-L{}: FAILED ({})\n",
-                step.start_line(),
-                step.end_line(),
-                reason_preview,
-            ));
+    if let Some(ref step) = ctx.failed_step
+        && overlaps(step)
+    {
+        if !any {
+            out.push_str("Previous edit attempt — steps in this slice:\n");
+            any = true;
         }
+        let reason_preview = if ctx.failure_reason.len() > 120 {
+            format!("{}…", &ctx.failure_reason[..117])
+        } else {
+            ctx.failure_reason.clone()
+        };
+        out.push_str(&format!(
+            "  ✗ L{}-L{}: FAILED ({})\n",
+            step.start_line(),
+            step.end_line(),
+            reason_preview,
+        ));
     }
 
     if any {
