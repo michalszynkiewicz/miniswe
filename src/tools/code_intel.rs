@@ -269,23 +269,22 @@ pub(super) fn context_tool_project_info(config: &Config) -> Result<ToolResult> {
     }
 
     let guide_path = config.miniswe_path("guide.md");
-    if let Ok(content) = std::fs::read_to_string(&guide_path) {
-        if !content.contains("<!-- Add project-specific instructions")
-            || content.lines().count() > 5
-        {
-            output.push_str("\n[GUIDE]\n");
-            output.push_str(&content);
-            output.push('\n');
-        }
+    if let Ok(content) = std::fs::read_to_string(&guide_path)
+        && (!content.contains("<!-- Add project-specific instructions")
+            || content.lines().count() > 5)
+    {
+        output.push_str("\n[GUIDE]\n");
+        output.push_str(&content);
+        output.push('\n');
     }
 
     let lessons_path = config.miniswe_path("lessons.md");
-    if let Ok(content) = std::fs::read_to_string(&lessons_path) {
-        if !content.contains("<!-- Accumulated tips") || content.lines().count() > 5 {
-            output.push_str("\n[LESSONS]\n");
-            output.push_str(&content);
-            output.push('\n');
-        }
+    if let Ok(content) = std::fs::read_to_string(&lessons_path)
+        && (!content.contains("<!-- Accumulated tips") || content.lines().count() > 5)
+    {
+        output.push_str("\n[LESSONS]\n");
+        output.push_str(&content);
+        output.push('\n');
     }
 
     if output.is_empty() {

@@ -255,10 +255,10 @@ impl LlmClient {
                                             String::new(),
                                         )
                                     });
-                                if let Some(id) = &tc_delta.id {
-                                    if !id.is_empty() {
-                                        entry.0 = id.clone();
-                                    }
+                                if let Some(id) = &tc_delta.id
+                                    && !id.is_empty()
+                                {
+                                    entry.0 = id.clone();
                                 }
                                 if let Some(func) = &tc_delta.function {
                                     if let Some(name) = &func.name {

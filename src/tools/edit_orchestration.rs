@@ -196,105 +196,105 @@ async fn auto_check(
     let is_new_file = !baseline.existed_before;
     // Try LSP diagnostics first — ~200ms vs 2-5s for compiler check
     {
-        if let Some(lsp) = lsp {
-            if lsp.is_ready() && !lsp.has_crashed() {
-                let abs_path = config.project_root.join(path);
-                if lsp.notify_file_changed(&abs_path).is_ok() {
-                    let timeout =
-                        std::time::Duration::from_millis(config.lsp.diagnostic_timeout_ms);
-                    let diags = lsp.get_diagnostics(&abs_path, timeout).await;
-                    // Always proceed — get_diagnostics already waited for the timeout
-                    {
-                        let errors: Vec<&lsp_types::Diagnostic> = diags
-                            .iter()
-                            .filter(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
-                            .collect();
-                        // For brand-new files we have no baseline at all,
-                        // so any errors are surfaced as informational —
-                        // don't flip success on new helper scripts whose
-                        // imports happen to be unresolved.
-                        let regressed = !is_new_file && errors.len() > baseline_errors;
-                        if errors.is_empty() {
-                            result.content.push_str("\n[lsp] OK");
-                        } else if is_new_file {
-                            let capped = errors.len().min(5);
-                            result.content.push_str(&format!(
+        if let Some(lsp) = lsp
+            && lsp.is_ready()
+            && !lsp.has_crashed()
+        {
+            let abs_path = config.project_root.join(path);
+            if lsp.notify_file_changed(&abs_path).is_ok() {
+                let timeout = std::time::Duration::from_millis(config.lsp.diagnostic_timeout_ms);
+                let diags = lsp.get_diagnostics(&abs_path, timeout).await;
+                // Always proceed — get_diagnostics already waited for the timeout
+                {
+                    let errors: Vec<&lsp_types::Diagnostic> = diags
+                        .iter()
+                        .filter(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
+                        .collect();
+                    // For brand-new files we have no baseline at all,
+                    // so any errors are surfaced as informational —
+                    // don't flip success on new helper scripts whose
+                    // imports happen to be unresolved.
+                    let regressed = !is_new_file && errors.len() > baseline_errors;
+                    if errors.is_empty() {
+                        result.content.push_str("\n[lsp] OK");
+                    } else if is_new_file {
+                        let capped = errors.len().min(5);
+                        result.content.push_str(&format!(
                                 "\n[lsp] WARNING: {} error(s) introduced by newly-created {path} — fix before relying on this file:\n",
                                 errors.len()
                             ));
-                            for diag in &errors[..capped] {
-                                let line = diag.range.start.line + 1;
-                                let col = diag.range.start.character + 1;
-                                result.content.push_str(&format!(
-                                    "{}:{}:{}: error: {}\n",
-                                    path, line, col, diag.message
-                                ));
-                            }
-                            if errors.len() > capped {
-                                result.content.push_str(&format!(
-                                    "... and {} more errors\n",
-                                    errors.len() - capped
-                                ));
-                            }
-                        } else if !regressed {
-                            // Pre-existing errors weren't introduced by this
-                            // edit — surface them as informational, don't
-                            // flip success.
+                        for diag in &errors[..capped] {
+                            let line = diag.range.start.line + 1;
+                            let col = diag.range.start.character + 1;
                             result.content.push_str(&format!(
+                                "{}:{}:{}: error: {}\n",
+                                path, line, col, diag.message
+                            ));
+                        }
+                        if errors.len() > capped {
+                            result.content.push_str(&format!(
+                                "... and {} more errors\n",
+                                errors.len() - capped
+                            ));
+                        }
+                    } else if !regressed {
+                        // Pre-existing errors weren't introduced by this
+                        // edit — surface them as informational, don't
+                        // flip success.
+                        result.content.push_str(&format!(
                                 "\n[lsp] OK ({} pre-existing error(s) in {path}, unchanged by this edit)",
                                 errors.len()
                             ));
-                        } else {
-                            // LSP regression: errors increased after this edit.
-                            // Build an error report and ask the outer model
-                            // whether to keep or revert the changes.
-                            let capped = errors.len().min(20);
-                            let mut error_report = format!(
-                                "{} error(s) in {path} (was {} before this edit):\n",
-                                errors.len(),
-                                baseline_errors
-                            );
-                            for diag in &errors[..capped] {
-                                let line = diag.range.start.line + 1;
-                                let col = diag.range.start.character + 1;
-                                error_report.push_str(&format!(
-                                    "  {}:{}:{}: error: {}\n",
-                                    path, line, col, diag.message
-                                ));
-                            }
-                            if errors.len() > capped {
-                                error_report.push_str(&format!(
-                                    "  ... and {} more errors\n",
-                                    errors.len() - capped
-                                ));
-                            }
-
-                            let accepted = if let Some(router) = router {
-                                ask_accept_lsp_regression(router, path, &error_report).await
-                            } else {
-                                false
-                            };
-
-                            if accepted {
-                                result.content.push_str(&format!(
-                                    "\n[lsp] WARNING: {error_report}Changes kept (accepted by model)."
-                                ));
-                            } else {
-                                // Revert the file to its pre-edit content.
-                                if let Some(ref original) = baseline.original_content {
-                                    let abs = config.project_root.join(path);
-                                    let _ = std::fs::write(&abs, original);
-                                    // Re-notify LSP so it sees the reverted state.
-                                    let _ = lsp.notify_file_changed(&abs);
-                                }
-                                result
-                                    .content
-                                    .push_str(&format!("\n[lsp] {error_report}Edit reverted."));
-                                result.success = false;
-                            }
+                    } else {
+                        // LSP regression: errors increased after this edit.
+                        // Build an error report and ask the outer model
+                        // whether to keep or revert the changes.
+                        let capped = errors.len().min(20);
+                        let mut error_report = format!(
+                            "{} error(s) in {path} (was {} before this edit):\n",
+                            errors.len(),
+                            baseline_errors
+                        );
+                        for diag in &errors[..capped] {
+                            let line = diag.range.start.line + 1;
+                            let col = diag.range.start.character + 1;
+                            error_report.push_str(&format!(
+                                "  {}:{}:{}: error: {}\n",
+                                path, line, col, diag.message
+                            ));
                         }
-                        return;
+                        if errors.len() > capped {
+                            error_report.push_str(&format!(
+                                "  ... and {} more errors\n",
+                                errors.len() - capped
+                            ));
+                        }
+
+                        let accepted = if let Some(router) = router {
+                            ask_accept_lsp_regression(router, path, &error_report).await
+                        } else {
+                            false
+                        };
+
+                        if accepted {
+                            result.content.push_str(&format!(
+                                "\n[lsp] WARNING: {error_report}Changes kept (accepted by model)."
+                            ));
+                        } else {
+                            // Revert the file to its pre-edit content.
+                            if let Some(ref original) = baseline.original_content {
+                                let abs = config.project_root.join(path);
+                                let _ = std::fs::write(&abs, original);
+                                // Re-notify LSP so it sees the reverted state.
+                                let _ = lsp.notify_file_changed(&abs);
+                            }
+                            result
+                                .content
+                                .push_str(&format!("\n[lsp] {error_report}Edit reverted."));
+                            result.success = false;
+                        }
                     }
+                    return;
                 }
             }
         }

@@ -95,14 +95,14 @@ impl McpRegistry {
 
                     // Try loading from cache as fallback
                     let cache_path = cache_dir.join(format!("{name}.json"));
-                    if let Ok(cached) = std::fs::read_to_string(&cache_path) {
-                        if let Ok(info) = serde_json::from_str::<McpServerInfo>(&cached) {
-                            tracing::info!(
-                                "MCP server '{name}': using cached schema ({} tools)",
-                                info.tools.len()
-                            );
-                            servers.push(info);
-                        }
+                    if let Ok(cached) = std::fs::read_to_string(&cache_path)
+                        && let Ok(info) = serde_json::from_str::<McpServerInfo>(&cached)
+                    {
+                        tracing::info!(
+                            "MCP server '{name}': using cached schema ({} tools)",
+                            info.tools.len()
+                        );
+                        servers.push(info);
                     }
                 }
             }
@@ -118,12 +118,11 @@ impl McpRegistry {
 
         if let Ok(entries) = std::fs::read_dir(cache_dir) {
             for entry in entries.flatten() {
-                if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
-                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                        if let Ok(info) = serde_json::from_str::<McpServerInfo>(&content) {
-                            servers.push(info);
-                        }
-                    }
+                if entry.path().extension().and_then(|e| e.to_str()) == Some("json")
+                    && let Ok(content) = std::fs::read_to_string(entry.path())
+                    && let Ok(info) = serde_json::from_str::<McpServerInfo>(&content)
+                {
+                    servers.push(info);
                 }
             }
         }

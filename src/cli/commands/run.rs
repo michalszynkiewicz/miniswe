@@ -278,10 +278,10 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         log.round_start(round);
 
         // Snapshot at start of each round for revert support
-        if let Some(ref snap) = snapshots {
-            if let Ok(mut guard) = snap.lock() {
-                let _ = guard.begin_round(round);
-            }
+        if let Some(ref snap) = snapshots
+            && let Ok(mut guard) = snap.lock()
+        {
+            let _ = guard.begin_round(round);
         }
         if round > max_rounds {
             tui::print_error("Maximum tool rounds reached. Stopping.");
@@ -434,10 +434,10 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         let tool_calls = match &assistant_msg.tool_calls {
             Some(tc) if !tc.is_empty() => tc.clone(),
             _ => {
-                if let Some(finish) = &choice.finish_reason {
-                    if finish == "stop" {
-                        break;
-                    }
+                if let Some(finish) = &choice.finish_reason
+                    && finish == "stop"
+                {
+                    break;
                 }
                 break;
             }
@@ -743,11 +743,11 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 }
             };
 
-            if !result.success {
-                if let Some(hint) = tools::plan::failure_hint(&config) {
-                    result.content.push_str("\n");
-                    result.content.push_str(&hint);
-                }
+            if !result.success
+                && let Some(hint) = tools::plan::failure_hint(&config)
+            {
+                result.content.push('\n');
+                result.content.push_str(&hint);
             }
 
             // Append round number to every tool result
@@ -773,7 +773,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 calls_since_last_edit = 0;
                 if config.tools.plan {
                     if tools::plan::plan_exists(&config) {
-                        result.content.push_str("\n");
+                        result.content.push('\n');
                         result.content.push_str(PLAN_PROGRESS_NUDGE);
                     }
                     successful_edits_since_plan_update += 1;
@@ -781,7 +781,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                         plan_checkpoint_pending = true;
                     }
                     if successful_edits_since_plan_update == PLAN_CHECKPOINT_AFTER_EDITS {
-                        result.content.push_str("\n");
+                        result.content.push('\n');
                         result.content.push_str(PLAN_CHECKPOINT_WARNING);
                     }
                 }
@@ -795,7 +795,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         }
 
         // Stall detection: too many tool calls without any edits
-        if calls_since_last_edit >= 20 && calls_since_last_edit % 20 == 0 {
+        if calls_since_last_edit >= 20 && calls_since_last_edit.is_multiple_of(20) {
             let edit_hint = match config.tools.edit_mode {
                 EditMode::Smart => "Use edit_file for semantic file edits.",
                 EditMode::Fast => "Use replace_range or insert_at to land targeted edits.",
@@ -812,10 +812,10 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     log.session_end(round, had_error);
 
     // Shut down LSP
-    if let Some(lsp) = lsp_client {
-        if let Ok(lsp) = Arc::try_unwrap(lsp) {
-            lsp.shutdown().await;
-        }
+    if let Some(lsp) = lsp_client
+        && let Ok(lsp) = Arc::try_unwrap(lsp)
+    {
+        lsp.shutdown().await;
     }
 
     tui::print_separator();
@@ -872,12 +872,6 @@ async fn await_shell_job_run(
     crate::tools::ToolResult::err("Shell worker dropped before reporting a result".into())
 }
 
-/// Replace old tool results with compressed summaries using per-type thresholds.
-///
-/// For each tool type, keeps the N most recent results in full (where N
-/// depends on the tool type — reads are kept longer than writes/searches).
-/// Older results are replaced with one-line summaries.
-
 /// Create a brief summary of tool arguments for display.
 fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
     let action = args["action"].as_str().unwrap_or("");
@@ -917,7 +911,7 @@ fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                 }
             }
             "revert" => "revert".to_string(),
-            _ => format!("{action}"),
+            _ => action.to_string(),
         },
         "code" => match action {
             "goto_definition" | "find_references" => {

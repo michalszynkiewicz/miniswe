@@ -885,13 +885,12 @@ async fn stream_cancellation_via_flag() {
 
     // Pre-cancelled stream may return Ok (partial) or Err (aborted) — both are fine.
     // The key is it finishes quickly without processing all 100 tokens.
-    match result {
-        Ok(_) => assert!(
+    if result.is_ok() {
+        assert!(
             tokens.len() < 10,
             "should stop early: got {} tokens",
             tokens.len()
-        ),
-        Err(_) => {} // Aborted — also acceptable
+        );
     }
 }
 

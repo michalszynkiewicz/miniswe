@@ -471,13 +471,12 @@ fn prompt_user(message: &str) -> String {
     io::stderr().flush().ok();
 
     let mut input = String::new();
-    let result = match io::stdin().read_line(&mut input) {
-        Ok(_) => input.trim().to_lowercase(),
-        Err(_) => "n".into(),
-    };
 
     // Don't re-enable raw mode — reedline will do that on next read_line()
-    result
+    match io::stdin().read_line(&mut input) {
+        Ok(_) => input.trim().to_lowercase(),
+        Err(_) => "n".into(),
+    }
 }
 
 #[cfg(test)]

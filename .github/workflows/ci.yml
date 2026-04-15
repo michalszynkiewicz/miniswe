@@ -39,11 +39,19 @@ jobs:
 
       # rust-analyzer is auto-downloaded by the LSP tests into
       # ~/.miniswe/lsp-servers/. Cache it so we don't re-pull ~30MB every run.
+      # Key includes an ISO week so a stale or corrupted cache evicts itself
+      # within at most 7 days without needing a manual key bump.
+      - name: Compute LSP cache epoch
+        id: lsp-cache-epoch
+        run: echo "week=$(date +%G-%V)" >> "$GITHUB_OUTPUT"
+
       - name: Cache LSP servers (rust-analyzer)
         uses: actions/cache@v4
         with:
           path: ~/.miniswe/lsp-servers
-          key: lsp-servers-${{ runner.os }}-v1
+          key: lsp-servers-${{ runner.os }}-${{ steps.lsp-cache-epoch.outputs.week }}
+          restore-keys: |
+            lsp-servers-${{ runner.os }}-
 
       - name: cargo fmt
         run: cargo fmt --all -- --check

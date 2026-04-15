@@ -293,15 +293,15 @@ fn heuristic_summarize(messages: &[&Message]) -> String {
         let content = msg.content.as_deref().unwrap_or("");
 
         if msg.role == "tool" {
-            if content.contains("[read:") || content.starts_with("[src/") {
-                if let Some(path) = content.split(':').nth(1).and_then(|s| s.split('→').next()) {
-                    files_read.push(path.trim().to_string());
-                }
+            if (content.contains("[read:") || content.starts_with("[src/"))
+                && let Some(path) = content.split(':').nth(1).and_then(|s| s.split('→').next())
+            {
+                files_read.push(path.trim().to_string());
             }
-            if content.contains("✓ Edited") || content.contains("✓ Wrote") {
-                if let Some(path) = content.split_whitespace().nth(2) {
-                    files_edited.push(path.to_string());
-                }
+            if (content.contains("✓ Edited") || content.contains("✓ Wrote"))
+                && let Some(path) = content.split_whitespace().nth(2)
+            {
+                files_edited.push(path.to_string());
             }
             if content.contains("error") && !content.contains("[cargo check] OK") {
                 let first_error = content

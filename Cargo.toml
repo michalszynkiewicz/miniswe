@@ -106,6 +106,17 @@ tempfile = "3"
 avt = "0.17"
 wiremock = "0.6"
 
+# Pedantic clippy lints we deliberately don't enforce. These are style
+# preferences, not bug indicators — silencing them keeps `-D warnings`
+# focused on real issues.
+[lints.clippy]
+too_many_arguments = "allow"          # several agent-loop fns have 8-18 args by design
+field_reassign_with_default = "allow" # common pattern in tests
+items_after_test_module = "allow"     # a few files keep helpers after `mod tests`
+should_implement_trait = "allow"      # LogLevel::from_str returns Self, not Result
+ptr_arg = "allow"                     # `&mut Vec<T>` matches caller intent
+duplicate_mod = "allow"               # `mod helpers;` shared across integration tests
+
 [[bin]]
 name = "miniswe"
 path = "src/main.rs"
