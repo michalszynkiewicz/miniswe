@@ -4,17 +4,6 @@
 //! rust-analyzer is auto-downloaded to ~/.miniswe/lsp-servers/ if not found.
 //!
 //! Tests are skipped if download fails (no network, unsupported platform).
-//!
-//! ## Concurrency note
-//!
-//! `cargo test` runs the tests in this file in parallel. All of them need
-//! the same `rust-analyzer` binary at `~/.miniswe/lsp-servers/`. Without
-//! coordination, every test would race to download and overwrite that
-//! file on a cold cache — on Linux that reliably produces `ETXTBSY` (or
-//! a corrupt binary and a hanging `exec`). The `RUST_ANALYZER` OnceCell
-//! below acts as an effective `@BeforeAll`: the first test to call
-//! `ensure_rust_analyzer()` runs the download, every later caller awaits
-//! the same future.
 
 mod helpers;
 
@@ -24,20 +13,11 @@ use std::time::Duration;
 
 use miniswe::lsp::{LspClient, LspServer};
 use serde_json::json;
-use tokio::sync::OnceCell;
 
-/// Set once the first test has finished downloading / locating the
-/// rust-analyzer binary. `Some(true)` = available, `Some(false)` =
-/// download failed (tests skip). All tests read the same resolved value.
-static RUST_ANALYZER: OnceCell<bool> = OnceCell::const_new();
-
-/// Shared "is rust-analyzer available?" gate. The first test blocks
-/// until `ensure_binary()` returns; every later test returns instantly
-/// with the cached answer.
+/// Try to ensure rust-analyzer is available (downloads if needed).
+/// Returns false if unavailable (no network, unsupported platform).
 async fn ensure_rust_analyzer() -> bool {
-    *RUST_ANALYZER
-        .get_or_init(|| async { LspServer::RustAnalyzer.ensure_binary().await.is_ok() })
-        .await
+    LspServer::RustAnalyzer.ensure_binary().await.is_ok()
 }
 
 /// Create a minimal Rust project in the temp dir for LSP testing.
