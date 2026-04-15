@@ -13,7 +13,11 @@ use miniswe::tools;
 use miniswe::tools::permissions::PermissionManager;
 use serde_json::json;
 
-fn setup() -> (tempfile::TempDir, miniswe::config::Config, tools::RevisionStore) {
+fn setup() -> (
+    tempfile::TempDir,
+    miniswe::config::Config,
+    tools::RevisionStore,
+) {
     let (tmp, config) = helpers::create_test_project();
     let store = tools::RevisionStore::new(&PathBuf::from("/tmp/_unused_test")).unwrap();
     (tmp, config, store)
@@ -41,8 +45,16 @@ async fn replace_range_applies_and_records_revision() {
     let disk = fs::read_to_string(helpers::project_path(&config, "f.rs")).unwrap();
     assert_eq!(disk, "a\nB\nc\n");
     assert_eq!(store.current("f.rs"), Some(1));
-    assert!(r.content.contains("rev_1 applied"), "header should announce rev_1: {}", r.content);
-    assert!(r.content.contains("[revisions] f.rs"), "feedback missing revision table: {}", r.content);
+    assert!(
+        r.content.contains("rev_1 applied"),
+        "header should announce rev_1: {}",
+        r.content
+    );
+    assert!(
+        r.content.contains("[revisions] f.rs"),
+        "feedback missing revision table: {}",
+        r.content
+    );
 }
 
 #[tokio::test]
@@ -164,11 +176,9 @@ async fn replay_of_reverted_edit_coexists_as_fresh_rev_with_tombstone() {
     let args = json!({
         "path": "f.rs", "start": 1, "end": 1, "content": "CHANGED"
     });
-    tools::execute_fast_tool(
-        "replace_range", &args, &config, &perms, None, &store, 0,
-    )
-    .await
-    .unwrap();
+    tools::execute_fast_tool("replace_range", &args, &config, &perms, None, &store, 0)
+        .await
+        .unwrap();
     tools::execute_fast_tool(
         "revert",
         &json!({ "path": "f.rs", "rev": 0 }),
@@ -182,11 +192,9 @@ async fn replay_of_reverted_edit_coexists_as_fresh_rev_with_tombstone() {
     .unwrap();
     // Same args as before — this is the loop pathology we're guarding
     // against.
-    let replay = tools::execute_fast_tool(
-        "replace_range", &args, &config, &perms, None, &store, 0,
-    )
-    .await
-    .unwrap();
+    let replay = tools::execute_fast_tool("replace_range", &args, &config, &perms, None, &store, 0)
+        .await
+        .unwrap();
     assert!(replay.success, "{}", replay.content);
 
     // The replay should have gotten a FRESH number (rev_2), not recycled
@@ -201,8 +209,7 @@ async fn replay_of_reverted_edit_coexists_as_fresh_rev_with_tombstone() {
     // The replay's feedback should carry the tombstone row so the model
     // can see its own prior identical attempt.
     assert!(
-        replay.content.contains("rev_1")
-            && replay.content.contains("[reverted"),
+        replay.content.contains("rev_1") && replay.content.contains("[reverted"),
         "replay feedback should surface the tombstone:\n{}",
         replay.content
     );
@@ -317,17 +324,9 @@ async fn check_on_empty_dir_reports_unknown_toolchain_gracefully() {
     let (_tmp, config, store) = setup();
     let perms = PermissionManager::headless(&config);
 
-    let r = tools::execute_fast_tool(
-        "check",
-        &json!({}),
-        &config,
-        &perms,
-        None,
-        &store,
-        0,
-    )
-    .await
-    .unwrap();
+    let r = tools::execute_fast_tool("check", &json!({}), &config, &perms, None, &store, 0)
+        .await
+        .unwrap();
     assert!(r.success);
     assert!(r.content.contains("no recognized project toolchain"));
 }

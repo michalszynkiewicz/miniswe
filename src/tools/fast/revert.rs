@@ -35,7 +35,8 @@ pub async fn execute(
     }
     if rev == u64::MAX {
         return Ok(ToolResult::err(
-            "revert: 'rev' is required (the numeric revision to restore, e.g. 0 for pristine)".into(),
+            "revert: 'rev' is required (the numeric revision to restore, e.g. 0 for pristine)"
+                .into(),
         ));
     }
     let rev = rev as usize;
@@ -240,13 +241,9 @@ mod tests {
         let cfg = scratch_config(tmp.path());
         let store = RevisionStore::with_cap(20);
 
-        let r = run(
-            serde_json::json!({ "path": "f.rs" }),
-            &cfg,
-            &store,
-        )
-        .await
-        .unwrap();
+        let r = run(serde_json::json!({ "path": "f.rs" }), &cfg, &store)
+            .await
+            .unwrap();
         assert!(!r.success);
         assert!(r.content.contains("rev"));
     }

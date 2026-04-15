@@ -145,10 +145,7 @@ pub async fn execute(
                  or split the work into more specific steps. The file was not modified."
             )))
         }
-        Err(e) => Ok(ToolResult::err(format!(
-            "✗ edit_file({path_str}): {}",
-            e
-        ))),
+        Err(e) => Ok(ToolResult::err(format!("✗ edit_file({path_str}): {}", e))),
     }
 }
 
@@ -472,8 +469,7 @@ async fn execute_preplanned_steps(
                     Ok(_note) => return Ok(PreplanResult::Applied(current)),
                     Err(ValidationError::Other(e)) => return Err(e),
                     Err(ValidationError::LspRegression(regression)) => {
-                        let summary =
-                            ValidationError::LspRegression(regression.clone()).summary();
+                        let summary = ValidationError::LspRegression(regression.clone()).summary();
                         log_debug(
                             log,
                             path_str,
@@ -1277,9 +1273,10 @@ fn parse_preplan_window_response(text: &str) -> PreplanWindowResponse {
         if let Some(rest) = strip_case_insensitive_prefix(line, "READ:") {
             let rest = rest.trim();
             if let Some((start_s, end_s)) = rest.split_once('-') {
-                if let (Ok(start), Ok(end)) =
-                    (start_s.trim().parse::<usize>(), end_s.trim().parse::<usize>())
-                {
+                if let (Ok(start), Ok(end)) = (
+                    start_s.trim().parse::<usize>(),
+                    end_s.trim().parse::<usize>(),
+                ) {
                     if start > 0 && end >= start {
                         commands.push(InspectionCommand::Read { start, end });
                     }
@@ -1292,7 +1289,11 @@ fn parse_preplan_window_response(text: &str) -> PreplanWindowResponse {
         // without erroring out.
     }
 
-    PreplanWindowResponse { notes, commands, clarification }
+    PreplanWindowResponse {
+        notes,
+        commands,
+        clarification,
+    }
 }
 
 /// Extract `(start, end)` line ranges from a note string.
@@ -1327,7 +1328,9 @@ fn extract_line_ranges_from_note(note: &str) -> Vec<(usize, usize)> {
             continue;
         }
         // Reject mid-word: char before prefix must not be alphanumeric
-        if prefix_start > 0 && (chars[prefix_start - 1].is_alphanumeric() || chars[prefix_start - 1] == '_') {
+        if prefix_start > 0
+            && (chars[prefix_start - 1].is_alphanumeric() || chars[prefix_start - 1] == '_')
+        {
             i = prefix_start + 1;
             continue;
         }
@@ -1407,7 +1410,10 @@ fn search_in_file(content: &str, query: &str) -> String {
 fn read_in_file(content: &str, start: usize, end: usize) -> Result<String> {
     let lines: Vec<&str> = content.lines().collect();
     if end > lines.len() {
-        bail!("READ range L{start}-L{end} outside file with {} lines", lines.len());
+        bail!(
+            "READ range L{start}-L{end} outside file with {} lines",
+            lines.len()
+        );
     }
     let mut out = format!("READ RESULT L{start}-L{end}:\n");
     for line_no in start..=end {
@@ -1432,7 +1438,6 @@ fn extend_unique_notes(existing: &mut Vec<String>, new_notes: Vec<String>) {
         }
     }
 }
-
 
 fn append_inspection_result(extra_context: &mut String, label: &str, result: &str) {
     extra_context.push_str(label);
@@ -1500,9 +1505,7 @@ fn execute_inspection_commands(
                 let result = match read_in_file(content, *start, *end) {
                     Ok(r) => r,
                     Err(e) => {
-                        extra_context.push_str(&format!(
-                            "(READ {start}-{end} failed: {e})\n\n",
-                        ));
+                        extra_context.push_str(&format!("(READ {start}-{end} failed: {e})\n\n",));
                         continue;
                     }
                 };
@@ -1627,7 +1630,11 @@ async fn request_patch(
             tool_choice: None,
         };
 
-        log_stage(log, path_str, &format!("patch:window:{}-{}", start + 1, end));
+        log_stage(
+            log,
+            path_str,
+            &format!("patch:window:{}-{}", start + 1, end),
+        );
         let response = router
             .chat_with_cancel(ModelRole::Fast, &request, cancelled)
             .await?;
@@ -1828,9 +1835,7 @@ async fn request_preplan_steps(
     } else {
         MAX_PREPLAN_READS_INITIAL
     };
-    let feedback_block = repair
-        .map(format_repair_context)
-        .unwrap_or_default();
+    let feedback_block = repair.map(format_repair_context).unwrap_or_default();
     let mut notes = Vec::<String>::new();
     let mut collected_commands = Vec::<InspectionCommand>::new();
 
@@ -1860,7 +1865,11 @@ async fn request_preplan_steps(
         } else {
             format!(
                 "Notes gathered so far:\n{}\n\n",
-                notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
+                notes
+                    .iter()
+                    .map(|note| format!("- {note}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             )
         };
         let pending_block = if collected_commands.is_empty() {
@@ -1924,7 +1933,13 @@ async fn request_preplan_steps(
         log_stage(
             log,
             path_str,
-            &format!("preplan:window:{}/{}:{}-{}", idx + 1, windows.len(), start + 1, end),
+            &format!(
+                "preplan:window:{}/{}:{}-{}",
+                idx + 1,
+                windows.len(),
+                start + 1,
+                end
+            ),
         );
         let response = router
             .chat_with_cancel(ModelRole::Fast, &request, cancelled)
@@ -2035,7 +2050,11 @@ async fn request_preplan_steps(
         } else {
             format!(
                 "Notes:\n{}\n\n",
-                notes.iter().map(|note| format!("- {note}")).collect::<Vec<_>>().join("\n")
+                notes
+                    .iter()
+                    .map(|note| format!("- {note}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             )
         };
         let results_block = if extra_context.is_empty() {
@@ -2098,7 +2117,11 @@ async fn request_preplan_steps(
         tool_choice: None,
     };
 
-    log_stage(log, path_str, &format!("preplan:finalize:file:1-{total_lines}"));
+    log_stage(
+        log,
+        path_str,
+        &format!("preplan:finalize:file:1-{total_lines}"),
+    );
     log_debug(
         log,
         path_str,
@@ -2106,7 +2129,11 @@ async fn request_preplan_steps(
             "preplan:finalize:prompt_len={} notes={} inspection_results={} small_file={small_file}",
             finalize_prompt.len(),
             notes.len(),
-            if extra_context.is_empty() { 0 } else { extra_context.lines().count() },
+            if extra_context.is_empty() {
+                0
+            } else {
+                extra_context.lines().count()
+            },
         ),
     );
     let response = router
@@ -2159,9 +2186,7 @@ async fn request_preplan_steps(
         log_debug(
             log,
             path_str,
-            &format!(
-                "preplan:finalize:file:1-{total_lines} verdict=failed reason={reason}"
-            ),
+            &format!("preplan:finalize:file:1-{total_lines} verdict=failed reason={reason}"),
         );
         return Ok(PreplanOutcome::Failed(reason));
     }
@@ -2255,9 +2280,6 @@ fn validate_steps_in_file(steps: &[EditPlanStep], total_lines: usize) -> Result<
     // dropped steps in the per-step output instead of bailing on the plan.
     Ok(())
 }
-
-
-
 
 /// Render a `RepairContext` into a planner-facing block. Used at the top
 /// of both the windowed pre-plan prompts and the finalize prompt so the
@@ -2437,9 +2459,6 @@ fn format_lsp_regression_for_planner(reg: &LspRegression) -> String {
     out
 }
 
-
-
-
 fn validate_candidate(original: &str, candidate: &str) -> Result<()> {
     if !original.is_empty() && candidate.is_empty() {
         bail!("candidate output is empty for a non-empty file");
@@ -2465,8 +2484,7 @@ fn gate_truncation(
         return Ok(());
     }
 
-    let rejection =
-        format!("candidate truncates {path_str} from {old_lines} to {new_lines} lines");
+    let rejection = format!("candidate truncates {path_str} from {old_lines} to {new_lines} lines");
     if let Some(perms) = perms
         && perms.confirm(&format!(
             "\x1b[1;33medit_file wants to shrink {path_str} from {old_lines} to {new_lines} lines.\x1b[0m\n  Is this intentional? [y]es / [n]o: "
@@ -2502,7 +2520,6 @@ pub fn build_windows(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::apply::{
         find_all_exact_line_matches, find_all_fuzzy_line_matches,
         find_all_ws_tolerant_line_matches, pick_best_candidate,
@@ -2511,6 +2528,7 @@ mod tests {
         MAX_FAILED_REASON_CHARS, looks_like_complete, parse_edit_plan, parse_failed,
         parse_needs_clarification, parse_patch, partition_overlapping_steps, strip_code_fences,
     };
+    use super::*;
     #[test]
     fn retry_feedback_adds_signature_guidance_for_lsp_arity_errors() {
         let feedback = build_retry_feedback(
@@ -2655,11 +2673,8 @@ mod tests {
     fn find_all_ws_tolerant_ignores_indentation_drift() {
         // Planner used spaces, file uses tabs.
         let content = "\tif x {\n\t\treturn 1;\n\t}\n";
-        let hits = find_all_ws_tolerant_line_matches(
-            content,
-            &s(&["if x {", "    return 1;", "}"]),
-            &[],
-        );
+        let hits =
+            find_all_ws_tolerant_line_matches(content, &s(&["if x {", "    return 1;", "}"]), &[]);
         assert_eq!(hits, vec![(1, 3)]);
     }
 
@@ -2734,9 +2749,7 @@ mod tests {
 
     #[test]
     fn extract_line_ranges_parses_multiple_ranges() {
-        let ranges = extract_line_ranges_from_note(
-            "L10-20 foo, L30-40 bar",
-        );
+        let ranges = extract_line_ranges_from_note("L10-20 foo, L30-40 bar");
         assert_eq!(ranges, vec![(10, 20), (30, 40)]);
     }
 
@@ -2767,7 +2780,8 @@ mod tests {
     fn find_all_fuzzy_rescues_multiline_near_match() {
         // Two lines where one has a small typo. Both lines clear the
         // per-line floor and the block average clears the block floor.
-        let content = "let mut config = Config::default();\nconfig.timeout = 30;\nconfig.retries = 5;\n";
+        let content =
+            "let mut config = Config::default();\nconfig.timeout = 30;\nconfig.retries = 5;\n";
         let hits = find_all_fuzzy_line_matches(
             content,
             &s(&["let mut config = Config::defalt();", "config.timeout = 30;"]),
@@ -2804,8 +2818,7 @@ mod tests {
         let content = "callback(foo);\ncallback(foo);\n";
         // Pretend the first line was already matched exactly elsewhere;
         // fuzzy should still return the second.
-        let hits =
-            find_all_fuzzy_line_matches(content, &s(&["calback(foo);"]), &[(1, 1)]);
+        let hits = find_all_fuzzy_line_matches(content, &s(&["calback(foo);"]), &[(1, 1)]);
         assert_eq!(hits, vec![(2, 2)]);
     }
 
@@ -2839,7 +2852,10 @@ mod tests {
             response.commands,
             vec![
                 InspectionCommand::Search("assemble(".into()),
-                InspectionCommand::Read { start: 280, end: 300 },
+                InspectionCommand::Read {
+                    start: 280,
+                    end: 300
+                },
             ],
         );
     }
@@ -2849,9 +2865,8 @@ mod tests {
         // Malformed READ ranges (start=0, end<start, non-numeric) are
         // silently dropped rather than erroring out so the model doesn't
         // crash the pipeline with a typo.
-        let response = parse_preplan_window_response(
-            "READ: 0-5\nREAD: 10-3\nREAD: bad\nNOTE still here\n",
-        );
+        let response =
+            parse_preplan_window_response("READ: 0-5\nREAD: 10-3\nREAD: bad\nNOTE still here\n");
         assert!(response.commands.is_empty());
         assert_eq!(response.notes, vec!["still here".to_string()]);
     }
@@ -2998,8 +3013,16 @@ mod tests {
     #[test]
     fn inspection_results_are_labeled() {
         let mut extra = String::new();
-        append_inspection_result(&mut extra, "SEARCH_RESULT query=`foo`", "SEARCH RESULT for `foo`: 1 hit");
-        append_inspection_result(&mut extra, "READ_RESULT range=L10-L12", "READ RESULT L10-L12:\n  10│x");
+        append_inspection_result(
+            &mut extra,
+            "SEARCH_RESULT query=`foo`",
+            "SEARCH RESULT for `foo`: 1 hit",
+        );
+        append_inspection_result(
+            &mut extra,
+            "READ_RESULT range=L10-L12",
+            "READ RESULT L10-L12:\n  10│x",
+        );
 
         assert!(extra.contains("SEARCH_RESULT query=`foo`"));
         assert!(extra.contains("READ_RESULT range=L10-L12"));
@@ -3022,7 +3045,10 @@ mod tests {
         let r = parse_needs_clarification(
             "NEEDS_CLARIFICATION   what should the new parameter default to?\n",
         );
-        assert_eq!(r, Some("what should the new parameter default to?".to_string()));
+        assert_eq!(
+            r,
+            Some("what should the new parameter default to?".to_string())
+        );
     }
 
     #[test]
@@ -3041,13 +3067,19 @@ mod tests {
     fn parse_needs_clarification_rejects_lookalikes() {
         // Don't false-match on a word that just starts with NEEDS_CLARIFICATION.
         assert_eq!(parse_needs_clarification("NEEDS_CLARIFICATIONS"), None);
-        assert_eq!(parse_needs_clarification("NEEDS_CLARIFICATIONAL: foo"), None);
+        assert_eq!(
+            parse_needs_clarification("NEEDS_CLARIFICATIONAL: foo"),
+            None
+        );
     }
 
     #[test]
     fn parse_needs_clarification_rejects_unrelated_text() {
         assert_eq!(parse_needs_clarification("NO_CHANGES"), None);
-        assert_eq!(parse_needs_clarification("LITERAL_REPLACE\nSCOPE 1 1\n"), None);
+        assert_eq!(
+            parse_needs_clarification("LITERAL_REPLACE\nSCOPE 1 1\n"),
+            None
+        );
         assert_eq!(parse_needs_clarification(""), None);
     }
 
@@ -3300,13 +3332,19 @@ mod tests {
         let block = format_repair_steps_for_window(&ctx, 1, 30);
         assert!(block.contains("✓ L17"));
         assert!(block.contains("LITERAL_REPLACE applied"));
-        assert!(!block.contains("✗"), "failed step at L54 should not appear in window 1-30");
+        assert!(
+            !block.contains("✗"),
+            "failed step at L54 should not appear in window 1-30"
+        );
 
         // Window 40-70: only the failed step overlaps
         let block = format_repair_steps_for_window(&ctx, 40, 70);
         assert!(block.contains("✗ L54"));
         assert!(block.contains("FAILED"));
-        assert!(!block.contains("✓"), "completed step at L17 should not appear in window 40-70");
+        assert!(
+            !block.contains("✓"),
+            "completed step at L17 should not appear in window 40-70"
+        );
 
         // Window 1-100: both steps overlap
         let block = format_repair_steps_for_window(&ctx, 1, 100);
@@ -3345,7 +3383,8 @@ mod tests {
 
     #[test]
     fn strip_code_fences_keeps_text_with_no_fence() {
-        let input = "LITERAL_REPLACE\nSCOPE 1 1\nALL true\nOLD:\nfoo\nEND_OLD\nNEW:\nbar\nEND_NEW\nEND\n";
+        let input =
+            "LITERAL_REPLACE\nSCOPE 1 1\nALL true\nOLD:\nfoo\nEND_OLD\nNEW:\nbar\nEND_NEW\nEND\n";
         let stripped = strip_code_fences(input);
         // Identical pass-through.
         assert_eq!(stripped, input);
@@ -3383,7 +3422,13 @@ mod tests {
         let steps = parse_edit_plan(input).expect("fenced plan should parse");
         assert_eq!(steps.len(), 1);
         match &steps[0] {
-            EditPlanStep::LiteralReplace { scope_start, scope_end, all, old, new } => {
+            EditPlanStep::LiteralReplace {
+                scope_start,
+                scope_end,
+                all,
+                old,
+                new,
+            } => {
                 assert_eq!(*scope_start, 1);
                 assert_eq!(*scope_end, 1);
                 assert!(*all);

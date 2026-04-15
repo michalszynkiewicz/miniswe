@@ -167,12 +167,7 @@ impl RevisionStore {
     /// Record a new revision for `rel_path`. Returns the rev number
     /// assigned — strictly monotonic across the full history including
     /// tombstones. Errors if `ensure_pristine` was never called.
-    pub fn record(
-        &self,
-        rel_path: &str,
-        new_content: &str,
-        args: RecordArgs<'_>,
-    ) -> Result<usize> {
+    pub fn record(&self, rel_path: &str, new_content: &str, args: RecordArgs<'_>) -> Result<usize> {
         let mut inner = self.inner.lock().expect("revision store mutex poisoned");
         let live_cap = inner.live_cap;
         let revs = inner
@@ -254,9 +249,10 @@ impl RevisionStore {
             .per_file
             .get_mut(rel_path)
             .ok_or_else(|| anyhow!("no revisions recorded for {rel_path}"))?;
-        let target = revs.iter().find(|r| r.number == rev).ok_or_else(|| {
-            anyhow!("rev_{rev} not found for {rel_path}")
-        })?;
+        let target = revs
+            .iter()
+            .find(|r| r.number == rev)
+            .ok_or_else(|| anyhow!("rev_{rev} not found for {rel_path}"))?;
         if target.reverted {
             return Err(anyhow!(
                 "rev_{rev} is a tombstone (previously reverted); pick a live rev"
@@ -275,23 +271,17 @@ impl RevisionStore {
     /// file hasn't been touched by the agent yet. Includes tombstones.
     pub fn list(&self, rel_path: &str) -> Vec<Revision> {
         let inner = self.inner.lock().expect("revision store mutex poisoned");
-        inner
-            .per_file
-            .get(rel_path)
-            .cloned()
-            .unwrap_or_default()
+        inner.per_file.get(rel_path).cloned().unwrap_or_default()
     }
 
     /// Highest *live* revision number for `rel_path`, or `None` if
     /// unknown. Tombstones are skipped.
     pub fn current(&self, rel_path: &str) -> Option<usize> {
         let inner = self.inner.lock().expect("revision store mutex poisoned");
-        inner.per_file.get(rel_path).and_then(|revs| {
-            revs.iter()
-                .rev()
-                .find(|r| !r.reverted)
-                .map(|r| r.number)
-        })
+        inner
+            .per_file
+            .get(rel_path)
+            .and_then(|revs| revs.iter().rev().find(|r| !r.reverted).map(|r| r.number))
     }
 }
 
@@ -319,18 +309,12 @@ fn cap_payload(mut s: String) -> String {
 /// `live_cap`. rev_0 and tombstones are skipped.
 fn evict_live_overflow(revs: &mut Vec<Revision>, live_cap: usize) {
     loop {
-        let live_count = revs
-            .iter()
-            .filter(|r| !r.reverted && r.number != 0)
-            .count();
+        let live_count = revs.iter().filter(|r| !r.reverted && r.number != 0).count();
         if live_count <= live_cap {
             return;
         }
         // Find index of oldest non-rev_0 live entry and remove it.
-        let Some(idx) = revs
-            .iter()
-            .position(|r| !r.reverted && r.number != 0)
-        else {
+        let Some(idx) = revs.iter().position(|r| !r.reverted && r.number != 0) else {
             return;
         };
         revs.remove(idx);
@@ -459,9 +443,7 @@ mod tests {
         s.mark_reverted_to("a.rs", 1).unwrap();
 
         // Next record should be rev_4, NOT rev_2 (2 and 3 are tombstones)
-        let n = s
-            .record("a.rs", "v4", args("replace_range", "r4"))
-            .unwrap();
+        let n = s.record("a.rs", "v4", args("replace_range", "r4")).unwrap();
         assert_eq!(n, 4);
         assert_eq!(s.current("a.rs"), Some(4));
 

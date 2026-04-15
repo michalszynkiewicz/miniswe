@@ -19,9 +19,15 @@ use super::super::cargo_check::run_check_with_timeout;
 
 /// Detect the project's checker from marker files in `project_root`.
 /// Returns `(command, args, human_name)` or None if no known toolchain.
-fn detect_checker(project_root: &std::path::Path) -> Option<(&'static str, Vec<&'static str>, &'static str)> {
+fn detect_checker(
+    project_root: &std::path::Path,
+) -> Option<(&'static str, Vec<&'static str>, &'static str)> {
     if project_root.join("Cargo.toml").exists() {
-        return Some(("cargo", vec!["check", "--message-format=short"], "cargo check"));
+        return Some((
+            "cargo",
+            vec!["check", "--message-format=short"],
+            "cargo check",
+        ));
     }
     if project_root.join("tsconfig.json").exists() {
         return Some(("npx", vec!["tsc", "--noEmit", "--pretty", "false"], "tsc"));

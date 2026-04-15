@@ -205,8 +205,7 @@ async fn search_github(
     match req.send().await {
         Ok(resp) => {
             if resp.status() == 403 || resp.status() == 429 {
-                let mut msg =
-                    "GitHub search rate limited (10/min unauthenticated).".to_string();
+                let mut msg = "GitHub search rate limited (10/min unauthenticated).".to_string();
                 if let Some(hint) = missing_key_hint {
                     msg.push_str("\n");
                     msg.push_str(hint);

@@ -472,7 +472,8 @@ async fn llm_client_chat_stream_no_retry_after_partial_progress() {
         "error should mention idle timeout, got: {err}"
     );
     assert_eq!(
-        tokens, vec!["hi"],
+        tokens,
+        vec!["hi"],
         "exactly one token should have been delivered to the UI"
     );
     assert_eq!(

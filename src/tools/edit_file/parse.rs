@@ -127,7 +127,10 @@ pub(super) fn format_completed_steps_compact(steps: &[EditPlanStep]) -> String {
                 new,
                 ..
             } => {
-                let old_preview: String = old.first().map(|l| l.trim().to_string()).unwrap_or_default();
+                let old_preview: String = old
+                    .first()
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default();
                 let old_preview = if old_preview.len() > 60 {
                     format!("{}…", &old_preview[..57])
                 } else {
@@ -182,7 +185,10 @@ pub(super) fn parse_failed(text: &str) -> Option<String> {
     let first_line = after.lines().next().unwrap_or("");
     let trimmed_reason = first_line.trim();
     let reason = if trimmed_reason.chars().count() > MAX_FAILED_REASON_CHARS {
-        let truncated: String = trimmed_reason.chars().take(MAX_FAILED_REASON_CHARS).collect();
+        let truncated: String = trimmed_reason
+            .chars()
+            .take(MAX_FAILED_REASON_CHARS)
+            .collect();
         format!("{truncated}…")
     } else {
         trimmed_reason.to_string()

@@ -185,9 +185,7 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
     // left/right borders) and adds top+bottom border space (+2) to the
     // result, so we subtract it back out to get pure content rows.
     let inner_width = area.width.saturating_sub(2);
-    let total = paragraph
-        .line_count(inner_width)
-        .saturating_sub(2);
+    let total = paragraph.line_count(inner_width).saturating_sub(2);
 
     let scroll = if app.scroll_offset == 0 {
         total.saturating_sub(inner_height)
@@ -278,11 +276,7 @@ fn draw_permission_modal(frame: &mut Frame, app: &App, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .title(" Permission Required ")
-            .border_style(
-                Style::default()
-                    .fg(WARNING)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .border_style(Style::default().fg(WARNING).add_modifier(Modifier::BOLD))
             .style(Style::default().bg(BG_PANEL)),
         modal,
     );
@@ -452,8 +446,14 @@ mod tests {
 
         // Simulate ~50 output lines — none wrap at 146-col content width.
         for i in 0..30 {
-            app.push_output(&format!("  → file(shell step {i})"), crate::tui::app::LineStyle::ToolCall);
-            app.push_output(&format!("  ✓ file: [shell: exit 0]"), crate::tui::app::LineStyle::ToolOk);
+            app.push_output(
+                &format!("  → file(shell step {i})"),
+                crate::tui::app::LineStyle::ToolCall,
+            );
+            app.push_output(
+                &format!("  ✓ file: [shell: exit 0]"),
+                crate::tui::app::LineStyle::ToolOk,
+            );
         }
         // Tail marker — if the math is right, this is the last thing on screen.
         app.push_output("FINAL_TAIL_MARKER", crate::tui::app::LineStyle::Normal);

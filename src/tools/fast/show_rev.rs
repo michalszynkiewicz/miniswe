@@ -119,7 +119,11 @@ fn render(path: &str, r: &Revision) -> String {
             ));
         }
         (_, Some(payload)) => {
-            let key = if r.operation == "insert_at" { "text" } else { "new_text" };
+            let key = if r.operation == "insert_at" {
+                "text"
+            } else {
+                "new_text"
+            };
             let (shown, truncated_bytes) = cap_for_display(payload, SHOW_REV_PAYLOAD_CAP);
             out.push_str(&format!("  {key}: |\n"));
             for line in shown.lines() {
@@ -311,13 +315,9 @@ mod tests {
     async fn missing_rev_arg_errors() {
         let store = RevisionStore::with_cap(20);
         let perms = scratch_perms();
-        let r = execute(
-            &serde_json::json!({ "path": "f.rs" }),
-            &perms,
-            &store,
-        )
-        .await
-        .unwrap();
+        let r = execute(&serde_json::json!({ "path": "f.rs" }), &perms, &store)
+            .await
+            .unwrap();
         assert!(!r.success);
         assert!(r.content.contains("rev"));
     }
