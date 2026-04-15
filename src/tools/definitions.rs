@@ -314,7 +314,8 @@ pub fn mcp_tool_definition() -> ToolDefinition {
 /// Help text for the `file` tool group.
 pub fn file_help(edit_mode: EditMode) -> &'static str {
     match edit_mode {
-        EditMode::Smart => "\
+        EditMode::Smart => {
+            "\
 Available actions for `file`:
 
 - read: Read a file. Params: path (required), start_line, end_line
@@ -326,8 +327,10 @@ Available actions for `file`:
 - revert: Revert files to a previous round. Params: to_round, path (both optional)
 
 For text edits use edit_file (semantic, planner-driven). For full-file overwrites \
-use write_file. There is no longer a deterministic search-and-replace action.",
-        EditMode::Fast => "\
+use write_file. There is no longer a deterministic search-and-replace action."
+        }
+        EditMode::Fast => {
+            "\
 Available actions for `file`:
 
 - read: Read a file. Params: path (required), start_line, end_line
@@ -340,7 +343,8 @@ Available actions for `file`:
 
 For partial edits use replace_range or insert_at; if an edit regresses, \
 revert that revision instead of layering more edits. For full-file overwrites \
-use write_file.",
+use write_file."
+        }
     }
 }
 

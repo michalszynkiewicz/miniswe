@@ -166,10 +166,7 @@ impl LspTransport {
 /// Apply a parsed `$/progress` notification to a token map. Standalone
 /// so unit tests can drive it with a fresh `DashMap` and synthetic JSON
 /// — no real LSP transport / `ChildStdin` required.
-pub(crate) fn apply_progress_to_map(
-    map: &DashMap<String, ProgressKind>,
-    params: &Value,
-) {
+pub(crate) fn apply_progress_to_map(map: &DashMap<String, ProgressKind>, params: &Value) {
     let Some((token, update)) = parse_progress_params(params) else {
         return;
     };
@@ -403,7 +400,10 @@ mod tests {
         apply_progress_to_map(&map, &json!({ "garbage": true }));
         apply_progress_to_map(&map, &json!(null));
         apply_progress_to_map(&map, &json!("not even an object"));
-        assert!(map.is_empty(), "garbage messages should not insert anything");
+        assert!(
+            map.is_empty(),
+            "garbage messages should not insert anything"
+        );
     }
 
     #[test]

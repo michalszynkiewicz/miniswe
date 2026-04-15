@@ -147,10 +147,7 @@ pub(super) enum RelocateOutcome {
 
 /// Collect all 1-based inclusive `(start, end)` line ranges where the
 /// `old` block matches `content` byte-exact, line-by-line.
-pub(super) fn find_all_exact_line_matches(
-    content: &str,
-    old: &[String],
-) -> Vec<(usize, usize)> {
+pub(super) fn find_all_exact_line_matches(content: &str, old: &[String]) -> Vec<(usize, usize)> {
     if old.is_empty() {
         return Vec::new();
     }
@@ -526,9 +523,7 @@ async fn request_relocation_confirmation(
 
     let request = ChatRequest {
         messages: vec![
-            Message::system(
-                "You answer with exactly `YES` or `NO`. No other output, no markdown.",
-            ),
+            Message::system("You answer with exactly `YES` or `NO`. No other output, no markdown."),
             Message::user(&prompt),
         ],
         tools: None,

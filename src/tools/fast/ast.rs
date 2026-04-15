@@ -147,7 +147,10 @@ mod tests {
     fn unclosed_brace_flagged() {
         let src = "fn main() { let x = 1;\n";
         let err = parse_check("m.rs", src).unwrap_err();
-        assert!(err.contains(':'), "error should carry a line:col prefix: {err}");
+        assert!(
+            err.contains(':'),
+            "error should carry a line:col prefix: {err}"
+        );
     }
 
     #[cfg(feature = "lang-rust")]

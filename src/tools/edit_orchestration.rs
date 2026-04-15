@@ -9,8 +9,8 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::config::{Config, ModelRole};
-use crate::knowledge::indexer;
 use crate::knowledge::ProjectIndex;
+use crate::knowledge::indexer;
 use crate::llm::{ChatRequest, Message, ModelRouter};
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
@@ -287,9 +287,9 @@ async fn auto_check(
                                     // Re-notify LSP so it sees the reverted state.
                                     let _ = lsp.notify_file_changed(&abs);
                                 }
-                                result.content.push_str(&format!(
-                                    "\n[lsp] {error_report}Edit reverted."
-                                ));
+                                result
+                                    .content
+                                    .push_str(&format!("\n[lsp] {error_report}Edit reverted."));
                                 result.success = false;
                             }
                         }
@@ -438,11 +438,7 @@ async fn auto_check(
 
 /// Ask the outer model whether to accept an edit that increased LSP errors.
 /// Returns `true` for YES (keep changes), `false` for NO (revert).
-async fn ask_accept_lsp_regression(
-    router: &ModelRouter,
-    path: &str,
-    error_report: &str,
-) -> bool {
+async fn ask_accept_lsp_regression(router: &ModelRouter, path: &str, error_report: &str) -> bool {
     let prompt = format!(
         "edit_file wrote changes to {path}.\n\
          LSP diagnostics show new errors:\n\
