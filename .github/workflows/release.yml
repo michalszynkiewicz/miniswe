@@ -1,9 +1,8 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  release:
+    types: [created]
 
 permissions:
   contents: write  # required to create releases and upload assets
@@ -18,49 +17,132 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-linux-x86_64:
-    name: Build linux-x86_64 (all-languages)
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    strategy:
+      # Build all platforms in parallel for faster release cycles.
+      matrix:
+        include:
+          # Linux x86_64 — static musl binary, runs on any Linux
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use_cross: true
+
+          # Linux aarch64 — static musl binary, cross-compiled via `cross`
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use_cross: true
+
+          # macOS x86_64 — explicit target on ARM runner
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            use_cross: false
+
+          # macOS aarch64 (Apple Silicon) — native on ARM runner
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            use_cross: false
+
+          # Windows x86_64
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            use_cross: false
+
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (Linux aarch64 only)
+        if: matrix.use_cross
+        run: cargo install cross --locked
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          # Keyed off the tag so releases get a fresh cache slot but rebuilds
-          # of the same tag (e.g. retries) are fast.
-          key: release-${{ github.ref_name }}
+          key: release-${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --locked --features all-languages
+        shell: bash
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --locked --features all-languages --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --features all-languages --target ${{ matrix.target }}
+          fi
 
-      - name: Strip binary
-        run: strip target/release/miniswe
+      - name: Strip binary (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/miniswe"
+          if [ -f "$BIN" ]; then strip "$BIN"; fi
 
-      - name: Package tarball + checksum
-        id: package
+      - name: Package tarball + checksum (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          name="miniswe-${{ github.ref_name }}-x86_64-unknown-linux-gnu"
-          tar -czf "dist/${name}.tar.gz" -C target/release miniswe
+          name="miniswe-${{ github.ref_name }}-${{ matrix.target }}"
+          tar -czf "dist/${name}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" miniswe
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
           ls -lh dist
 
-      - name: Upload artifact (for debugging if release step fails)
-        uses: actions/upload-artifact@v7
+      - name: Package zip + checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $name = "miniswe-${{ github.ref_name }}-${{ matrix.target }}"
+          Compress-Archive `
+            -Path "target\${{ matrix.target }}\release\miniswe.exe" `
+            -DestinationPath "dist\${name}.zip"
+          $hash = (Get-FileHash -Path "dist\${name}.zip" -Algorithm SHA256).Hash
+          "${hash}  ${name}.zip" | Out-File -FilePath "dist\${name}.zip.sha256" -Encoding ASCII
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: miniswe-linux-x86_64
+          name: miniswe-${{ matrix.name }}
           path: dist/*
           retention-days: 7
 
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
+      - name: Collect release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find all-artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) \
+            -exec cp {} release-assets/ \;
+          echo "=== Release assets ==="
+          ls -lh release-assets/
+
       # Split create + upload so a re-run after a partial failure (release
-      # created, asset upload died) can still finish. `--clobber` lets the
-      # upload step overwrite assets from a prior attempt.
+      # created, asset upload died) can still finish.
       - name: Create GitHub release (idempotent)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -77,4 +159,4 @@ jobs:
           gh release upload "${{ github.ref_name }}" \
             --repo "${{ github.repository }}" \
             --clobber \
-            dist/*
+            release-assets/*
