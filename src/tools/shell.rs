@@ -260,3 +260,48 @@ fn terminate_process_tree(child: &mut Child, signal: i32) {
         let _ = child.kill();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_kills_child_and_cleans_temp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = tmp.path().to_path_buf();
+
+        let args = serde_json::json!({
+            "command": "sleep 300"
+        });
+        let running = start(&args, &config).unwrap();
+        let stdout_path = running.stdout_path.clone();
+        let stderr_path = running.stderr_path.clone();
+        let pid = running.child.id();
+
+        assert!(stdout_path.exists());
+        assert!(stderr_path.exists());
+
+        // Drop without calling wait/kill/interrupt
+        drop(running);
+
+        // Child should be dead — try_wait returns Some (reaped)
+        // We can't call try_wait on the dropped child, but we can
+        // verify the temp files are cleaned up and the process is gone.
+        assert!(
+            !stdout_path.exists(),
+            "stdout temp file should be cleaned up"
+        );
+        assert!(
+            !stderr_path.exists(),
+            "stderr temp file should be cleaned up"
+        );
+
+        // On Unix, verify the process is actually dead
+        #[cfg(unix)]
+        {
+            let alive = unsafe { libc::kill(pid as i32, 0) };
+            assert_eq!(alive, -1, "process should be dead after drop");
+        }
+    }
+}
