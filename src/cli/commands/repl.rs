@@ -1226,7 +1226,7 @@ fn finish_completed_turn(
     );
     terminal
         .draw(|frame| ui::draw(frame, app))
-        .map_err(io::Error::other)?;
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     Ok(())
 }
 
