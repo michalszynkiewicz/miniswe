@@ -90,10 +90,8 @@ pub fn spawn_key_reader(
                                 break;
                             }
                         }
-                        Event::Mouse(mouse) => {
-                            if tx.send(AppEvent::Mouse(mouse)).is_err() {
-                                break;
-                            }
+                        Event::Mouse(mouse) if tx.send(AppEvent::Mouse(mouse)).is_err() => {
+                            break;
                         }
                         _ => {}
                     }
