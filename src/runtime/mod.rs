@@ -1,7 +1,9 @@
 //! Runtime execution helpers: dedicated LLM worker and shared tool worker pool.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc as std_mpsc};
+use std::sync::{Arc, mpsc as std_mpsc};
+
+use parking_lot::Mutex;
 use std::thread;
 
 use crate::config::ModelRole;
@@ -149,7 +151,7 @@ impl ToolWorkerPool {
         for _ in 0..size.max(1) {
             let rx = submit_rx.clone();
             threads.push(thread::spawn(move || {
-                while let Ok(task) = rx.lock().expect("tool worker rx poisoned").recv() {
+                while let Ok(task) = rx.lock().recv() {
                     let result = (task.job)();
                     let _ = task.result_tx.send(result);
                 }

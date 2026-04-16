@@ -1,8 +1,10 @@
 //! Interactive REPL mode with ratatui TUI.
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+
+use parking_lot::Mutex;
 
 use anyhow::Result;
 use crossterm::ExecutableCommand;
@@ -132,7 +134,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
 
     let mcp_summary = mcp_registry
         .as_ref()
-        .and_then(|r| r.lock().ok().and_then(|g| g.context_summary()));
+        .and_then(|r| r.lock().context_summary());
 
     // Token budget for compression decisions. Tool definitions are a fixed
     // overhead per request, so compute once.
@@ -159,18 +161,18 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
             LineStyle::Status,
         );
     }
-    if let Some(ref mcp) = mcp_registry
-        && let Ok(guard) = mcp.lock()
-        && guard.has_servers()
-    {
-        app.push_output(
-            &format!(
-                "MCP: {} servers, {} tools",
-                guard.servers.len(),
-                guard.tool_count()
-            ),
-            LineStyle::Status,
-        );
+    if let Some(ref mcp) = mcp_registry {
+        let guard = mcp.lock();
+        if guard.has_servers() {
+            app.push_output(
+                &format!(
+                    "MCP: {} servers, {} tools",
+                    guard.servers.len(),
+                    guard.tool_count()
+                ),
+                LineStyle::Status,
+            );
+        }
     }
     app.push_output(
         "Type your message. Ctrl+O: details, Ctrl+C: interrupt, Ctrl+D: quit",
@@ -884,9 +886,7 @@ async fn run_agent_loop(
                 let registry = mcp_registry.clone();
                 let mut result_rx = tool_pool.submit(move || match registry {
                     Some(registry) => {
-                        let mut guard = registry
-                            .lock()
-                            .map_err(|_| "MCP registry poisoned".to_string())?;
+                        let mut guard = registry.lock();
                         guard
                             .call_tool(&server, &tool, tool_args)
                             .map(crate::tools::ToolResult::ok)
