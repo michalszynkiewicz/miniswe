@@ -80,9 +80,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.miniswe/lsp-servers
-          key: lsp-servers-${{ runner.os }}-${{ steps.lsp-cache-epoch.outputs.week }}
-          restore-keys: |
-            lsp-servers-${{ runner.os }}-
+          # TEMPORARY: bust the RA cache to force a cold-start and reproduce
+          # the lsp_auto_check_integration flake with full RA_LOG output.
+          # Revert to the weekly key once we have the diagnostic data:
+          #   key: lsp-servers-${{ runner.os }}-${{ steps.lsp-cache-epoch.outputs.week }}
+          #   restore-keys: lsp-servers-${{ runner.os }}-
+          key: lsp-servers-bust-${{ github.run_id }}
+          restore-keys: ""
 
       - name: cargo build
         run: cargo build --locked --all-targets
