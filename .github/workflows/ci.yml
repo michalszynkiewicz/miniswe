@@ -62,6 +62,12 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # rust-src is needed by rust-analyzer for std library resolution.
+          # Without it, RA logs "can't load standard library" and operates
+          # in degraded mode where type-checking is unreliable — the root
+          # cause of the lsp_auto_check_integration flake.
+          components: rust-src
 
       - name: Cache cargo registry, index, and target/
         uses: Swatinem/rust-cache@v2
