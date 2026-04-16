@@ -218,21 +218,18 @@ impl PermissionManager {
 
     /// Record user's approval for an action after prompting.
     pub fn approve(&self, action: &Action, always: bool) {
+        if !always {
+            return;
+        }
         match action {
             Action::Shell(cmd) => {
-                if always {
-                    self.approved_shell.lock().insert(cmd.trim().to_string());
-                }
+                self.approved_shell.lock().insert(cmd.trim().to_string());
             }
             Action::WebSearch(_) | Action::WebFetch(_) => {
-                if always {
-                    *self.web_approved.lock() = true;
-                }
+                *self.web_approved.lock() = true;
             }
             Action::McpUse(server, _) => {
-                if always {
-                    self.approved_mcp.lock().insert(server.clone());
-                }
+                self.approved_mcp.lock().insert(server.clone());
             }
             _ => {}
         }
