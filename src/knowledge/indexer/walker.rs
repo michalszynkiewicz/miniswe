@@ -247,6 +247,6 @@ pub fn audit_file_sizes(root: &Path, max_lines: usize) -> Vec<(String, usize)> {
         }
     }
 
-    large_files.sort_by(|a, b| b.1.cmp(&a.1));
+    large_files.sort_by_key(|f| std::cmp::Reverse(f.1));
     large_files
 }
