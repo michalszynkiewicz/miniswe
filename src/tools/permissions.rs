@@ -455,7 +455,13 @@ impl PermissionManager {
             {
                 return response_rx.recv().unwrap_or_else(|_| "n".into());
             }
+            // TUI mode but the event channel is broken (receiver
+            // dropped). Deny rather than falling through to
+            // prompt_user(), which would corrupt the terminal by
+            // disabling raw mode and reading stdin directly.
+            return "n".into();
         }
+        // Non-TUI mode (run.rs single-shot path) — prompt on stdin.
         prompt_user(prompt)
     }
 }
@@ -688,6 +694,30 @@ mod tests {
         assert!(
             perms.resolve_and_check_path(".miniswe/config.toml").is_ok(),
             ".miniswe symlink should be allowed to escape"
+        );
+    }
+
+    #[test]
+    fn broken_tui_channel_denies_instead_of_falling_to_stdin() {
+        let config = Config::default();
+        let perms = PermissionManager::new(&config);
+
+        // Set up a TUI event channel, then drop the receiver so the
+        // channel is broken. This simulates "TUI mode, but something
+        // went wrong."
+        let (tx, _rx) = mpsc::unbounded_channel();
+        perms.set_prompt_event_tx(tx);
+        drop(_rx); // receiver gone — send will fail
+
+        // A shell command that isn't on the allowlist and has no
+        // metachars, so it would normally prompt.
+        let result = perms.check(&Action::Shell("dangerous-command".into()));
+
+        // Should be denied (not hang on stdin, not panic, not corrupt
+        // the terminal).
+        assert!(
+            result.is_err(),
+            "broken TUI channel should deny, got: {result:?}"
         );
     }
 }
