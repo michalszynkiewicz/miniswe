@@ -159,15 +159,15 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let mut plan_checkpoint_pending = false;
     let mut plan_update_requested = false;
 
-    // Ctrl+C cancellation flag
+    // Ctrl+C cancellation flag. The handler fires once and exits — no
+    // loop, because `ctrl_c().await` resolves immediately after the
+    // first signal and would otherwise busy-spin at 100% CPU.
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_for_handler = cancelled.clone();
     tokio::spawn(async move {
-        loop {
-            tokio::signal::ctrl_c().await.ok();
-            cancelled_for_handler.store(true, Ordering::Relaxed);
-            eprintln!("\n\x1b[33m(interrupted — finishing current step)\x1b[0m");
-        }
+        let _ = tokio::signal::ctrl_c().await;
+        cancelled_for_handler.store(true, Ordering::Relaxed);
+        eprintln!("\n\x1b[33m(interrupted — finishing current step)\x1b[0m");
     });
 
     // Initialize snapshot manager for revert support

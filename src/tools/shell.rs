@@ -23,6 +23,18 @@ pub struct RunningShellCommand {
     stderr_path: PathBuf,
 }
 
+impl Drop for RunningShellCommand {
+    /// Kill the child and clean up temp files if the struct is dropped
+    /// without going through `kill`/`interrupt`/`render_finished_result`
+    /// (e.g. a panic or early `?` return in an outer caller).
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = cleanup_temp_file(&self.stdout_path);
+        let _ = cleanup_temp_file(&self.stderr_path);
+    }
+}
+
 pub enum ShellWaitOutcome {
     Completed(ToolResult),
     TimedOut(RunningShellCommand),
