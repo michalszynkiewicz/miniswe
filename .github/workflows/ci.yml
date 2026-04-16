@@ -77,7 +77,7 @@ jobs:
         run: echo "week=$(date +%G-%V)" >> "$GITHUB_OUTPUT"
 
       - name: Cache LSP servers (rust-analyzer)
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.miniswe/lsp-servers
           key: lsp-servers-${{ runner.os }}-${{ steps.lsp-cache-epoch.outputs.week }}
