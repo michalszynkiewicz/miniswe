@@ -21,9 +21,9 @@ use crate::lsp::transport::LspTransport;
 /// LSP client wrapping a rust-analyzer process.
 pub struct LspClient {
     transport: Arc<LspTransport>,
-    child: std::sync::Mutex<Child>,
+    child: parking_lot::Mutex<Child>,
     ready: AtomicBool,
-    opened_files: std::sync::Mutex<HashSet<String>>,
+    opened_files: parking_lot::Mutex<HashSet<String>>,
     project_root: PathBuf,
     _reader_handle: JoinHandle<()>,
 }
@@ -55,7 +55,8 @@ impl LspClient {
                             "[lsp] attempt {attempt}/{max_attempts} failed, retrying in 2s..."
                         );
                         // Kill the failed process
-                        if let Ok(mut child) = client.child.lock() {
+                        {
+                            let mut child = client.child.lock();
                             let _ = child.kill();
                             let _ = child.wait();
                         }
@@ -127,9 +128,9 @@ impl LspClient {
 
         let client = Self {
             transport: Arc::clone(&transport),
-            child: std::sync::Mutex::new(child),
+            child: parking_lot::Mutex::new(child),
             ready: AtomicBool::new(false),
-            opened_files: std::sync::Mutex::new(HashSet::new()),
+            opened_files: parking_lot::Mutex::new(HashSet::new()),
             project_root: project_root.to_path_buf(),
             _reader_handle: reader_handle,
         };
@@ -185,10 +186,7 @@ impl LspClient {
         let content =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
 
-        let mut opened = self
-            .opened_files
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut opened = self.opened_files.lock();
         if opened.contains(&uri) {
             // didChange — full sync
             self.transport.send_notification(
@@ -367,10 +365,9 @@ impl LspClient {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Force kill if still running
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let mut child = self.child.lock();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -388,10 +385,9 @@ impl Drop for LspClient {
     /// Idempotent: calling `kill` on an already-reaped child is a no-op
     /// we swallow, so the graceful `shutdown()` path is unaffected.
     fn drop(&mut self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let mut child = self.child.lock();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 

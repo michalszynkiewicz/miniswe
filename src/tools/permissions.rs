@@ -10,10 +10,10 @@
 //! - Web access: requires user approval on first use per session
 //! - MCP tools: require user approval per server on first use
 
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Component, PathBuf};
-use std::sync::Mutex;
 
 use crate::config::Config;
 use crate::tui::event::AppEvent;
@@ -112,7 +112,7 @@ impl PermissionManager {
     }
 
     pub fn set_prompt_event_tx(&self, tx: mpsc::UnboundedSender<AppEvent>) {
-        *self.prompt_events.lock().unwrap() = Some(tx);
+        *self.prompt_events.lock() = Some(tx);
     }
 
     /// Resolve a file path and verify it's within the project root.
@@ -207,20 +207,17 @@ impl PermissionManager {
         match action {
             Action::Shell(cmd) => {
                 if always {
-                    self.approved_shell
-                        .lock()
-                        .unwrap()
-                        .insert(cmd.trim().to_string());
+                    self.approved_shell.lock().insert(cmd.trim().to_string());
                 }
             }
             Action::WebSearch(_) | Action::WebFetch(_) => {
                 if always {
-                    *self.web_approved.lock().unwrap() = true;
+                    *self.web_approved.lock() = true;
                 }
             }
             Action::McpUse(server, _) => {
                 if always {
-                    self.approved_mcp.lock().unwrap().insert(server.clone());
+                    self.approved_mcp.lock().insert(server.clone());
                 }
             }
             _ => {}
@@ -240,7 +237,7 @@ impl PermissionManager {
             }
         }
         {
-            let approved = self.approved_shell.lock().unwrap();
+            let approved = self.approved_shell.lock();
             if approved.contains(cmd_trimmed) {
                 return Ok(None);
             }
@@ -252,7 +249,7 @@ impl PermissionManager {
 
     fn check_web_needs_prompt(&self, prompt: &str) -> Result<Option<String>, String> {
         {
-            let approved = self.web_approved.lock().unwrap();
+            let approved = self.web_approved.lock();
             if *approved {
                 return Ok(None);
             }
@@ -262,7 +259,7 @@ impl PermissionManager {
 
     fn check_mcp_needs_prompt(&self, server: &str, tool: &str) -> Result<Option<String>, String> {
         {
-            let approved = self.approved_mcp.lock().unwrap();
+            let approved = self.approved_mcp.lock();
             if approved.contains(server) {
                 return Ok(None);
             }
@@ -311,7 +308,7 @@ impl PermissionManager {
 
         // Check session approvals
         {
-            let approved = self.approved_shell.lock().unwrap();
+            let approved = self.approved_shell.lock();
             if approved.contains(cmd_trimmed) {
                 return Ok(());
             }
@@ -325,10 +322,7 @@ impl PermissionManager {
         match approved.as_str() {
             "y" | "yes" => Ok(()),
             "a" | "always" => {
-                self.approved_shell
-                    .lock()
-                    .unwrap()
-                    .insert(cmd_trimmed.to_string());
+                self.approved_shell.lock().insert(cmd_trimmed.to_string());
                 Ok(())
             }
             _ => Err("Shell command denied by user".into()),
@@ -339,7 +333,7 @@ impl PermissionManager {
     fn check_web_search(&self, query: &str) -> Result<(), String> {
         // If blanket web access was approved, allow
         {
-            let approved = self.web_approved.lock().unwrap();
+            let approved = self.web_approved.lock();
             if *approved {
                 return Ok(());
             }
@@ -355,7 +349,7 @@ impl PermissionManager {
         match response.as_str() {
             "y" | "yes" => Ok(()),
             "a" | "always" | "allow" => {
-                *self.web_approved.lock().unwrap() = true;
+                *self.web_approved.lock() = true;
                 Ok(())
             }
             _ => Err("Web search denied by user".into()),
@@ -366,7 +360,7 @@ impl PermissionManager {
     fn check_web_fetch(&self, url: &str) -> Result<(), String> {
         // If blanket web access was approved, allow
         {
-            let approved = self.web_approved.lock().unwrap();
+            let approved = self.web_approved.lock();
             if *approved {
                 return Ok(());
             }
@@ -388,7 +382,7 @@ impl PermissionManager {
         match response.as_str() {
             "y" | "yes" => Ok(()),
             "a" | "always" | "allow" => {
-                *self.web_approved.lock().unwrap() = true;
+                *self.web_approved.lock() = true;
                 Ok(())
             }
             _ => Err("Web fetch denied by user".into()),
@@ -398,7 +392,7 @@ impl PermissionManager {
     /// Check if an MCP tool call is allowed.
     fn check_mcp(&self, server: &str, tool: &str) -> Result<(), String> {
         {
-            let approved = self.approved_mcp.lock().unwrap();
+            let approved = self.approved_mcp.lock();
             if approved.contains(server) {
                 return Ok(());
             }
@@ -411,7 +405,7 @@ impl PermissionManager {
         match response.as_str() {
             "y" | "yes" => Ok(()),
             "a" | "always" => {
-                self.approved_mcp.lock().unwrap().insert(server.to_string());
+                self.approved_mcp.lock().insert(server.to_string());
                 Ok(())
             }
             _ => Err(format!("MCP tool '{server}/{tool}' denied by user")),
@@ -432,7 +426,7 @@ impl PermissionManager {
     }
 
     fn request_user_decision(&self, prompt: &str) -> String {
-        if let Some(tx) = self.prompt_events.lock().unwrap().clone() {
+        if let Some(tx) = self.prompt_events.lock().clone() {
             let (response_tx, response_rx) = std::sync::mpsc::channel();
             if tx
                 .send(AppEvent::PermissionRequest(prompt.to_string(), response_tx))

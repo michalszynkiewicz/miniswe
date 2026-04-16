@@ -247,6 +247,11 @@ fn cleanup_temp_file(path: &PathBuf) -> std::io::Result<()> {
 }
 
 fn terminate_process_tree(child: &mut Child, signal: i32) {
+    // If the child has already exited, skip signaling — the PID may have
+    // been recycled by the kernel and we'd kill an unrelated process.
+    if let Ok(Some(_)) = child.try_wait() {
+        return;
+    }
     #[cfg(unix)]
     {
         let pid = child.id() as i32;
@@ -303,5 +308,16 @@ mod tests {
             let alive = unsafe { libc::kill(pid as i32, 0) };
             assert_eq!(alive, -1, "process should be dead after drop");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_skips_already_exited_process() {
+        let mut child = Command::new("true").spawn().unwrap();
+        // Wait for it to exit naturally
+        child.wait().unwrap();
+        // terminate_process_tree should not panic or signal an
+        // unrelated PID — the try_wait guard skips the kill.
+        terminate_process_tree(&mut child, libc::SIGTERM);
     }
 }

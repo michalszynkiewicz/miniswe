@@ -9,8 +9,10 @@
 //! 6. Feed results back and repeat
 
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+
+use parking_lot::Mutex;
 
 use anyhow::Result;
 
@@ -137,7 +139,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
 
     let mcp_summary = mcp_registry
         .as_ref()
-        .and_then(|r| r.lock().ok().and_then(|g| g.context_summary()));
+        .and_then(|r| r.lock().context_summary());
 
     // Estimate tool definition overhead for context budgeting
     let tool_def_tokens =
@@ -233,9 +235,8 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         log.round_start(round);
 
         // Snapshot at start of each round for revert support
-        if let Some(ref snap) = snapshots
-            && let Ok(mut guard) = snap.lock()
-        {
+        if let Some(ref snap) = snapshots {
+            let mut guard = snap.lock();
             let _ = guard.begin_round(round);
         }
         if round > max_rounds {
@@ -498,9 +499,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                         let path = args["path"].as_str().unwrap_or("").to_string();
                         match snapshots {
                             Some(snap) => {
-                                let guard = snap
-                                    .lock()
-                                    .map_err(|_| "Snapshot manager poisoned".to_string())?;
+                                let guard = snap.lock();
                                 let res = if !path.is_empty() {
                                     guard.revert_file(&path, to_round)
                                 } else {
@@ -643,9 +642,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                         match tool_pool
                             .submit(move || match registry {
                                 Some(registry) => {
-                                    let mut guard = registry
-                                        .lock()
-                                        .map_err(|_| "MCP registry poisoned".to_string())?;
+                                    let mut guard = registry.lock();
                                     guard
                                         .call_tool(&server, &tool, tool_args)
                                         .map(crate::tools::ToolResult::ok)

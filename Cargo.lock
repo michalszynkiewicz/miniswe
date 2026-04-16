@@ -1795,6 +1795,7 @@ dependencies = [
  "libc",
  "lsp-types",
  "notify",
+ "parking_lot",
  "petgraph",
  "portable-pty",
  "ratatui",

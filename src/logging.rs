@@ -5,10 +5,10 @@
 //! - **debug**: full interactions — LLM messages, tool args/results, file changes
 //! - **trace**: everything + context assembly stats, token counts, masking decisions
 
+use parking_lot::Mutex;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use crate::config::Config;
 
@@ -237,9 +237,7 @@ impl SessionLog {
     // ── Internal ────────────────────────────────────────────────────
 
     fn write(&self, line: &str) {
-        let Ok(mut guard) = self.file.lock() else {
-            return;
-        };
+        let mut guard = self.file.lock();
         let Some(ref mut file) = *guard else {
             return;
         };

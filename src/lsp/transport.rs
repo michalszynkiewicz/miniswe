@@ -20,7 +20,7 @@ pub(crate) enum ProgressKind {
 
 /// JSON-RPC transport for LSP communication.
 pub struct LspTransport {
-    writer: std::sync::Mutex<BufWriter<ChildStdin>>,
+    writer: parking_lot::Mutex<BufWriter<ChildStdin>>,
     pub(crate) pending: DashMap<i64, oneshot::Sender<Value>>,
     pub(crate) diagnostics: DashMap<String, Vec<lsp_types::Diagnostic>>,
     /// In-flight `$/progress` tokens. Inserted on `begin`, refreshed on
@@ -33,7 +33,7 @@ pub struct LspTransport {
 impl LspTransport {
     pub fn new(stdin: ChildStdin) -> Self {
         Self {
-            writer: std::sync::Mutex::new(BufWriter::new(stdin)),
+            writer: parking_lot::Mutex::new(BufWriter::new(stdin)),
             pending: DashMap::new(),
             diagnostics: DashMap::new(),
             progress: DashMap::new(),
@@ -91,10 +91,7 @@ impl LspTransport {
         let body = serde_json::to_string(msg)?;
         let header = format!("Content-Length: {}\r\n\r\n", body.len());
 
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut writer = self.writer.lock();
         writer.write_all(header.as_bytes())?;
         writer.write_all(body.as_bytes())?;
         writer.flush()?;

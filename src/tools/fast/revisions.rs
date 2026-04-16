@@ -22,9 +22,9 @@
 //! durability is a possible follow-up.
 
 use anyhow::{Result, anyhow};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
 
 /// Default cap for live (non-reverted, non-rev_0) entries per file.
 pub const DEFAULT_LIVE_CAP: usize = 20;
@@ -140,7 +140,7 @@ impl RevisionStore {
     /// Record the pristine state of `rel_path` as `rev_0`. Idempotent: the
     /// first call wins, subsequent calls for the same path are no-ops.
     pub fn ensure_pristine(&self, rel_path: &str, content: &str) -> Result<()> {
-        let mut inner = self.inner.lock().expect("revision store mutex poisoned");
+        let mut inner = self.inner.lock();
         inner
             .per_file
             .entry(rel_path.to_string())
@@ -168,7 +168,7 @@ impl RevisionStore {
     /// assigned — strictly monotonic across the full history including
     /// tombstones. Errors if `ensure_pristine` was never called.
     pub fn record(&self, rel_path: &str, new_content: &str, args: RecordArgs<'_>) -> Result<usize> {
-        let mut inner = self.inner.lock().expect("revision store mutex poisoned");
+        let mut inner = self.inner.lock();
         let live_cap = inner.live_cap;
         let revs = inner
             .per_file
@@ -205,7 +205,7 @@ impl RevisionStore {
     /// tombstone (reverted). Tombstones are advisory-only; reverting back
     /// to them is not supported.
     pub fn read_content(&self, rel_path: &str, rev: usize) -> Result<String> {
-        let inner = self.inner.lock().expect("revision store mutex poisoned");
+        let inner = self.inner.lock();
         let revs = inner
             .per_file
             .get(rel_path)
@@ -232,7 +232,7 @@ impl RevisionStore {
     /// and payload). Used by the `show_rev` tool. `None` if the file or
     /// rev is unknown.
     pub fn get(&self, rel_path: &str, rev: usize) -> Option<Revision> {
-        let inner = self.inner.lock().expect("revision store mutex poisoned");
+        let inner = self.inner.lock();
         inner
             .per_file
             .get(rel_path)
@@ -243,7 +243,7 @@ impl RevisionStore {
     /// `rel_path`. Called after a successful `revert`. The target rev
     /// itself stays live. Applies the tombstone cap after marking.
     pub fn mark_reverted_to(&self, rel_path: &str, rev: usize) -> Result<()> {
-        let mut inner = self.inner.lock().expect("revision store mutex poisoned");
+        let mut inner = self.inner.lock();
         let tombstone_cap = inner.tombstone_cap;
         let revs = inner
             .per_file
@@ -270,14 +270,14 @@ impl RevisionStore {
     /// Return the revision list for `rel_path` in order. Empty vec if the
     /// file hasn't been touched by the agent yet. Includes tombstones.
     pub fn list(&self, rel_path: &str) -> Vec<Revision> {
-        let inner = self.inner.lock().expect("revision store mutex poisoned");
+        let inner = self.inner.lock();
         inner.per_file.get(rel_path).cloned().unwrap_or_default()
     }
 
     /// Highest *live* revision number for `rel_path`, or `None` if
     /// unknown. Tombstones are skipped.
     pub fn current(&self, rel_path: &str) -> Option<usize> {
-        let inner = self.inner.lock().expect("revision store mutex poisoned");
+        let inner = self.inner.lock();
         inner
             .per_file
             .get(rel_path)
