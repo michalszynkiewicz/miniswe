@@ -196,7 +196,9 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
     // Main event loop
     loop {
         // Render
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        terminal
+            .draw(|frame| ui::draw(frame, &app))
+            .map_err(io::Error::other)?;
 
         // Wait for next event
         let evt = match rx.recv().await {
@@ -1222,7 +1224,9 @@ fn finish_completed_turn(
         "────────────────────────────────────────────────",
         LineStyle::Separator,
     );
-    terminal.draw(|frame| ui::draw(frame, app))?;
+    terminal
+        .draw(|frame| ui::draw(frame, app))
+        .map_err(io::Error::other)?;
     Ok(())
 }
 
