@@ -43,7 +43,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 
 # HTTP client for LLM API
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
