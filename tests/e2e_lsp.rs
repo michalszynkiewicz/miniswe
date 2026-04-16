@@ -239,6 +239,27 @@ async fn lsp_auto_check_integration() {
         start.elapsed().as_millis()
     );
 
+    // Pre-warm: force rust-analyzer to finish indexing the sysroot (core,
+    // alloc, std — 26 crates parsed from source when `rust-src` is
+    // installed) BEFORE we exercise the write_file auto-check path.
+    //
+    // Without this, `execute_tool("write_file")` calls
+    // `capture_edit_baseline` which queries diagnostics while RA is still
+    // indexing. That eats the 30s diagnostic timeout on a no-op baseline,
+    // leaving no budget for the actual post-write diagnostic check. The
+    // result: `success=true` even though the file has a type error.
+    //
+    // This mirrors what the passing `lsp_diagnostics_on_type_error` test
+    // does implicitly — it calls `notify_file_changed` + `get_diagnostics`
+    // directly, giving RA time to finish before any assertions fire.
+    let main_rs = config.project_root.join("src/main.rs");
+    client.notify_file_changed(&main_rs).unwrap();
+    eprintln!("[trace] pre-warming RA (waiting for initial diagnostics)");
+    client
+        .get_diagnostics(&main_rs, Duration::from_secs(30))
+        .await;
+    eprintln!("[trace] pre-warm complete");
+
     let perms = miniswe::tools::permissions::PermissionManager::headless(&config);
 
     // Write a file with a type error via the tool system
