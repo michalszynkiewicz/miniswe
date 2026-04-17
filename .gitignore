@@ -4,3 +4,4 @@ models/
 .mcp.json
 .env
 **/benchmark_results
+tmp
