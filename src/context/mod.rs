@@ -113,7 +113,9 @@ Every edit returns a revision table; if an edit regresses, call revert {\"path\"
          Tool contract: grouped tools require action plus action-specific params.\n\
          file read: {{\"action\":\"read\",\"path\":\"README.md\"}}\n\
          {edit_contract}\n\
-         If a tool says a parameter is missing, retry with the exact required parameter names.\n"
+         If a tool says a parameter is missing, retry with the exact required parameter names.\n\
+         Background servers: spawn with `& echo $! > .pid` and kill via that pid before respawning — don't pkill/grep ps.\n\
+         Bound port with no matching process under you: switch ports, don't escalate kills.\n"
     )
 }
 

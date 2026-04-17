@@ -43,12 +43,6 @@ jobs:
             target: aarch64-apple-darwin
             use_cross: false
 
-          # Windows x86_64
-          - name: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            use_cross: false
-
     steps:
       - uses: actions/checkout@v4
 
@@ -75,15 +69,13 @@ jobs:
             cargo build --release --locked --features all-languages --target ${{ matrix.target }}
           fi
 
-      - name: Strip binary (Unix)
-        if: runner.os != 'Windows'
+      - name: Strip binary
         shell: bash
         run: |
           BIN="target/${{ matrix.target }}/release/miniswe"
           if [ -f "$BIN" ]; then strip "$BIN"; fi
 
-      - name: Package tarball + checksum (Unix)
-        if: runner.os != 'Windows'
+      - name: Package tarball + checksum
         shell: bash
         run: |
           set -euo pipefail
@@ -93,19 +85,6 @@ jobs:
             -C "target/${{ matrix.target }}/release" miniswe
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
           ls -lh dist
-
-      - name: Package zip + checksum (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $name = "miniswe-${{ github.ref_name }}-${{ matrix.target }}"
-          Compress-Archive `
-            -Path "target\${{ matrix.target }}\release\miniswe.exe" `
-            -DestinationPath "dist\${name}.zip"
-          $hash = (Get-FileHash -Path "dist\${name}.zip" -Algorithm SHA256).Hash
-          "${hash}  ${name}.zip" | Out-File -FilePath "dist\${name}.zip.sha256" -Encoding ASCII
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -130,7 +109,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          find all-artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) \
+          find all-artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) \
             -exec cp {} release-assets/ \;
           echo "=== Release assets ==="
           ls -lh release-assets/
