@@ -284,16 +284,43 @@ async fn auto_check(
                                 "\n[lsp] WARNING: {error_report}Changes kept (accepted by model)."
                             ));
                         } else {
-                            // Revert the file to its pre-edit content.
+                            // Revert the file to its pre-edit content. If the
+                            // write fails we must NOT tell the caller "reverted"
+                            // — the broken edit is still on disk.
+                            let mut reverted = false;
+                            let mut revert_error: Option<String> = None;
                             if let Some(ref original) = baseline.original_content {
                                 let abs = config.project_root.join(path);
-                                let _ = std::fs::write(&abs, original);
-                                // Re-notify LSP so it sees the reverted state.
-                                let _ = lsp.notify_file_changed(&abs);
+                                match std::fs::write(&abs, original) {
+                                    Ok(()) => {
+                                        reverted = true;
+                                        // Re-notify LSP so it sees the reverted state.
+                                        if let Err(e) = lsp.notify_file_changed(&abs) {
+                                            tracing::warn!(
+                                                "LSP notify failed after revert of {path}: {e}"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to revert {path}: {e}");
+                                        revert_error = Some(e.to_string());
+                                    }
+                                }
+                            } else {
+                                revert_error = Some("no pre-edit baseline captured".to_string());
                             }
-                            result
-                                .content
-                                .push_str(&format!("\n[lsp] {error_report}Edit reverted."));
+
+                            if reverted {
+                                result
+                                    .content
+                                    .push_str(&format!("\n[lsp] {error_report}Edit reverted."));
+                            } else {
+                                let why =
+                                    revert_error.unwrap_or_else(|| "unknown reason".to_string());
+                                result.content.push_str(&format!(
+                                    "\n[lsp] {error_report}Revert FAILED ({why}) — broken edit is still on disk. Inspect {path} and restore manually."
+                                ));
+                            }
                             result.success = false;
                         }
                     }

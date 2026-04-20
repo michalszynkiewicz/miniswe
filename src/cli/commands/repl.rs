@@ -1091,7 +1091,18 @@ fn mask_old_tool_results(
 
     if summary_count > keep_count {
         let archive_path = project_root.join(".miniswe").join("tool_history.md");
-        let mut archive = std::fs::read_to_string(&archive_path).unwrap_or_default();
+        let mut archive = match std::fs::read_to_string(&archive_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                tracing::warn!(
+                    "Tool history read failed for {}; starting fresh and the next archive \
+                     will overwrite the existing file: {e}",
+                    archive_path.display()
+                );
+                String::new()
+            }
+        };
         let excess = summary_count - keep_count;
         let mut archived = 0;
         for s in &summaries {
@@ -1103,7 +1114,12 @@ fn mask_old_tool_results(
                 archived += 1;
             }
         }
-        let _ = crate::atomic_write(&archive_path, archive.as_bytes());
+        if let Err(e) = crate::atomic_write(&archive_path, archive.as_bytes()) {
+            tracing::warn!(
+                "Tool history write failed for {}: {e}",
+                archive_path.display()
+            );
+        }
     }
 
     let total_summaries = summaries.iter().filter(|s| s.is_some()).count();

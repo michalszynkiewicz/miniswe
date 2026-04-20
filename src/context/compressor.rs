@@ -334,7 +334,21 @@ fn heuristic_summarize(messages: &[&Message]) -> String {
 /// Archive compressed messages to `.miniswe/session_archive.md`.
 fn archive_messages(messages: &[&Message], config: &Config) {
     let archive_path = config.miniswe_dir().join("session_archive.md");
-    let mut archive = std::fs::read_to_string(&archive_path).unwrap_or_default();
+    let mut archive = match std::fs::read_to_string(&archive_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            // Read error on an existing archive — start from empty and warn.
+            // The next atomic_write will overwrite the file, so the user
+            // should know history was discarded before that happens.
+            tracing::warn!(
+                "Session archive read failed for {}; starting fresh and the next archive \
+                 will overwrite the existing file: {e}",
+                archive_path.display()
+            );
+            String::new()
+        }
+    };
 
     archive.push_str(&format!("\n## Compressed at round ~{}\n", messages.len()));
     for msg in messages {
@@ -376,5 +390,10 @@ fn archive_messages(messages: &[&Message], config: &Config) {
         }
     }
 
-    let _ = crate::atomic_write(&archive_path, archive.as_bytes());
+    if let Err(e) = crate::atomic_write(&archive_path, archive.as_bytes()) {
+        tracing::warn!(
+            "Session archive write failed for {}: {e}",
+            archive_path.display()
+        );
+    }
 }

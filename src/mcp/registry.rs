@@ -72,10 +72,24 @@ impl McpRegistry {
                                 tools: tool_infos,
                             };
 
-                            // Cache to disk
+                            // Cache to disk. Miss is non-fatal — worst case the
+                            // MCP handshake runs again next startup — but warn
+                            // so a misconfigured cache dir shows up in logs.
                             let cache_path = cache_dir.join(format!("{name}.json"));
-                            if let Ok(json) = serde_json::to_string_pretty(&info) {
-                                let _ = std::fs::write(&cache_path, json);
+                            match serde_json::to_string_pretty(&info) {
+                                Ok(json) => {
+                                    if let Err(e) = std::fs::write(&cache_path, json) {
+                                        tracing::warn!(
+                                            "MCP server '{name}': failed to write tool cache to {}: {e}",
+                                            cache_path.display()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "MCP server '{name}': failed to serialize tool cache: {e}"
+                                    );
+                                }
                             }
 
                             servers.push(info);
