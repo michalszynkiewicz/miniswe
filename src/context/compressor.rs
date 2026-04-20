@@ -376,5 +376,5 @@ fn archive_messages(messages: &[&Message], config: &Config) {
         }
     }
 
-    let _ = std::fs::write(&archive_path, &archive);
+    let _ = crate::atomic_write(&archive_path, archive.as_bytes());
 }
