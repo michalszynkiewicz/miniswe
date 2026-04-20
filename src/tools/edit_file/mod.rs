@@ -82,19 +82,18 @@ pub async fn execute(
     baseline_lsp_errors: Option<usize>,
     perms: Option<&PermissionManager>,
 ) -> Result<ToolResult> {
-    let path_str = args["path"].as_str().unwrap_or("");
-    let task = args["task"].as_str().unwrap_or("");
+    let path_str = match crate::tools::args::require_str(args, "path") {
+        Ok(p) => p,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
+    let task = match crate::tools::args::require_str(args, "task") {
+        Ok(t) => t,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
     let lsp_validation = match LspValidationMode::from_args(args) {
         Ok(mode) => mode,
         Err(e) => return Ok(ToolResult::err(e.to_string())),
     };
-
-    if path_str.is_empty() {
-        return Ok(ToolResult::err("Missing required parameter: path".into()));
-    }
-    if task.is_empty() {
-        return Ok(ToolResult::err("Missing required parameter: task".into()));
-    }
 
     let path = config.project_root.join(path_str);
     if !path.exists() {
@@ -367,7 +366,10 @@ enum LspValidationMode {
 
 impl LspValidationMode {
     fn from_args(args: &Value) -> Result<Self> {
-        match args["lsp_validation"].as_str().unwrap_or("auto") {
+        let mode = crate::tools::args::opt_str(args, "lsp_validation")
+            .map_err(|e| anyhow::anyhow!(e))?
+            .unwrap_or("auto");
+        match mode {
             "auto" => Ok(Self::Auto),
             "require" => Ok(Self::Require),
             "off" => Ok(Self::Off),

@@ -14,6 +14,7 @@
 //!
 //! [`ToolResult`] is the shared return type used across all submodules.
 
+pub(crate) mod args;
 mod cargo_check;
 mod code_intel;
 mod delete_file;

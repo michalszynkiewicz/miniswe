@@ -8,11 +8,13 @@ use super::ToolResult;
 use crate::config::Config;
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
-    let content = args["content"].as_str().unwrap_or("");
-
+    let content = match super::args::require_str(args, "content") {
+        Ok(c) => c,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
     if content.is_empty() {
         return Ok(ToolResult::err(
-            "Missing required parameter: content".into(),
+            "Parameter 'content' must not be empty".into(),
         ));
     }
 

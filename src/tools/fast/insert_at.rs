@@ -30,16 +30,21 @@ pub async fn execute(
     revisions: &RevisionStore,
     project_baseline_errors: usize,
 ) -> Result<ToolResult> {
-    let path = args["path"].as_str().unwrap_or("");
-    let after_line = args["after_line"].as_u64().unwrap_or(0) as usize;
-    let content = args["content"].as_str().unwrap_or("");
-
-    if path.is_empty() {
-        return Ok(ToolResult::err("insert_at: 'path' is required".into()));
-    }
+    let path = match super::super::args::require_str(args, "path") {
+        Ok(p) => p,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
+    let after_line = match super::super::args::require_u64(args, "after_line") {
+        Ok(n) => n as usize,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
+    let content = match super::super::args::require_str(args, "content") {
+        Ok(c) => c,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
     if content.is_empty() {
         return Ok(ToolResult::err(
-            "insert_at: 'content' is required (empty insertion is a no-op)".into(),
+            "insert_at: 'content' must not be empty (empty insertion is a no-op)".into(),
         ));
     }
     if let Err(e) = perms.resolve_and_check_path(path) {

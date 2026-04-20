@@ -13,13 +13,15 @@
 
 /// One-line summary of a tool call's arguments.
 pub fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
-    let action = args["action"].as_str().unwrap_or("");
+    use crate::tools::args::{get_str_or, get_u64_or, opt_str, opt_u64};
+
+    let action = get_str_or(args, "action", "");
     match tool_name {
         "file" => match action {
             "read" => {
-                let path = args["path"].as_str().unwrap_or("?");
-                let start = args["start_line"].as_u64();
-                let end = args["end_line"].as_u64();
+                let path = get_str_or(args, "path", "?");
+                let start = opt_u64(args, "start_line").unwrap_or(None);
+                let end = opt_u64(args, "end_line").unwrap_or(None);
                 match (start, end) {
                     (Some(s), Some(e)) => format!("read {path}:{s}-{e}"),
                     (Some(s), None) => format!("read {path}:{s}-"),
@@ -27,23 +29,25 @@ pub fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
                 }
             }
             "search" => {
-                let query = args["query"]
-                    .as_str()
-                    .or_else(|| args["pattern"].as_str())
+                let query = opt_str(args, "query")
+                    .ok()
+                    .flatten()
+                    .or_else(|| opt_str(args, "pattern").ok().flatten())
                     .unwrap_or("?");
-                let scope = args["scope"]
-                    .as_str()
-                    .or_else(|| args["path"].as_str())
+                let scope = opt_str(args, "scope")
+                    .ok()
+                    .flatten()
+                    .or_else(|| opt_str(args, "path").ok().flatten())
                     .unwrap_or("project");
                 format!("search \"{query}\" in {scope}")
             }
             "delete" => {
-                let path = args["path"].as_str().unwrap_or("?");
+                let path = get_str_or(args, "path", "?");
                 format!("delete {path}")
             }
             "shell" => {
-                let cmd = args["command"].as_str().unwrap_or("?");
-                let timeout = args["timeout"].as_u64();
+                let cmd = get_str_or(args, "command", "?");
+                let timeout = opt_u64(args, "timeout").unwrap_or(None);
                 match timeout {
                     Some(t) => format!("shell {} [timeout={t}]", crate::truncate_chars(cmd, 40)),
                     None => format!("shell {}", crate::truncate_chars(cmd, 40)),
@@ -54,30 +58,30 @@ pub fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
         },
         "code" => match action {
             "goto_definition" | "find_references" => {
-                let path = args["path"].as_str().unwrap_or("?");
-                let line = args["line"].as_u64().unwrap_or(0);
+                let path = get_str_or(args, "path", "?");
+                let line = get_u64_or(args, "line", 0);
                 format!("{action} {path}:{line}")
             }
             _ => action.to_string(),
         },
         "web" => match action {
             "search" => {
-                let query = args["query"].as_str().unwrap_or("?");
+                let query = get_str_or(args, "query", "?");
                 format!("search \"{query}\"")
             }
-            "fetch" => args["url"].as_str().unwrap_or("?").to_string(),
+            "fetch" => get_str_or(args, "url", "?").to_string(),
             _ => action.to_string(),
         },
         "plan" => match action {
             "scratchpad" => "scratchpad".to_string(),
-            "check" => format!("check step {}", args["step"].as_u64().unwrap_or(0)),
-            "refine" => format!("refine step {}", args["step"].as_u64().unwrap_or(0)),
+            "check" => format!("check step {}", get_u64_or(args, "step", 0)),
+            "refine" => format!("refine step {}", get_u64_or(args, "step", 0)),
             _ => action.to_string(),
         },
         "edit_file" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            let task = args["task"].as_str().unwrap_or("");
-            let lsp = args["lsp_validation"].as_str().unwrap_or("auto");
+            let path = get_str_or(args, "path", "?");
+            let task = get_str_or(args, "task", "");
+            let lsp = get_str_or(args, "lsp_validation", "auto");
             if task.is_empty() {
                 path.to_string()
             } else if lsp == "auto" {
@@ -87,33 +91,33 @@ pub fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
             }
         }
         "write_file" => {
-            let path = args["path"].as_str().unwrap_or("?");
+            let path = get_str_or(args, "path", "?");
             format!("write {path}")
         }
         "mcp_use" => {
-            let server = args["server"].as_str().unwrap_or("?");
-            let tool = args["tool"].as_str().unwrap_or("?");
+            let server = get_str_or(args, "server", "?");
+            let tool = get_str_or(args, "tool", "?");
             format!("{server}/{tool}")
         }
         "replace_range" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            let start = args["start"].as_u64().unwrap_or(0);
-            let end = args["end"].as_u64().unwrap_or(0);
+            let path = get_str_or(args, "path", "?");
+            let start = get_u64_or(args, "start", 0);
+            let end = get_u64_or(args, "end", 0);
             format!("{path} L{start}-{end}")
         }
         "insert_at" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            let after = args["after_line"].as_u64().unwrap_or(0);
+            let path = get_str_or(args, "path", "?");
+            let after = get_u64_or(args, "after_line", 0);
             format!("{path} @L{after}")
         }
         "revert" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            let rev = args["rev"].as_u64().unwrap_or(0);
+            let path = get_str_or(args, "path", "?");
+            let rev = get_u64_or(args, "rev", 0);
             format!("{path} to rev_{rev}")
         }
         "show_rev" => {
-            let path = args["path"].as_str().unwrap_or("?");
-            let rev = args["rev"].as_u64().unwrap_or(0);
+            let path = get_str_or(args, "path", "?");
+            let rev = get_u64_or(args, "rev", 0);
             format!("{path} rev_{rev}")
         }
         "check" => String::new(),

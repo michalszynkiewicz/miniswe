@@ -6,12 +6,14 @@
 ///
 /// This replaces full tool outputs in older conversation turns with dense summaries.
 pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content: &str) -> String {
-    let action = args["action"].as_str().unwrap_or("");
+    use crate::tools::args::get_str_or;
+
+    let action = get_str_or(args, "action", "");
 
     match tool_name {
         "file" => match action {
             "read" => {
-                let path = args["path"].as_str().unwrap_or("?");
+                let path = get_str_or(args, "path", "?");
                 let line_count = content.lines().count();
                 let mut sigs = Vec::new();
                 for line in content.lines() {
@@ -61,12 +63,12 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
                 }
             }
             "search" => {
-                let query = args["query"].as_str().unwrap_or("?");
+                let query = get_str_or(args, "query", "?");
                 let match_count = content.lines().filter(|l| !l.starts_with('[')).count();
                 format!("[search:\"{query}\"→{match_count} matches]")
             }
             "shell" => {
-                let cmd = args["command"].as_str().unwrap_or("?");
+                let cmd = get_str_or(args, "command", "?");
                 let short_cmd = crate::truncate_chars(cmd, 30);
                 let exit_code = if content.contains("exit 0") {
                     "ok"
@@ -87,7 +89,7 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
         },
         "web" => match action {
             "search" => {
-                let query = args["query"].as_str().unwrap_or("?");
+                let query = get_str_or(args, "query", "?");
                 let result_count = content
                     .lines()
                     .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
@@ -95,7 +97,7 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
                 format!("[web_search:\"{query}\"→{result_count} results]")
             }
             "fetch" => {
-                let url = args["url"].as_str().unwrap_or("?");
+                let url = get_str_or(args, "url", "?");
                 format!("[web_fetch:{url}→{}chars]", content.len())
             }
             _ => format!("[web.{action}→done]"),
@@ -105,7 +107,7 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
             _ => format!("[plan.{action}→done]"),
         },
         "edit_file" => {
-            let path = args["path"].as_str().unwrap_or("?");
+            let path = get_str_or(args, "path", "?");
             if content.contains('✓') {
                 if content.contains("error")
                     && (content.contains("[cargo check]") || content.contains("[lsp]"))
@@ -124,8 +126,8 @@ pub fn summarize_tool_result(tool_name: &str, args: &serde_json::Value, content:
             }
         }
         "mcp_use" => {
-            let server = args["server"].as_str().unwrap_or("?");
-            let tool = args["tool"].as_str().unwrap_or("?");
+            let server = get_str_or(args, "server", "?");
+            let tool = get_str_or(args, "tool", "?");
             format!("[mcp:{server}/{tool}→{}chars]", content.len())
         }
         _ => format!("[{tool_name}→done]"),

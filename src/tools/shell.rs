@@ -42,9 +42,10 @@ pub enum ShellWaitOutcome {
 }
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
-    let timeout_secs = args["timeout"]
-        .as_u64()
-        .unwrap_or(config.shell.default_timeout_secs);
+    let timeout_secs = match super::args::opt_u64(args, "timeout") {
+        Ok(t) => t.unwrap_or(config.shell.default_timeout_secs),
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
     let running = match start(args, config) {
         Ok(r) => r,
         Err(e) => return Ok(ToolResult::err(e.to_string())),
@@ -58,12 +59,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 }
 
 pub fn start(args: &Value, config: &Config) -> Result<RunningShellCommand> {
-    let command = args["command"].as_str().unwrap_or("");
-    if command.is_empty() {
-        return Err(anyhow!(
-            "Missing required parameter: command. Expected JSON arguments: {{\"action\":\"shell\",\"command\":\"cargo check\",\"timeout\":60}}."
-        ));
-    }
+    let command = super::args::require_str(args, "command").map_err(|e| anyhow!(e))?;
 
     let temp_dir = config.miniswe_dir().join("shell_tmp");
     std::fs::create_dir_all(&temp_dir)?;

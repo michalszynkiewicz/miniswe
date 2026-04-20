@@ -37,7 +37,10 @@ pub async fn execute_tool(
         "web" => execute_web_tool(args, config, perms).await,
         "write_file" => execute_write_file_tool(args, config, perms, lsp).await,
         "plan" => {
-            let action = args["action"].as_str().unwrap_or("");
+            let action = match super::args::require_str(args, "action") {
+                Ok(a) => a,
+                Err(e) => return Ok(ToolResult::err(e)),
+            };
             if action == "help" {
                 return Ok(ToolResult::ok(definitions::plan_help().into()));
             }
@@ -58,7 +61,10 @@ async fn execute_file_tool(
     config: &Config,
     perms: &PermissionManager,
 ) -> Result<ToolResult> {
-    let action = args["action"].as_str().unwrap_or("");
+    let action = match super::args::require_str(args, "action") {
+        Ok(a) => a,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
 
     match action {
         "help" => Ok(ToolResult::ok(
@@ -66,7 +72,10 @@ async fn execute_file_tool(
         )),
 
         "read" => {
-            let path = args["path"].as_str().unwrap_or("");
+            let path = match super::args::require_str(args, "path") {
+                Ok(p) => p,
+                Err(e) => return Ok(ToolResult::err(e)),
+            };
             if let Err(e) = perms.resolve_and_check_path(path) {
                 return Ok(ToolResult::err(e));
             }
@@ -78,7 +87,10 @@ async fn execute_file_tool(
         )),
 
         "delete" => {
-            let path = args["path"].as_str().unwrap_or("");
+            let path = match super::args::require_str(args, "path") {
+                Ok(p) => p,
+                Err(e) => return Ok(ToolResult::err(e)),
+            };
             if let Err(e) = perms.resolve_and_check_path(path) {
                 return Ok(ToolResult::err(e));
             }
@@ -104,7 +116,10 @@ async fn execute_file_tool(
         "search" => search::execute(args, config).await,
 
         "shell" => {
-            let cmd = args["command"].as_str().unwrap_or("");
+            let cmd = match super::args::require_str(args, "command") {
+                Ok(c) => c,
+                Err(e) => return Ok(ToolResult::err(e)),
+            };
             if let Err(e) = perms.check(&Action::Shell(cmd.into())) {
                 return Ok(ToolResult::err(e));
             }
@@ -131,7 +146,10 @@ async fn execute_write_file_tool(
     perms: &PermissionManager,
     lsp: Option<&LspClient>,
 ) -> Result<ToolResult> {
-    let path = args["path"].as_str().unwrap_or("");
+    let path = match super::args::require_str(args, "path") {
+        Ok(p) => p,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
     if let Err(e) = perms.resolve_and_check_path(path) {
         return Ok(ToolResult::err(e));
     }
@@ -150,23 +168,32 @@ async fn execute_code_tool(
     config: &Config,
     lsp: Option<&LspClient>,
 ) -> Result<ToolResult> {
-    let action = args["action"].as_str().unwrap_or("");
+    let action = match super::args::require_str(args, "action") {
+        Ok(a) => a,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
 
     match action {
         "help" => Ok(ToolResult::ok(definitions::code_help().into())),
 
-        "goto_definition" => {
-            let path = args["path"].as_str().unwrap_or("");
-            let line = args["line"].as_u64().unwrap_or(1).saturating_sub(1) as u32;
-            let column = args["column"].as_u64().unwrap_or(1).saturating_sub(1) as u32;
-            lsp_goto_definition(path, line, column, config, lsp).await
-        }
-
-        "find_references" => {
-            let path = args["path"].as_str().unwrap_or("");
-            let line = args["line"].as_u64().unwrap_or(1).saturating_sub(1) as u32;
-            let column = args["column"].as_u64().unwrap_or(1).saturating_sub(1) as u32;
-            lsp_find_references(path, line, column, config, lsp).await
+        "goto_definition" | "find_references" => {
+            let path = match super::args::require_str(args, "path") {
+                Ok(p) => p,
+                Err(e) => return Ok(ToolResult::err(e)),
+            };
+            let line = match super::args::require_u64(args, "line") {
+                Ok(n) => n.saturating_sub(1) as u32,
+                Err(e) => return Ok(ToolResult::err(e)),
+            };
+            let column = match super::args::require_u64(args, "column") {
+                Ok(n) => n.saturating_sub(1) as u32,
+                Err(e) => return Ok(ToolResult::err(e)),
+            };
+            if action == "goto_definition" {
+                lsp_goto_definition(path, line, column, config, lsp).await
+            } else {
+                lsp_find_references(path, line, column, config, lsp).await
+            }
         }
 
         "diagnostics" => {
@@ -187,7 +214,7 @@ async fn execute_code_tool(
         }
 
         "repo_map" => {
-            let keywords_str = args["keywords"].as_str().unwrap_or("");
+            let keywords_str = super::args::get_str_or(args, "keywords", "");
             context_tool_repo_map(keywords_str, config)
         }
 
@@ -208,13 +235,19 @@ async fn execute_web_tool(
     config: &Config,
     perms: &PermissionManager,
 ) -> Result<ToolResult> {
-    let action = args["action"].as_str().unwrap_or("");
+    let action = match super::args::require_str(args, "action") {
+        Ok(a) => a,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
 
     match action {
         "help" => Ok(ToolResult::ok(definitions::web_help().into())),
 
         "search" => {
-            let query = args["query"].as_str().unwrap_or("");
+            let query = match super::args::require_str(args, "query") {
+                Ok(q) => q,
+                Err(e) => return Ok(ToolResult::err(e)),
+            };
             if let Err(e) = perms.check(&Action::WebSearch(query.into())) {
                 return Ok(ToolResult::err(e));
             }
@@ -222,7 +255,10 @@ async fn execute_web_tool(
         }
 
         "fetch" => {
-            let url = args["url"].as_str().unwrap_or("");
+            let url = match super::args::require_str(args, "url") {
+                Ok(u) => u,
+                Err(e) => return Ok(ToolResult::err(e)),
+            };
             if let Err(e) = perms.check(&Action::WebFetch(url.into())) {
                 return Ok(ToolResult::err(e));
             }

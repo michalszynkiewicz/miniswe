@@ -21,11 +21,10 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     // Max lines derived from context budget (~80 chars/line)
     let max_lines = config.tool_output_budget_chars() / 80;
 
-    let path_str = args["path"].as_str().unwrap_or("");
-
-    if path_str.is_empty() {
-        return Ok(ToolResult::err("Missing required parameter: path".into()));
-    }
+    let path_str = match super::args::require_str(args, "path") {
+        Ok(s) => s,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
 
     let path = resolve_path(path_str, config);
 
