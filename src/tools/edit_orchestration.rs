@@ -32,7 +32,10 @@ pub async fn execute_edit_file_tool(
     cancelled: Option<&std::sync::atomic::AtomicBool>,
     log: Option<&SessionLog>,
 ) -> Result<ToolResult> {
-    let path = args["path"].as_str().unwrap_or("");
+    let path = match super::args::require_str(args, "path") {
+        Ok(p) => p,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
     if let Err(e) = perms.resolve_and_check_path(path) {
         return Ok(ToolResult::err(e));
     }

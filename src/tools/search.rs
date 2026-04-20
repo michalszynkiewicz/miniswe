@@ -25,8 +25,14 @@ const CODE_EXTENSIONS: &[&str] = &[
 ];
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
-    let query = args["query"].as_str().unwrap_or("");
-    let pattern = args["pattern"].as_str().unwrap_or("");
+    let query = match super::args::opt_str(args, "query") {
+        Ok(s) => s.unwrap_or(""),
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
+    let pattern = match super::args::opt_str(args, "pattern") {
+        Ok(s) => s.unwrap_or(""),
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
 
     // Exactly one of query (literal) or pattern (regex) must be provided.
     let (search_term, literal) = if !query.is_empty() {
@@ -39,8 +45,14 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         ));
     };
 
-    let max_results = args["max_results"].as_u64().unwrap_or(20) as usize;
-    let scope = args["scope"].as_str().unwrap_or("project");
+    let max_results = match super::args::opt_u64(args, "max_results") {
+        Ok(n) => n.unwrap_or(20) as usize,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
+    let scope = match super::args::opt_str(args, "scope") {
+        Ok(s) => s.unwrap_or("project"),
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
 
     let search_dir = match scope {
         "project" | "symbols" => config.project_root.clone(),

@@ -399,7 +399,7 @@ async fn delete_file_missing_path_or_file_fails() {
     assert!(
         missing_path
             .content
-            .contains("Missing required parameter: path")
+            .contains("Missing required parameter: 'path'")
     );
 
     let missing_file_args = json!({"action": "delete", "path": "nope.txt"});

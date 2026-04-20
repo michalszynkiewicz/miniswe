@@ -27,19 +27,14 @@ pub async fn execute(
     revisions: &RevisionStore,
     project_baseline_errors: usize,
 ) -> Result<ToolResult> {
-    let path = args["path"].as_str().unwrap_or("");
-    let rev = args["rev"].as_u64().unwrap_or(u64::MAX);
-
-    if path.is_empty() {
-        return Ok(ToolResult::err("revert: 'path' is required".into()));
-    }
-    if rev == u64::MAX {
-        return Ok(ToolResult::err(
-            "revert: 'rev' is required (the numeric revision to restore, e.g. 0 for pristine)"
-                .into(),
-        ));
-    }
-    let rev = rev as usize;
+    let path = match super::super::args::require_str(args, "path") {
+        Ok(p) => p,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
+    let rev = match super::super::args::require_u64(args, "rev") {
+        Ok(n) => n as usize,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
 
     if let Err(e) = perms.resolve_and_check_path(path) {
         return Ok(ToolResult::err(e));

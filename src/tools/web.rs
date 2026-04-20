@@ -11,12 +11,14 @@ use crate::config::Config;
 /// Requires an API key in config. Get a free key at https://serper.dev
 /// (2,500 queries/month, no credit card).
 pub async fn search(args: &Value, config: &Config) -> Result<ToolResult> {
-    let query = args["query"].as_str().unwrap_or("");
-    let max_results = args["max_results"].as_u64().unwrap_or(5) as usize;
-
-    if query.is_empty() {
-        return Ok(ToolResult::err("Missing required parameter: query".into()));
-    }
+    let query = match super::args::require_str(args, "query") {
+        Ok(q) => q,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
+    let max_results = match super::args::opt_u64(args, "max_results") {
+        Ok(n) => n.unwrap_or(5) as usize,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
 
     match config.web.search_backend.as_str() {
         "searxng" => search_searxng(query, max_results, config).await,
@@ -274,11 +276,10 @@ fn missing_serper_key_hint() -> String {
 
 /// web_fetch — Fetch a URL and extract content as markdown.
 pub async fn fetch(args: &Value, config: &Config) -> Result<ToolResult> {
-    let url = args["url"].as_str().unwrap_or("");
-
-    if url.is_empty() {
-        return Ok(ToolResult::err("Missing required parameter: url".into()));
-    }
+    let url = match super::args::require_str(args, "url") {
+        Ok(u) => u,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
 
     let fetch_url = if config.web.fetch_backend == "jina" {
         format!("https://r.jina.ai/{url}")
