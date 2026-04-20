@@ -4,7 +4,7 @@
 //! JSON-RPC 2.0 over stdin/stdout.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,12 @@ static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 /// A connected MCP server process.
 pub struct McpClient {
     child: Child,
+    /// Owned stdin — kept on the struct so we don't re-borrow the child per request.
+    stdin: ChildStdin,
+    /// Persistent BufReader over stdout. Creating a fresh BufReader per request
+    /// (the previous design) would drop any bytes the prior read had buffered
+    /// past the consumed line — causing silent data loss and eventual hangs.
+    stdout: BufReader<ChildStdout>,
     server_name: String,
 }
 
@@ -73,12 +79,23 @@ impl McpClient {
             cmd.env(k, v);
         }
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to start MCP server '{name}': {}", config.command))?;
 
+        let stdin = child
+            .stdin
+            .take()
+            .context("MCP server stdin not available")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("MCP server stdout not available")?;
+
         let mut client = Self {
             child,
+            stdin,
+            stdout: BufReader::new(stdout),
             server_name: name.to_string(),
         };
 
@@ -156,22 +173,9 @@ impl McpClient {
         let mut request_json = serde_json::to_string(&request)?;
         request_json.push('\n');
 
-        // Write to stdin
-        let stdin = self
-            .child
-            .stdin
-            .as_mut()
-            .context("MCP server stdin not available")?;
-        stdin.write_all(request_json.as_bytes())?;
-        stdin.flush()?;
+        self.stdin.write_all(request_json.as_bytes())?;
+        self.stdin.flush()?;
 
-        // Read response from stdout with timeout
-        let stdout = self
-            .child
-            .stdout
-            .as_mut()
-            .context("MCP server stdout not available")?;
-        let mut reader = BufReader::new(stdout);
         let deadline = Instant::now() + timeout;
 
         // Read lines until we get a JSON-RPC response with our id
@@ -187,7 +191,7 @@ impl McpClient {
             }
 
             let mut line = String::new();
-            let bytes_read = reader.read_line(&mut line)?;
+            let bytes_read = self.stdout.read_line(&mut line)?;
             if bytes_read == 0 {
                 bail!(
                     "MCP server '{}' closed connection unexpectedly",
@@ -233,13 +237,8 @@ impl McpClient {
         let mut json = serde_json::to_string(&notification)?;
         json.push('\n');
 
-        let stdin = self
-            .child
-            .stdin
-            .as_mut()
-            .context("MCP server stdin not available")?;
-        stdin.write_all(json.as_bytes())?;
-        stdin.flush()?;
+        self.stdin.write_all(json.as_bytes())?;
+        self.stdin.flush()?;
 
         Ok(())
     }
