@@ -187,6 +187,9 @@ impl LlmClient {
             (String, String, String),
         > = std::collections::HashMap::new();
         let mut sse_buf = String::new();
+        // Warn at most once per stream if the server omits tool_call index;
+        // a broken server would otherwise spam a line per delta.
+        let mut warned_missing_index = false;
 
         loop {
             // Wrap each chunk read in an idle-timeout. If the model has
@@ -246,7 +249,20 @@ impl LlmClient {
                         }
                         if let Some(tc_deltas) = &choice.delta.tool_calls {
                             for tc_delta in tc_deltas {
-                                let idx = tc_delta.index.unwrap_or(0);
+                                // Per OpenAI spec every tool-call delta carries `index`.
+                                // Guessing 0 would silently corrupt parallel calls by
+                                // merging stray deltas into call #0. Skip instead.
+                                let Some(idx) = tc_delta.index else {
+                                    if !warned_missing_index {
+                                        tracing::warn!(
+                                            "LLM stream: tool_call delta missing `index`; skipping. \
+                                             The server emitted a non-spec-compliant SSE chunk — \
+                                             if you see this often, the upstream tool call may be incomplete."
+                                        );
+                                        warned_missing_index = true;
+                                    }
+                                    continue;
+                                };
                                 let entry =
                                     current_tool_call_parts.entry(idx).or_insert_with(|| {
                                         (
