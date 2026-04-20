@@ -456,16 +456,6 @@ impl Config {
         Ok(config)
     }
 
-    /// Save configuration to `~/.miniswe/config.toml`.
-    pub fn save(&self) -> Result<()> {
-        let config_dir = Self::global_dir().context("Cannot determine home directory")?;
-        std::fs::create_dir_all(&config_dir)?;
-        let config_path = config_dir.join("config.toml");
-        let contents = toml::to_string_pretty(self)?;
-        std::fs::write(&config_path, contents)?;
-        Ok(())
-    }
-
     /// Path to the `.miniswe/` data directory in the project.
     pub fn miniswe_dir(&self) -> PathBuf {
         self.project_root.join(".miniswe")
