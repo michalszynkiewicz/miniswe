@@ -1103,7 +1103,7 @@ fn mask_old_tool_results(
                 archived += 1;
             }
         }
-        let _ = std::fs::write(&archive_path, &archive);
+        let _ = crate::atomic_write(&archive_path, archive.as_bytes());
     }
 
     let total_summaries = summaries.iter().filter(|s| s.is_some()).count();
