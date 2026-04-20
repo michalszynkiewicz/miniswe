@@ -28,14 +28,23 @@ pub async fn execute(
     revisions: &RevisionStore,
     project_baseline_errors: usize,
 ) -> Result<ToolResult> {
-    let path = args["path"].as_str().unwrap_or("");
-    let start = args["start"].as_u64().unwrap_or(0) as usize;
-    let end = args["end"].as_u64().unwrap_or(0) as usize;
-    let content = args["content"].as_str().unwrap_or("");
+    let path = match super::super::args::require_str(args, "path") {
+        Ok(p) => p,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
+    let start = match super::super::args::require_u64(args, "start") {
+        Ok(n) => n as usize,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
+    let end = match super::super::args::require_u64(args, "end") {
+        Ok(n) => n as usize,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
+    let content = match super::super::args::require_str(args, "content") {
+        Ok(c) => c,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
 
-    if path.is_empty() {
-        return Ok(ToolResult::err("replace_range: 'path' is required".into()));
-    }
     if let Err(e) = perms.resolve_and_check_path(path) {
         return Ok(ToolResult::err(e));
     }

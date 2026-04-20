@@ -16,15 +16,16 @@ use crate::config::Config;
 const LARGE_FILE_WARNING: usize = 250;
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
-    let path_str = args["path"].as_str().unwrap_or("");
-    let content = args["content"].as_str().unwrap_or("");
-    let has_content = args.get("content").is_some();
-
-    if path_str.is_empty() {
-        return Ok(ToolResult::err(
-            "Missing required parameter: path. Expected JSON arguments: {\"action\":\"write\",\"path\":\"src/bin/hello.rs\",\"content\":\"fn main() {\\n    println!(\\\"hello\\\");\\n}\\n\"}. Omit content only to create a new empty file.".into()
-        ));
-    }
+    let path_str = match super::args::require_str(args, "path") {
+        Ok(s) => s,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
+    let content = match super::args::opt_str(args, "content") {
+        Ok(c) => c,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
+    let has_content = content.is_some();
+    let content = content.unwrap_or("");
 
     let path = resolve_path(path_str, config);
 

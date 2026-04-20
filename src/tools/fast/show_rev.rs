@@ -26,18 +26,14 @@ pub async fn execute(
     perms: &PermissionManager,
     revisions: &RevisionStore,
 ) -> Result<ToolResult> {
-    let path = args["path"].as_str().unwrap_or("");
-    let rev_num = args["rev"].as_u64();
-
-    if path.is_empty() {
-        return Ok(ToolResult::err("show_rev: 'path' is required".into()));
-    }
-    let Some(rev_num) = rev_num else {
-        return Ok(ToolResult::err(
-            "show_rev: 'rev' is required (the numeric revision to inspect, e.g. 0)".into(),
-        ));
+    let path = match super::super::args::require_str(args, "path") {
+        Ok(p) => p,
+        Err(e) => return Ok(ToolResult::err(e)),
     };
-    let rev_num = rev_num as usize;
+    let rev_num = match super::super::args::require_u64(args, "rev") {
+        Ok(n) => n as usize,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
 
     if let Err(e) = perms.resolve_and_check_path(path) {
         return Ok(ToolResult::err(e));

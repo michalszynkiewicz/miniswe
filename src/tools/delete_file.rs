@@ -10,13 +10,10 @@ use crate::config::Config;
 use super::ToolResult;
 
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
-    let path_str = args["path"].as_str().unwrap_or("");
-
-    if path_str.is_empty() {
-        return Ok(ToolResult::err(
-            "Missing required parameter: path. Expected JSON arguments: {\"action\":\"delete\",\"path\":\"src/bin/hello.rs\"}.".into(),
-        ));
-    }
+    let path_str = match super::args::require_str(args, "path") {
+        Ok(s) => s,
+        Err(e) => return Ok(ToolResult::err(e)),
+    };
 
     let path = config.project_root.join(path_str);
 
