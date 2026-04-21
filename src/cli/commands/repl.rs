@@ -151,15 +151,12 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
     let history_file = config.miniswe_path("sessions/repl_history.txt");
     app.load_history(&history_file);
 
-    // Welcome message
-    for line in router.startup_summary() {
+    // Welcome message — probe what the server is actually serving rather
+    // than parroting config.toml, which can disagree with reality when a
+    // llama-swap/llama-cpp in front of the endpoint is loading a
+    // different gguf than named in config.
+    for line in router.startup_summary().await {
         app.push_output(&format!("miniswe — {line}"), LineStyle::Status);
-    }
-    if !router.is_multi_model() {
-        app.push_output(
-            "Tip: configure [models] in config.toml with llama-swap for multi-model routing",
-            LineStyle::Status,
-        );
     }
     if let Some(ref mcp) = mcp_registry {
         let guard = mcp.lock();

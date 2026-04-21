@@ -78,14 +78,10 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         "miniswe"
     });
 
-    // Show model info
-    for line in router.startup_summary() {
+    // Ask the server what's actually running, so startup reflects reality
+    // rather than what config.toml claims. Done once per session.
+    for line in router.startup_summary().await {
         tui::print_status(&line);
-    }
-    if !router.is_multi_model() {
-        tui::print_status(
-            "Tip: configure [models] in config.toml with llama-swap for multi-model routing (plan/code/fast)",
-        );
     }
 
     // Select model role: plan mode uses the plan model, normal mode uses default

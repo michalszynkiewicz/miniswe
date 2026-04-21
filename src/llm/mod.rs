@@ -44,6 +44,43 @@ impl LlmClient {
         }
     }
 
+    /// Ask the server what model it's actually serving, via `/v1/models`
+    /// (or `/api/tags` for Ollama). Returns the first id the server reports.
+    /// Short timeout so a dead endpoint doesn't stall startup.
+    pub async fn probe_model(&self) -> Result<String> {
+        let base = self.config.endpoint.trim_end_matches('/');
+        let (url, ollama) = match self.config.provider.as_str() {
+            "ollama" => (format!("{base}/api/tags"), true),
+            _ => (format!("{base}/v1/models"), false),
+        };
+        let resp = tokio::time::timeout(Duration::from_secs(3), self.client.get(&url).send())
+            .await
+            .map_err(|_| anyhow::anyhow!("probe timed out"))?
+            .with_context(|| format!("connecting to {url}"))?;
+        if !resp.status().is_success() {
+            bail!("HTTP {}", resp.status());
+        }
+        let body: Value = resp.json().await.context("parsing /v1/models response")?;
+        let first = if ollama {
+            body["models"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|m| m["name"].as_str())
+                .map(|s| s.to_string())
+        } else {
+            body["data"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|m| m["id"].as_str())
+                .map(|s| s.to_string())
+        };
+        first.ok_or_else(|| anyhow::anyhow!("server returned no models"))
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.config.endpoint
+    }
+
     /// Send a chat completion request and return the full response.
     pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
         self.chat_with_cancel(request, None).await
