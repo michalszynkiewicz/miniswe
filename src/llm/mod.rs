@@ -47,20 +47,28 @@ impl LlmClient {
     /// Ask the server what model it's actually serving, via `/v1/models`
     /// (or `/api/tags` for Ollama). Returns the first id the server reports.
     /// Short timeout so a dead endpoint doesn't stall startup.
+    ///
+    /// Error messages are kept short and URL-free — the caller already
+    /// displays the endpoint alongside the probe result, so we avoid
+    /// repeating it.
     pub async fn probe_model(&self) -> Result<String> {
         let base = self.config.endpoint.trim_end_matches('/');
         let (url, ollama) = match self.config.provider.as_str() {
             "ollama" => (format!("{base}/api/tags"), true),
             _ => (format!("{base}/v1/models"), false),
         };
-        let resp = tokio::time::timeout(Duration::from_secs(3), self.client.get(&url).send())
+        let resp = match tokio::time::timeout(Duration::from_secs(3), self.client.get(&url).send())
             .await
-            .map_err(|_| anyhow::anyhow!("probe timed out"))?
-            .with_context(|| format!("connecting to {url}"))?;
+        {
+            Err(_) => bail!("timeout"),
+            Ok(Err(e)) if e.is_connect() => bail!("unreachable"),
+            Ok(Err(e)) => bail!("transport error ({e})"),
+            Ok(Ok(r)) => r,
+        };
         if !resp.status().is_success() {
-            bail!("HTTP {}", resp.status());
+            bail!("HTTP {}", resp.status().as_u16());
         }
-        let body: Value = resp.json().await.context("parsing /v1/models response")?;
+        let body: Value = resp.json().await.map_err(|_| anyhow::anyhow!("bad JSON"))?;
         let first = if ollama {
             body["models"]
                 .as_array()
@@ -74,7 +82,7 @@ impl LlmClient {
                 .and_then(|m| m["id"].as_str())
                 .map(|s| s.to_string())
         };
-        first.ok_or_else(|| anyhow::anyhow!("server returned no models"))
+        first.ok_or_else(|| anyhow::anyhow!("no models listed"))
     }
 
     pub fn endpoint(&self) -> &str {
