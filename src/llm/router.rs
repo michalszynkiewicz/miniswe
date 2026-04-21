@@ -88,28 +88,42 @@ impl ModelRouter {
         &self.config_for(role).model
     }
 
-    /// Summary of configured models for display at startup.
-    pub fn startup_summary(&self) -> Vec<String> {
-        if !self.is_multi_model() {
-            let cfg = self.config_for(ModelRole::Default);
-            return vec![format!("Model: {} @ {}", cfg.model, cfg.endpoint)];
+    /// Probe each distinct endpoint we route to and format one line per
+    /// endpoint with what the server says it's running. The returned
+    /// strings are the LLM's own self-description, not what `config.toml`
+    /// claims — so when the server is llama-swap / llama-cpp in front of
+    /// a different gguf than config names, we show reality.
+    ///
+    /// If a probe fails (server down, wrong provider format, timeout) we
+    /// still emit a line with the endpoint + the error, so startup stays
+    /// informative rather than silently empty.
+    pub async fn startup_summary(&self) -> Vec<String> {
+        // Dedupe by endpoint (same physical server even if two role keys
+        // point at it) and preserve default-first order for display.
+        let mut seen = std::collections::HashSet::new();
+        let mut ordered_keys: Vec<&str> = Vec::new();
+        for role in [ModelRole::Default, ModelRole::Plan, ModelRole::Fast] {
+            let key = self.key_for(role);
+            let endpoint = self
+                .configs
+                .get(key)
+                .map(|c| c.endpoint.as_str())
+                .unwrap_or("");
+            if seen.insert(endpoint.to_string()) {
+                ordered_keys.push(key);
+            }
         }
 
-        let mut lines = vec!["Models:".to_string()];
-        let roles = [
-            ("default", ModelRole::Default),
-            ("plan", ModelRole::Plan),
-            ("fast", ModelRole::Fast),
-        ];
-        // Deduplicate — don't repeat if plan/fast point to the same as default
-        let default_key = self.key_for(ModelRole::Default);
-        for (label, role) in &roles {
-            let key = self.key_for(*role);
-            if *label != "default" && key == default_key {
-                continue; // Same as default, skip
+        let mut lines = Vec::new();
+        for key in ordered_keys {
+            let Some(client) = self.clients.get(key) else {
+                continue;
+            };
+            let endpoint = client.endpoint();
+            match client.probe_model().await {
+                Ok(model) => lines.push(format!("Model: {model} @ {endpoint}")),
+                Err(e) => lines.push(format!("Model: (probe failed: {e}) @ {endpoint}")),
             }
-            let cfg = self.config_for(*role);
-            lines.push(format!("  {label}: {} @ {}", cfg.model, cfg.endpoint));
         }
         lines
     }
