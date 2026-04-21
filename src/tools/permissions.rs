@@ -358,10 +358,10 @@ impl PermissionManager {
         }
 
         let response = self.request_user_decision(&format!(
-            "Allow web search?\n\
-             \x1b[2m  query: \"{query}\"\n\
-             \x1b[2m  sends to: web search API\x1b[0m\n\
-             \x1b[1;33m  [y]es / [n]o / [a]llow all web this session: \x1b[0m"
+            "Allow web search?\n  \
+             query: \"{query}\"\n  \
+             sends to: web search API\n  \
+             [y]es / [n]o / [a]llow all web this session: "
         ));
 
         match response.as_str() {
@@ -391,10 +391,10 @@ impl PermissionManager {
         };
 
         let response = self.request_user_decision(&format!(
-            "Allow web fetch?\n\
-             \x1b[2m  url: {url}\n\
-             \x1b[2m  via: {via}\x1b[0m\n\
-             \x1b[1;33m  [y]es / [n]o / [a]llow all web this session: \x1b[0m"
+            "Allow web fetch?\n  \
+             url: {url}\n  \
+             via: {via}\n  \
+             [y]es / [n]o / [a]llow all web this session: "
         ));
 
         match response.as_str() {
