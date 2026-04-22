@@ -87,7 +87,7 @@ jobs:
           ls -lh dist
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: miniswe-${{ matrix.name }}
           path: dist/*
