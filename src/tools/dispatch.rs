@@ -134,6 +134,20 @@ async fn execute_file_tool(
             ))
         }
 
+        "replace_range" | "insert_at" | "show_rev" | "check" => {
+            match config.tools.edit_mode {
+                crate::config::EditMode::Fast => Ok(ToolResult::err(format!(
+                    "'{action}' is a top-level tool, not a file action. \
+                     Call it directly: {action}(path, ...) instead of \
+                     file(action='{action}', ...)."
+                ))),
+                crate::config::EditMode::Smart => Ok(ToolResult::err(format!(
+                    "'{action}' is not available in smart edit mode. \
+                     Use edit_file(path, task) for code edits."
+                ))),
+            }
+        }
+
         _ => Ok(ToolResult::err(format!(
             "Unknown file action: '{action}'. Use 'help' to see available actions."
         ))),

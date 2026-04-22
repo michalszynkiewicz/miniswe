@@ -26,6 +26,11 @@ pub fn parse_check(rel_path: &str, content: &str) -> Result<(), String> {
 pub fn parse_check_ext(ext: &str, content: &str) -> Result<(), String> {
     use tree_sitter::Parser;
 
+    #[cfg(feature = "lang-yaml")]
+    if ext == "yaml" || ext == "yml" {
+        return yaml_check(content);
+    }
+
     let Some(lang) = language_for(ext) else {
         return Ok(()); // unsupported — treat as ok
     };
@@ -94,6 +99,73 @@ fn first_error(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
     None
 }
 
+/// YAML syntax + duplicate-key check using tree-sitter-yaml.
+/// tree-sitter catches structural syntax errors; we walk the mapping nodes
+/// ourselves to catch duplicate keys (technically valid YAML syntax but
+/// almost always a bug — parsers silently last-value-wins).
+#[cfg(feature = "lang-yaml")]
+fn yaml_check(content: &str) -> Result<(), String> {
+    use tree_sitter::Parser;
+
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_yaml::LANGUAGE.into())
+        .is_err()
+    {
+        return Ok(());
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return Err("tree-sitter parse returned no tree".into());
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        let err = first_error(root).unwrap_or(root);
+        let start = err.start_position();
+        return Err(format!(
+            "{}:{}: syntax error",
+            start.row + 1,
+            start.column + 1
+        ));
+    }
+    yaml_check_dup_keys(root, content)
+}
+
+/// Recursively walk the tree and report the first duplicate key in any mapping.
+#[cfg(feature = "lang-yaml")]
+fn yaml_check_dup_keys(node: tree_sitter::Node, src: &str) -> Result<(), String> {
+    if node.kind() == "block_mapping" || node.kind() == "flow_mapping" {
+        let pair_kind = if node.kind() == "block_mapping" {
+            "block_mapping_pair"
+        } else {
+            "flow_pair"
+        };
+        let mut seen: std::collections::HashMap<String, (usize, usize)> = Default::default();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() != pair_kind {
+                continue;
+            }
+            // Key is the first named child of the pair
+            if let Some(key_node) = child.child(0) {
+                let key_text = &src[key_node.start_byte()..key_node.end_byte()];
+                let row = key_node.start_position().row + 1;
+                let col = key_node.start_position().column + 1;
+                if let Some(&(prev_row, prev_col)) = seen.get(key_text) {
+                    return Err(format!(
+                        "{row}:{col}: duplicate key '{key_text}' (first defined at {prev_row}:{prev_col})"
+                    ));
+                }
+                seen.insert(key_text.to_string(), (row, col));
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        yaml_check_dup_keys(child, src)?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "tree-sitter")]
 fn language_for(ext: &str) -> Option<tree_sitter::Language> {
     match ext {
@@ -114,6 +186,7 @@ fn language_for(ext: &str) -> Option<tree_sitter::Language> {
         #[cfg(feature = "lang-go")]
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
 
+        // YAML: handled separately (dup-key check), not via language_for
         _ => None,
     }
 }
@@ -166,5 +239,36 @@ mod tests {
     #[test]
     fn clean_python_parses() {
         assert!(parse_check("m.py", "def f():\n    return 1\n").is_ok());
+    }
+
+    #[cfg(feature = "lang-yaml")]
+    #[test]
+    fn clean_yaml_parses() {
+        let src = "key: value\nother: 123\nnested:\n  a: 1\n  b: 2\n";
+        assert!(parse_check("zarf.yaml", src).is_ok());
+    }
+
+    #[cfg(feature = "lang-yaml")]
+    #[test]
+    fn yaml_duplicate_key_caught() {
+        let src = "charts:\n  - name: podinfo\n    valuesFiles:\n      - a.yaml\n    valuesFiles:\n      - b.yaml\n";
+        let err = parse_check("common/zarf.yaml", src).unwrap_err();
+        assert!(err.contains("duplicate key 'valuesFiles'"), "got: {err}");
+        assert!(err.contains("first defined at"), "got: {err}");
+    }
+
+    #[cfg(feature = "lang-yaml")]
+    #[test]
+    fn yaml_top_level_duplicate_key_caught() {
+        let src = "name: foo\nversion: 1\nname: bar\n";
+        let err = parse_check("config.yml", src).unwrap_err();
+        assert!(err.contains("duplicate key 'name'"), "got: {err}");
+    }
+
+    #[cfg(feature = "lang-yaml")]
+    #[test]
+    fn yaml_syntax_error_caught() {
+        let src = "key: :\n  bad indent\n";
+        assert!(parse_check("bad.yaml", src).is_err());
     }
 }
