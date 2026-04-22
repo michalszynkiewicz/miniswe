@@ -6,7 +6,7 @@ description = "A lightweight CLI coding agent for local LLMs"
 license = "MIT"
 
 [features]
-default = ["lang-rust", "lang-python", "lang-javascript", "lang-typescript", "lang-go"]
+default = ["lang-rust", "lang-python", "lang-javascript", "lang-typescript", "lang-go", "lang-yaml"]
 tree-sitter = ["dep:tree-sitter", "dep:tree-sitter-tags"]
 # Tier 1: default languages
 lang-rust = ["tree-sitter", "dep:tree-sitter-rust"]
@@ -14,6 +14,7 @@ lang-python = ["tree-sitter", "dep:tree-sitter-python"]
 lang-javascript = ["tree-sitter", "dep:tree-sitter-javascript"]
 lang-typescript = ["tree-sitter", "dep:tree-sitter-typescript"]
 lang-go = ["tree-sitter", "dep:tree-sitter-go"]
+lang-yaml = ["tree-sitter", "dep:tree-sitter-yaml"]
 # Tier 2: opt-in languages
 lang-java = ["tree-sitter", "dep:tree-sitter-java"]
 lang-c = ["tree-sitter", "dep:tree-sitter-c"]
@@ -59,6 +60,7 @@ tree-sitter-python = { version = "0.25", optional = true }
 tree-sitter-javascript = { version = "0.25", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-yaml = { version = "0.7", optional = true }
 # Tier 2
 tree-sitter-java = { version = "0.23", optional = true }
 tree-sitter-c = { version = "0.24", optional = true }

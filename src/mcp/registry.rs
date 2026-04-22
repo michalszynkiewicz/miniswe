@@ -204,19 +204,35 @@ impl McpRegistry {
     }
 }
 
-/// Build a one-line summary for LLM context.
-/// Example: "[MCP:github] 12 tools: create_issue, list_prs, review, ..."
+/// Build a multi-line summary for LLM context.
+/// Each tool gets one line: "- name(req1, req2): description"
+/// Required params are listed so the model doesn't need a round-trip to discover them.
 fn build_summary(name: &str, tools: &[McpToolInfo]) -> String {
-    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-    let preview = if tool_names.len() <= 5 {
-        tool_names.join(", ")
-    } else {
-        format!(
-            "{}, ... (+{} more)",
-            tool_names[..4].join(", "),
-            tool_names.len() - 4
-        )
-    };
-
-    format!("[MCP:{}] {} tools: {}", name, tools.len(), preview)
+    let mut lines = Vec::new();
+    lines.push(format!("[MCP:{}] {} tools:", name, tools.len()));
+    for t in tools {
+        let required = t
+            .input_schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let sig = if required.is_empty() {
+            t.name.clone()
+        } else {
+            format!("{}({})", t.name, required)
+        };
+        let desc = t.description.lines().next().unwrap_or("").trim();
+        if desc.is_empty() {
+            lines.push(format!("- {sig}"));
+        } else {
+            lines.push(format!("- {sig}: {desc}"));
+        }
+    }
+    lines.join("\n")
 }
