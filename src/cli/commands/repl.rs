@@ -351,15 +351,29 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                 app.set_active_job("compressing context");
                                 let _ = terminal.draw(|frame| ui::draw(frame, &app));
                                 let mut plan_update_requested = true;
-                                context::compressor::maybe_compress(
-                                    &mut conversation_history,
-                                    &config,
-                                    &router,
-                                    &llm_worker,
-                                    tool_def_tokens,
-                                    &mut plan_update_requested,
-                                )
-                                .await;
+                                {
+                                    let compress_fut = context::compressor::maybe_compress(
+                                        &mut conversation_history,
+                                        &config,
+                                        &router,
+                                        &llm_worker,
+                                        tool_def_tokens,
+                                        &mut plan_update_requested,
+                                    );
+                                    let mut compress_fut = std::pin::pin!(compress_fut);
+                                    let mut done = false;
+                                    while !done {
+                                        tokio::select! {
+                                            biased;
+                                            () = &mut compress_fut, if !done => { done = true; }
+                                            evt = rx.recv() => {
+                                                if matches!(evt, Some(AppEvent::Tick)) {
+                                                    let _ = terminal.draw(|frame| ui::draw(frame, &app));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 app.clear_active_job();
 
                                 // Now the turn and any post-turn work are
