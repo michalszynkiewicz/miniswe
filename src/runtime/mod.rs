@@ -31,40 +31,49 @@ pub struct LlmWorkerHandle {
 }
 
 impl LlmWorkerHandle {
-    pub fn new(router: Arc<ModelRouter>) -> Self {
+    /// Create a new handle. `concurrency` controls how many LLM requests can
+    /// run simultaneously. Use 1 (the default) for local models that can only
+    /// handle one inference at a time; increase for API providers.
+    pub fn new(router: Arc<ModelRouter>, concurrency: usize) -> Self {
         let (submit_tx, submit_rx) = std_mpsc::channel::<LlmJob>();
-        thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build llm worker runtime");
-            while let Ok(job) = submit_rx.recv() {
-                let router = router.clone();
-                let events = job.events.clone();
-                let cancelled = job.cancelled.clone();
-                let role = job.role;
-                let request = job.request.clone();
-                let stream = job.stream;
-                let result = runtime.block_on(async move {
-                    if stream {
-                        router
-                            .chat_stream(
-                                role,
-                                &request,
-                                |token| {
-                                    let _ = events.send(LlmWorkerEvent::Token(token.to_string()));
-                                },
-                                &cancelled,
-                            )
-                            .await
-                            .map_err(|e| e.to_string())
-                    } else {
-                        router.chat(role, &request).await.map_err(|e| e.to_string())
-                    }
-                });
-                let _ = job.events.send(LlmWorkerEvent::Completed(result));
-            }
-        });
+        let submit_rx = Arc::new(Mutex::new(submit_rx));
+        for _ in 0..concurrency.max(1) {
+            let router = router.clone();
+            let rx = submit_rx.clone();
+            thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build llm worker runtime");
+                while let Ok(job) = rx.lock().recv() {
+                    let router = router.clone();
+                    let events = job.events.clone();
+                    let cancelled = job.cancelled.clone();
+                    let role = job.role;
+                    let request = job.request.clone();
+                    let stream = job.stream;
+                    let result = runtime.block_on(async move {
+                        if stream {
+                            router
+                                .chat_stream(
+                                    role,
+                                    &request,
+                                    |token| {
+                                        let _ =
+                                            events.send(LlmWorkerEvent::Token(token.to_string()));
+                                    },
+                                    &cancelled,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                        } else {
+                            router.chat(role, &request).await.map_err(|e| e.to_string())
+                        }
+                    });
+                    let _ = job.events.send(LlmWorkerEvent::Completed(result));
+                }
+            });
+        }
         Self { submit_tx }
     }
 

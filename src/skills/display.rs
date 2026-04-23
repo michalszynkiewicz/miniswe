@@ -54,9 +54,11 @@ mod tests {
 
     #[test]
     fn list_entry_with_description() {
-        let skill =
-            parse(&fake_path(), "---\nname: my-skill\ndescription: Does things\n---\nbody\n")
-                .unwrap();
+        let skill = parse(
+            &fake_path(),
+            "---\nname: my-skill\ndescription: Does things\n---\nbody\n",
+        )
+        .unwrap();
         assert_eq!(format_list_entry(&skill), "my-skill — Does things");
     }
 
