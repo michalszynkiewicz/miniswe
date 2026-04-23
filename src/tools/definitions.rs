@@ -311,6 +311,44 @@ pub fn mcp_tool_definition() -> ToolDefinition {
     }
 }
 
+pub fn spawn_agents_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".into(),
+        function: FunctionDefinition {
+            name: "spawn_agents".into(),
+            description: "Run multiple independent agent sub-tasks concurrently. \
+                Each agent gets its own prompt and runs to completion with full tool access. \
+                All agents share the same LLM concurrency limit. \
+                Returns all agents' outputs when every agent has finished."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "agents": {
+                        "type": "array",
+                        "description": "List of agents to run",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {
+                                    "type": "string",
+                                    "description": "Short label for this agent (shown in output)"
+                                },
+                                "prompt": {
+                                    "type": "string",
+                                    "description": "Full task prompt for this agent"
+                                }
+                            },
+                            "required": ["label", "prompt"]
+                        }
+                    }
+                },
+                "required": ["agents"]
+            }),
+        },
+    }
+}
+
 /// Help text for the `file` tool group.
 pub fn file_help(edit_mode: EditMode) -> &'static str {
     match edit_mode {

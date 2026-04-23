@@ -239,6 +239,11 @@ pub struct ShellConfig {
 pub struct RuntimeConfig {
     /// Size of the shared tool worker pool.
     pub tool_worker_pool_size: usize,
+    /// Maximum number of concurrent LLM requests across all agents.
+    /// Default 1 serializes all LLM calls — appropriate for local models
+    /// (llama.cpp, Ollama) that can only run one inference at a time.
+    /// Increase for API providers that support true parallelism.
+    pub llm_concurrency: usize,
 }
 
 /// LSP integration configuration.
@@ -399,6 +404,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             tool_worker_pool_size: 10,
+            llm_concurrency: 1,
         }
     }
 }

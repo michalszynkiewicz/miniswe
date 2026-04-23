@@ -60,7 +60,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
     let log = Arc::new(SessionLog::new(&config));
 
     let router = Arc::new(ModelRouter::new(&config));
-    let llm_worker = LlmWorkerHandle::new(router.clone());
+    let llm_worker = LlmWorkerHandle::new(router.clone(), config.runtime.llm_concurrency);
     let perms = Arc::new(if headless {
         PermissionManager::headless(&config)
     } else {
@@ -84,6 +84,7 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         if config.tools.edit_mode == EditMode::Fast {
             tool_defs.extend(tools::fast_mode_tool_definitions());
         }
+        tool_defs.push(tools::definitions::spawn_agents_tool_definition());
     }
 
     // Spawn LSP client (non-blocking)
@@ -1034,6 +1035,53 @@ async fn run_agent_loop(
                     });
                     await_tool_job_ui(rx, terminal, app, "mcp_use", &mut result_rx, cancelled).await
                 }
+            } else if tc.function.name == "spawn_agents" {
+                let tasks = parse_agent_tasks(&args);
+                if tasks.is_empty() {
+                    crate::tools::ToolResult::err(
+                        "spawn_agents: 'agents' must be a non-empty array of {label, prompt}"
+                            .into(),
+                    )
+                } else {
+                    let (out_tx, mut out_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<(String, LineStyle)>();
+                    let subagents_fut = crate::cli::commands::agent::subagent::run_subagents(
+                        tasks,
+                        config,
+                        llm_worker,
+                        tool_pool,
+                        tool_defs,
+                        perms,
+                        mcp_registry,
+                        lsp,
+                        fast_revisions,
+                        fast_baseline_errors,
+                        cancelled,
+                        Some(out_tx),
+                    );
+                    let mut subagents_fut = std::pin::pin!(subagents_fut);
+                    let mut outputs = None;
+                    while outputs.is_none() {
+                        tokio::select! {
+                            biased;
+                            r = &mut subagents_fut, if outputs.is_none() => { outputs = Some(r); }
+                            line = out_rx.recv() => {
+                                if let Some((text, style)) = line {
+                                    app.push_output(&text, style);
+                                    let _ = terminal.draw(|frame| ui::draw(frame, app));
+                                }
+                            }
+                            evt = rx.recv() => {
+                                if matches!(evt, Some(AppEvent::Tick)) {
+                                    let _ = terminal.draw(|frame| ui::draw(frame, app));
+                                }
+                            }
+                        }
+                    }
+                    let combined =
+                        crate::cli::commands::agent::subagent::format_outputs(outputs.unwrap());
+                    crate::tools::ToolResult::ok(combined)
+                }
             } else if tc.function.name == "edit_file" {
                 let args = args.clone();
                 let config = config.clone();
@@ -1429,6 +1477,22 @@ async fn await_tool_job_ui(
             }
         }
     }
+}
+
+/// Parse `spawn_agents` args into a list of `AgentTask`s.
+fn parse_agent_tasks(
+    args: &serde_json::Value,
+) -> Vec<crate::cli::commands::agent::subagent::AgentTask> {
+    let Some(arr) = args["agents"].as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|item| {
+            let label = item["label"].as_str()?.to_string();
+            let prompt = item["prompt"].as_str()?.to_string();
+            Some(crate::cli::commands::agent::subagent::AgentTask { label, prompt })
+        })
+        .collect()
 }
 
 #[cfg(test)]
