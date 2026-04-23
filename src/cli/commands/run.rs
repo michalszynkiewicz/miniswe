@@ -41,7 +41,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     log.user_message(message);
 
     let router = Arc::new(ModelRouter::new(&config));
-    let llm_worker = LlmWorkerHandle::new(router.clone());
+    let llm_worker = LlmWorkerHandle::new(router.clone(), config.runtime.llm_concurrency);
     let perms = Arc::new(if headless {
         PermissionManager::headless(&config)
     } else {
@@ -66,6 +66,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         if config.tools.edit_mode == EditMode::Fast {
             tool_defs.extend(tools::fast_mode_tool_definitions());
         }
+        tool_defs.push(tools::definitions::spawn_agents_tool_definition());
     }
 
     // Clear stale scratchpad/plan from previous sessions
@@ -674,6 +675,43 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                             }
                         }
                     }
+                }
+            } else if tc.function.name == "spawn_agents" {
+                let tasks: Vec<_> = args["agents"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|item| {
+                        Some(crate::cli::commands::agent::subagent::AgentTask {
+                            label: item["label"].as_str()?.to_string(),
+                            prompt: item["prompt"].as_str()?.to_string(),
+                        })
+                    })
+                    .collect();
+                if tasks.is_empty() {
+                    crate::tools::ToolResult::err(
+                        "spawn_agents: 'agents' must be a non-empty array of {label, prompt}"
+                            .into(),
+                    )
+                } else {
+                    tui::print_status(&format!("spawning {} subagents...", tasks.len()));
+                    let outputs = crate::cli::commands::agent::subagent::run_subagents(
+                        tasks,
+                        &config,
+                        &llm_worker,
+                        &tool_pool,
+                        &tool_defs,
+                        &perms,
+                        &mcp_registry,
+                        &lsp_client,
+                        &fast_revisions,
+                        fast_baseline_errors,
+                        &cancelled,
+                        None,
+                    )
+                    .await;
+                    let combined = crate::cli::commands::agent::subagent::format_outputs(outputs);
+                    crate::tools::ToolResult::ok(combined)
                 }
             } else {
                 let tool_name = tc.function.name.clone();
