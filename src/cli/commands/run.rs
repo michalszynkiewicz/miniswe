@@ -631,29 +631,36 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                 let server = args["server"].as_str().unwrap_or("").to_string();
                 let tool = args["tool"].as_str().unwrap_or("").to_string();
                 let tool_args = args.get("arguments").cloned().unwrap_or_default();
-                match perms.check(&Action::McpUse(server.clone(), tool.clone())) {
-                    Err(e) => crate::tools::ToolResult::err(e),
-                    Ok(()) => {
-                        let registry = mcp_registry.clone();
-                        match tool_pool
-                            .submit(move || match registry {
-                                Some(registry) => {
-                                    let mut guard = registry.lock();
-                                    guard
-                                        .call_tool(&server, &tool, tool_args)
-                                        .map(crate::tools::ToolResult::ok)
-                                        .map_err(|e| format!("MCP error: {e}"))
-                                }
-                                None => Ok(crate::tools::ToolResult::err(
-                                    "No MCP servers connected".into(),
-                                )),
-                            })
-                            .await
-                        {
-                            Ok(Ok(r)) => r,
-                            Ok(Err(e)) => crate::tools::ToolResult::err(e),
-                            Err(_) => {
-                                crate::tools::ToolResult::err("Tool worker dropped mcp job".into())
+                if server.is_empty() || tool.is_empty() {
+                    crate::tools::ToolResult::err(
+                        "mcp_use requires top-level 'server' and 'tool' string fields. \
+                         Example: {\"server\": \"my-server\", \"tool\": \"my-tool\", \"arguments\": {}}".into(),
+                    )
+                } else {
+                    match perms.check(&Action::McpUse(server.clone(), tool.clone())) {
+                        Err(e) => crate::tools::ToolResult::err(e),
+                        Ok(()) => {
+                            let registry = mcp_registry.clone();
+                            match tool_pool
+                                .submit(move || match registry {
+                                    Some(registry) => {
+                                        let mut guard = registry.lock();
+                                        guard
+                                            .call_tool(&server, &tool, tool_args)
+                                            .map(crate::tools::ToolResult::ok)
+                                            .map_err(|e| format!("MCP error: {e}"))
+                                    }
+                                    None => Ok(crate::tools::ToolResult::err(
+                                        "No MCP servers connected".into(),
+                                    )),
+                                })
+                                .await
+                            {
+                                Ok(Ok(r)) => r,
+                                Ok(Err(e)) => crate::tools::ToolResult::err(e),
+                                Err(_) => crate::tools::ToolResult::err(
+                                    "Tool worker dropped mcp job".into(),
+                                ),
                             }
                         }
                     }

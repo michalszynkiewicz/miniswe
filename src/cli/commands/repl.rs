@@ -894,20 +894,27 @@ async fn run_agent_loop(
                 let server = args["server"].as_str().unwrap_or("").to_string();
                 let tool = args["tool"].as_str().unwrap_or("").to_string();
                 let tool_args = args.get("arguments").cloned().unwrap_or_default();
-                let registry = mcp_registry.clone();
-                let mut result_rx = tool_pool.submit(move || match registry {
-                    Some(registry) => {
-                        let mut guard = registry.lock();
-                        guard
-                            .call_tool(&server, &tool, tool_args)
-                            .map(crate::tools::ToolResult::ok)
-                            .map_err(|e| format!("MCP error: {e}"))
-                    }
-                    None => Ok(crate::tools::ToolResult::err(
-                        "No MCP servers connected".into(),
-                    )),
-                });
-                await_tool_job_ui(rx, terminal, app, "mcp_use", &mut result_rx, cancelled).await
+                if server.is_empty() || tool.is_empty() {
+                    crate::tools::ToolResult::err(
+                        "mcp_use requires top-level 'server' and 'tool' string fields. \
+                         Example: {\"server\": \"my-server\", \"tool\": \"my-tool\", \"arguments\": {}}".into(),
+                    )
+                } else {
+                    let registry = mcp_registry.clone();
+                    let mut result_rx = tool_pool.submit(move || match registry {
+                        Some(registry) => {
+                            let mut guard = registry.lock();
+                            guard
+                                .call_tool(&server, &tool, tool_args)
+                                .map(crate::tools::ToolResult::ok)
+                                .map_err(|e| format!("MCP error: {e}"))
+                        }
+                        None => Ok(crate::tools::ToolResult::err(
+                            "No MCP servers connected".into(),
+                        )),
+                    });
+                    await_tool_job_ui(rx, terminal, app, "mcp_use", &mut result_rx, cancelled).await
+                }
             } else if tc.function.name == "edit_file" {
                 let args = args.clone();
                 let config = config.clone();
