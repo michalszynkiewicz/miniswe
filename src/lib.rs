@@ -13,6 +13,7 @@ pub mod logging;
 pub mod lsp;
 pub mod mcp;
 pub mod runtime;
+pub mod skills;
 pub mod tools;
 pub mod tui;
 

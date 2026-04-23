@@ -380,7 +380,17 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         if let Some(content) = &assistant_msg.content {
             log.llm_response(content);
         }
-        conversation_history.push(assistant_msg.clone());
+        let has_content = assistant_msg
+            .content
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+        let has_tool_calls = assistant_msg
+            .tool_calls
+            .as_deref()
+            .is_some_and(|tc| !tc.is_empty());
+        if has_content || has_tool_calls {
+            conversation_history.push(assistant_msg.clone());
+        }
 
         // Check for tool calls
         let tool_calls = match &assistant_msg.tool_calls {

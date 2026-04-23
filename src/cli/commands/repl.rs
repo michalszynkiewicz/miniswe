@@ -287,13 +287,113 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                         "/new   — clear history + scratchpad + plan",
                                         LineStyle::Status,
                                     );
+                                    app.push_output(
+                                        "/skills list       — list available skills",
+                                        LineStyle::Status,
+                                    );
+                                    app.push_output(
+                                        "/skills <name> help — show skill details",
+                                        LineStyle::Status,
+                                    );
                                     app.push_output("/help  — show this help", LineStyle::Status);
                                     app.push_output("quit   — exit", LineStyle::Status);
                                     continue;
                                 }
 
-                                // Show user message in output
-                                app.push_output(&format!("you> {input}"), LineStyle::Normal);
+                                if input == "/skills" || input == "/skills list" {
+                                    let entries = crate::skills::discover(&config.project_root);
+                                    if entries.is_empty() {
+                                        app.push_output(
+                                            "No skills found in .ai/skills/",
+                                            LineStyle::Status,
+                                        );
+                                    } else {
+                                        for entry in &entries {
+                                            if let Ok(skill) = crate::skills::load(&entry.path) {
+                                                app.push_output(
+                                                    &crate::skills::format_list_entry(&skill),
+                                                    LineStyle::Status,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                if let Some(rest) = input.strip_prefix("/skills ") {
+                                    let name = rest
+                                        .trim_end_matches(" help")
+                                        .trim_end_matches(" --help")
+                                        .trim();
+                                    if rest.ends_with(" help") || rest.ends_with(" --help") {
+                                        match crate::skills::load_by_name(
+                                            name,
+                                            &config.project_root,
+                                        ) {
+                                            Some(skill) => {
+                                                for line in crate::skills::format_help(
+                                                    &skill,
+                                                    &config.project_root,
+                                                ) {
+                                                    app.push_output(&line, LineStyle::Status);
+                                                }
+                                            }
+                                            None => app.push_output(
+                                                &format!("skill '{name}' not found"),
+                                                LineStyle::Error,
+                                            ),
+                                        }
+                                        continue;
+                                    }
+                                }
+
+                                // Check for skill invocation: /skill-name [args]
+                                let (user_message, active_skill_reminder) = if let Some(
+                                    slash_rest,
+                                ) =
+                                    input.strip_prefix('/')
+                                {
+                                    let (name, args) =
+                                        slash_rest.split_once(' ').unwrap_or((slash_rest, ""));
+                                    if let Some(skill) =
+                                        crate::skills::load_by_name(name, &config.project_root)
+                                    {
+                                        match crate::skills::render(&skill, args) {
+                                            Ok(rendered) => {
+                                                let display = if args.is_empty() {
+                                                    format!("/{}", skill.name)
+                                                } else {
+                                                    format!("/{} {args}", skill.name)
+                                                };
+                                                app.push_output(
+                                                    &format!("you> {display}"),
+                                                    LineStyle::Normal,
+                                                );
+                                                let reminder = format!(
+                                                    "Follow the instructions from {} (already provided as your task).",
+                                                    skill.display_path(&config.project_root)
+                                                );
+                                                (rendered, Some(reminder))
+                                            }
+                                            Err(e) => {
+                                                app.push_output(
+                                                    &format!("skill error: {e}"),
+                                                    LineStyle::Error,
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                    } else {
+                                        app.push_output(
+                                            &format!("you> {input}"),
+                                            LineStyle::Normal,
+                                        );
+                                        (input.clone(), None)
+                                    }
+                                } else {
+                                    app.push_output(&format!("you> {input}"), LineStyle::Normal);
+                                    (input.clone(), None)
+                                };
 
                                 // Run the agent loop
                                 let mcp_summary_clone = mcp_summary.clone();
@@ -301,17 +401,26 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                 // Assemble context
                                 let assembled = context::assemble(
                                     &config,
-                                    &input,
+                                    &user_message,
                                     &conversation_history,
                                     false,
                                     mcp_summary_clone.as_deref(),
                                 );
-                                conversation_history.push(Message::user(&input));
+                                conversation_history.push(Message::user(&user_message));
+
+                                // Inject skill reminder into system prompt so every LLM call
+                                // in this turn is reminded which skill is being executed.
+                                let mut messages = assembled.messages;
+                                if let Some(ref reminder) = active_skill_reminder
+                                    && let Some(sys_msg) = messages.first_mut()
+                                    && let Some(ref mut content) = sys_msg.content
+                                {
+                                    content.push_str("\n[ACTIVE SKILL]\n");
+                                    content.push_str(reminder);
+                                }
 
                                 app.is_thinking = true;
 
-                                // Spawn agent loop as async task
-                                let mut messages = assembled.messages;
                                 let max_rounds = config.context.max_rounds;
                                 let perms_ref = &perms;
                                 let mcp_ref = &mcp_registry;
@@ -689,7 +798,17 @@ async fn run_agent_loop(
                 let _ = terminal.draw(|frame| ui::draw(frame, app));
             }
         }
-        conversation_history.push(assistant_msg.clone());
+        let has_content = assistant_msg
+            .content
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+        let has_tool_calls = assistant_msg
+            .tool_calls
+            .as_deref()
+            .is_some_and(|tc| !tc.is_empty());
+        if has_content || has_tool_calls {
+            conversation_history.push(assistant_msg.clone());
+        }
 
         let tool_calls = match &assistant_msg.tool_calls {
             Some(tc) if !tc.is_empty() => tc.clone(),
