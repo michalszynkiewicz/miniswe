@@ -13,7 +13,7 @@
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::io::{self, Write};
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::Config;
 use crate::tui::event::AppEvent;
@@ -29,6 +29,9 @@ pub struct PermissionManager {
     approved_mcp: Mutex<HashSet<String>>,
     /// Whether web access has been approved this session
     web_approved: Mutex<bool>,
+    /// Skill paths whose shell-injection blocks the user has approved
+    /// for this session (`render` runs `!`cmd`` and ` ```! ` blocks).
+    approved_skills: Mutex<HashSet<PathBuf>>,
     /// Pre-approved shell command prefixes from config
     shell_allowlist: Vec<String>,
     /// Whether to auto-approve all actions (--yes flag, dangerous)
@@ -105,9 +108,58 @@ impl PermissionManager {
             approved_shell: Mutex::new(HashSet::new()),
             approved_mcp: Mutex::new(HashSet::new()),
             web_approved: Mutex::new(false),
+            approved_skills: Mutex::new(HashSet::new()),
             shell_allowlist,
             auto_approve,
             prompt_events: Mutex::new(None),
+        }
+    }
+
+    /// Authorize shell injections (`` !`cmd` `` / ` ```! `) inside a skill body.
+    ///
+    /// Global skills under `~/.ai/skills/` are trusted (the user installed them
+    /// deliberately). Project-local skills under `<project>/.ai/skills/` may
+    /// arrive via `git clone` of an untrusted repo, so we prompt on first use
+    /// and cache the approval per-skill-path for the rest of the session.
+    pub fn check_skill_shell(&self, skill_path: &Path) -> Result<(), String> {
+        if self.auto_approve {
+            return Ok(());
+        }
+
+        // Global skills are trusted — only project-local skills get prompted.
+        if let Some(home) = dirs::home_dir()
+            && skill_path.starts_with(home.join(".ai").join("skills"))
+        {
+            return Ok(());
+        }
+
+        {
+            let approved = self.approved_skills.lock();
+            if approved.contains(skill_path) {
+                return Ok(());
+            }
+        }
+
+        let display = skill_path
+            .strip_prefix(&self.project_root)
+            .unwrap_or(skill_path)
+            .display();
+        let response = self.request_user_decision(&format!(
+            "Allow project skill to run shell commands?\n  \
+             skill: {display}\n  \
+             this skill contains `!`cmd`` or ` ```! ` blocks that will execute on render.\n  \
+             [y]es / [n]o / [a]lways for this skill: "
+        ));
+        match response.as_str() {
+            "y" | "yes" => Ok(()),
+            "a" | "always" => {
+                self.approved_skills.lock().insert(skill_path.to_path_buf());
+                Ok(())
+            }
+            _ => Err(format!(
+                "Shell injection in skill {} denied by user",
+                display
+            )),
         }
     }
 

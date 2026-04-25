@@ -381,15 +381,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         if let Some(content) = &assistant_msg.content {
             log.llm_response(content);
         }
-        let has_content = assistant_msg
-            .content
-            .as_deref()
-            .is_some_and(|s| !s.is_empty());
-        let has_tool_calls = assistant_msg
-            .tool_calls
-            .as_deref()
-            .is_some_and(|tc| !tc.is_empty());
-        if has_content || has_tool_calls {
+        if assistant_msg.is_meaningful() {
             conversation_history.push(assistant_msg.clone());
         }
 
@@ -677,17 +669,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
                     }
                 }
             } else if tc.function.name == "spawn_agents" {
-                let tasks: Vec<_> = args["agents"]
-                    .as_array()
-                    .unwrap_or(&vec![])
-                    .iter()
-                    .filter_map(|item| {
-                        Some(crate::cli::commands::agent::subagent::AgentTask {
-                            label: item["label"].as_str()?.to_string(),
-                            prompt: item["prompt"].as_str()?.to_string(),
-                        })
-                    })
-                    .collect();
+                let tasks = crate::cli::commands::agent::subagent::parse_tasks(&args);
                 if tasks.is_empty() {
                     crate::tools::ToolResult::err(
                         "spawn_agents: 'agents' must be a non-empty array of {label, prompt}"

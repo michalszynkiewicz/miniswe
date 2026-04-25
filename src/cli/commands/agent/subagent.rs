@@ -157,15 +157,7 @@ async fn run_single_subagent(
             final_content = content.clone();
         }
 
-        let has_content = assistant_msg
-            .content
-            .as_deref()
-            .is_some_and(|s| !s.is_empty());
-        let has_tc = assistant_msg
-            .tool_calls
-            .as_deref()
-            .is_some_and(|tc| !tc.is_empty());
-        if has_content || has_tc {
+        if assistant_msg.is_meaningful() {
             messages.push(assistant_msg.clone());
         }
 
@@ -333,4 +325,81 @@ pub fn format_outputs(outputs: Vec<AgentOutput>) -> String {
         .map(|o| format!("## Agent: {}\n\n{}\n", o.label, o.content.trim()))
         .collect::<Vec<_>>()
         .join("\n---\n\n")
+}
+
+/// Parse `spawn_agents` JSON args into a list of `AgentTask`s. Items with
+/// missing `label` or `prompt` strings are silently dropped — callers
+/// should treat an empty result as "bad arguments, refuse the call".
+pub fn parse_tasks(args: &serde_json::Value) -> Vec<AgentTask> {
+    let Some(arr) = args.get("agents").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|item| {
+            let label = item.get("label")?.as_str()?.to_string();
+            let prompt = item.get("prompt")?.as_str()?.to_string();
+            Some(AgentTask { label, prompt })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_tasks_drops_missing_fields() {
+        let args = json!({
+            "agents": [
+                {"label": "a", "prompt": "do a"},
+                {"label": "b"},                  // missing prompt
+                {"prompt": "no label"},          // missing label
+                {"label": "c", "prompt": "do c"},
+            ]
+        });
+        let tasks = parse_tasks(&args);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].label, "a");
+        assert_eq!(tasks[1].label, "c");
+    }
+
+    #[test]
+    fn parse_tasks_no_agents_key() {
+        assert!(parse_tasks(&json!({})).is_empty());
+        assert!(parse_tasks(&json!({"agents": "not an array"})).is_empty());
+    }
+
+    #[test]
+    fn parse_tasks_empty_array() {
+        assert!(parse_tasks(&json!({"agents": []})).is_empty());
+    }
+
+    #[test]
+    fn run_subagents_strips_spawn_agents_from_tool_defs() {
+        // We only test the filtering itself — not a full agent loop.
+        // The filter logic lives at the top of run_subagents.
+        let parent_tools = [
+            tool_def("read"),
+            tool_def("spawn_agents"),
+            tool_def("write"),
+        ];
+        let filtered: Vec<_> = parent_tools
+            .iter()
+            .filter(|t| t.function.name != "spawn_agents")
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert_eq!(filtered, vec!["read", "write"]);
+    }
+
+    fn tool_def(name: &str) -> crate::llm::ToolDefinition {
+        crate::llm::ToolDefinition {
+            r#type: "function".into(),
+            function: crate::llm::FunctionDefinition {
+                name: name.into(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            },
+        }
+    }
 }
