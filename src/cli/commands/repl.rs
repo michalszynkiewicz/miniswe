@@ -359,7 +359,11 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
                                     if let Some(skill) =
                                         crate::skills::load_by_name(name, &config.project_root)
                                     {
-                                        match crate::skills::render(&skill, args) {
+                                        let skill_path = skill.path.clone();
+                                        let perms_for_skill = perms.clone();
+                                        let authorize =
+                                            move || perms_for_skill.check_skill_shell(&skill_path);
+                                        match crate::skills::render(&skill, args, authorize) {
                                             Ok(rendered) => {
                                                 let display = if args.is_empty() {
                                                     format!("/{}", skill.name)
@@ -799,15 +803,7 @@ async fn run_agent_loop(
                 let _ = terminal.draw(|frame| ui::draw(frame, app));
             }
         }
-        let has_content = assistant_msg
-            .content
-            .as_deref()
-            .is_some_and(|s| !s.is_empty());
-        let has_tool_calls = assistant_msg
-            .tool_calls
-            .as_deref()
-            .is_some_and(|tc| !tc.is_empty());
-        if has_content || has_tool_calls {
+        if assistant_msg.is_meaningful() {
             conversation_history.push(assistant_msg.clone());
         }
 
@@ -1036,7 +1032,7 @@ async fn run_agent_loop(
                     await_tool_job_ui(rx, terminal, app, "mcp_use", &mut result_rx, cancelled).await
                 }
             } else if tc.function.name == "spawn_agents" {
-                let tasks = parse_agent_tasks(&args);
+                let tasks = crate::cli::commands::agent::subagent::parse_tasks(&args);
                 if tasks.is_empty() {
                     crate::tools::ToolResult::err(
                         "spawn_agents: 'agents' must be a non-empty array of {label, prompt}"
@@ -1477,22 +1473,6 @@ async fn await_tool_job_ui(
             }
         }
     }
-}
-
-/// Parse `spawn_agents` args into a list of `AgentTask`s.
-fn parse_agent_tasks(
-    args: &serde_json::Value,
-) -> Vec<crate::cli::commands::agent::subagent::AgentTask> {
-    let Some(arr) = args["agents"].as_array() else {
-        return Vec::new();
-    };
-    arr.iter()
-        .filter_map(|item| {
-            let label = item["label"].as_str()?.to_string();
-            let prompt = item["prompt"].as_str()?.to_string();
-            Some(crate::cli::commands::agent::subagent::AgentTask { label, prompt })
-        })
-        .collect()
 }
 
 #[cfg(test)]

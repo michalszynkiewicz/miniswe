@@ -77,6 +77,15 @@ impl Message {
             name: None,
         }
     }
+
+    /// True if this message has any content or any tool calls.
+    /// Empty assistant messages (no content, no tool_calls) trigger 400s
+    /// from most chat APIs, so callers should drop them before pushing
+    /// to history.
+    pub fn is_meaningful(&self) -> bool {
+        self.content.as_deref().is_some_and(|s| !s.is_empty())
+            || self.tool_calls.as_deref().is_some_and(|tc| !tc.is_empty())
+    }
 }
 
 /// A tool call from the assistant.
