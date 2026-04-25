@@ -151,10 +151,10 @@ async fn run_single_subagent(
         };
         let assistant_msg = &choice.message;
 
-        if let Some(ref content) = assistant_msg.content {
-            if !content.is_empty() {
-                final_content = content.clone();
-            }
+        if let Some(ref content) = assistant_msg.content
+            && !content.is_empty()
+        {
+            final_content = content.clone();
         }
 
         let has_content = assistant_msg
@@ -269,7 +269,7 @@ async fn execute_subagent_tool(
         let lsp = lsp.clone();
         let revisions = fast_revisions.clone();
         let baseline = fast_baseline_errors;
-        let mut rx = tool_pool.submit(move || {
+        let rx = tool_pool.submit(move || {
             let Some(revisions) = revisions else {
                 return Ok(tools::ToolResult::err(
                     "fast mode: revision store unavailable".into(),
@@ -307,7 +307,7 @@ async fn execute_subagent_tool(
     let config = config.clone();
     let perms = perms.clone();
     let lsp = lsp.clone();
-    let mut rx = tool_pool.submit(move || {
+    let rx = tool_pool.submit(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
