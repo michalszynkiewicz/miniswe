@@ -23,6 +23,12 @@ Plan checkpoint required before more edits. You have continued editing after the
 pub const PREMATURE_EXIT_NUDGE: &str = "\
 Stopping. Are you sure? Check the plan — if steps remain, continue.";
 
+/// Pushed when a read/inspection tool repeats 3× with identical args.
+/// Doesn't end the round — the call has no side effects, the model is
+/// just wasting tokens. Surface it once so the model notices.
+pub const REPEATED_READ_NUDGE: &str = "\
+You just made this same read/inspection call 3 times in a row. The result hasn't changed. What specifically are you looking for? Try a narrower search, a different range, or move on to making an edit.";
+
 // ── Error-recovery hints ─────────────────────────────────────────────
 
 /// Injected as a user-role message after the model repeats the same
