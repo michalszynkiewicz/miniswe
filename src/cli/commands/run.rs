@@ -19,10 +19,10 @@ use anyhow::Result;
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
     PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_BLOCK_MESSAGE, PLAN_CHECKPOINT_WARNING,
-    PLAN_HARD_BLOCK_AFTER_EDITS, PLAN_PROGRESS_NUDGE, PREMATURE_EXIT_NUDGE, loop_detected_hint,
-    truncated_tool_call_hint,
+    PLAN_HARD_BLOCK_AFTER_EDITS, PLAN_PROGRESS_NUDGE, PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE,
+    loop_detected_hint, truncated_tool_call_hint,
 };
-use crate::cli::commands::agent::loop_detector::loop_call_key;
+use crate::cli::commands::agent::loop_detector::{is_mutating_call, loop_call_key};
 use crate::config::{Config, EditMode, ModelRole};
 use crate::context;
 use crate::llm::{ChatRequest, Message, ModelRouter, is_truncated_tool_call_error};
@@ -450,14 +450,32 @@ pub async fn run(
                 same_call_streak = 1;
             }
             if same_call_streak >= 3 {
+                let mutating = is_mutating_call(&tc.function.name, &args);
                 log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
+
+                // Read-only repetition: harmless, just wasted tokens.
+                // Surface a polite nudge inline and let the for-loop
+                // continue so the model can react in subsequent rounds.
+                if !mutating {
+                    let result_msg = Message::tool_result(&tc.id, REPEATED_READ_NUDGE);
+                    messages.push(result_msg.clone());
+                    conversation_history.push(result_msg);
+                    tui::print_status(&format!(
+                        "Repeated read: {}({}) — nudge sent, continuing",
+                        tc.function.name, args_summary
+                    ));
+                    last_call_key = None;
+                    same_call_streak = 0;
+                    continue;
+                }
+
                 let result_msg =
                     Message::tool_result(&tc.id, loop_detected_hint(config.tools.edit_mode));
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
 
-                // First loop in this turn: surface the hint, reset the
-                // streak, and let the model try a different approach.
+                // First mutating loop in this turn: surface the hint, reset
+                // the streak, and let the model try a different approach.
                 // Subsequent loops mean the recovery itself spiraled —
                 // abort for real.
                 if loop_recoveries == 0 {
