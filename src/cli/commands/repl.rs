@@ -625,6 +625,9 @@ async fn run_agent_loop(
     // Track consecutive identical tool calls to detect loops
     let mut last_call_key: Option<String> = None;
     let mut same_call_streak = 0u32;
+    // Number of distinct loops the model has been pulled out of in this
+    // turn. We give one recovery; a second loop ends the turn for real.
+    let mut loop_recoveries = 0u32;
     let mut successful_edits_since_plan_update = 0u32;
     let mut plan_checkpoint_pending = false;
     let mut nudged_premature_exit = false;
@@ -866,20 +869,36 @@ async fn run_agent_loop(
                 same_call_streak = 1;
             }
             if same_call_streak >= 3 {
-                if same_call_streak == 3 {
-                    log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
-                    app.push_output(
-                        &format!(
-                            "  ✗ Loop detected: {}({}) repeated 3 times in a row — stopping this turn",
-                            tc.function.name, args_summary
-                        ),
-                        LineStyle::Error,
-                    );
-                }
+                log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
                 let result_msg =
                     Message::tool_result(&tc.id, loop_detected_hint(config.tools.edit_mode));
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
+
+                // First loop in this turn: surface the hint, reset the
+                // streak, and let the model try a different approach.
+                // A second loop after the recovery means the model is
+                // genuinely stuck — bail then.
+                if loop_recoveries == 0 {
+                    loop_recoveries += 1;
+                    last_call_key = None;
+                    same_call_streak = 0;
+                    app.push_output(
+                        &format!(
+                            "  ⚠ Loop detected: {}({}) repeated 3 times — surfacing a hint, giving the model one more round",
+                            tc.function.name, args_summary
+                        ),
+                        LineStyle::Status,
+                    );
+                    break;
+                }
+                app.push_output(
+                    &format!(
+                        "  ✗ Loop detected again ({}({})) after the recovery hint — stopping this turn",
+                        tc.function.name, args_summary
+                    ),
+                    LineStyle::Error,
+                );
                 return;
             }
 
