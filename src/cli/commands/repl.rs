@@ -57,7 +57,7 @@ impl Drop for ReplTerminalGuard {
 }
 
 /// Run the interactive REPL with TUI.
-pub async fn run(config: Config, headless: bool) -> Result<()> {
+pub async fn run(config: Config, headless: bool, continue_session: bool) -> Result<()> {
     let log = Arc::new(SessionLog::new(&config));
 
     let router = Arc::new(ModelRouter::new(&config));
@@ -113,9 +113,12 @@ pub async fn run(config: Config, headless: bool) -> Result<()> {
         0
     };
 
-    // Clear stale scratchpad/plan
-    let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
-    let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+    // Clear stale scratchpad/plan — unless `--continue` is set, in which
+    // case carry the previous session's state forward.
+    if !continue_session {
+        let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+        let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+    }
 
     // Initialize MCP
     let mcp_config = McpConfig::load(&config.project_root)?;

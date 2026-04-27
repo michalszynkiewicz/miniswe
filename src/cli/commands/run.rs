@@ -37,7 +37,13 @@ use crate::tools::permissions::{Action, PermissionManager};
 use crate::tui;
 
 /// Run the agent for a single message.
-pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()> {
+pub async fn run(
+    config: Config,
+    message: &str,
+    plan_only: bool,
+    headless: bool,
+    continue_session: bool,
+) -> Result<()> {
     let log = Arc::new(SessionLog::new(&config));
     log.user_message(message);
 
@@ -70,9 +76,13 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         tool_defs.push(tools::definitions::spawn_agents_tool_definition());
     }
 
-    // Clear stale scratchpad/plan from previous sessions
-    let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
-    let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+    // Clear stale scratchpad/plan from previous sessions — unless this
+    // is a `--continue` invocation, in which case the model is meant to
+    // pick up where the previous session left off.
+    if !continue_session {
+        let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+        let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+    }
 
     tui::print_header(if plan_only {
         "Plan Mode (read-only)"
