@@ -18,7 +18,8 @@ use tokio::sync::mpsc;
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
     PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_BLOCK_MESSAGE, PLAN_CHECKPOINT_WARNING,
-    PLAN_HARD_BLOCK_AFTER_EDITS, PLAN_PROGRESS_NUDGE, loop_detected_hint, truncated_tool_call_hint,
+    PLAN_HARD_BLOCK_AFTER_EDITS, PLAN_PROGRESS_NUDGE, PREMATURE_EXIT_NUDGE, loop_detected_hint,
+    truncated_tool_call_hint,
 };
 use crate::cli::commands::agent::loop_detector::loop_call_key;
 use crate::cli::commands::agent::permissions::permission_action;
@@ -623,6 +624,7 @@ async fn run_agent_loop(
     let mut same_call_streak = 0u32;
     let mut successful_edits_since_plan_update = 0u32;
     let mut plan_checkpoint_pending = false;
+    let mut nudged_premature_exit = false;
 
     loop {
         // Check cancellation at the top of every round
@@ -809,7 +811,19 @@ async fn run_agent_loop(
 
         let tool_calls = match &assistant_msg.tool_calls {
             Some(tc) if !tc.is_empty() => tc.clone(),
-            _ => break,
+            _ => {
+                if !nudged_premature_exit
+                    && config.tools.plan
+                    && tools::plan::has_unchecked_steps(config)
+                {
+                    nudged_premature_exit = true;
+                    let nudge = Message::user(PREMATURE_EXIT_NUDGE);
+                    messages.push(nudge.clone());
+                    conversation_history.push(nudge);
+                    continue;
+                }
+                break;
+            }
         };
 
         messages.push(assistant_msg.clone());

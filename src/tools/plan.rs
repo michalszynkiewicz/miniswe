@@ -29,6 +29,16 @@ pub fn plan_exists(config: &Config) -> bool {
             .unwrap_or(false)
 }
 
+/// True if the plan has at least one unchecked step. Used by the agent
+/// loop to second-guess a premature exit: if the model is about to stop
+/// but the plan still has work outstanding, we nudge once.
+pub fn has_unchecked_steps(config: &Config) -> bool {
+    let Some(content) = load_plan(config) else {
+        return false;
+    };
+    step::parse_steps(&content).iter().any(|s| !s.checked)
+}
+
 /// Load the current plan for context injection.
 pub fn load_plan(config: &Config) -> Option<String> {
     let plan_path = config.miniswe_dir().join("plan.md");
@@ -96,4 +106,48 @@ pub fn failure_hint(config: &Config) -> Option<String> {
     );
 
     Some(parts.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_plan(tmp: &tempfile::TempDir, plan_md: &str) -> Config {
+        let mut config = Config::default();
+        config.project_root = tmp.path().to_path_buf();
+        let dir = config.miniswe_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plan.md"), plan_md).unwrap();
+        config
+    }
+
+    #[test]
+    fn has_unchecked_steps_false_without_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.project_root = tmp.path().to_path_buf();
+        assert!(!has_unchecked_steps(&config));
+    }
+
+    #[test]
+    fn has_unchecked_steps_true_when_any_step_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = "- [x] (round 1) Done step [compile]\n\
+                    - [ ] Open step [compile]\n";
+        assert!(has_unchecked_steps(&config_with_plan(&tmp, plan)));
+    }
+
+    #[test]
+    fn has_unchecked_steps_false_when_all_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = "- [x] (round 1) First [compile]\n\
+                    - [x] (round 2) Second [compile]\n";
+        assert!(!has_unchecked_steps(&config_with_plan(&tmp, plan)));
+    }
+
+    #[test]
+    fn has_unchecked_steps_false_for_empty_plan_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!has_unchecked_steps(&config_with_plan(&tmp, "")));
+    }
 }

@@ -17,6 +17,12 @@ PLAN CHECKPOINT: You have made 5 edits since the last successful plan action. Be
 pub const PLAN_CHECKPOINT_BLOCK_MESSAGE: &str = "\
 Plan checkpoint required before more edits. You have continued editing after the checkpoint warning. Use any successful plan action now: plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet.";
 
+/// Pushed once per turn when the assistant returns no tool calls but the
+/// plan still has unchecked steps. Intentionally short and open-ended —
+/// the model decides whether to continue or really stop.
+pub const PREMATURE_EXIT_NUDGE: &str = "\
+Stopping. Are you sure? Check the plan — if steps remain, continue.";
+
 // ── Error-recovery hints ─────────────────────────────────────────────
 
 /// Injected as a user-role message after the model repeats the same

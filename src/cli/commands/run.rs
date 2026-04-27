@@ -19,7 +19,8 @@ use anyhow::Result;
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
     PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_BLOCK_MESSAGE, PLAN_CHECKPOINT_WARNING,
-    PLAN_HARD_BLOCK_AFTER_EDITS, PLAN_PROGRESS_NUDGE, loop_detected_hint, truncated_tool_call_hint,
+    PLAN_HARD_BLOCK_AFTER_EDITS, PLAN_PROGRESS_NUDGE, PREMATURE_EXIT_NUDGE, loop_detected_hint,
+    truncated_tool_call_hint,
 };
 use crate::cli::commands::agent::loop_detector::loop_call_key;
 use crate::config::{Config, EditMode, ModelRole};
@@ -157,6 +158,7 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
     let mut successful_edits_since_plan_update = 0u32;
     let mut plan_checkpoint_pending = false;
     let mut plan_update_requested = false;
+    let mut nudged_premature_exit = false;
 
     // Ctrl+C cancellation flag. The handler fires once and exits — no
     // loop, because `ctrl_c().await` resolves immediately after the
@@ -389,10 +391,15 @@ pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool)
         let tool_calls = match &assistant_msg.tool_calls {
             Some(tc) if !tc.is_empty() => tc.clone(),
             _ => {
-                if let Some(finish) = &choice.finish_reason
-                    && finish == "stop"
+                if !nudged_premature_exit
+                    && config.tools.plan
+                    && tools::plan::has_unchecked_steps(&config)
                 {
-                    break;
+                    nudged_premature_exit = true;
+                    let nudge = Message::user(PREMATURE_EXIT_NUDGE);
+                    messages.push(nudge.clone());
+                    conversation_history.push(nudge);
+                    continue;
                 }
                 break;
             }
