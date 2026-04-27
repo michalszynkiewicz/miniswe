@@ -315,9 +315,15 @@ run_miniswe() {
         # Clear logs from previous attempt
         rm -f "${WORK_DIR}/.miniswe/logs/"*.log
 
-        # Run miniswe — workdir retains modifications from previous attempts
+        # Run miniswe — workdir retains modifications from previous attempts.
+        # On retry attempts (2+), pass --continue so plan.md and scratchpad.md
+        # from the previous attempt survive the startup wipe.
+        local continue_flag=""
+        if [ "$attempt" -gt 1 ]; then
+            continue_flag="--continue"
+        fi
         cd "${WORK_DIR}"
-        timeout "${remaining}" "${MINISWE}" --yes "${current_task}" \
+        timeout "${remaining}" "${MINISWE}" ${continue_flag} --yes "${current_task}" \
             > "${attempt_dir}/stdout.txt" \
             2> "${attempt_dir}/stderr.txt" \
             || true
