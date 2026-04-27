@@ -177,7 +177,7 @@ pub async fn maybe_compress(
     messages.truncate(compress_start);
 
     messages.push(Message::user(&format!(
-        "[Your earlier work in this session]\n{summary}\n[Details: read_file(\".miniswe/session_archive.md\"). Continue from where you left off.]"
+        "[Your earlier work in this session]\n{summary}\n[Details: file(action='read', path='.miniswe/session_archive.md'). Continue from where you left off.]"
     )));
 
     messages.extend(after_split);
@@ -325,7 +325,7 @@ fn heuristic_summarize(messages: &[&Message]) -> String {
         summary.push_str(&format!("Errors: {}\n", errors.join("; ")));
     }
     if summary.is_empty() {
-        summary.push_str("(earlier session activity — use read_file(\".miniswe/session_archive.md\") for details)");
+        summary.push_str("(earlier session activity — use file(action='read', path='.miniswe/session_archive.md') for details)");
     }
 
     summary

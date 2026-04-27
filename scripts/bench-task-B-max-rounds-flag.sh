@@ -128,11 +128,8 @@ ${help_output}"
             details="${details}test:PASS "
         else
             details="${details}test:FAIL "
-            local failures
-            failures=$(echo "${test_output}" | grep -A5 'FAILED\|panicked\|test result:' | head -20)
             errors="${errors}
-TESTS FAILED (exit ${test_exit}):
-${failures}"
+TESTS FAILED (exit ${test_exit}). Run \`cargo test\` from the project root to see the details and fix the failures."
         fi
     else
         details="${details}test:SKIP "

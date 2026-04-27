@@ -218,9 +218,11 @@ async fn execute_code_tool(
             {
                 return Ok(result);
             }
-            // Fallback: cargo check
+            // Fallback: cargo check. Don't `| head` — let the shell tool's
+            // own truncation save the full output to a file the model can read,
+            // instead of silently dropping the tail.
             let shell_args = serde_json::json!({
-                "command": format!("cd {} && cargo check --message-format=short 2>&1 | head -50",
+                "command": format!("cd {} && cargo check --message-format=short 2>&1",
                     config.project_root.display()),
                 "timeout": 30
             });

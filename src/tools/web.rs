@@ -324,7 +324,7 @@ pub async fn fetch(args: &Value, config: &Config) -> Result<ToolResult> {
                 Ok(ToolResult::ok(format!(
                     "[fetch: {url} — {total_chars} chars, showing first {budget}]\n\
                      {preview}\n\n\
-                     [Full content saved to {rel_path} — use read_file(\"{rel_path}\") for more]"
+                     [Full content saved to {rel_path} — use file(action='read', path='{rel_path}') for more]"
                 )))
             }
         }
