@@ -28,16 +28,18 @@ async fn main() -> Result<()> {
         }
         Some(Command::Plan { message }) => {
             let config = Config::load()?;
-            miniswe::cli::commands::run::run(config, &message, true, cli.yes).await?;
+            miniswe::cli::commands::run::run(config, &message, true, cli.yes, cli.r#continue)
+                .await?;
         }
         None => {
             let config = Config::load()?;
             if let Some(message) = cli.message {
                 // Single-shot mode
-                miniswe::cli::commands::run::run(config, &message, false, cli.yes).await?;
+                miniswe::cli::commands::run::run(config, &message, false, cli.yes, cli.r#continue)
+                    .await?;
             } else {
                 // Interactive REPL
-                miniswe::cli::commands::repl::run(config, cli.yes).await?;
+                miniswe::cli::commands::repl::run(config, cli.yes, cli.r#continue).await?;
             }
         }
     }
