@@ -111,7 +111,7 @@ fn render(path: &str, r: &Revision) -> String {
             let bytes = r.content.len();
             let lines = r.content.lines().count().max(1);
             out.push_str(&format!(
-                "  (full rewrite, {lines} line(s), {bytes} bytes — use read_file to see current content)\n"
+                "  (full rewrite, {lines} line(s), {bytes} bytes — use file(action='read') to see current content)\n"
             ));
         }
         (_, Some(payload)) => {

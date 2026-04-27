@@ -211,7 +211,7 @@ fn render_finished_result(mut running: RunningShellCommand, config: &Config) -> 
         }
 
         result.push_str(&format!(
-            "\n\n[Full output saved to {rel_path} — use read_file(\"{rel_path}\") for more]"
+            "\n\n[Full output saved to {rel_path} — use file(action='read', path='{rel_path}') for more]"
         ));
     } else {
         result.push_str("]\n");

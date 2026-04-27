@@ -1331,7 +1331,7 @@ fn mask_old_tool_results(
                     msg.content = Some(summary.clone());
                 } else {
                     msg.content = Some(
-                        "[archived — use read_file(\".miniswe/tool_history.md\") to recall]".into(),
+                        "[archived — use file(action='read', path='.miniswe/tool_history.md') to recall]".into(),
                     );
                 }
             }
