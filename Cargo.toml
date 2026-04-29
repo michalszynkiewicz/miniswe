@@ -102,7 +102,7 @@ chrono = { version = "0.4", features = ["serde"] }
 lsp-types = "0.97.0"
 dashmap = "6.1.0"
 flate2 = "1.1.9"
-zip = "8.5.1"
+zip = "8.6.0"
 tar = "0.4.45"
 libc = "0.2"
 parking_lot = "0.12"
