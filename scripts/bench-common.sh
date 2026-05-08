@@ -24,7 +24,7 @@ RUN_TIMEOUT=900
 MAX_ROUNDS=50
 MAX_ATTEMPTS=3
 RUNS_PER_VARIANT=1
-TEMPERATURE=0.0
+TEMPERATURE=0.2
 STRATEGY="full"  # "full" = test every provider, "bisect" = coarse triage then drill down
 PROVIDERS=(profile guide project_notes lessons repo_map scratchpad lsp)
 # Provider groups for bisect strategy
