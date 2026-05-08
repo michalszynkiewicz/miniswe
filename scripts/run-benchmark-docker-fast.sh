@@ -28,7 +28,18 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE_NAME="miniswe-bench"
-RESULTS_DIR="${REPO_DIR}/benchmark_results/docker_fast_$(date +%Y%m%d_%H%M%S)"
+
+# Probe the running llama-server for the loaded model so the result dir is
+# self-labeling. Falls back to "unknown" if the server isn't reachable.
+LLAMA_ENDPOINT="${LLAMA_ENDPOINT:-http://localhost:8464}"
+MODEL_TAG="$(
+    curl -fsS --max-time 3 "${LLAMA_ENDPOINT}/v1/models" 2>/dev/null \
+    | python3 -c "import json,sys; r=json.load(sys.stdin); print((r.get('data') or [{}])[0].get('id','?'))" 2>/dev/null \
+    | sed -E 's/\.gguf$//; s/[^A-Za-z0-9._-]/_/g' \
+    | cut -c1-40
+)"
+MODEL_TAG="${MODEL_TAG:-unknown}"
+RESULTS_DIR="${REPO_DIR}/benchmark_results/docker_fast_$(date +%Y%m%d_%H%M%S)_${MODEL_TAG}"
 BASELINE_SHA="cc34d2626faf32c1b6dd1b8b33af693fb936b098"
 ACTIVE_CONTAINER_NAME=""
 ACTIVE_TMP_SCRIPT=""
@@ -53,7 +64,7 @@ trap cleanup EXIT INT TERM
 TIMEOUT=1800
 MAX_ROUNDS=50
 MAX_ATTEMPTS=3
-TEMPERATURE=0.0
+TEMPERATURE=0.2
 MODEL="devstral-small-2"
 TASK="Add a CLI flag --system-prompt-override (short: -s) that takes a string and replaces the default system prompt with the provided text. When this flag is set, skip all context providers and just use the override text as the system message. Make sure it works for both single-shot and interactive modes."
 
@@ -103,20 +114,26 @@ generate_config() {
     # Helper for provider toggles
     _dis() { echo ",${disabled}," | grep -q ",${1}," && echo "false" || echo "true"; }
 
+    local CTX_WINDOW=60000
+    local REPO_MAP_BUDGET=5000
+    local SNIPPET_BUDGET=12000
+    local HISTORY_TURNS=5
+    local HISTORY_BUDGET=6000
+
     cat <<TOML
 [model]
 provider = "llama-cpp"
 endpoint = "http://localhost:8464"
 model = "${MODEL}"
-context_window = 60000
+context_window = ${CTX_WINDOW}
 temperature = ${TEMPERATURE}
-max_output_tokens = 4096
+max_output_tokens = 16384
 
 [context]
-repo_map_budget = 5000
-snippet_budget = 12000
-history_turns = 5
-history_budget = 6000
+repo_map_budget = ${REPO_MAP_BUDGET}
+snippet_budget = ${SNIPPET_BUDGET}
+history_turns = ${HISTORY_TURNS}
+history_budget = ${HISTORY_BUDGET}
 scratchpad_budget = 1500
 max_rounds = ${MAX_ROUNDS}
 pause_after_rounds = 99999
@@ -439,11 +456,13 @@ SCRIPT
 
     ACTIVE_CONTAINER_NAME="${container_name}"
 
+    # See run-benchmark-docker.sh for rationale on MINISWE_LLM_DUMP_DIR.
     docker run --rm \
         --network=host \
         -v "${variant_dir}:/output" \
         -v "${variant_dir}/config.toml:/config/config.toml:ro" \
         -v "${tmp_script}:/run.sh:ro" \
+        -e MINISWE_LLM_DUMP_DIR=/output/llm_dumps \
         --name "${container_name}" \
         "${IMAGE_NAME}" \
         bash /run.sh "${BASELINE_SHA}" "${TASK}" "${TIMEOUT}" "${MAX_ATTEMPTS}" \
