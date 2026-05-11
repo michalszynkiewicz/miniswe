@@ -127,7 +127,7 @@ endpoint = "http://localhost:8464"
 model = "${MODEL}"
 context_window = ${CTX_WINDOW}
 temperature = ${TEMPERATURE}
-max_output_tokens = 16384
+max_output_tokens = 4096
 
 [context]
 repo_map_budget = ${REPO_MAP_BUDGET}
