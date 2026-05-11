@@ -88,6 +88,13 @@ impl ModelRouter {
         &self.config_for(role).model
     }
 
+    /// Probe the default-role endpoint for the model it's actually serving.
+    /// Used at startup to populate `ModelConfig::probed_model`, which drives
+    /// model-family checks more reliably than the user-supplied config alias.
+    pub async fn probe_default_model(&self) -> anyhow::Result<String> {
+        self.client_for(ModelRole::Default).probe_model().await
+    }
+
     /// Probe each distinct endpoint we route to and format one line per
     /// endpoint with what the server says it's running. The returned
     /// strings are the LLM's own self-description, not what `config.toml`

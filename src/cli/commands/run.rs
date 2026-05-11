@@ -20,7 +20,8 @@ use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
     PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_BLOCK_MESSAGE, PLAN_CHECKPOINT_WARNING,
     PLAN_HARD_BLOCK_AFTER_EDITS, PLAN_PROGRESS_NUDGE, PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE,
-    loop_detected_hint, truncated_tool_call_hint,
+    is_file_write, is_prunable_change_signature_failure, loop_detected_hint,
+    truncated_tool_call_hint, visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{is_mutating_call, loop_call_key};
 use crate::config::{Config, EditMode, ModelRole};
@@ -38,7 +39,7 @@ use crate::tui;
 
 /// Run the agent for a single message.
 pub async fn run(
-    config: Config,
+    mut config: Config,
     message: &str,
     plan_only: bool,
     headless: bool,
@@ -48,6 +49,11 @@ pub async fn run(
     log.user_message(message);
 
     let router = Arc::new(ModelRouter::new(&config));
+    // Probe the server for the actual model identity before building the
+    // tool list — model-family checks need the server-reported name, not
+    // the user's config alias. Probe failure leaves probed_model = None
+    // and we fall back to the config string.
+    config.model.probed_model = router.probe_default_model().await.ok();
     let llm_worker = LlmWorkerHandle::new(router.clone(), config.runtime.llm_concurrency);
     let perms = Arc::new(if headless {
         PermissionManager::headless(&config)
@@ -65,15 +71,27 @@ pub async fn run(
         if !config.tools.plan {
             disabled.push("plan");
         }
-        if config.tools.edit_mode == EditMode::Fast {
-            // Fast mode replaces edit_file with the primitive surface.
-            disabled.push("edit_file");
+        if config.model.is_devstral_family() {
+            // Devstral mangles change_signature args; route signature
+            // edits through edit_file instead. See ModelConfig::is_devstral_family.
+            disabled.push("change_signature");
         }
+        // In Fast mode we ALSO expose `edit_file` alongside the
+        // primitives. Body edits with tricky brace nesting (e.g.
+        // wrapping an existing block in `if let Some(x) = ... {} else
+        // {}`) are an attention-quality problem for small models —
+        // probe in /tmp/gemma-edit-probe.py shows Gemma writes them
+        // first-try with focused context but takes 10+ revisions in the
+        // full agent context. `edit_file` runs an inner focused LLM
+        // call which avoids the dilution. Primitives stay available
+        // for surgical line-precise edits.
         tool_defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
         if config.tools.edit_mode == EditMode::Fast {
             tool_defs.extend(tools::fast_mode_tool_definitions());
         }
         tool_defs.push(tools::definitions::spawn_agents_tool_definition());
+        // rename last — see rename_tool_definition rationale.
+        tool_defs.push(tools::definitions::rename_tool_definition());
     }
 
     // Clear stale scratchpad/plan from previous sessions — unless this
@@ -294,11 +312,28 @@ pub async fn run(
         // Sanitize message roles before sending (strict chat template compat)
         context::sanitize_messages(&mut messages);
 
-        // Call LLM with streaming
+        // Call LLM with streaming.
+        //
+        // Disable thinking mode: Gemma's chat template defaults to a
+        // long internal-reasoning pass that lands in `reasoning_content`,
+        // which we do NOT persist to history. The reasoning is
+        // write-only. Worse, on tight token budgets the reasoning eats
+        // the whole response and `content`/`tool_calls` come back empty
+        // (probe in /tmp/gemma-thinking-probe.py — 0 chars content,
+        // finish_reason=length, after burning 2K tokens reasoning to a
+        // simple question). The kwarg is a no-op for models whose chat
+        // template doesn't honor it (e.g. Devstral). For strategic
+        // reasoning the agent has plan/scratchpad — that's persistent
+        // and visible to subsequent turns.
+        // Hide edit tools from the model until a plan exists. See
+        // visible_tool_defs for rationale.
+        let visible = visible_tool_defs(&tool_defs, tools::plan::plan_exists(&config));
         let request = ChatRequest {
             messages: messages.clone(),
-            tools: Some(tool_defs.clone()),
+            tools: Some(visible),
             tool_choice: None,
+            max_tokens_override: None,
+            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
         };
         log.llm_request(&request);
 
@@ -421,6 +456,25 @@ pub async fn run(
         // Add assistant's tool call message to messages
         messages.push(assistant_msg.clone());
 
+        // Snapshot lengths so we can rewind both buffers if every tool call
+        // in this assistant message turned out to be a prunable validator
+        // failure. The assistant message and its tool_results then get
+        // replaced with a single user-role corrective — this kills the
+        // priming chain that keeps the model copying the same bad shape.
+        // Both buffers' last entry IS the assistant_msg we just pushed, so
+        // truncate one before to also drop it.
+        let messages_pre = messages.len() - 1;
+        let history_pre = if conversation_history
+            .last()
+            .is_some_and(|m| m.role == "assistant")
+        {
+            conversation_history.len() - 1
+        } else {
+            conversation_history.len()
+        };
+        let mut all_prunable_failures = !tool_calls.is_empty();
+        let mut prunable_errors: Vec<String> = Vec::new();
+
         for tc in &tool_calls {
             let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
                 Ok(v) => v,
@@ -503,7 +557,10 @@ pub async fn run(
             let file_action = args["action"].as_str().unwrap_or("");
             if plan_only
                 && ((tc.function.name == "file" && file_action == "shell")
-                    || matches!(tc.function.name.as_str(), "edit_file" | "write_file"))
+                    || matches!(
+                        tc.function.name.as_str(),
+                        "edit_file" | "write_file" | "change_signature" | "rename"
+                    ))
             {
                 let result_msg = Message::tool_result(
                     &tc.id,
@@ -516,7 +573,7 @@ pub async fn run(
             }
 
             // Write gating: require plan before write tools
-            let is_write_action = matches!(tc.function.name.as_str(), "edit_file" | "write_file");
+            let is_write_action = is_file_write(tc.function.name.as_str());
             if config.tools.plan && !tools::plan::plan_exists(&config) && is_write_action {
                 let result_msg = Message::tool_result(
                     &tc.id,
@@ -627,6 +684,65 @@ pub async fn run(
                     Ok(Err(e)) => crate::tools::ToolResult::err(e),
                     Err(_) => {
                         crate::tools::ToolResult::err("Tool worker dropped edit_file job".into())
+                    }
+                }
+            } else if tc.function.name == "change_signature" {
+                let args = args.clone();
+                let config = config.clone();
+                let router = router.clone();
+                let lsp = lsp_client.clone();
+                let log_for_job = log.clone();
+                let revisions_for_job = fast_revisions.clone();
+                match tool_pool
+                    .submit(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| e.to_string())?;
+                        runtime
+                            .block_on(async move {
+                                tools::execute_refactor_tool(
+                                    &args,
+                                    &config,
+                                    router.as_ref(),
+                                    lsp.as_deref(),
+                                    Some(log_for_job.as_ref()),
+                                    revisions_for_job.as_deref(),
+                                )
+                                .await
+                            })
+                            .map_err(|e| format!("change_signature error: {e}"))
+                    })
+                    .await
+                {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => crate::tools::ToolResult::err(e),
+                    Err(_) => crate::tools::ToolResult::err(
+                        "Tool worker dropped change_signature job".into(),
+                    ),
+                }
+            } else if tc.function.name == "rename" {
+                let args = args.clone();
+                let config = config.clone();
+                let lsp = lsp_client.clone();
+                match tool_pool
+                    .submit(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| e.to_string())?;
+                        runtime
+                            .block_on(async move {
+                                tools::execute_rename_tool(&args, &config, lsp.as_deref()).await
+                            })
+                            .map_err(|e| format!("rename error: {e}"))
+                    })
+                    .await
+                {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => crate::tools::ToolResult::err(e),
+                    Err(_) => {
+                        crate::tools::ToolResult::err("Tool worker dropped rename job".into())
                     }
                 }
             } else if tc.function.name == "file" && file_action == "shell" {
@@ -802,8 +918,7 @@ pub async fn run(
             }
 
             // A successful file write means code changed — reset trackers.
-            let is_file_write = matches!(tc.function.name.as_str(), "edit_file" | "write_file");
-            if result.success && is_file_write {
+            if result.success && is_file_write(tc.function.name.as_str()) {
                 last_call_key = None;
                 same_call_streak = 0;
                 calls_since_last_edit = 0;
@@ -825,9 +940,41 @@ pub async fn run(
                 calls_since_last_edit += 1;
             }
 
+            if !is_prunable_change_signature_failure(&result.content, result.success) {
+                all_prunable_failures = false;
+            } else {
+                prunable_errors.push(result.content.clone());
+            }
+
             let result_msg = Message::tool_result(&tc.id, &result.content);
             messages.push(result_msg.clone());
             conversation_history.push(result_msg);
+        }
+
+        // History pruning: if every tool call in this assistant message was
+        // a prunable validator failure, drop the assistant message + its
+        // tool_results and replace with a user-role corrective. The
+        // assistant's bad-shape arguments are what prime the model to
+        // repeat them; removing them breaks the loop. Verified empirically
+        // (probe D3): clean history → clean output.
+        if all_prunable_failures && !prunable_errors.is_empty() {
+            messages.truncate(messages_pre);
+            conversation_history.truncate(history_pre);
+            let hint = Message::user(&format!(
+                "Your previous change_signature call(s) were rejected:\n\n{}\n\n\
+                 Retry with all required parameters and a clean position value \
+                 (one of 'start' or 'after:<single_param_name>').",
+                prunable_errors.join("\n\n---\n\n")
+            ));
+            messages.push(hint.clone());
+            conversation_history.push(hint);
+            log.tool_debug(
+                "agent",
+                &format!(
+                    "history pruned: dropped {} tool_result(s) after change_signature validator failure",
+                    prunable_errors.len()
+                ),
+            );
         }
 
         // Stall detection: too many tool calls without any edits

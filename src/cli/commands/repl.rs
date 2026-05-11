@@ -19,7 +19,8 @@ use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
     PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_BLOCK_MESSAGE, PLAN_CHECKPOINT_WARNING,
     PLAN_HARD_BLOCK_AFTER_EDITS, PLAN_PROGRESS_NUDGE, PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE,
-    loop_detected_hint, truncated_tool_call_hint,
+    is_file_write, is_prunable_change_signature_failure, loop_detected_hint,
+    truncated_tool_call_hint, visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{is_mutating_call, loop_call_key};
 use crate::cli::commands::agent::permissions::permission_action;
@@ -57,10 +58,12 @@ impl Drop for ReplTerminalGuard {
 }
 
 /// Run the interactive REPL with TUI.
-pub async fn run(config: Config, headless: bool, continue_session: bool) -> Result<()> {
+pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> Result<()> {
     let log = Arc::new(SessionLog::new(&config));
 
     let router = Arc::new(ModelRouter::new(&config));
+    // Probe server for the actual model identity (see run.rs for rationale).
+    config.model.probed_model = router.probe_default_model().await.ok();
     let llm_worker = LlmWorkerHandle::new(router.clone(), config.runtime.llm_concurrency);
     let perms = Arc::new(if headless {
         PermissionManager::headless(&config)
@@ -78,14 +81,18 @@ pub async fn run(config: Config, headless: bool, continue_session: bool) -> Resu
         if !config.tools.plan {
             disabled.push("plan");
         }
-        if config.tools.edit_mode == EditMode::Fast {
-            disabled.push("edit_file");
+        if config.model.is_devstral_family() {
+            disabled.push("change_signature");
         }
+        // Fast mode keeps `edit_file` available alongside the
+        // primitives — see run.rs for rationale.
         tool_defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
         if config.tools.edit_mode == EditMode::Fast {
             tool_defs.extend(tools::fast_mode_tool_definitions());
         }
         tool_defs.push(tools::definitions::spawn_agents_tool_definition());
+        // rename last — see rename_tool_definition rationale.
+        tool_defs.push(tools::definitions::rename_tool_definition());
     }
 
     // Spawn LSP client (non-blocking)
@@ -658,11 +665,15 @@ async fn run_agent_loop(
         // Sanitize messages
         context::sanitize_messages(messages);
 
-        // Build request
+        // Hide edit tools until a plan exists; see visible_tool_defs.
+        let visible = visible_tool_defs(tool_defs, tools::plan::plan_exists(config));
+        // Build request. See run.rs for why thinking is disabled.
         let request = ChatRequest {
             messages: messages.clone(),
-            tools: Some(tool_defs.to_vec()),
+            tools: Some(visible),
             tool_choice: None,
+            max_tokens_override: None,
+            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
         };
         log.llm_request(&request);
 
@@ -834,6 +845,23 @@ async fn run_agent_loop(
 
         messages.push(assistant_msg.clone());
 
+        // See run.rs for the rationale — both buffers' last entry is the
+        // assistant_msg we just pushed, so truncate one before to also
+        // drop it. If every tool call in this assistant message turns out
+        // to be a prunable validator failure, we rewind here and replace
+        // with a single user-role corrective.
+        let messages_pre = messages.len() - 1;
+        let history_pre = if conversation_history
+            .last()
+            .is_some_and(|m| m.role == "assistant")
+        {
+            conversation_history.len() - 1
+        } else {
+            conversation_history.len()
+        };
+        let mut all_prunable_failures = !tool_calls.is_empty();
+        let mut prunable_errors: Vec<String> = Vec::new();
+
         // Execute tool calls
         for tc in &tool_calls {
             // Check cancellation between tool calls
@@ -1002,7 +1030,7 @@ async fn run_agent_loop(
             }
 
             let file_action = args["action"].as_str().unwrap_or("");
-            let is_write_action = matches!(tc.function.name.as_str(), "edit_file" | "write_file");
+            let is_write_action = is_file_write(tc.function.name.as_str());
             if config.tools.plan
                 && plan_checkpoint_pending
                 && successful_edits_since_plan_update >= PLAN_HARD_BLOCK_AFTER_EDITS
@@ -1176,6 +1204,57 @@ async fn run_agent_loop(
                         .map_err(|e| format!("plan error: {e}"))
                 });
                 await_tool_job_ui(rx, terminal, app, "plan", &mut result_rx, cancelled).await
+            } else if tc.function.name == "change_signature" {
+                let args = args.clone();
+                let config = config.clone();
+                let router = router.clone();
+                let lsp = lsp.clone();
+                let log_for_job = log.clone();
+                let revisions_for_job = fast_revisions.clone();
+                let mut result_rx = tool_pool.submit(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    runtime
+                        .block_on(async move {
+                            crate::tools::execute_refactor_tool(
+                                &args,
+                                &config,
+                                router.as_ref(),
+                                lsp.as_deref(),
+                                Some(log_for_job.as_ref()),
+                                revisions_for_job.as_deref(),
+                            )
+                            .await
+                        })
+                        .map_err(|e| format!("change_signature error: {e}"))
+                });
+                await_tool_job_ui(
+                    rx,
+                    terminal,
+                    app,
+                    "change_signature",
+                    &mut result_rx,
+                    cancelled,
+                )
+                .await
+            } else if tc.function.name == "rename" {
+                let args = args.clone();
+                let config = config.clone();
+                let lsp = lsp.clone();
+                let mut result_rx = tool_pool.submit(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    runtime
+                        .block_on(async move {
+                            crate::tools::execute_rename_tool(&args, &config, lsp.as_deref()).await
+                        })
+                        .map_err(|e| format!("rename error: {e}"))
+                });
+                await_tool_job_ui(rx, terminal, app, "rename", &mut result_rx, cancelled).await
             } else if tc.function.name == "file" && file_action == "shell" {
                 await_shell_job_repl(
                     tool_pool.submit_shell(args.clone(), config.clone(), cancelled.clone()),
@@ -1248,8 +1327,7 @@ async fn run_agent_loop(
             }
 
             // Successful file write = code changed, reset loop detector
-            let is_file_write = matches!(tc.function.name.as_str(), "edit_file" | "write_file");
-            if result.success && is_file_write {
+            if result.success && is_file_write(tc.function.name.as_str()) {
                 last_call_key = None;
                 same_call_streak = 0;
                 if config.tools.plan {
@@ -1274,12 +1352,39 @@ async fn run_agent_loop(
                 result.content.clone(),
             ));
 
+            if !is_prunable_change_signature_failure(&result.content, result.success) {
+                all_prunable_failures = false;
+            } else {
+                prunable_errors.push(result.content.clone());
+            }
+
             let result_msg = Message::tool_result(&tc.id, &result.content);
             messages.push(result_msg.clone());
             conversation_history.push(result_msg);
 
             // Re-render after tool result
             let _ = terminal.draw(|frame| ui::draw(frame, app));
+        }
+
+        // History pruning — see run.rs for rationale.
+        if all_prunable_failures && !prunable_errors.is_empty() {
+            messages.truncate(messages_pre);
+            conversation_history.truncate(history_pre);
+            let hint = Message::user(&format!(
+                "Your previous change_signature call(s) were rejected:\n\n{}\n\n\
+                 Retry with all required parameters and a clean position value \
+                 (one of 'start' or 'after:<single_param_name>').",
+                prunable_errors.join("\n\n---\n\n")
+            ));
+            messages.push(hint.clone());
+            conversation_history.push(hint);
+            log.tool_debug(
+                "agent",
+                &format!(
+                    "history pruned: dropped {} tool_result(s) after change_signature validator failure",
+                    prunable_errors.len()
+                ),
+            );
         }
     }
 }
@@ -1601,7 +1706,9 @@ mod tests {
         let hint = loop_detected_hint(EditMode::Fast);
         assert!(hint.contains("show_rev"));
         assert!(hint.contains("revert"));
-        assert!(!hint.contains("edit_file"));
+        // Fast mode now exposes edit_file, so the loop hint suggests it
+        // as a structural-rewrite escape hatch.
+        assert!(hint.contains("edit_file"));
     }
 
     #[test]
