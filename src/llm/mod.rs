@@ -10,7 +10,7 @@ pub use router::ModelRouter;
 pub use types::*;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -20,6 +20,48 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 use crate::config::ModelConfig;
+
+/// Counter for dumped request bodies. Atomic so multi-threaded callers
+/// don't collide on filenames.
+static DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Per-process dump prefix. Without this, multiple agent runs sharing
+/// a single dump dir (e.g. successive bench retry attempts mounting the
+/// same /output volume) would all start at req-000000 and clobber each
+/// other's data — exactly the most diagnostic data when something fails.
+/// `seconds-since-epoch + pid` gives chronological sort order across
+/// sessions and uniqueness within a host.
+static DUMP_SESSION_PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn dump_session_prefix() -> &'static str {
+    DUMP_SESSION_PREFIX.get_or_init(|| {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        format!("{secs:010}-{pid:05}")
+    })
+}
+
+/// If `MINISWE_LLM_DUMP_DIR` is set, write the full request body to a
+/// numbered JSON file inside that directory. Used to capture exact
+/// llama.cpp request bodies for offline replay (the structured logger
+/// truncates large bodies, so it can't be used for verbatim replay).
+fn maybe_dump_request(body: &Value) {
+    let Ok(dir) = std::env::var("MINISWE_LLM_DUMP_DIR") else {
+        return;
+    };
+    let n = DUMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let prefix = dump_session_prefix();
+    let path = std::path::PathBuf::from(&dir).join(format!("req-{prefix}-{n:06}.json"));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[dump] mkdir {dir:?}: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, serde_json::to_vec_pretty(body).unwrap_or_default()) {
+        eprintln!("[dump] write {path:?}: {e}");
+    }
+}
 
 /// Client for communicating with an OpenAI-compatible LLM API.
 pub struct LlmClient {
@@ -115,12 +157,28 @@ impl LlmClient {
         // ChatResponse to the caller.
         body["model"] = Value::String(self.config.model.clone());
         body["temperature"] = Value::from(self.config.temperature);
-        body["max_tokens"] = Value::from(self.config.max_output_tokens);
+        // Per-request override wins, otherwise the model's configured
+        // default. Some callers (e.g. refactor's ask_rewrite) need more
+        // budget for thinking-mode models that emit reasoning tokens
+        // before the final answer; if the default is too low the
+        // response collapses to empty.
+        let max_tokens = request
+            .max_tokens_override
+            .unwrap_or(self.config.max_output_tokens as u64);
+        body["max_tokens"] = Value::from(max_tokens);
         body["stream"] = Value::Bool(true);
+        // Forward server-specific chat-template kwargs (e.g. to disable
+        // reasoning-mode on Gemma 4). Servers that don't recognise the
+        // field ignore it.
+        if let Some(kwargs) = &request.chat_template_kwargs {
+            body["chat_template_kwargs"] = kwargs.clone();
+        }
+        maybe_dump_request(&body);
         let connect_timeout = Duration::from_secs(self.config.request_timeout_secs);
         let idle_timeout = Duration::from_secs(self.config.stream_idle_timeout_secs);
 
         let mut attempt = 0usize;
+        let mut cache_busted = false;
         let mut noop = |_: &str| {};
         loop {
             let result = self
@@ -135,6 +193,18 @@ impl LlmClient {
                 .await;
 
             match result {
+                Ok(resp) if !cache_busted && has_tool_call_leak(&resp) => {
+                    // Devstral occasionally emits chat-template tokens
+                    // ([TOOL_CALLS]/[ARGS]) embedded inside tool-call
+                    // arguments. Verbatim replay shows this is not bytes-
+                    // deterministic — it depends on KV-cache state from
+                    // prior generations on the same llama.cpp slot. Force
+                    // a fresh prompt eval and retry once.
+                    tracing::warn!("LLM tool-call leak detected; retrying with cache_prompt=false");
+                    body["cache_prompt"] = Value::Bool(false);
+                    cache_busted = true;
+                    continue;
+                }
                 Ok(resp) => return Ok(resp),
                 Err(err) if attempt < max_retries && is_retryable_llm_error(&err) => {
                     let delay = retry_delays[attempt];
@@ -461,8 +531,18 @@ impl LlmClient {
         let mut body = serde_json::to_value(request)?;
         body["model"] = Value::String(self.config.model.clone());
         body["temperature"] = Value::from(self.config.temperature);
-        body["max_tokens"] = Value::from(self.config.max_output_tokens);
+        let max_tokens = request
+            .max_tokens_override
+            .unwrap_or(self.config.max_output_tokens as u64);
+        body["max_tokens"] = Value::from(max_tokens);
         body["stream"] = Value::Bool(true);
+        // Forward server-specific chat-template kwargs (e.g. to disable
+        // reasoning-mode on Gemma 4). Servers that don't recognise the
+        // field ignore it.
+        if let Some(kwargs) = &request.chat_template_kwargs {
+            body["chat_template_kwargs"] = kwargs.clone();
+        }
+        maybe_dump_request(&body);
         let connect_timeout = Duration::from_secs(self.config.request_timeout_secs);
         let idle_timeout = Duration::from_secs(self.config.stream_idle_timeout_secs);
 
@@ -526,6 +606,25 @@ pub const TRUNCATED_TOOL_CALL_MARKER: &str = "Failed to parse tool call argument
 /// the caller should surface a hint to the agent instead.
 pub fn is_truncated_tool_call_error(err_msg: &str) -> bool {
     err_msg.contains(TRUNCATED_TOOL_CALL_MARKER)
+}
+
+/// True if any tool-call argument string contains a chat-template token
+/// that should never appear in valid JSON arguments (`[TOOL_CALLS]`,
+/// `[ARGS]`). When this happens the model has bled control tokens into
+/// its own output — usually transient, KV-cache-state dependent.
+fn has_tool_call_leak(resp: &ChatResponse) -> bool {
+    for choice in &resp.choices {
+        let Some(tcs) = &choice.message.tool_calls else {
+            continue;
+        };
+        for tc in tcs {
+            let args = &tc.function.arguments;
+            if args.contains("[TOOL_CALLS]") || args.contains("[ARGS]") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn is_retryable_llm_error(err: &anyhow::Error) -> bool {
@@ -592,5 +691,46 @@ mod tests {
 
         let err = anyhow::anyhow!("Failed to connect to LLM at http://localhost:8080");
         assert!(is_retryable_llm_error(&err));
+    }
+
+    fn resp_with_args(args: &str) -> ChatResponse {
+        ChatResponse {
+            choices: vec![Choice {
+                message: Message {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "x".into(),
+                        r#type: "function".into(),
+                        function: FunctionCall {
+                            name: "change_signature".into(),
+                            arguments: args.into(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn detects_tool_calls_token_leak() {
+        let r = resp_with_args(r#"{"action":"add_param"}[TOOL_CALLS]"#);
+        assert!(has_tool_call_leak(&r));
+    }
+
+    #[test]
+    fn detects_args_token_leak() {
+        let r = resp_with_args(r#"[ARGS]{"action":"add_param"}"#);
+        assert!(has_tool_call_leak(&r));
+    }
+
+    #[test]
+    fn clean_response_has_no_leak() {
+        let r = resp_with_args(r#"{"action":"add_param","position":"after:foo"}"#);
+        assert!(!has_tool_call_leak(&r));
     }
 }

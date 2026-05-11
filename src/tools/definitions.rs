@@ -22,11 +22,43 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
             "Do not use for partial edits to existing code; use edit_file instead.",
         ),
         EditMode::Fast => (
-            "For partial code edits use replace_range or insert_at; for full-file overwrites use write_file.",
-            "Do not use for partial edits to existing code; use replace_range or insert_at instead.",
+            "For surgical line-precise code edits use replace_range or insert_at; for structural rewrites (e.g. wrapping a block in if-let) use edit_file; for full-file overwrites use write_file.",
+            "Do not use for partial edits to existing code; use replace_range/insert_at or edit_file instead.",
         ),
     };
     vec![
+        // ── change_signature: top of list — first thing the model sees
+        //    when scanning for an edit tool. Atomic def + callsite fan-out
+        //    is much faster than hand-editing each callsite, and small
+        //    models follow tool-list ordering as a relevance ranking.
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "change_signature".into(),
+                description: "Change a function signature and update every callsite atomically. \
+                    Actions: add_param (insert a new parameter, fill literal at each call), \
+                    drop_param (remove a parameter, drop the matching argument at each call). \
+                    The tool finds the function by `name` (LSP-resolved), so you don't need to know its exact line/column. \
+                    Use action='help' for parameter details and a worked example.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "One of: add_param, drop_param, help"
+                        },
+                        "path": { "type": "string", "description": "File containing the function DEFINITION (relative to project root). If you only have a callsite, use code(goto_definition) first." },
+                        "name": { "type": "string", "description": "Function or method name. Resolved via LSP — works even if your line number is approximate." },
+                        "line": { "type": "integer", "description": "Optional. 1-based line hint, only used to disambiguate when multiple methods share `name` (e.g. several impls of `run`)." },
+                        "new_param": { "type": "string", "description": "For add_param: the new parameter declaration as it should appear in the signature, e.g. 'system_prompt_override: Option<&str>'" },
+                        "position": { "type": "string", "description": "For add_param: where to insert. Either 'start' or 'after:<existing_param_name>'. Use after:<last_param> to append at the end." },
+                        "default": { "type": "string", "description": "For add_param: the literal expression to insert at every existing callsite, e.g. 'None'" },
+                        "param": { "type": "string", "description": "For drop_param: the name of the parameter to remove" }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
         // ── file: core file I/O and shell ─────────────────────────────
         ToolDefinition {
             r#type: "function".into(),
@@ -104,7 +136,7 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "plan".into(),
-                description: "Plan and track work. Actions: set (create plan), check (mark step done with compile gate), refine (split step), show (view plan), scratchpad (save notes). Use action='help' for details.".into(),
+                description: "Plan and track work. Actions: set (create plan — UNLOCKS the edit tools edit_file/write_file/replace_range/insert_at/change_signature/rename), check (mark step done with compile gate), refine (split step), show (view plan), scratchpad (save notes). Use action='help' for details. Call set ONCE early in the session before editing.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -118,29 +150,27 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
                         },
                         "steps": {
                             "type": "array",
-                            "description": "For set: structured step list",
+                            "description": "For set: structured step list. Each item is {step: string (the action text), compile?: boolean (default true)}.",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "description": { "type": "string" },
-                                    "compile": { "type": "boolean" },
-                                    "reason": { "type": "string" }
+                                    "step": { "type": "string", "description": "What to do in this step." },
+                                    "compile": { "type": "boolean", "description": "Whether the project should compile after this step. Default true." }
                                 },
-                                "required": ["description"]
+                                "required": ["step"]
                             }
                         },
-                        "step": { "type": "integer", "description": "Step number (for check/refine)" },
+                        "step": { "type": "integer", "description": "Step number (for check/refine — disambiguated from per-item 'step' string by parent property name)." },
                         "substeps": {
                             "type": "array",
-                            "description": "For refine: substeps to replace target step",
+                            "description": "For refine: substeps to replace target step. Same item shape as steps.",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "description": { "type": "string" },
-                                    "compile": { "type": "boolean" },
-                                    "reason": { "type": "string" }
+                                    "step": { "type": "string", "description": "What to do in this substep." },
+                                    "compile": { "type": "boolean", "description": "Whether the project should compile after this substep. Default true." }
                                 },
-                                "required": ["description"]
+                                "required": ["step"]
                             }
                         }
                     },
@@ -197,6 +227,30 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
             },
         },
     ]
+}
+
+/// Rename tool kept separate so callers can push it last in the tool
+/// list — small models treat ordering as a relevance ranking, and rename
+/// is rarely the right choice (most "rename" needs are signature changes
+/// → use change_signature, or single-symbol within-file → edit_file).
+pub fn rename_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".into(),
+        function: FunctionDefinition {
+            name: "rename".into(),
+            description: "Rename a symbol (function, type, variable, parameter, field, module) using the language server's native rename. Type-aware and cross-file. Use action='help' for an example.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "description": "Optional. Set to 'help' to see usage." },
+                    "path": { "type": "string", "description": "File containing the symbol (relative to project root)" },
+                    "line": { "type": "integer", "description": "1-based line where `name` appears. Can be the definition line or any reference line." },
+                    "name": { "type": "string", "description": "Current name of the symbol. The tool finds its column on the given line, so you don't need to specify column." },
+                    "new_name": { "type": "string", "description": "New name for the symbol" }
+                }
+            }),
+        },
+    }
 }
 
 /// Return the fast-mode tool definitions (`replace_range`, `insert_at`,
