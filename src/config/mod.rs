@@ -110,10 +110,39 @@ pub struct ModelConfig {
     pub stream_idle_timeout_secs: u64,
     /// Maximum number of transient retry attempts for LLM requests.
     pub max_retries: usize,
+    /// Server-reported model identity from `/v1/models`, populated at
+    /// startup. Drives model-family checks more reliably than the
+    /// user-supplied `model` string, which may be a generic alias like
+    /// `"default"` or a llama-swap slot name. Skipped from (de)serialization
+    /// since it's a runtime probe result, not user config.
+    #[serde(skip)]
+    pub probed_model: Option<String>,
 }
 
 fn default_stream_idle_timeout_secs() -> u64 {
     30
+}
+
+impl ModelConfig {
+    /// True if the model the server is actually serving is in the Devstral
+    /// family. Used to gate model-specific workarounds — Devstral's
+    /// tool-call parser reliably mangles `change_signature` arguments at
+    /// moderate context sizes (verbatim replay shows ~75% schema confusion
+    /// on the same bytes), so we hide that tool for Devstral and route
+    /// signature edits through `edit_file` instead.
+    ///
+    /// Probe-only by design: the user-supplied `model` config string is
+    /// often a generic alias ("devstral-small-2" hard-coded in our bench
+    /// scripts even when the server is serving Gemma or GPT-OSS), so an
+    /// OR with the config string false-positives on every non-Devstral
+    /// run that uses the same config skeleton. Probe failure or any
+    /// non-Devstral identity → not Devstral → keep the tool.
+    pub fn is_devstral_family(&self) -> bool {
+        match &self.probed_model {
+            Some(probed) => probed.to_ascii_lowercase().contains("devstral"),
+            None => false,
+        }
+    }
 }
 
 /// Token budget allocation for context assembly.
@@ -352,6 +381,7 @@ impl Default for ModelConfig {
             request_timeout_secs: 120,
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             max_retries: 6,
+            probed_model: None,
         }
     }
 }

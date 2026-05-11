@@ -16,12 +16,8 @@ async fn plan_set_creates_file() {
     let result = plan::execute(&args, &config, 1).await.unwrap();
 
     assert!(result.success);
-    assert!(result.content.contains("Architecture check before editing"));
-    assert!(
-        result
-            .content
-            .contains("changes the right abstraction level")
-    );
+    assert!(result.content.contains("Before editing"));
+    assert!(result.content.contains("plan(action='refine')"));
     let plan = fs::read_to_string(config.miniswe_dir().join("plan.md")).unwrap();
     assert!(plan.contains("Step one"));
     assert!(plan.contains("- [ ]"));
