@@ -89,52 +89,81 @@ pub struct AssembledContext {
 /// (`replace_range` / `insert_at` / `revert` / `show_rev`). Telling the model
 /// to use a tool that isn't in its tool list wastes rounds, so we branch here.
 ///
-/// `change_signature_available` toggles the `change_signature` guidance —
+/// `refactor_available` toggles the `refactor` guidance —
 /// some models (Devstral) have the tool hidden, and prompting them to use
 /// it just wastes turns. When disabled, signature edits route through
 /// `edit_file` (Smart) or `replace_range`/`insert_at` (Fast).
 fn build_system_prompt(
     edit_mode: crate::config::EditMode,
-    change_signature_available: bool,
+    refactor_available: bool,
+    edit_file_available: bool,
 ) -> String {
-    let cs_smart = if change_signature_available {
-        "\
-change_signature adds or drops a function parameter and updates every callsite in one atomic call (give the function NAME, not its column — the tool resolves the location): {\"action\":\"add_param\",\"path\":\"src/lib.rs\",\"name\":\"assemble\",\"new_param\":\"x: u32\",\"position\":\"after:b\",\"default\":\"0\"}\n\
-rename renames any symbol (function, type, variable, parameter, field, module) cross-file via LSP (give the symbol NAME plus a line where it appears): {\"path\":\"src/lib.rs\",\"line\":42,\"name\":\"assemble\",\"new_name\":\"build_context\"}\n\
-Reach for change_signature/rename BEFORE doing per-callsite edit_file calls when a function signature changes or a name changes — they handle the fan-out in one round.\n"
-    } else {
-        "\
-rename renames any symbol (function, type, variable, parameter, field, module) cross-file via LSP (give the symbol NAME plus a line where it appears): {\"path\":\"src/lib.rs\",\"line\":42,\"name\":\"assemble\",\"new_name\":\"build_context\"}\n\
-For signature changes (adding/dropping a parameter), edit the function definition with edit_file FIRST, then update each callsite — definitions before callers, never the other way around.\n"
+    // Combinations the caller actually sends are:
+    //   Devstral (any mode): refactor=false, edit_file=true
+    //   Non-Devstral (any mode): refactor=true, edit_file=false
+    // The (false, false) and (true, true) cells exist for completeness.
+    let refactor_blurb = "\
+refactor adds/drops a parameter (action='add_param'/'drop_param') or renames a symbol (action='rename') and updates every callsite in ONE atomic call. Give the target NAME — the tool resolves the location via LSP. add_param example: {\"action\":\"add_param\",\"path\":\"src/lib.rs\",\"name\":\"assemble\",\"new_param\":\"x: u32\",\"position\":\"after:b\",\"callsite_fill_in\":\"0\"}. rename example: {\"action\":\"rename\",\"path\":\"src/lib.rs\",\"line\":42,\"name\":\"assemble\",\"new_name\":\"build_context\"}.\n";
+    let cs_smart = match (refactor_available, edit_file_available) {
+        (true, true) => format!(
+            "{refactor_blurb}\
+Reach for refactor BEFORE doing per-callsite edit_file calls when a function signature changes or a name changes — it handles the fan-out in one round.\n"
+        ),
+        (true, false) => format!(
+            "{refactor_blurb}\
+Reach for refactor for any signature change or rename — it handles the fan-out across callsites in one round.\n"
+        ),
+        (false, true) => "\
+For signature changes (adding/dropping a parameter) or renames, edit the function definition with edit_file FIRST, then update each callsite — definitions before callers, never the other way around.\n".to_string(),
+        (false, false) => "\
+For signature changes (adding/dropping a parameter) or renames, edit the function definition with replace_range FIRST, then update each callsite — definitions before callers, never the other way around.\n".to_string(),
     };
-    let cs_fast = if change_signature_available {
-        "\
-change_signature adds or drops a function parameter and updates every callsite in one atomic call (give the function NAME, not its column — the tool resolves the location): {\"action\":\"add_param\",\"path\":\"src/lib.rs\",\"name\":\"assemble\",\"new_param\":\"x: u32\",\"position\":\"after:b\",\"default\":\"0\"}\n\
-rename renames any symbol (function, type, variable, parameter, field, module) cross-file via LSP (give the symbol NAME plus a line where it appears): {\"path\":\"src/lib.rs\",\"line\":42,\"name\":\"assemble\",\"new_name\":\"build_context\"}\n\
-Reach for change_signature/rename BEFORE doing per-callsite replace_range edits when a function signature changes or a name changes — they handle the fan-out in one round.\n"
+    let cs_fast = match (refactor_available, edit_file_available) {
+        (true, true) => format!(
+            "{refactor_blurb}\
+Reach for refactor BEFORE doing per-callsite edit_file or replace_range edits when a function signature changes or a name changes — it handles the fan-out in one round.\n"
+        ),
+        (true, false) => format!(
+            "{refactor_blurb}\
+Reach for refactor BEFORE doing per-callsite replace_range edits when a function signature changes or a name changes — it handles the fan-out in one round.\n"
+        ),
+        (false, true) => "\
+For signature changes (adding/dropping a parameter) or renames, edit the function definition with replace_range or edit_file FIRST, then update each callsite — definitions before callers, never the other way around.\n".to_string(),
+        (false, false) => "\
+For signature changes (adding/dropping a parameter) or renames, edit the function definition with replace_range FIRST, then update each callsite — definitions before callers, never the other way around.\n".to_string(),
+    };
+    let edit_file_smart_line = if edit_file_available {
+        "edit_file applies a semantic patch to one file: {{\"path\":\"src/lib.rs\",\"task\":\"rename foo to bar throughout the file\"}}\n"
     } else {
-        "\
-rename renames any symbol (function, type, variable, parameter, field, module) cross-file via LSP (give the symbol NAME plus a line where it appears): {\"path\":\"src/lib.rs\",\"line\":42,\"name\":\"assemble\",\"new_name\":\"build_context\"}\n\
-For signature changes (adding/dropping a parameter), edit the function definition with replace_range or edit_file FIRST, then update each callsite — definitions before callers, never the other way around.\n"
+        ""
+    };
+    let edit_file_fast_line = if edit_file_available {
+        "edit_file applies a semantic patch to one file using a focused inner LLM (best for non-trivial body edits like wrapping a block in if-let, restructuring brace nesting, or any change where line-precise replace_range is fiddly): {{\"path\":\"src/lib.rs\",\"task\":\"wrap the assemble body in an if-let so override_text replaces system_context when system_prompt_override is Some\"}}\nPrefer edit_file for structural rewrites; use replace_range / insert_at for surgical line-precise edits.\n"
+    } else {
+        ""
+    };
+    let smart_tail_line = if edit_file_available {
+        "For any partial file edit (single line or multi-line) that isn't a signature change or rename, use edit_file with a clear task description."
+    } else {
+        "For partial file edits use replace_range / insert_at; refactor handles signature changes and renames; write_file is for whole-file overwrites."
     };
     let edit_contract = match edit_mode {
         crate::config::EditMode::Smart => {
             format!(
                 "{cs_smart}\
-edit_file applies a semantic patch to one file: {{\"path\":\"src/lib.rs\",\"task\":\"rename foo to bar throughout the file\"}}\n\
+{edit_file_smart_line}\
 write_file with content replaces the whole file: {{\"path\":\"notes/todo.txt\",\"content\":\"first line\\nsecond line\\n\"}}\n\
 write_file without content creates a new empty file: {{\"path\":\"tmp/placeholder.txt\"}}\n\
 file shell: {{\"action\":\"shell\",\"command\":\"ls\",\"timeout\":60}}\n\
-For any partial file edit (single line or multi-line) that isn't a signature change or rename, use edit_file with a clear task description."
+{smart_tail_line}"
             )
         }
         crate::config::EditMode::Fast => {
             format!(
                 "{cs_fast}\
-edit_file applies a semantic patch to one file using a focused inner LLM (best for non-trivial body edits like wrapping a block in if-let, restructuring brace nesting, or any change where line-precise replace_range is fiddly): {{\"path\":\"src/lib.rs\",\"task\":\"wrap the assemble body in an if-let so override_text replaces system_context when system_prompt_override is Some\"}}\n\
+{edit_file_fast_line}\
 replace_range replaces lines [start..=end] (1-based, inclusive) with content: {{\"path\":\"src/lib.rs\",\"start\":10,\"end\":15,\"content\":\"...\"}}\n\
 insert_at inserts content after a line (0=top, last line = append): {{\"path\":\"src/lib.rs\",\"after_line\":0,\"content\":\"use std::fs;\\n\"}}\n\
-Prefer edit_file for structural rewrites; use replace_range / insert_at for surgical line-precise edits.\n\
 write_file with content replaces the whole file: {{\"path\":\"notes/todo.txt\",\"content\":\"first line\\nsecond line\\n\"}}\n\
 write_file without content creates a new empty file: {{\"path\":\"tmp/placeholder.txt\"}}\n\
 file shell: {{\"action\":\"shell\",\"command\":\"ls\",\"timeout\":60}}\n\
@@ -142,9 +171,21 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
             )
         }
     };
+    let mut unlock_tools: Vec<&str> = Vec::new();
+    if refactor_available {
+        unlock_tools.push("refactor (preferred for adding/dropping a parameter or renaming a symbol — updates definition + all callsites atomically)");
+    }
+    if edit_file_available {
+        unlock_tools.push("edit_file");
+    }
+    unlock_tools.extend(["replace_range", "insert_at", "write_file"]);
+    let workflow_unlock_preview = format!(
+        "After plan is set you'll get these edit tools: {}.",
+        unlock_tools.join(", ")
+    );
     format!(
         "You are miniswe, a coding agent. Use your tools to complete the task.\n\
-         WORKFLOW: explore briefly to find the relevant files, then call plan(action='set') with your step-by-step approach, then edit. After plan is set you'll get these edit tools: change_signature (preferred for adding/dropping a parameter — updates definition + all callsites atomically), edit_file, replace_range, insert_at, write_file, rename. Use plan(action='refine') to adjust the plan as you learn more; reserve plan(action='set') for the initial plan and rare full restarts.\n\
+         WORKFLOW: explore briefly to find the relevant files, then call plan(action='set') with your step-by-step approach, then edit. {workflow_unlock_preview} Use plan(action='refine') to adjust the plan as you learn more; reserve plan(action='set') for the initial plan and rare full restarts.\n\
          Emit ONE tool call per response. Wait for its result before issuing the next one — chaining multiple tool calls in a single response can confuse the parser and you will lose work.\n\
          Tool contract: grouped tools require action plus action-specific params.\n\
          file read: {{\"action\":\"read\",\"path\":\"README.md\"}}\n\
@@ -350,8 +391,14 @@ pub fn assemble(
     let mut used_tokens = 0;
 
     // 1. System prompt (always present)
-    let mut system_context =
-        build_system_prompt(config.tools.edit_mode, !config.model.is_devstral_family());
+    let mut system_context = build_system_prompt(
+        config.tools.edit_mode,
+        // refactor: hidden for Devstral (schema confusion), shown otherwise
+        !config.model.is_devstral_family(),
+        // edit_file: shown only for Devstral (its escape hatch since refactor is hidden);
+        // hidden for everyone else so the model reaches for refactor + replace_range/insert_at
+        config.model.is_devstral_family(),
+    );
 
     // 1b. Project root (always present)
     system_context.push_str(&format!(

@@ -20,8 +20,8 @@ use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
     PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_BLOCK_MESSAGE, PLAN_CHECKPOINT_WARNING,
     PLAN_HARD_BLOCK_AFTER_EDITS, PLAN_PROGRESS_NUDGE, PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE,
-    is_file_write, is_prunable_change_signature_failure, loop_detected_hint,
-    truncated_tool_call_hint, visible_tool_defs,
+    is_file_write, is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint,
+    visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{is_mutating_call, loop_call_key};
 use crate::config::{Config, EditMode, ModelRole};
@@ -72,9 +72,19 @@ pub async fn run(
             disabled.push("plan");
         }
         if config.model.is_devstral_family() {
-            // Devstral mangles change_signature args; route signature
-            // edits through edit_file instead. See ModelConfig::is_devstral_family.
-            disabled.push("change_signature");
+            // Devstral mangles refactor args (schema confusion on `position`);
+            // route signature edits through edit_file instead.
+            // See ModelConfig::is_devstral_family.
+            disabled.push("refactor");
+        } else {
+            // For every non-Devstral model: hide edit_file. Empirical data
+            // (Gemma Apr 30 fast 6/6 at 291s vs May 11 6/6 at 2195s with
+            // edit_file visible) shows edit_file monopolizes tool choice —
+            // model defaults to it for everything and never reaches for
+            // `refactor` (atomic) or the surgical primitives. Devstral keeps
+            // edit_file because refactor is hidden for it and it needs an
+            // escape hatch beyond replace_range/insert_at.
+            disabled.push("edit_file");
         }
         // In Fast mode we ALSO expose `edit_file` alongside the
         // primitives. Body edits with tricky brace nesting (e.g.
@@ -90,8 +100,6 @@ pub async fn run(
             tool_defs.extend(tools::fast_mode_tool_definitions());
         }
         tool_defs.push(tools::definitions::spawn_agents_tool_definition());
-        // rename last — see rename_tool_definition rationale.
-        tool_defs.push(tools::definitions::rename_tool_definition());
     }
 
     // Clear stale scratchpad/plan from previous sessions — unless this
@@ -190,6 +198,7 @@ pub async fn run(
     let mut plan_checkpoint_pending = false;
     let mut plan_update_requested = false;
     let mut nudged_premature_exit = false;
+    let mut nudged_no_plan = false;
 
     // Ctrl+C cancellation flag. The handler fires once and exits — no
     // loop, because `ctrl_c().await` resolves immediately after the
@@ -559,7 +568,7 @@ pub async fn run(
                 && ((tc.function.name == "file" && file_action == "shell")
                     || matches!(
                         tc.function.name.as_str(),
-                        "edit_file" | "write_file" | "change_signature" | "rename"
+                        "edit_file" | "write_file" | "refactor"
                     ))
             {
                 let result_msg = Message::tool_result(
@@ -686,7 +695,7 @@ pub async fn run(
                         crate::tools::ToolResult::err("Tool worker dropped edit_file job".into())
                     }
                 }
-            } else if tc.function.name == "change_signature" {
+            } else if tc.function.name == "refactor" {
                 let args = args.clone();
                 let config = config.clone();
                 let router = router.clone();
@@ -711,38 +720,14 @@ pub async fn run(
                                 )
                                 .await
                             })
-                            .map_err(|e| format!("change_signature error: {e}"))
-                    })
-                    .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => crate::tools::ToolResult::err(e),
-                    Err(_) => crate::tools::ToolResult::err(
-                        "Tool worker dropped change_signature job".into(),
-                    ),
-                }
-            } else if tc.function.name == "rename" {
-                let args = args.clone();
-                let config = config.clone();
-                let lsp = lsp_client.clone();
-                match tool_pool
-                    .submit(move || {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(|e| e.to_string())?;
-                        runtime
-                            .block_on(async move {
-                                tools::execute_rename_tool(&args, &config, lsp.as_deref()).await
-                            })
-                            .map_err(|e| format!("rename error: {e}"))
+                            .map_err(|e| format!("refactor error: {e}"))
                     })
                     .await
                 {
                     Ok(Ok(r)) => r,
                     Ok(Err(e)) => crate::tools::ToolResult::err(e),
                     Err(_) => {
-                        crate::tools::ToolResult::err("Tool worker dropped rename job".into())
+                        crate::tools::ToolResult::err("Tool worker dropped refactor job".into())
                     }
                 }
             } else if tc.function.name == "file" && file_action == "shell" {
@@ -940,7 +925,7 @@ pub async fn run(
                 calls_since_last_edit += 1;
             }
 
-            if !is_prunable_change_signature_failure(&result.content, result.success) {
+            if !is_prunable_refactor_failure(&result.content, result.success) {
                 all_prunable_failures = false;
             } else {
                 prunable_errors.push(result.content.clone());
@@ -961,7 +946,7 @@ pub async fn run(
             messages.truncate(messages_pre);
             conversation_history.truncate(history_pre);
             let hint = Message::user(&format!(
-                "Your previous change_signature call(s) were rejected:\n\n{}\n\n\
+                "Your previous refactor call(s) were rejected:\n\n{}\n\n\
                  Retry with all required parameters and a clean position value \
                  (one of 'start' or 'after:<single_param_name>').",
                 prunable_errors.join("\n\n---\n\n")
@@ -971,24 +956,63 @@ pub async fn run(
             log.tool_debug(
                 "agent",
                 &format!(
-                    "history pruned: dropped {} tool_result(s) after change_signature validator failure",
+                    "history pruned: dropped {} tool_result(s) after refactor validator failure",
                     prunable_errors.len()
                 ),
             );
         }
 
-        // Stall detection: too many tool calls without any edits
-        if calls_since_last_edit >= 20 && calls_since_last_edit.is_multiple_of(20) {
-            let edit_hint = match config.tools.edit_mode {
-                EditMode::Smart => "Use edit_file for semantic file edits.",
-                EditMode::Fast => "Use replace_range or insert_at to land targeted edits.",
+        // Early no-plan nudge: edit tools are hidden until plan(action='set').
+        // The system prompt explains this but some models (GPT-OSS in particular)
+        // ignore it and explore until the stall warning fires at round 20+ —
+        // wasting most of an attempt. Nudge around round 12 so the model gets a
+        // course correction before it's deeply stuck, but late enough that real
+        // multi-file exploration has had room to breathe (a few file reads, a
+        // search, a goto_definition or two).
+        if round >= 12 && !nudged_no_plan && !tools::plan::plan_exists(&config) {
+            // Tool list in the hint must match what the model will actually
+            // see post-unlock — Devstral keeps edit_file (no refactor),
+            // everyone else gets refactor (no edit_file). Mismatch here is
+            // exactly the schema-runtime confusion we work to avoid.
+            let unlock_tools = if config.model.is_devstral_family() {
+                "edit_file, replace_range, insert_at, write_file"
+            } else {
+                "refactor, replace_range, insert_at, write_file"
             };
             messages.push(Message::user(&format!(
-                "[WARNING: You have used 20+ tool calls without making any edits. \
-                 You likely have enough information. Start making changes now. \
-                 {edit_hint} \
-                 If you're stuck, explain what's blocking you.]"
+                "[Reminder: you've explored for several rounds without a plan. \
+                 Call plan(action='set') with your step-by-step approach now — \
+                 the edit tools ({unlock_tools}) are hidden until you do, and \
+                 you'll need them to make changes.]"
             )));
+            nudged_no_plan = true;
+        }
+
+        // Stall detection: too many tool calls without any edits.
+        // Content is plan-state aware: without a plan the edit tools are
+        // hidden, so pointing the model at them is a schema-runtime
+        // mismatch. Re-fire the plan nudge instead (with a more urgent
+        // tone than the round-12 first nudge).
+        if calls_since_last_edit >= 20 && calls_since_last_edit.is_multiple_of(20) {
+            let body = if !tools::plan::plan_exists(&config) {
+                "Still no plan set after 20+ exploration calls. \
+                 Edit tools cannot appear in your tool list until plan(action='set') is called. \
+                 Stop exploring and set a plan now — even an imperfect plan can be refined later. \
+                 If something is blocking you from planning, say so."
+                    .to_string()
+            } else {
+                let edit_hint = match config.tools.edit_mode {
+                    EditMode::Smart => "Use edit_file for semantic file edits.",
+                    EditMode::Fast => "Use replace_range or insert_at to land targeted edits.",
+                };
+                format!(
+                    "You have used 20+ tool calls without making any edits. \
+                     You likely have enough information. Start making changes now. \
+                     {edit_hint} \
+                     If you're stuck, explain what's blocking you."
+                )
+            };
+            messages.push(Message::user(&format!("[WARNING: {body}]")));
         }
     }
 
