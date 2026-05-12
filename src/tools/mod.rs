@@ -24,6 +24,7 @@ mod edit_orchestration;
 pub mod fast;
 pub mod plan;
 mod read_file;
+mod refactor;
 mod search;
 pub(crate) mod shell;
 pub mod snapshots;
@@ -39,6 +40,7 @@ pub use dispatch::execute_tool;
 pub use edit_orchestration::execute_edit_file_tool;
 pub use fast::{RevisionStore, execute_fast_tool};
 pub use permissions::PermissionManager;
+pub use refactor::execute_refactor_tool;
 
 /// Result of executing a tool.
 #[derive(Debug, Clone)]
