@@ -8,14 +8,14 @@ use crate::config::EditMode;
 pub const PLAN_CHECKPOINT_AFTER_EDITS: u32 = 5;
 pub const PLAN_HARD_BLOCK_AFTER_EDITS: u32 = 8;
 
-/// True if `content` is a `change_signature` validator-shaped failure that's
-/// safe to drop from history. We rewind the assistant message + tool results
+/// True if `content` is a `refactor` validator-shaped failure that's safe
+/// to drop from history. We rewind the assistant message + tool results
 /// and replace with a user-role corrective so the model isn't primed by its
 /// own bad-shape arguments. Only fires for *schema* failures (missing keys
 /// or malformed `position`), not for downstream LSP / inner-rewrite errors.
-pub fn is_prunable_change_signature_failure(content: &str, success: bool) -> bool {
+pub fn is_prunable_refactor_failure(content: &str, success: bool) -> bool {
     !success
-        && content.starts_with("✗ change_signature(")
+        && (content.starts_with("✗ refactor(") || content.starts_with("✗ change_signature("))
         && (content.contains("missing required parameter") || content.contains("is malformed"))
 }
 
@@ -30,7 +30,7 @@ pub fn is_prunable_change_signature_failure(content: &str, success: bool) -> boo
 pub fn is_file_write(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "edit_file" | "write_file" | "change_signature" | "rename" | "replace_range" | "insert_at"
+        "edit_file" | "write_file" | "refactor" | "replace_range" | "insert_at"
     )
 }
 
@@ -147,18 +147,24 @@ mod tests {
     #[test]
     fn prunable_failure_recognizes_validator_shapes() {
         // Missing keys.
-        assert!(is_prunable_change_signature_failure(
-            "✗ change_signature(add_param): missing required parameter(s): name, default\nRequired: ...",
+        assert!(is_prunable_refactor_failure(
+            "✗ refactor(add_param): missing required parameter(s): name, callsite_fill_in\nRequired: ...",
             false,
         ));
         // Malformed position.
-        assert!(is_prunable_change_signature_failure(
-            "✗ change_signature(add_param): the 'position' value you sent (\"bogus\") is malformed.",
+        assert!(is_prunable_refactor_failure(
+            "✗ refactor(add_param): the 'position' value you sent (\"bogus\") is malformed.",
             false,
         ));
         // Combined error.
-        assert!(is_prunable_change_signature_failure(
-            "✗ change_signature(add_param): missing required parameter(s): name\n\nAlso: the 'position' value you sent (\"x\") is malformed.",
+        assert!(is_prunable_refactor_failure(
+            "✗ refactor(add_param): missing required parameter(s): name\n\nAlso: the 'position' value you sent (\"x\") is malformed.",
+            false,
+        ));
+        // Backward compat: still match the old change_signature prefix in
+        // case `--continue` carries history from a pre-rename session.
+        assert!(is_prunable_refactor_failure(
+            "✗ change_signature(add_param): missing required parameter(s): name",
             false,
         ));
     }
@@ -166,20 +172,19 @@ mod tests {
     #[test]
     fn prunable_failure_rejects_non_validator_failures() {
         // Tool succeeded → never prune.
-        assert!(!is_prunable_change_signature_failure(
+        assert!(!is_prunable_refactor_failure(
             "✓ add_param: signature + 2/2 callsite(s) rewritten.",
             true,
         ));
         // Different tool prefix.
-        assert!(!is_prunable_change_signature_failure(
+        assert!(!is_prunable_refactor_failure(
             "✗ rename: target symbol not found",
             false,
         ));
-        // change_signature with a downstream LSP / inner-rewrite error
-        // (not a schema-shape failure) — keep these so the agent sees the
-        // real cause.
-        assert!(!is_prunable_change_signature_failure(
-            "change_signature error: apply signature rewrite to src/x.rs (model output didn't match)",
+        // refactor with a downstream LSP / inner-rewrite error (not a
+        // schema-shape failure) — keep these so the agent sees the real cause.
+        assert!(!is_prunable_refactor_failure(
+            "refactor error: apply signature rewrite to src/x.rs (model output didn't match)",
             false,
         ));
     }
@@ -189,15 +194,24 @@ mod tests {
         for tool in [
             "edit_file",
             "write_file",
-            "change_signature",
-            "rename",
+            "refactor",
             "replace_range",
             "insert_at",
         ] {
             assert!(is_file_write(tool), "{tool} should count as a file write");
         }
-        // Excluded: read-only or undo tools.
-        for tool in ["file", "code", "plan", "revert", "show_rev", "check"] {
+        // Excluded: read-only or undo tools, and the deprecated standalone
+        // names that have been folded into `refactor`.
+        for tool in [
+            "file",
+            "code",
+            "plan",
+            "revert",
+            "show_rev",
+            "check",
+            "change_signature",
+            "rename",
+        ] {
             assert!(
                 !is_file_write(tool),
                 "{tool} must not count as a file write"

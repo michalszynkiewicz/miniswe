@@ -27,33 +27,37 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
         ),
     };
     vec![
-        // ── change_signature: top of list — first thing the model sees
-        //    when scanning for an edit tool. Atomic def + callsite fan-out
-        //    is much faster than hand-editing each callsite, and small
-        //    models follow tool-list ordering as a relevance ranking.
+        // ── refactor: top of list — verb name matches the model's mental
+        //    model for "I need to modify a function signature." Empirically
+        //    Gemma successfully used a tool named `refactor` (Apr 30 fast
+        //    6/6 runs, one call rewrote 16 callsites across 4 files); after
+        //    we renamed it to `change_signature` Gemma stopped reaching for
+        //    it. Restored the broader name + `callsite_fill_in` field.
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
-                name: "change_signature".into(),
-                description: "Change a function signature and update every callsite atomically. \
-                    Actions: add_param (insert a new parameter, fill literal at each call), \
-                    drop_param (remove a parameter, drop the matching argument at each call). \
-                    The tool finds the function by `name` (LSP-resolved), so you don't need to know its exact line/column. \
-                    Use action='help' for parameter details and a worked example.".into(),
+                name: "refactor".into(),
+                description: "Refactor a function signature or rename a symbol atomically across all callsites. \
+                    Actions: add_param (insert a parameter, fill a literal at each callsite), \
+                    drop_param (remove a parameter and the matching argument at each callsite), \
+                    rename (LSP-driven rename of a symbol cross-file). \
+                    The tool finds the target by `name` (LSP-resolved), so you don't need to know its exact line/column. \
+                    Use action='help' for parameter details and worked examples.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "description": "One of: add_param, drop_param, help"
+                            "description": "One of: add_param, drop_param, rename, help"
                         },
-                        "path": { "type": "string", "description": "File containing the function DEFINITION (relative to project root). If you only have a callsite, use code(goto_definition) first." },
-                        "name": { "type": "string", "description": "Function or method name. Resolved via LSP — works even if your line number is approximate." },
-                        "line": { "type": "integer", "description": "Optional. 1-based line hint, only used to disambiguate when multiple methods share `name` (e.g. several impls of `run`)." },
+                        "path": { "type": "string", "description": "File containing the function DEFINITION or a reference to the symbol (relative to project root). If you only have a callsite, use code(goto_definition) first." },
+                        "name": { "type": "string", "description": "Function/symbol name. Resolved via LSP — works even if your line number is approximate." },
+                        "line": { "type": "integer", "description": "1-based line hint. For add_param/drop_param: optional, disambiguates when multiple methods share `name`. For rename: required — line where `name` appears." },
                         "new_param": { "type": "string", "description": "For add_param: the new parameter declaration as it should appear in the signature, e.g. 'system_prompt_override: Option<&str>'" },
                         "position": { "type": "string", "description": "For add_param: where to insert. Either 'start' or 'after:<existing_param_name>'. Use after:<last_param> to append at the end." },
-                        "default": { "type": "string", "description": "For add_param: the literal expression to insert at every existing callsite, e.g. 'None'" },
-                        "param": { "type": "string", "description": "For drop_param: the name of the parameter to remove" }
+                        "callsite_fill_in": { "type": "string", "description": "For add_param: the literal expression to insert at every existing callsite, e.g. 'None'" },
+                        "param": { "type": "string", "description": "For drop_param: the name of the parameter to remove" },
+                        "new_name": { "type": "string", "description": "For rename: the new symbol name" }
                     },
                     "required": ["action"]
                 }),
@@ -136,7 +140,7 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "plan".into(),
-                description: "Plan and track work. Actions: set (create plan — UNLOCKS the edit tools edit_file/write_file/replace_range/insert_at/change_signature/rename), check (mark step done with compile gate), refine (split step), show (view plan), scratchpad (save notes). Use action='help' for details. Call set ONCE early in the session before editing.".into(),
+                description: "Plan and track work. Actions: set (create plan — UNLOCKS the edit tools refactor/edit_file/write_file/replace_range/insert_at), check (mark step done with compile gate), refine (split step), show (view plan), scratchpad (save notes). Use action='help' for details. Call set ONCE early in the session before editing.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -227,30 +231,6 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
             },
         },
     ]
-}
-
-/// Rename tool kept separate so callers can push it last in the tool
-/// list — small models treat ordering as a relevance ranking, and rename
-/// is rarely the right choice (most "rename" needs are signature changes
-/// → use change_signature, or single-symbol within-file → edit_file).
-pub fn rename_tool_definition() -> ToolDefinition {
-    ToolDefinition {
-        r#type: "function".into(),
-        function: FunctionDefinition {
-            name: "rename".into(),
-            description: "Rename a symbol (function, type, variable, parameter, field, module) using the language server's native rename. Type-aware and cross-file. Use action='help' for an example.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "description": "Optional. Set to 'help' to see usage." },
-                    "path": { "type": "string", "description": "File containing the symbol (relative to project root)" },
-                    "line": { "type": "integer", "description": "1-based line where `name` appears. Can be the definition line or any reference line." },
-                    "name": { "type": "string", "description": "Current name of the symbol. The tool finds its column on the given line, so you don't need to specify column." },
-                    "new_name": { "type": "string", "description": "New name for the symbol" }
-                }
-            }),
-        },
-    }
 }
 
 /// Return the fast-mode tool definitions (`replace_range`, `insert_at`,

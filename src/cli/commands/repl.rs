@@ -19,8 +19,8 @@ use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
     PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_BLOCK_MESSAGE, PLAN_CHECKPOINT_WARNING,
     PLAN_HARD_BLOCK_AFTER_EDITS, PLAN_PROGRESS_NUDGE, PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE,
-    is_file_write, is_prunable_change_signature_failure, loop_detected_hint,
-    truncated_tool_call_hint, visible_tool_defs,
+    is_file_write, is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint,
+    visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{is_mutating_call, loop_call_key};
 use crate::cli::commands::agent::permissions::permission_action;
@@ -82,7 +82,13 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
             disabled.push("plan");
         }
         if config.model.is_devstral_family() {
-            disabled.push("change_signature");
+            // Devstral mangles refactor args (schema confusion). See run.rs.
+            disabled.push("refactor");
+        } else {
+            // Non-Devstral: hide edit_file. See run.rs for the empirical
+            // case — edit_file monopolizes tool choice on Gemma and crowds
+            // out the more specific refactor + replace_range/insert_at path.
+            disabled.push("edit_file");
         }
         // Fast mode keeps `edit_file` available alongside the
         // primitives — see run.rs for rationale.
@@ -91,8 +97,6 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
             tool_defs.extend(tools::fast_mode_tool_definitions());
         }
         tool_defs.push(tools::definitions::spawn_agents_tool_definition());
-        // rename last — see rename_tool_definition rationale.
-        tool_defs.push(tools::definitions::rename_tool_definition());
     }
 
     // Spawn LSP client (non-blocking)
@@ -1204,7 +1208,7 @@ async fn run_agent_loop(
                         .map_err(|e| format!("plan error: {e}"))
                 });
                 await_tool_job_ui(rx, terminal, app, "plan", &mut result_rx, cancelled).await
-            } else if tc.function.name == "change_signature" {
+            } else if tc.function.name == "refactor" {
                 let args = args.clone();
                 let config = config.clone();
                 let router = router.clone();
@@ -1228,33 +1232,9 @@ async fn run_agent_loop(
                             )
                             .await
                         })
-                        .map_err(|e| format!("change_signature error: {e}"))
+                        .map_err(|e| format!("refactor error: {e}"))
                 });
-                await_tool_job_ui(
-                    rx,
-                    terminal,
-                    app,
-                    "change_signature",
-                    &mut result_rx,
-                    cancelled,
-                )
-                .await
-            } else if tc.function.name == "rename" {
-                let args = args.clone();
-                let config = config.clone();
-                let lsp = lsp.clone();
-                let mut result_rx = tool_pool.submit(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| e.to_string())?;
-                    runtime
-                        .block_on(async move {
-                            crate::tools::execute_rename_tool(&args, &config, lsp.as_deref()).await
-                        })
-                        .map_err(|e| format!("rename error: {e}"))
-                });
-                await_tool_job_ui(rx, terminal, app, "rename", &mut result_rx, cancelled).await
+                await_tool_job_ui(rx, terminal, app, "refactor", &mut result_rx, cancelled).await
             } else if tc.function.name == "file" && file_action == "shell" {
                 await_shell_job_repl(
                     tool_pool.submit_shell(args.clone(), config.clone(), cancelled.clone()),
@@ -1352,7 +1332,7 @@ async fn run_agent_loop(
                 result.content.clone(),
             ));
 
-            if !is_prunable_change_signature_failure(&result.content, result.success) {
+            if !is_prunable_refactor_failure(&result.content, result.success) {
                 all_prunable_failures = false;
             } else {
                 prunable_errors.push(result.content.clone());
@@ -1371,7 +1351,7 @@ async fn run_agent_loop(
             messages.truncate(messages_pre);
             conversation_history.truncate(history_pre);
             let hint = Message::user(&format!(
-                "Your previous change_signature call(s) were rejected:\n\n{}\n\n\
+                "Your previous refactor call(s) were rejected:\n\n{}\n\n\
                  Retry with all required parameters and a clean position value \
                  (one of 'start' or 'after:<single_param_name>').",
                 prunable_errors.join("\n\n---\n\n")
@@ -1381,7 +1361,7 @@ async fn run_agent_loop(
             log.tool_debug(
                 "agent",
                 &format!(
-                    "history pruned: dropped {} tool_result(s) after change_signature validator failure",
+                    "history pruned: dropped {} tool_result(s) after refactor validator failure",
                     prunable_errors.len()
                 ),
             );
