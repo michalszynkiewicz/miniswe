@@ -17,10 +17,9 @@ use tokio::sync::mpsc;
 
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
-    PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_BLOCK_MESSAGE, PLAN_CHECKPOINT_WARNING,
-    PLAN_HARD_BLOCK_AFTER_EDITS, PLAN_PROGRESS_NUDGE, PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE,
-    is_file_write, is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint,
-    visible_tool_defs,
+    PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
+    PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE, is_file_write, is_prunable_refactor_failure,
+    loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{is_mutating_call, loop_call_key};
 use crate::cli::commands::agent::permissions::permission_action;
@@ -640,7 +639,6 @@ async fn run_agent_loop(
     // turn. We give one recovery; a second loop ends the turn for real.
     let mut loop_recoveries = 0u32;
     let mut successful_edits_since_plan_update = 0u32;
-    let mut plan_checkpoint_pending = false;
     let mut nudged_premature_exit = false;
 
     loop {
@@ -670,14 +668,29 @@ async fn run_agent_loop(
         context::sanitize_messages(messages);
 
         // Hide edit tools until a plan exists; see visible_tool_defs.
-        let visible = visible_tool_defs(tool_defs, tools::plan::plan_exists(config));
-        // Build request. See run.rs for why thinking is disabled.
+        let plan_set = tools::plan::plan_exists(config);
+        let visible = visible_tool_defs(tool_defs, plan_set);
+        // Build request. See run.rs for the per-model reasoning_effort logic.
+        let chat_template_kwargs = if config.model.is_mistral_small_4_family() {
+            let effort = if plan_set { "none" } else { "high" };
+            serde_json::json!({"reasoning_effort": effort})
+        } else {
+            serde_json::json!({"enable_thinking": false})
+        };
+        // Bump output budget for Mistral 4 — see run.rs for rationale
+        // (probe data: 8K truncates with empty content, 16K emits clean
+        // correct output at ~6K tokens used).
+        let max_tokens_override = if config.model.is_mistral_small_4_family() {
+            Some(16384)
+        } else {
+            None
+        };
         let request = ChatRequest {
             messages: messages.clone(),
             tools: Some(visible),
             tool_choice: None,
-            max_tokens_override: None,
-            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+            max_tokens_override,
+            chat_template_kwargs: Some(chat_template_kwargs),
         };
         log.llm_request(&request);
 
@@ -833,15 +846,28 @@ async fn run_agent_loop(
         let tool_calls = match &assistant_msg.tool_calls {
             Some(tc) if !tc.is_empty() => tc.clone(),
             _ => {
-                if !nudged_premature_exit
-                    && config.tools.plan
-                    && tools::plan::has_unchecked_steps(config)
-                {
-                    nudged_premature_exit = true;
-                    let nudge = Message::user(PREMATURE_EXIT_NUDGE);
-                    messages.push(nudge.clone());
-                    conversation_history.push(nudge);
-                    continue;
+                // See run.rs for rationale — nudge on both "mid-plan exit"
+                // and "no-plan exit" (the latter caught Mistral Small 4
+                // bailing during exploration before any meaningful work).
+                if !nudged_premature_exit && config.tools.plan {
+                    let has_unchecked = tools::plan::has_unchecked_steps(config);
+                    let plan_exists = tools::plan::plan_exists(config);
+                    if has_unchecked || !plan_exists {
+                        nudged_premature_exit = true;
+                        let nudge_text = if plan_exists {
+                            PREMATURE_EXIT_NUDGE.to_string()
+                        } else {
+                            "[You returned no tool call before setting a plan. \
+                             Don't exit yet — call plan(action='set') with your \
+                             step-by-step approach (or file/code if you need more \
+                             exploration). The task isn't done.]"
+                                .to_string()
+                        };
+                        let nudge = Message::user(&nudge_text);
+                        messages.push(nudge.clone());
+                        conversation_history.push(nudge);
+                        continue;
+                    }
                 }
                 break;
             }
@@ -1034,18 +1060,12 @@ async fn run_agent_loop(
             }
 
             let file_action = args["action"].as_str().unwrap_or("");
-            let is_write_action = is_file_write(tc.function.name.as_str());
-            if config.tools.plan
-                && plan_checkpoint_pending
-                && successful_edits_since_plan_update >= PLAN_HARD_BLOCK_AFTER_EDITS
-                && is_write_action
-            {
-                let result_msg = Message::tool_result(&tc.id, PLAN_CHECKPOINT_BLOCK_MESSAGE);
-                messages.push(result_msg.clone());
-                conversation_history.push(result_msg);
-                app.push_output("  ✗ blocked: plan checkpoint", LineStyle::ToolErr);
-                continue;
-            }
+            // (Plan-checkpoint used to hard-block writes after N edits without
+            //  a plan action; that interacted poorly with the compile-gate on
+            //  `plan(check)` — if the project didn't compile, the model
+            //  couldn't escape the block, couldn't fix the project, deadlock.
+            //  Now we just warn at the threshold via PLAN_CHECKPOINT_WARNING
+            //  appended to the tool result; the model decides what to do.)
 
             // Execute tool (permissions already checked above for shell/web/mcp)
             let mut result = if matches!(
@@ -1302,7 +1322,6 @@ async fn run_agent_loop(
             app.store_tool_result(&tc.function.name, &result.content);
 
             if result.success && tc.function.name == "plan" {
-                plan_checkpoint_pending = false;
                 successful_edits_since_plan_update = 0;
             }
 
@@ -1316,9 +1335,6 @@ async fn run_agent_loop(
                         result.content.push_str(PLAN_PROGRESS_NUDGE);
                     }
                     successful_edits_since_plan_update += 1;
-                    if successful_edits_since_plan_update >= PLAN_CHECKPOINT_AFTER_EDITS {
-                        plan_checkpoint_pending = true;
-                    }
                     if successful_edits_since_plan_update == PLAN_CHECKPOINT_AFTER_EDITS {
                         result.content.push('\n');
                         result.content.push_str(PLAN_CHECKPOINT_WARNING);

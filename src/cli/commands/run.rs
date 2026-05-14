@@ -18,10 +18,9 @@ use anyhow::Result;
 
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
-    PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_BLOCK_MESSAGE, PLAN_CHECKPOINT_WARNING,
-    PLAN_HARD_BLOCK_AFTER_EDITS, PLAN_PROGRESS_NUDGE, PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE,
-    is_file_write, is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint,
-    visible_tool_defs,
+    PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
+    PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE, is_file_write, is_prunable_refactor_failure,
+    loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{is_mutating_call, loop_call_key};
 use crate::config::{Config, EditMode, ModelRole};
@@ -195,7 +194,6 @@ pub async fn run(
     let mut loop_recoveries = 0u32;
     let mut calls_since_last_edit = 0u32;
     let mut successful_edits_since_plan_update = 0u32;
-    let mut plan_checkpoint_pending = false;
     let mut plan_update_requested = false;
     let mut nudged_premature_exit = false;
     let mut nudged_no_plan = false;
@@ -336,13 +334,38 @@ pub async fn run(
         // and visible to subsequent turns.
         // Hide edit tools from the model until a plan exists. See
         // visible_tool_defs for rationale.
-        let visible = visible_tool_defs(&tool_defs, tools::plan::plan_exists(&config));
+        let plan_set = tools::plan::plan_exists(&config);
+        let visible = visible_tool_defs(&tool_defs, plan_set);
+        // Mistral Small 4 honors `reasoning_effort` ("none"/"high"); other
+        // models (Gemma, GPT-OSS, Devstral) use `enable_thinking` or
+        // ignore the kwarg entirely. For Mistral 4 we want deep reasoning
+        // during the planning phase (decomposing the task — exactly where
+        // it goes wrong, picking the wrong file family) and fast execution
+        // once a plan is set. Per-model gating keeps the cost localized.
+        let chat_template_kwargs = if config.model.is_mistral_small_4_family() {
+            let effort = if plan_set { "none" } else { "high" };
+            serde_json::json!({"reasoning_effort": effort})
+        } else {
+            serde_json::json!({"enable_thinking": false})
+        };
+        // Mistral Small 4 with reasoning_effort=high needs significant
+        // output budget. Probe data: at 8192 max_tokens the model hits
+        // finish_reason=length after ~32K chars of reasoning_content with
+        // ZERO chars of content emitted. At 16384 it reasons for ~24K
+        // chars and emits a clean ~2K-char correct plan (finish_reason=stop,
+        // ~6K tokens used). Per llama.cpp #20668 and vLLM #37081 — known
+        // Mistral 4 budget-hungry reasoning behavior.
+        let max_tokens_override = if config.model.is_mistral_small_4_family() {
+            Some(16384)
+        } else {
+            None
+        };
         let request = ChatRequest {
             messages: messages.clone(),
             tools: Some(visible),
             tool_choice: None,
-            max_tokens_override: None,
-            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+            max_tokens_override,
+            chat_template_kwargs: Some(chat_template_kwargs),
         };
         log.llm_request(&request);
 
@@ -448,15 +471,32 @@ pub async fn run(
         let tool_calls = match &assistant_msg.tool_calls {
             Some(tc) if !tc.is_empty() => tc.clone(),
             _ => {
-                if !nudged_premature_exit
-                    && config.tools.plan
-                    && tools::plan::has_unchecked_steps(&config)
-                {
-                    nudged_premature_exit = true;
-                    let nudge = Message::user(PREMATURE_EXIT_NUDGE);
-                    messages.push(nudge.clone());
-                    conversation_history.push(nudge);
-                    continue;
+                // Two distinct "model returned nothing" situations:
+                //  (1) plan exists, steps remain → standard mid-task exit
+                //  (2) no plan set yet → model stopped during exploration
+                //      before doing meaningful work. Mistral Small 4 with
+                //      reasoning_effort=high triggered this — read a few
+                //      files, reasoned heavily, then returned empty.
+                // Both deserve one nudge to recover.
+                if !nudged_premature_exit && config.tools.plan {
+                    let has_unchecked = tools::plan::has_unchecked_steps(&config);
+                    let plan_exists = tools::plan::plan_exists(&config);
+                    if has_unchecked || !plan_exists {
+                        nudged_premature_exit = true;
+                        let nudge_text = if plan_exists {
+                            PREMATURE_EXIT_NUDGE.to_string()
+                        } else {
+                            "[You returned no tool call before setting a plan. \
+                             Don't exit yet — call plan(action='set') with your \
+                             step-by-step approach (or file/code if you need more \
+                             exploration). The task isn't done.]"
+                                .to_string()
+                        };
+                        let nudge = Message::user(&nudge_text);
+                        messages.push(nudge.clone());
+                        conversation_history.push(nudge);
+                        continue;
+                    }
                 }
                 break;
             }
@@ -593,17 +633,12 @@ pub async fn run(
                 tui::print_tool_result(&tc.function.name, false, "blocked: no plan");
                 continue;
             }
-            if config.tools.plan
-                && plan_checkpoint_pending
-                && successful_edits_since_plan_update >= PLAN_HARD_BLOCK_AFTER_EDITS
-                && is_write_action
-            {
-                let result_msg = Message::tool_result(&tc.id, PLAN_CHECKPOINT_BLOCK_MESSAGE);
-                messages.push(result_msg.clone());
-                conversation_history.push(result_msg);
-                tui::print_tool_result(&tc.function.name, false, "blocked: plan checkpoint");
-                continue;
-            }
+            // (Plan-checkpoint used to hard-block writes after N edits without
+            //  a plan action; that interacted poorly with the compile-gate on
+            //  `plan(check)` — if the project didn't compile, the model
+            //  couldn't escape the block, couldn't fix the project, deadlock.
+            //  Now we just warn at the threshold via PLAN_CHECKPOINT_WARNING
+            //  appended to the tool result; the model decides what to do.)
 
             // Handle tool dispatch
             let mut result = if tc.function.name == "file" && file_action == "revert" {
@@ -898,7 +933,6 @@ pub async fn run(
             tui::print_tool_result(&tc.function.name, result.success, first_line);
 
             if result.success && tc.function.name == "plan" {
-                plan_checkpoint_pending = false;
                 successful_edits_since_plan_update = 0;
             }
 
@@ -913,9 +947,6 @@ pub async fn run(
                         result.content.push_str(PLAN_PROGRESS_NUDGE);
                     }
                     successful_edits_since_plan_update += 1;
-                    if successful_edits_since_plan_update >= PLAN_CHECKPOINT_AFTER_EDITS {
-                        plan_checkpoint_pending = true;
-                    }
                     if successful_edits_since_plan_update == PLAN_CHECKPOINT_AFTER_EDITS {
                         result.content.push('\n');
                         result.content.push_str(PLAN_CHECKPOINT_WARNING);
