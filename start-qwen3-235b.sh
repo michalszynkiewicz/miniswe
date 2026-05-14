@@ -42,7 +42,7 @@ echo "  Port:    $PORT"
 echo "  GPU:     none (CPU only — ~97GB in RAM)"
 echo ""
 
-exec llama-server \
+exec "$(dirname "$0")/scripts/run-llama-cuda.sh" \
     --model "$MODEL" \
     --model-draft "$HOME/models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf" \
     --n-gpu-layers-draft 99 \
