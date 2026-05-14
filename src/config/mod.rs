@@ -117,6 +117,28 @@ pub struct ModelConfig {
     /// since it's a runtime probe result, not user config.
     #[serde(skip)]
     pub probed_model: Option<String>,
+    /// How to interpret tool calls from the model. `auto` (default) accepts
+    /// OpenAI JSON tool_calls and falls back to parsing Anthropic-style XML
+    /// embedded in content when tool_calls is empty. `json` ignores XML;
+    /// `xml` skips JSON parsing and always treats content as the source.
+    /// The override exists so future models with known formats can be pinned
+    /// without relying on detection.
+    #[serde(default)]
+    pub tool_call_format: ToolCallFormat,
+}
+
+/// Wire format we expect the model to use for tool invocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCallFormat {
+    /// Try OpenAI JSON first; fall back to XML in content when tool_calls
+    /// is empty and the content looks like a tool-call block.
+    #[default]
+    Auto,
+    /// JSON tool_calls only. Ignore any XML in content.
+    Json,
+    /// Always parse XML from content. Ignore the tool_calls array.
+    Xml,
 }
 
 fn default_stream_idle_timeout_secs() -> u64 {
@@ -140,6 +162,22 @@ impl ModelConfig {
     pub fn is_devstral_family(&self) -> bool {
         match &self.probed_model {
             Some(probed) => probed.to_ascii_lowercase().contains("devstral"),
+            None => false,
+        }
+    }
+
+    /// True if the served model is Mistral Small 4 (the unified MoE that
+    /// folded Magistral/Pixtral/Devstral into one model). Used to gate the
+    /// `reasoning_effort` knob: Mistral Small 4 exposes a per-request
+    /// reasoning_effort kwarg (`none`/`high`) — we want `high` when the
+    /// model is deciding task decomposition (pre-plan) and `none` once
+    /// edits are flowing. Probe-only by the same logic as is_devstral_family.
+    pub fn is_mistral_small_4_family(&self) -> bool {
+        match &self.probed_model {
+            Some(probed) => {
+                let p = probed.to_ascii_lowercase();
+                p.contains("mistral-small-4") || p.contains("mistral_small_4")
+            }
             None => false,
         }
     }
@@ -382,6 +420,7 @@ impl Default for ModelConfig {
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             max_retries: 6,
             probed_model: None,
+            tool_call_format: ToolCallFormat::Auto,
         }
     }
 }
