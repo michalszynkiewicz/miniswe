@@ -6,7 +6,6 @@ use crate::config::EditMode;
 // ── Plan-checkpoint thresholds and nudges ────────────────────────────
 
 pub const PLAN_CHECKPOINT_AFTER_EDITS: u32 = 5;
-pub const PLAN_HARD_BLOCK_AFTER_EDITS: u32 = 8;
 
 /// True if `content` is a `refactor` validator-shaped failure that's safe
 /// to drop from history. We rewind the assistant message + tool results
@@ -62,10 +61,7 @@ pub const PLAN_PROGRESS_NUDGE: &str = "\
 PLAN STATUS: If this edit completed one of your current plan steps, mark it now with plan(action='check', step=N). If the work split changed, use plan(action='refine') or plan(action='set').";
 
 pub const PLAN_CHECKPOINT_WARNING: &str = "\
-PLAN CHECKPOINT: You have made 5 edits since the last successful plan action. Before making many more edits, review the plan: use plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet. Further edits may be blocked if you continue without any plan action.";
-
-pub const PLAN_CHECKPOINT_BLOCK_MESSAGE: &str = "\
-Plan checkpoint required before more edits. You have continued editing after the checkpoint warning. Use any successful plan action now: plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet.";
+PLAN CHECKPOINT: You have made 5 edits since the last successful plan action. Before making many more edits, review the plan: use plan(action='check') for completed steps, plan(action='refine' or 'set') if direction changed, or plan(action='show') if no step is complete yet.";
 
 /// Pushed once per turn when the assistant returns no tool calls but the
 /// plan still has unchecked steps. Intentionally short and open-ended —
