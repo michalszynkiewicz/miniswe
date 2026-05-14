@@ -148,9 +148,20 @@ async fn execute_file_tool(
             }
         }
 
-        _ => Ok(ToolResult::err(format!(
-            "Unknown file action: '{action}'. Use 'help' to see available actions."
-        ))),
+        _ => {
+            // Qwen3-Coder-Next and similar models sometimes emit Anthropic
+            // XML tool-call syntax inside the JSON `action` field (e.g.
+            // "shell>\n<parameter=command>\n..."). Detect that shape and
+            // surface a terse error rather than a generic "unknown action".
+            if action.contains('<') || action.contains('>') || action.contains("\n<parameter") {
+                return Ok(ToolResult::err(
+                    "You used XML tool-call syntax. Use OpenAI JSON tool call syntax.".into(),
+                ));
+            }
+            Ok(ToolResult::err(format!(
+                "Unknown file action: '{action}'. Use 'help' to see available actions."
+            )))
+        }
     }
 }
 

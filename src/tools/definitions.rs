@@ -140,7 +140,14 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "plan".into(),
-                description: "Plan and track work. Actions: set (create plan — UNLOCKS the edit tools refactor/edit_file/write_file/replace_range/insert_at), check (mark step done with compile gate), refine (split step), show (view plan), scratchpad (save notes). Use action='help' for details. Call set ONCE early in the session before editing.".into(),
+                description: "Plan and track work. Actions: \
+                    'set' (create plan from `steps` or `content` — UNLOCKS the edit tools refactor/edit_file/write_file/replace_range/insert_at), \
+                    'check' REQUIRES `step` (1-indexed step number; marks done with compile gate), \
+                    'refine' REQUIRES `step` AND `substeps` (replaces target step with substeps), \
+                    'show' (view plan), \
+                    'scratchpad' (save notes), \
+                    'help' (full details). \
+                    Call 'set' ONCE early in the session before editing.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -154,7 +161,7 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
                         },
                         "steps": {
                             "type": "array",
-                            "description": "For set: structured step list. Each item is {step: string (the action text), compile?: boolean (default true)}.",
+                            "description": "For action='set': structured step list. Each item is {step: string (the action text), compile?: boolean (default true)}.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -164,10 +171,10 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
                                 "required": ["step"]
                             }
                         },
-                        "step": { "type": "integer", "description": "Step number (for check/refine — disambiguated from per-item 'step' string by parent property name)." },
+                        "step": { "type": "integer", "description": "REQUIRED when action is 'check' or 'refine'. 1-indexed step number from the current plan." },
                         "substeps": {
                             "type": "array",
-                            "description": "For refine: substeps to replace target step. Same item shape as steps.",
+                            "description": "REQUIRED when action is 'refine'. Array of substep objects that replace the target step. Same item shape as the 'steps' array.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -239,11 +246,17 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
 /// `docs/fast-mode-design.md`.
 pub fn fast_mode_tool_definitions() -> Vec<ToolDefinition> {
     vec![
+        // The "smallest range" line is the model-facing fix for a Mistral 4
+        // failure mode: when given a wide range it tries to reproduce the
+        // surrounding unchanged lines from memory in `content`, drops bits,
+        // and silently deletes parts of the file. Keeping the range tight
+        // sidesteps that — content only needs to cover what's actually
+        // changing.
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "replace_range".into(),
-                description: "Replace lines [start..=end] (1-based, inclusive) with `content`. Empty content deletes the range. After each call you receive per-edit AST + LSP feedback and the file's revision table; if you see a regression, call `revert` with the prior rev number.".into(),
+                description: "Replace lines [start..=end] (1-based, inclusive) with `content`. Empty content deletes the range. Use the smallest range that covers only the lines you're actually changing — do not include surrounding unchanged lines. After each call you receive per-edit AST + LSP feedback and the file's revision table; if you see a regression, call `revert` with the prior rev number.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -393,7 +406,7 @@ Available actions for `file`:
 - read: Read a file. Params: path (required), start_line, end_line
 - delete: Delete an existing file. Params: path (required)
   Example: {\"action\":\"delete\",\"path\":\"src/bin/old.rs\"}
-- search: Search codebase. Params: query or pattern (one required), scope, max_results
+- search: Search codebase. Params: query (literal text, no regex) OR pattern (regex); exactly one required. Also: scope, max_results
 - shell: Run a command. Params: command (required), timeout
   Example: {\"action\":\"shell\",\"command\":\"cargo check\",\"timeout\":30}
 - revert: Revert files to a previous round. Params: to_round, path (both optional)
@@ -408,7 +421,7 @@ Available actions for `file`:
 - read: Read a file. Params: path (required), start_line, end_line
 - delete: Delete an existing file. Params: path (required)
   Example: {\"action\":\"delete\",\"path\":\"src/bin/old.rs\"}
-- search: Search codebase. Params: query or pattern (one required), scope, max_results
+- search: Search codebase. Params: query (literal text, no regex) OR pattern (regex); exactly one required. Also: scope, max_results
 - shell: Run a command. Params: command (required), timeout
   Example: {\"action\":\"shell\",\"command\":\"cargo check\",\"timeout\":30}
 - revert: Revert files to a previous round. Params: to_round, path (both optional)
