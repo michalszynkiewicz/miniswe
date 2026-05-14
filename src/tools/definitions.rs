@@ -16,14 +16,14 @@ use serde_json::json;
 /// isn't in its list wastes rounds, so the strings have to match the actual
 /// surface — see `cli/commands/{run,repl}.rs` for how the list is filtered.
 pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
-    let (file_edit_hint, write_partial_hint) = match edit_mode {
+    let (file_edit_hint, write_file_description) = match edit_mode {
         EditMode::Smart => (
             "For code edits use edit_file; for full-file overwrites use write_file.",
-            "Do not use for partial edits to existing code; use edit_file instead.",
+            "Create or overwrite a file. Provide complete file contents in `content`, or omit `content` to create a new empty file. Do not use for partial edits to existing code; use edit_file instead.",
         ),
         EditMode::Fast => (
             "For surgical line-precise code edits use replace_range or insert_at; for structural rewrites (e.g. wrapping a block in if-let) use edit_file; for full-file overwrites use write_file.",
-            "Do not use for partial edits to existing code; use replace_range/insert_at or edit_file instead.",
+            "Create a NEW file. Provide complete contents in `content`. WARNING: regenerating existing files often drops imports/braces/struct fields. For editing existing files, use replace_range/insert_at/refactor instead.",
         ),
     };
     vec![
@@ -227,7 +227,7 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "write_file".into(),
-                description: format!("Create or overwrite a file. Provide complete file contents in `content`, or omit `content` to create a new empty file. {write_partial_hint}"),
+                description: write_file_description.to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -263,7 +263,7 @@ pub fn fast_mode_tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "replace_range".into(),
-                description: "Replace lines [start..=end] (1-based, inclusive) with `content`. Empty content deletes the range. Use the smallest range that covers only the lines you're actually changing — do not include surrounding unchanged lines. For adding/removing a parameter or renaming a symbol across callsites, use `refactor` instead — one atomic call beats N manual replace_range edits. After each call you receive per-edit AST + LSP feedback and the file's revision table; if you see a regression, call `revert` with the prior rev number.".into(),
+                description: "Replace lines [start..=end] (1-based, inclusive) with `content`. Empty content deletes. Keep the range TIGHT — anything in the range that isn't in `content` is gone. To ADD new lines, use insert_at. For signature changes / renames, use refactor. Per-edit AST+LSP feedback comes back in the response; if you see a regression, call `revert`.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
