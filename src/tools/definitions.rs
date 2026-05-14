@@ -37,12 +37,19 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "refactor".into(),
-                description: "Refactor a function signature or rename a symbol atomically across all callsites. \
-                    Actions: add_param (insert a parameter, fill a literal at each callsite), \
-                    drop_param (remove a parameter and the matching argument at each callsite), \
-                    rename (LSP-driven rename of a symbol cross-file). \
-                    The tool finds the target by `name` (LSP-resolved), so you don't need to know its exact line/column. \
-                    Use action='help' for parameter details and worked examples.".into(),
+                description: "ATOMIC multi-file refactor — updates the definition AND every callsite \
+                    in one call. Use this WHENEVER the task is:\n\
+                    • adding a parameter (e.g. 'add a flag', 'add a context arg', 'extend signature with X')\n\
+                    • removing a parameter\n\
+                    • renaming a function, method, type, or variable across the codebase\n\
+                    \n\
+                    DO NOT enumerate or edit callsites yourself with replace_range/insert_at for these \
+                    tasks — that's manual, error-prone, and the exact thing this tool exists to avoid. \
+                    One refactor call is faster and atomic.\n\
+                    \n\
+                    Target is resolved by `name` via LSP, so exact line/column isn't needed. \
+                    Actions: add_param, drop_param, rename. Use action='help' for parameter details \
+                    and worked examples.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -256,7 +263,7 @@ pub fn fast_mode_tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "replace_range".into(),
-                description: "Replace lines [start..=end] (1-based, inclusive) with `content`. Empty content deletes the range. Use the smallest range that covers only the lines you're actually changing — do not include surrounding unchanged lines. After each call you receive per-edit AST + LSP feedback and the file's revision table; if you see a regression, call `revert` with the prior rev number.".into(),
+                description: "Replace lines [start..=end] (1-based, inclusive) with `content`. Empty content deletes the range. Use the smallest range that covers only the lines you're actually changing — do not include surrounding unchanged lines. For adding/removing a parameter or renaming a symbol across callsites, use `refactor` instead — one atomic call beats N manual replace_range edits. After each call you receive per-edit AST + LSP feedback and the file's revision table; if you see a regression, call `revert` with the prior rev number.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -273,7 +280,7 @@ pub fn fast_mode_tool_definitions() -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "insert_at".into(),
-                description: "Insert `content` after line `after_line` (1-based). Use after_line=0 to insert at the top of the file, after_line=<last line> to append. Use `replace_range` when you need to replace or delete existing lines.".into(),
+                description: "Insert `content` after line `after_line` (1-based). Use after_line=0 to insert at the top of the file, after_line=<last line> to append. Use `replace_range` when you need to replace or delete existing lines. For adding a parameter to a function (which also requires inserting an argument at every callsite), use `refactor(add_param)` instead — one atomic call beats hand-editing each callsite.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
