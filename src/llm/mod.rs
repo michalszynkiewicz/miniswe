@@ -5,6 +5,7 @@
 
 pub mod router;
 mod types;
+mod xml_tool_calls;
 
 pub use router::ModelRouter;
 pub use types::*;
@@ -19,7 +20,7 @@ use reqwest::Client;
 use reqwest::StatusCode;
 use serde_json::Value;
 
-use crate::config::ModelConfig;
+use crate::config::{ModelConfig, ToolCallFormat};
 
 /// Counter for dumped request bodies. Atomic so multi-threaded callers
 /// don't collide on filenames.
@@ -423,7 +424,7 @@ impl LlmClient {
             });
         }
 
-        Ok(ChatResponse {
+        let mut resp = ChatResponse {
             choices: vec![Choice {
                 message: Message {
                     role: "assistant".into(),
@@ -443,7 +444,9 @@ impl LlmClient {
                 finish_reason: Some("stop".into()),
             }],
             usage: None,
-        })
+        };
+        normalize_xml_tool_calls(&mut resp, self.config.tool_call_format);
+        Ok(resp)
     }
 
     /// Drain a non-streamed JSON response body chunk-by-chunk so the
@@ -491,8 +494,9 @@ impl LlmClient {
             buf.extend_from_slice(&chunk);
         }
 
-        let resp: ChatResponse =
+        let mut resp: ChatResponse =
             serde_json::from_slice(&buf).context("Failed to parse LLM response")?;
+        normalize_xml_tool_calls(&mut resp, self.config.tool_call_format);
         if let Some(content) = resp
             .choices
             .first()
@@ -627,6 +631,143 @@ fn has_tool_call_leak(resp: &ChatResponse) -> bool {
     false
 }
 
+/// Promote Anthropic-style XML tool calls embedded in `content` into the
+/// JSON `tool_calls` array so the rest of the pipeline doesn't need to
+/// know which wire format the model used.
+///
+/// Behaviour by [`ToolCallFormat`]:
+///
+/// * `Json`: no-op. We trust the OpenAI `tool_calls` field.
+/// * `Xml`: always parse content as the source; replace `tool_calls`.
+/// * `Auto`: keep existing `tool_calls` if non-empty; otherwise look for
+///   XML tool-call blocks in content and lift them.
+///
+/// When XML calls are lifted, the matching XML blocks are *stripped* from
+/// content so the surviving text is just the model's prose (thinking
+/// commentary). If stripping leaves content empty, content is cleared so
+/// downstream "empty assistant" checks still fire correctly.
+fn normalize_xml_tool_calls(resp: &mut ChatResponse, format: ToolCallFormat) {
+    if matches!(format, ToolCallFormat::Json) {
+        return;
+    }
+    // Pass 1: repair XML-leaked-into-args corruption (the dominant failure
+    // for Qwen3-Coder-Next on llama-server, which doesn't yet have a
+    // qwen3_coder tool-call parser — see llama.cpp issue #15012). Each tool
+    // call's args string is re-checked; if a field contains `<parameter=`,
+    // we lift the leaked XML into proper JSON fields in-place.
+    for choice in &mut resp.choices {
+        if let Some(tcs) = choice.message.tool_calls.as_mut() {
+            for tc in tcs.iter_mut() {
+                if let Some(repaired) = xml_tool_calls::repair_leaked_args(&tc.function.arguments) {
+                    tc.function.arguments = repaired;
+                }
+            }
+        }
+    }
+
+    // Pass 2: lift pure-content XML tool calls (the case where the model
+    // emits the XML in `content` and tool_calls is empty).
+    for choice in &mut resp.choices {
+        let msg = &mut choice.message;
+        let already_has_calls = msg.tool_calls.as_ref().is_some_and(|tcs| !tcs.is_empty());
+        if matches!(format, ToolCallFormat::Auto) && already_has_calls {
+            continue;
+        }
+        let Some(content_ref) = msg.content.as_deref() else {
+            continue;
+        };
+        let parsed = xml_tool_calls::parse(content_ref);
+        if parsed.is_empty() {
+            continue;
+        }
+
+        let stripped = strip_xml_tool_blocks(content_ref);
+        let synthesized: Vec<ToolCall> = parsed
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| ToolCall {
+                id: format!("xml_{i}"),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: p.name,
+                    arguments: p.arguments.to_string(),
+                },
+            })
+            .collect();
+
+        msg.tool_calls = Some(synthesized);
+        msg.content = if stripped.is_empty() {
+            None
+        } else {
+            Some(stripped)
+        };
+    }
+}
+
+/// Remove `<NAME>...</NAME>` blocks that contain `<parameter=...>` from
+/// the input, leaving surrounding thinking text untouched.
+fn strip_xml_tool_blocks(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        let rest = &content[cursor..];
+        let Some(lt_off) = rest.find('<') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..lt_off]);
+        let lt_pos = cursor + lt_off;
+        let after_lt = lt_pos + 1;
+
+        // Skip closing tags and <parameter=...> (we only strip outer tool tags).
+        if content[lt_pos..].starts_with("</") || content[lt_pos..].starts_with("<parameter=") {
+            out.push('<');
+            cursor = after_lt;
+            continue;
+        }
+
+        // Read tag name.
+        let mut name_end = after_lt;
+        while name_end < bytes.len()
+            && (bytes[name_end].is_ascii_alphanumeric() || bytes[name_end] == b'_')
+        {
+            name_end += 1;
+        }
+        if name_end == after_lt || bytes.get(name_end) != Some(&b'>') {
+            out.push('<');
+            cursor = after_lt;
+            continue;
+        }
+        let name = &content[after_lt..name_end];
+        let inner_start = name_end + 1;
+        let close_pat = format!("</{name}>");
+        let Some(close_off) = content[inner_start..].find(&close_pat) else {
+            out.push('<');
+            cursor = after_lt;
+            continue;
+        };
+        let close_pos = inner_start + close_off;
+        let inner = &content[inner_start..close_pos];
+
+        if inner.contains("<parameter=") {
+            // Tool-call block: drop it entirely.
+            cursor = close_pos + close_pat.len();
+            // Trim a trailing newline we likely inherited.
+            if out.ends_with("\n\n") {
+                out.pop();
+            }
+        } else {
+            // Non-tool tag: keep verbatim.
+            out.push_str(&content[lt_pos..close_pos + close_pat.len()]);
+            cursor = close_pos + close_pat.len();
+        }
+    }
+
+    out.trim().to_string()
+}
+
 fn is_retryable_llm_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     if is_truncated_tool_call_error(&msg) {
@@ -732,5 +873,96 @@ mod tests {
     fn clean_response_has_no_leak() {
         let r = resp_with_args(r#"{"action":"add_param","position":"after:foo"}"#);
         assert!(!has_tool_call_leak(&r));
+    }
+
+    fn resp_with_content(content: &str) -> ChatResponse {
+        ChatResponse {
+            choices: vec![Choice {
+                message: Message {
+                    role: "assistant".into(),
+                    content: Some(content.into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn normalize_lifts_xml_in_auto_mode_when_no_json_calls() {
+        let mut r = resp_with_content(
+            "Let me check.\n<file>\n<parameter=action>shell</parameter>\n<parameter=command>ls</parameter>\n</file>",
+        );
+        normalize_xml_tool_calls(&mut r, ToolCallFormat::Auto);
+        let tcs = r.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "file");
+        assert!(tcs[0].function.arguments.contains("\"action\":\"shell\""));
+        assert!(tcs[0].function.arguments.contains("\"command\":\"ls\""));
+        // Surrounding prose survives, XML block is gone.
+        assert_eq!(
+            r.choices[0].message.content.as_deref(),
+            Some("Let me check.")
+        );
+    }
+
+    #[test]
+    fn normalize_auto_keeps_existing_json_tool_calls() {
+        // Auto mode must not overwrite real OpenAI tool_calls just because
+        // the content happens to contain XML-looking text.
+        let mut r = resp_with_args(r#"{"a":1}"#);
+        r.choices[0].message.content =
+            Some("<shell>\n<parameter=command>ls</parameter>\n</shell>".into());
+        normalize_xml_tool_calls(&mut r, ToolCallFormat::Auto);
+        let tcs = r.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "change_signature");
+    }
+
+    #[test]
+    fn normalize_xml_mode_always_replaces() {
+        // In Xml mode we trust content even if tool_calls is populated.
+        let mut r = resp_with_args(r#"{"a":1}"#);
+        r.choices[0].message.content =
+            Some("<shell>\n<parameter=command>ls</parameter>\n</shell>".into());
+        normalize_xml_tool_calls(&mut r, ToolCallFormat::Xml);
+        let tcs = r.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "shell");
+    }
+
+    #[test]
+    fn normalize_repairs_xml_leaked_into_args() {
+        // Real shape captured from a Qwen3-Coder-Next bench dump.
+        let mut r =
+            resp_with_args(r#"{"action":"shell>\n<parameter=command>\ncd /work && grep -n foo"}"#);
+        // Set tool name to "file" to mirror what llama-server emits.
+        r.choices[0].message.tool_calls.as_mut().unwrap()[0]
+            .function
+            .name = "file".into();
+        normalize_xml_tool_calls(&mut r, ToolCallFormat::Auto);
+        let tc = &r.choices[0].message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tc.function.name, "file");
+        let args: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap();
+        assert_eq!(args["action"], "shell");
+        assert_eq!(args["command"], "cd /work && grep -n foo");
+    }
+
+    #[test]
+    fn normalize_json_mode_is_noop() {
+        let mut r = resp_with_content("<shell>\n<parameter=command>ls</parameter>\n</shell>");
+        normalize_xml_tool_calls(&mut r, ToolCallFormat::Json);
+        assert!(r.choices[0].message.tool_calls.is_none());
+        assert!(
+            r.choices[0]
+                .message
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("<shell>")
+        );
     }
 }
