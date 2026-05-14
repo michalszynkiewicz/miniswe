@@ -39,7 +39,7 @@ echo "  KV:      q4_0"
 echo "  Port:    $PORT"
 echo ""
 
-exec llama-server \
+exec "$(dirname "$0")/scripts/run-llama-cuda.sh" \
     --model "$MODEL" \
     --ctx-size "$CTX_SIZE" \
     --cache-type-k q4_0 \

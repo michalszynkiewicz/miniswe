@@ -24,7 +24,7 @@ if [ ! -f "$MODEL_FILE" ]; then
     fi
 fi
 
-exec llama-server \
+exec "$(dirname "$0")/scripts/run-llama-cuda.sh" \
     --jinja \
     -m "$MODEL_FILE" \
     -c 60000 \

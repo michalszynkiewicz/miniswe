@@ -94,15 +94,21 @@ echo "Results:  ${RESULTS_DIR}"
 echo "Task:     ${TASK:0:80}..."
 echo ""
 
+# Verify LLM server is reachable before spending minutes on docker build
+# and hours on a doomed run. Container uses --network=host, so the host's
+# 8464 is the same endpoint miniswe will see.
+if ! curl -fsS --max-time 5 "${LLAMA_ENDPOINT}/v1/models" > /dev/null 2>&1; then
+    echo "ERROR: LLM server not responding at ${LLAMA_ENDPOINT}" >&2
+    echo "" >&2
+    echo "Start a llama-server first (e.g. ./start-mistral-small-4.sh), then re-run." >&2
+    echo "Override the endpoint with: LLAMA_ENDPOINT=http://host:port ${0##*/} ..." >&2
+    exit 1
+fi
+
 # Build image
 echo "Building Docker image..."
 docker build -f "${REPO_DIR}/scripts/Dockerfile.benchmark" -t "${IMAGE_NAME}" "${REPO_DIR}" 2>&1 | tail -5
 echo ""
-
-# Check LLM endpoint
-if ! curl -s --connect-timeout 5 "http://localhost:8464/v1/models" > /dev/null 2>&1; then
-    echo "WARNING: LLM not responding at localhost:8464"
-fi
 
 # ── Config generator ────────────────────────────────────────────────────
 
@@ -147,7 +153,7 @@ guide = $(_dis guide)
 project_notes = $(_dis project_notes)
 plan = $(_dis plan)
 lessons = $(_dis lessons)
-repo_map = $(_dis repo_map)
+repo_map = false  # off by default — available on demand via code(action='repo_map')
 mcp = $(_dis mcp)
 scratchpad = $(_dis scratchpad)
 usage_guide = $(_dis usage_guide)
