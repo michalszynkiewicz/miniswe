@@ -37,7 +37,7 @@ echo "  KV:      Q8_0"
 echo "  Port:    $PORT"
 echo ""
 
-exec llama-server \
+exec "$(dirname "$0")/scripts/run-llama-cuda.sh" \
     --model "$MODEL" \
     --ctx-size "$CTX_SIZE" \
     --cache-type-k q8_0 \
@@ -46,6 +46,8 @@ exec llama-server \
     --flash-attn on \
     --threads "$THREADS" \
     --temp 0.15 \
+    --repeat-penalty 1.05 \
+    --repeat-last-n 256 \
     -np 1 \
     --port "$PORT" \
     --metrics
