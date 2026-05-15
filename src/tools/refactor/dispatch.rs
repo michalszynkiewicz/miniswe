@@ -78,15 +78,30 @@ pub async fn execute_refactor_tool(
         Ok(a) => a,
         Err(e) => return Ok(ToolResult::err(e)),
     };
-    match action {
-        "help" => Ok(ToolResult::ok(format!(
-            "{REFACTOR_HELP}\n\n--- rename action ---\n{RENAME_HELP}"
-        ))),
+    let result = match action {
+        "help" => {
+            return Ok(ToolResult::ok(format!(
+                "{REFACTOR_HELP}\n\n--- rename action ---\n{RENAME_HELP}"
+            )));
+        }
         "add_param" => add_param::execute(args, config, router, lsp, log, revisions).await,
         "drop_param" => drop_param::execute(args, config, router, lsp, log, revisions).await,
         "rename" => rename::execute(args, config, lsp).await,
-        _ => Ok(ToolResult::err(format!(
-            "Unknown refactor action: '{action}'. Use action='help' to see options (add_param, drop_param, rename)."
-        ))),
+        _ => {
+            return Ok(ToolResult::err(format!(
+                "Unknown refactor action: '{action}'. Use action='help' to see options (add_param, drop_param, rename)."
+            )));
+        }
+    };
+
+    // Refactor touches the definition file plus every callsite — possibly
+    // across many files. We don't have a single path to reindex, so do an
+    // incremental project reindex (only mtime-changed files get
+    // re-extracted). Without this the symbol index serves pre-refactor
+    // signatures for code the model just rewrote.
+    if result.as_ref().is_ok_and(|r| r.success) {
+        crate::tools::edit_orchestration::reindex_project_incremental(config);
     }
+
+    result
 }
