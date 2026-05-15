@@ -162,7 +162,14 @@ async fn lsp_error_count_inner(
 }
 
 /// Re-index a single changed file. Best-effort — doesn't fail the tool call.
-fn reindex_changed_file(rel_path: &str, config: &Config) {
+///
+/// Called by the smart-mode edit tools via `finalize_file_edit`, and
+/// directly by the fast-mode tools (`replace_range`/`insert_at`/`revert`)
+/// which don't go through `finalize_file_edit`. Keeping the tree-sitter
+/// symbol index in sync after every edit matters because the repo-map
+/// provider reads `ProjectIndex` fresh from disk each turn — a stale
+/// index means the model sees pre-edit structure for code it just wrote.
+pub(crate) fn reindex_changed_file(rel_path: &str, config: &Config) {
     let miniswe_dir = config.miniswe_dir();
     let abs_path = config.project_root.join(rel_path);
 
@@ -172,6 +179,20 @@ fn reindex_changed_file(rel_path: &str, config: &Config) {
     };
 
     indexer::reindex_file(rel_path, &abs_path, &mut index, &miniswe_dir);
+}
+
+/// Incrementally re-index every file whose mtime changed since the last
+/// index. Used after multi-file edits (`refactor`) where we don't have a
+/// single path to target — `index_project` in incremental mode only
+/// re-extracts files that actually changed, so this stays cheap.
+/// Best-effort — never fails the tool call.
+pub(crate) fn reindex_project_incremental(config: &Config) {
+    let miniswe_dir = config.miniswe_dir();
+    let previous = ProjectIndex::load(&miniswe_dir).ok();
+    let Ok(index) = indexer::index_project(&config.project_root, previous.as_ref()) else {
+        return;
+    };
+    let _ = index.save(&miniswe_dir);
 }
 
 /// Auto-run type checker after editing a source file. Appends output + source
@@ -488,6 +509,8 @@ async fn ask_accept_lsp_regression(router: &ModelRouter, path: &str, error_repor
         ],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
     };
     match router.chat(ModelRole::Fast, &request).await {
         Ok(response) => {

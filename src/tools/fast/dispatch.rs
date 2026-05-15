@@ -32,7 +32,7 @@ pub async fn execute_fast_tool(
     revisions: &RevisionStore,
     project_baseline_errors: usize,
 ) -> Result<ToolResult> {
-    match name {
+    let result = match name {
         "replace_range" => {
             replace_range::execute(args, config, perms, lsp, revisions, project_baseline_errors)
                 .await
@@ -43,8 +43,20 @@ pub async fn execute_fast_tool(
         "revert" => {
             revert::execute(args, config, perms, lsp, revisions, project_baseline_errors).await
         }
-        "show_rev" => show_rev::execute(args, perms, revisions).await,
-        "check" => check::execute(args, config).await,
+        "show_rev" => return show_rev::execute(args, perms, revisions).await,
+        "check" => return check::execute(args, config).await,
         _ => bail!("Unknown fast-mode tool: {name}"),
+    };
+
+    // Keep the tree-sitter symbol index in sync. The fast tools don't go
+    // through `finalize_file_edit` (that's the smart-mode path), so without
+    // this the repo-map / symbol lookups serve pre-edit structure for code
+    // the model just changed. <1ms per file; best-effort.
+    if result.as_ref().is_ok_and(|r| r.success)
+        && let Some(path) = args.get("path").and_then(|p| p.as_str())
+    {
+        super::super::edit_orchestration::reindex_changed_file(path, config);
     }
+
+    result
 }
