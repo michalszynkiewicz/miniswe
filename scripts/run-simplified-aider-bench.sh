@@ -1,36 +1,46 @@
 #!/usr/bin/env bash
-# run-aider-bench.sh — aider bench rooted at the repo with no file hints.
+# run-simplified-aider-bench.sh — Aider bench with pre-specified files.
 #
-# Aider is invoked with `.` as its single positional arg, mirroring
-# miniswe's setup: both agents see the same working tree and have to
-# figure out which files to touch. This is the closest "apples-to-apples"
-# we can get — aider runs autonomously off its repo-map, no pre-loaded
-# files. For the pre-loaded-files version (aider's design sweet spot),
-# see `run-simplified-aider-bench.sh`.
+# Aider's design is "user tells the agent which files to edit"; in fully
+# autonomous --message mode it tends to read the repo map, suggest files,
+# and ask the user to add them. That makes a head-to-head with miniswe
+# (which discovers files via its tool surface) unfair to aider —
+# measuring its discovery loop instead of its editing.
 #
-# Architect mode is on by default: the model does a planning pass (one
-# LLM call) followed by an editing pass (a second LLM call that turns
-# the plan into SEARCH/REPLACE edits). Aider's own docs report this can
-# improve quality even when the same model fills both roles. Disable
-# with `--no-architect` if you want the plain single-pass baseline.
+# This variant pre-loads the canonical file set for the bench task so we
+# measure aider's editing quality on a known scope. It's how aider users
+# actually invoke it in practice. The companion `run-aider-bench.sh`
+# leaves files unspecified — that one's for future "true autonomous"
+# experiments, this one is for the practical comparison.
 #
-# Honest caveat: aider's --message mode can suggest files but can't act
-# on those suggestions itself (there's no human to /add them). If aider
-# stalls asking for files, the attempt produces no edits and the harness
-# retries. Earlier experiments with --map-tokens 8192 and --no-stream
-# resulted in 1200s hangs with zero output; both have been removed.
+# Honest framing for any writeup: this comparison is "aider's editing on
+# a pre-scoped file set vs miniswe's full agent loop including
+# discovery." Not apples-to-apples on every axis; that's intentional.
 #
-# Validation suite is identical to run-benchmark-docker.sh (6 checks).
-# Same pinned baseline SHA, same Docker isolation, same endpoint.
+# Validation suite is identical to the miniswe bench (6 checks). Same
+# pinned baseline SHA, same Docker isolation, same endpoint.
 #
 # Usage:
-#   ./scripts/run-aider-bench.sh [--timeout 1800] [--max-attempts 3] \
-#                                [--model devstral-small-2]
+#   ./scripts/run-simplified-aider-bench.sh [--timeout 1800] [--max-attempts 3] \
+#                                           [--model devstral-small-2]
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE_NAME="miniswe-aider-bench"
+RESULTS_PREFIX="aider_scoped"
+
+# Canonical file set for the --system-prompt-override task. These are the
+# files miniswe touches across its 6/6 runs. Pre-loaded into aider's chat
+# context so it can edit them without asking the user to add them.
+SCOPED_FILES=(
+    src/main.rs
+    src/cli/mod.rs
+    src/cli/commands/run.rs
+    src/cli/commands/repl.rs
+    src/context/mod.rs
+    tests/e2e_context.rs
+)
 
 LLAMA_ENDPOINT="${LLAMA_ENDPOINT:-http://localhost:8464}"
 MODEL_TAG="$(
@@ -40,7 +50,7 @@ MODEL_TAG="$(
     | cut -c1-40
 )"
 MODEL_TAG="${MODEL_TAG:-unknown}"
-RESULTS_DIR="${REPO_DIR}/benchmark_results/aider_$(date +%Y%m%d_%H%M%S)_${MODEL_TAG}"
+RESULTS_DIR="${REPO_DIR}/benchmark_results/${RESULTS_PREFIX}_$(date +%Y%m%d_%H%M%S)_${MODEL_TAG}"
 BASELINE_SHA="cc34d2626faf32c1b6dd1b8b33af693fb936b098"
 ACTIVE_CONTAINER_NAME=""
 ACTIVE_TMP_SCRIPT=""
@@ -63,12 +73,6 @@ MAX_ATTEMPTS=3
 MODEL="devstral-small-2"
 TASK="Add a CLI flag --system-prompt-override (short: -s) that takes a string and replaces the default system prompt with the provided text. When this flag is set, skip all context providers and just use the override text as the system message. Make sure it works for both single-shot and interactive modes."
 EDIT_FORMAT="${AIDER_EDIT_FORMAT:-}"   # empty = aider auto-picks
-# Architect mode: model gets two passes per response — first to plan
-# ("here's how I'd solve this"), second to translate the plan into
-# SEARCH/REPLACE edits. Aider's docs say this can improve quality even
-# when the same model fills both roles, because each prompt is more
-# focused. Costs ~2x LLM tokens per attempt.
-ARCHITECT=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -78,15 +82,13 @@ while [[ $# -gt 0 ]]; do
         --task)         TASK="$2";         shift 2 ;;
         --sha)          BASELINE_SHA="$2"; shift 2 ;;
         --edit-format)  EDIT_FORMAT="$2";  shift 2 ;;
-        --architect)    ARCHITECT=1;       shift ;;
-        --no-architect) ARCHITECT=0;       shift ;;
         *) echo "Unknown: $1" >&2; exit 1 ;;
     esac
 done
 
 mkdir -p "${RESULTS_DIR}"
 
-echo "=== Docker-isolated aider benchmark ==="
+echo "=== Docker-isolated aider benchmark (scoped, pre-loaded files) ==="
 echo "Image:    ${IMAGE_NAME}"
 echo "SHA:      ${BASELINE_SHA}"
 echo "Model:    ${MODEL}"
@@ -94,11 +96,7 @@ echo "Endpoint: ${LLAMA_ENDPOINT}"
 echo "Timeout:  ${TIMEOUT}s"
 echo "Attempts: ${MAX_ATTEMPTS}"
 echo "Edit fmt: ${EDIT_FORMAT:-auto}"
-if [ "${ARCHITECT}" = "1" ]; then
-    echo "Mode:     architect (plan + edit, 2 LLM calls per attempt)"
-else
-    echo "Mode:     single-pass (1 LLM call per attempt)"
-fi
+echo "Files:    ${SCOPED_FILES[*]}"
 echo "Results:  ${RESULTS_DIR}"
 echo "Task:     ${TASK:0:80}..."
 echo ""
@@ -122,6 +120,10 @@ run_variant() {
     mkdir -p "${variant_dir}"
     echo "--- ${name} ---"
 
+    # Comma-separated paths, expanded back to --file args inside the container.
+    local SCOPED_FILES_CSV
+    SCOPED_FILES_CSV=$(IFS=','; echo "${SCOPED_FILES[*]}")
+
     local container_script
     container_script=$(cat <<'SCRIPT'
 #!/bin/bash
@@ -134,7 +136,7 @@ TIMEOUT="$3"
 MAX_ATTEMPTS="$4"
 EDIT_FORMAT="$5"
 LLAMA_ENDPOINT="$6"
-ARCHITECT="$7"
+SCOPED_FILES_CSV="$7"
 
 cd /work
 git -C /repo archive "${SHA}" | tar -x
@@ -179,13 +181,9 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
 
     echo "=== ATTEMPT ${ATTEMPT}/${MAX_ATTEMPTS} (${REMAINING}s remaining) ==="
 
-    # Aider in one-shot mode, rooted at the repo root via a single `.`
-    # positional arg. This is the closest mirror of miniswe's setup —
-    # both agents see the same working tree and have to figure out which
-    # files matter. Caveat: in --message mode aider's "please add these
-    # files" suggestions can't be acted on by the human; if aider asks
-    # for files it won't actually edit anything that round. The harness's
-    # retry loop is the recovery path.
+    # Aider in one-shot mode, with canonical files pre-loaded so it doesn't
+    # have to ask the user to /add them. The file list is passed in via
+    # SCOPED_FILES_CSV and expanded into --file args here.
     # Flags:
     #   --yes-always       auto-confirm file additions/edits
     #   --no-auto-commits  harness does its own git tracking
@@ -194,29 +192,22 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
     #   --edit-format diff force search/replace blocks (smaller than whole-
     #                      file rewrites; key for local llama-cpp throughput)
     # Notes:
-    #   --no-stream omitted so we get incremental output and can tell a
-    #   slow run from a hung one. --map-tokens left at aider's default
-    #   (~1024) so the repo-map is small and the prefill is cheap.
-    # When ARCHITECT=1 we run aider in architect mode: the model does a
-    # planning pass (using the main --model), then an editing pass
-    # (using the editor model, defaulted to the same one via
-    # --editor-model). --auto-accept-architect skips the human "approve
-    # plan?" prompt. The editor pass uses editor-diff format (variant
-    # of diff format that aider routes specifically through editor mode).
-    # When ARCHITECT=0 we run the plain single-pass mode and let
-    # EDIT_FORMAT_ARG control the edit format (defaults to diff).
-    MODE_ARGS=()
-    if [ "${ARCHITECT}" = "1" ]; then
-        MODE_ARGS=(--architect --auto-accept-architect
-                   --editor-model "${AIDER_MODEL}"
-                   --editor-edit-format editor-diff)
-    else
-        if [ ${#EDIT_FORMAT_ARG[@]} -eq 0 ]; then
-            EDIT_FORMAT_ARG=(--edit-format diff)
-        fi
-        MODE_ARGS=("${EDIT_FORMAT_ARG[@]}")
+    #   --map-tokens defaults to ~1024. We deliberately do NOT set it
+    #   higher: with the canonical files already in chat, the repo map
+    #   is just prompt-size overhead that costs prefill time. A prior
+    #   --map-tokens 8192 attempt with --no-stream produced zero output
+    #   in 1200s on Devstral 24B because the prefill never completed.
+    #   Likewise --no-stream is omitted so we get incremental output and
+    #   can tell a slow run from a hung one.
+    FILE_ARGS=()
+    IFS=',' read -ra _F <<< "${SCOPED_FILES_CSV}"
+    for f in "${_F[@]}"; do
+        FILE_ARGS+=(--file "$f")
+    done
+    # If the caller passed --edit-format, honor it; otherwise force diff.
+    if [ ${#EDIT_FORMAT_ARG[@]} -eq 0 ]; then
+        EDIT_FORMAT_ARG=(--edit-format diff)
     fi
-
     timeout "${REMAINING}" aider \
         --model "${AIDER_MODEL}" \
         --yes-always \
@@ -224,9 +215,9 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
         --no-gitignore \
         --no-show-model-warnings \
         --no-pretty \
-        . \
+        "${FILE_ARGS[@]}" \
         --message "${CURRENT_TASK}" \
-        "${MODE_ARGS[@]}" \
+        "${EDIT_FORMAT_ARG[@]}" \
         > /output/stdout_attempt${ATTEMPT}.txt \
         2> /output/stderr_attempt${ATTEMPT}.txt \
         || true
@@ -361,7 +352,7 @@ SCRIPT
         -v "${tmp_script}:/run.sh:ro" \
         --name "${container_name}" \
         "${IMAGE_NAME}" \
-        bash /run.sh "${BASELINE_SHA}" "${TASK}" "${TIMEOUT}" "${MAX_ATTEMPTS}" "${EDIT_FORMAT}" "${LLAMA_ENDPOINT}" "${ARCHITECT}" \
+        bash /run.sh "${BASELINE_SHA}" "${TASK}" "${TIMEOUT}" "${MAX_ATTEMPTS}" "${EDIT_FORMAT}" "${LLAMA_ENDPOINT}" "${SCOPED_FILES_CSV}" \
         2>&1 | tee "${variant_dir}/container.log"
 
     local end_time
