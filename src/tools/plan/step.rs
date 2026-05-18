@@ -4,8 +4,12 @@
 pub struct Step {
     pub checked: bool,
     pub checked_round: Option<usize>,
-    pub description: String,
+    pub step: String,
     pub compile: bool,
+    /// Carried for backward compatibility with on-disk plan.md files that
+    /// have ` [no-compile: <reason>]` tags from before we dropped `reason`
+    /// from the public schema. New plans always have `compile: true` and
+    /// `reason: None`.
     pub reason: Option<String>,
 }
 
@@ -21,7 +25,7 @@ impl Step {
         } else {
             format!(" [no-compile: {}]", self.reason.as_deref().unwrap_or("?"))
         };
-        format!("- {check} {}{compile_tag}", self.description)
+        format!("- {check} {}{compile_tag}", self.step)
     }
 
     pub fn from_markdown(line: &str) -> Option<Self> {
@@ -51,7 +55,7 @@ impl Step {
             };
 
         // Parse compile tag from end
-        let (description, compile, reason) = if let Some(idx) = rest.rfind(" [compile]") {
+        let (step_text, compile, reason) = if let Some(idx) = rest.rfind(" [compile]") {
             (rest[..idx].to_string(), true, None)
         } else if let Some(idx) = rest.rfind(" [no-compile: ") {
             let reason_start = idx + " [no-compile: ".len();
@@ -66,7 +70,7 @@ impl Step {
         Some(Step {
             checked,
             checked_round,
-            description,
+            step: step_text,
             compile,
             reason,
         })
@@ -93,7 +97,7 @@ pub fn plan_preview(steps: &[Step]) -> String {
         .iter()
         .take(4)
         .enumerate()
-        .map(|(idx, step)| format!("{}. {}", idx + 1, step.description))
+        .map(|(idx, step)| format!("{}. {}", idx + 1, step.step))
         .collect::<Vec<_>>()
         .join("; ")
 }

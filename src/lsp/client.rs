@@ -342,6 +342,125 @@ impl LspClient {
         parse_locations(&response)
     }
 
+    /// List all symbols defined in `path`.
+    ///
+    /// Returns a flat normalised list of `(name, kind, name_range, full_range)`
+    /// tuples regardless of which response shape the server emits — newer
+    /// servers return `DocumentSymbol[]` (hierarchical) and older ones return
+    /// `SymbolInformation[]` (flat). For nested symbols (methods inside impls)
+    /// the children are flattened in too.
+    pub async fn document_symbol(&self, path: &Path) -> Result<Vec<DocumentSymbolEntry>> {
+        let uri = path_to_uri(path);
+        let rx = self.transport.send_request(
+            "textDocument/documentSymbol",
+            serde_json::json!({
+                "textDocument": { "uri": uri }
+            }),
+        )?;
+
+        let response = tokio::time::timeout(Duration::from_secs(15), rx)
+            .await
+            .context("documentSymbol request timed out")?
+            .context("channel closed")?;
+
+        let result = response.get("result").cloned().unwrap_or(Value::Null);
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        // Try hierarchical first, fall back to flat.
+        if let Ok(hier) = serde_json::from_value::<Vec<DocumentSymbol>>(result.clone()) {
+            let mut out = Vec::new();
+            for sym in hier {
+                flatten_document_symbol(sym, &mut out);
+            }
+            return Ok(out);
+        }
+        if let Ok(flat) = serde_json::from_value::<Vec<SymbolInformation>>(result) {
+            return Ok(flat
+                .into_iter()
+                .map(|s| DocumentSymbolEntry {
+                    name: s.name,
+                    kind: s.kind,
+                    name_range: s.location.range,
+                    full_range: s.location.range,
+                })
+                .collect());
+        }
+        Ok(Vec::new())
+    }
+
+    /// Search the entire workspace for symbols matching `query`.
+    /// Used as a "did you mean" fallback when a per-file lookup misses.
+    pub async fn workspace_symbol(&self, query: &str) -> Result<Vec<WorkspaceSymbolEntry>> {
+        let rx = self
+            .transport
+            .send_request("workspace/symbol", serde_json::json!({ "query": query }))?;
+        let response = tokio::time::timeout(Duration::from_secs(15), rx)
+            .await
+            .context("workspaceSymbol request timed out")?
+            .context("channel closed")?;
+        let result = response.get("result").cloned().unwrap_or(Value::Null);
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+        // Newer servers may return `WorkspaceSymbol[]` with a `location` that's
+        // a `OneOf<Location, {uri}>`; older return `SymbolInformation[]`.
+        if let Ok(flat) = serde_json::from_value::<Vec<SymbolInformation>>(result) {
+            return Ok(flat
+                .into_iter()
+                .filter_map(|s| {
+                    Some(WorkspaceSymbolEntry {
+                        name: s.name,
+                        kind: s.kind,
+                        path: uri_to_path(&s.location.uri)?,
+                        line: s.location.range.start.line,
+                    })
+                })
+                .collect());
+        }
+        Ok(Vec::new())
+    }
+
+    /// Request a workspace-wide rename of the symbol at `(line, character)`
+    /// in `path` to `new_name`. Returns the `WorkspaceEdit` the server
+    /// produced; the caller is responsible for applying it.
+    ///
+    /// `textDocument/rename` is part of the standard LSP and is supported
+    /// by every server miniswe ships against (rust-analyzer, gopls,
+    /// ts-language-server, pyright, clangd, jdtls). When it isn't supported
+    /// the server returns null, which surfaces here as `Ok(None)`.
+    pub async fn rename(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        new_name: &str,
+    ) -> Result<Option<WorkspaceEdit>> {
+        let uri = path_to_uri(path);
+        let rx = self.transport.send_request(
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "newName": new_name,
+            }),
+        )?;
+
+        let response = tokio::time::timeout(Duration::from_secs(30), rx)
+            .await
+            .context("rename request timed out")?
+            .context("channel closed")?;
+
+        let result = response.get("result").cloned().unwrap_or(Value::Null);
+        if result.is_null() {
+            return Ok(None);
+        }
+        let edit: WorkspaceEdit =
+            serde_json::from_value(result).context("parse rename WorkspaceEdit response")?;
+        Ok(Some(edit))
+    }
+
     /// Get a snapshot of all current diagnostics across all files.
     pub fn diagnostics_snapshot(&self) -> Vec<(String, Vec<Diagnostic>)> {
         self.transport
@@ -402,12 +521,27 @@ async fn initialize(transport: &LspTransport, project_root: &Path) -> Result<()>
             "clientInfo": { "name": "miniswe", "version": "0.1.0" },
             "rootUri": root_uri,
             "capabilities": {
+                "workspace": {
+                    "workspaceEdit": {
+                        "documentChanges": true,
+                        "resourceOperations": ["create", "rename", "delete"],
+                        "failureHandling": "abort"
+                    }
+                },
                 "textDocument": {
                     "publishDiagnostics": {
                         "relatedInformation": false
                     },
                     "definition": { "dynamicRegistration": false },
                     "references": { "dynamicRegistration": false },
+                    "rename": {
+                        "dynamicRegistration": false,
+                        "prepareSupport": false
+                    },
+                    "documentSymbol": {
+                        "dynamicRegistration": false,
+                        "hierarchicalDocumentSymbolSupport": true
+                    },
                     "synchronization": {
                         "didSave": true,
                         "willSave": false,
@@ -434,6 +568,43 @@ async fn initialize(transport: &LspTransport, project_root: &Path) -> Result<()>
     transport.send_notification("initialized", serde_json::json!({}))?;
 
     Ok(())
+}
+
+/// One symbol from `textDocument/documentSymbol`, normalised across the
+/// hierarchical and flat response shapes.
+#[derive(Debug, Clone)]
+pub struct DocumentSymbolEntry {
+    pub name: String,
+    pub kind: SymbolKind,
+    /// The range of just the symbol's name (selection_range in hierarchical
+    /// shape, or the whole range when only flat data is available).
+    pub name_range: Range,
+    /// The range covering the entire definition (signature + body for
+    /// functions, brace-enclosed body for types, etc.).
+    pub full_range: Range,
+}
+
+/// One match from `workspace/symbol`.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSymbolEntry {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub path: PathBuf,
+    pub line: u32,
+}
+
+fn flatten_document_symbol(sym: DocumentSymbol, out: &mut Vec<DocumentSymbolEntry>) {
+    out.push(DocumentSymbolEntry {
+        name: sym.name,
+        kind: sym.kind,
+        name_range: sym.selection_range,
+        full_range: sym.range,
+    });
+    if let Some(children) = sym.children {
+        for child in children {
+            flatten_document_symbol(child, out);
+        }
+    }
 }
 
 /// Convert a file path to a file:// URI.

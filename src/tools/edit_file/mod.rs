@@ -1630,6 +1630,8 @@ async fn request_patch(
             ],
             tools: None,
             tool_choice: None,
+            max_tokens_override: None,
+            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
         };
 
         log_stage(
@@ -1765,6 +1767,8 @@ async fn request_patch_for_region(
         ],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
     };
 
     log_stage(
@@ -1930,6 +1934,8 @@ async fn request_preplan_steps(
             ],
             tools: None,
             tool_choice: None,
+            max_tokens_override: None,
+            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
         };
 
         log_stage(
@@ -2117,6 +2123,8 @@ async fn request_preplan_steps(
         ],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
     };
 
     log_stage(

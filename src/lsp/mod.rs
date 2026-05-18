@@ -9,5 +9,5 @@ pub mod client;
 pub mod servers;
 pub mod transport;
 
-pub use client::LspClient;
+pub use client::{DocumentSymbolEntry, LspClient, WorkspaceSymbolEntry, uri_to_path};
 pub use servers::LspServer;
