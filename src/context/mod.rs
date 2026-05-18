@@ -104,9 +104,19 @@ fn build_system_prompt(
     edit_file_available: bool,
     plan_set: bool,
     ceremony: crate::config::CeremonyMode,
+    flat: bool,
 ) -> String {
-    let refactor_blurb = "\
-refactor adds/drops a parameter (action='add_param'/'drop_param') or renames a symbol (action='rename') and updates every callsite in ONE atomic call. Give the target NAME — the tool resolves the location via LSP. add_param example: {\"action\":\"add_param\",\"path\":\"src/lib.rs\",\"name\":\"assemble\",\"new_param\":\"x: u32\",\"position\":\"after:b\",\"callsite_fill_in\":\"0\"}. rename example: {\"action\":\"rename\",\"path\":\"src/lib.rs\",\"line\":42,\"name\":\"assemble\",\"new_name\":\"build_context\"}.\n";
+    // Prompt must match the visible tool surface (tools.flat swaps the
+    // grouped `refactor` DSL for flat single-purpose tools).
+    let refactor_blurb = if flat {
+        "add_function_param / drop_function_param / rename_symbol each update a function's \
+definition AND every callsite in ONE atomic call (resolved by NAME via LSP). \
+add_function_param example: {\"path\":\"src/lib.rs\",\"function\":\"assemble\",\"param\":\"x: u32\",\"call_value\":\"0\"} (appends at end; pass \"after\":\"b\" to place after a param). \
+rename_symbol example: {\"path\":\"src/lib.rs\",\"line\":42,\"name\":\"assemble\",\"new_name\":\"build_context\"}.\n"
+    } else {
+        "\
+refactor adds/drops a parameter (action='add_param'/'drop_param') or renames a symbol (action='rename') and updates every callsite in ONE atomic call. Give the target NAME — the tool resolves the location via LSP. add_param example: {\"action\":\"add_param\",\"path\":\"src/lib.rs\",\"name\":\"assemble\",\"new_param\":\"x: u32\",\"position\":\"after:b\",\"callsite_fill_in\":\"0\"}. rename example: {\"action\":\"rename\",\"path\":\"src/lib.rs\",\"line\":42,\"name\":\"assemble\",\"new_name\":\"build_context\"}.\n"
+    };
     let cs_smart = match (refactor_available, edit_file_available) {
         (true, true) => format!(
             "{refactor_blurb}\
@@ -185,7 +195,9 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
     // Which tool the "signature change / rename" intent routes to. With
     // refactor available it's refactor; the fallbacks exist only for
     // configs that hide it.
-    let sig_route = if refactor_available {
+    let sig_route = if flat {
+        "add_function_param / drop_function_param / rename_symbol"
+    } else if refactor_available {
         "refactor"
     } else if edit_file_available {
         "edit_file"
@@ -493,6 +505,7 @@ pub fn assemble(
         false, // edit_file hidden for all models
         crate::tools::plan::plan_exists(config),
         config.tools.ceremony,
+        config.tools.flat,
     );
 
     // 1b. Project root (always present)
@@ -573,10 +586,24 @@ mod prompt_phase_tests {
     // plan_set phase split). Production default is Off — see
     // ceremony_off_is_minimal below.
     fn pre() -> String {
-        build_system_prompt(EditMode::Fast, true, false, false, CeremonyMode::Strict)
+        build_system_prompt(
+            EditMode::Fast,
+            true,
+            false,
+            false,
+            CeremonyMode::Strict,
+            false,
+        )
     }
     fn post() -> String {
-        build_system_prompt(EditMode::Fast, true, false, true, CeremonyMode::Strict)
+        build_system_prompt(
+            EditMode::Fast,
+            true,
+            false,
+            true,
+            CeremonyMode::Strict,
+            false,
+        )
     }
 
     #[test]
@@ -585,7 +612,7 @@ mod prompt_phase_tests {
         // language, regardless of plan_set; identical for both plan_set
         // values (no phase split).
         for ps in [false, true] {
-            let p = build_system_prompt(EditMode::Fast, true, false, ps, CeremonyMode::Off);
+            let p = build_system_prompt(EditMode::Fast, true, false, ps, CeremonyMode::Off, false);
             assert!(!p.contains("WORKFLOW: explore"), "off: no explore→plan");
             assert!(!p.contains("EDITING phase"), "off: no phase framing");
             assert!(
@@ -599,8 +626,8 @@ mod prompt_phase_tests {
             );
             assert!(p.contains("Emit ONE tool call per response."));
         }
-        let a = build_system_prompt(EditMode::Fast, true, false, false, CeremonyMode::Off);
-        let b = build_system_prompt(EditMode::Fast, true, false, true, CeremonyMode::Off);
+        let a = build_system_prompt(EditMode::Fast, true, false, false, CeremonyMode::Off, false);
+        let b = build_system_prompt(EditMode::Fast, true, false, true, CeremonyMode::Off, false);
         assert_eq!(
             a, b,
             "off: plan_set must not change the prompt (no phase split)"
@@ -612,7 +639,8 @@ mod prompt_phase_tests {
         // Advise = lean (no gate/phase language) + a strong advisory to
         // decompose first. plan_set-invariant like Off.
         for ps in [false, true] {
-            let p = build_system_prompt(EditMode::Fast, true, false, ps, CeremonyMode::Advise);
+            let p =
+                build_system_prompt(EditMode::Fast, true, false, ps, CeremonyMode::Advise, false);
             assert!(
                 !p.contains("WORKFLOW: explore"),
                 "advise: no explore→plan gate"
@@ -628,11 +656,25 @@ mod prompt_phase_tests {
                 "advise: planning must be explicitly optional"
             );
         }
-        let a = build_system_prompt(EditMode::Fast, true, false, false, CeremonyMode::Advise);
-        let b = build_system_prompt(EditMode::Fast, true, false, true, CeremonyMode::Advise);
+        let a = build_system_prompt(
+            EditMode::Fast,
+            true,
+            false,
+            false,
+            CeremonyMode::Advise,
+            false,
+        );
+        let b = build_system_prompt(
+            EditMode::Fast,
+            true,
+            false,
+            true,
+            CeremonyMode::Advise,
+            false,
+        );
         assert_eq!(a, b, "advise: plan_set must not change the prompt");
         // And advise must differ from off (the advisory paragraph).
-        let off = build_system_prompt(EditMode::Fast, true, false, false, CeremonyMode::Off);
+        let off = build_system_prompt(EditMode::Fast, true, false, false, CeremonyMode::Off, false);
         assert_ne!(a, off, "advise must add content vs off");
     }
 

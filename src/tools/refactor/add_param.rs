@@ -48,6 +48,10 @@ const ADD_PARAM_SCHEMA: ArgSchema<'static> = ArgSchema {
 pub enum Position {
     Start,
     After(String),
+    /// Append after all existing parameters. The footgun-free default
+    /// used by the flat `add_function_param` tool (`tools.flat`) — no
+    /// `after:<name>` anchor to mangle. Also a valid grouped value.
+    End,
 }
 
 impl Position {
@@ -55,6 +59,9 @@ impl Position {
         let trimmed = raw.trim();
         if trimmed == "start" {
             return Ok(Self::Start);
+        }
+        if trimmed == "end" || trimmed == "append" {
+            return Ok(Self::End);
         }
         if let Some(rest) = trimmed.strip_prefix("after:") {
             let name = rest.trim();
@@ -79,7 +86,7 @@ impl Position {
     fn malformed_position_error(raw: &str) -> String {
         format!(
             "the 'position' value you sent ({raw:?}) is malformed. \
-             The 'position' field accepts ONLY one of: 'start', \
+             The 'position' field accepts ONLY one of: 'start', 'end', \
              or 'after:<single_param_name>' (e.g. 'after:mcp_summary'). \
              Do NOT include parameter types (like ': u32'), doc comments, \
              commas, or multiple parameter names — just the literal anchor."
@@ -92,6 +99,9 @@ impl Position {
                 "at the start of the parameter list (before all existing parameters)".to_string()
             }
             Self::After(name) => format!("immediately after the existing parameter `{name}`"),
+            Self::End => {
+                "at the end of the parameter list (after all existing parameters)".to_string()
+            }
         }
     }
 }
@@ -397,6 +407,14 @@ fn display_path(p: &std::path::Path, config: &Config) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn position_parses_end_append() {
+        assert!(matches!(Position::parse("end").unwrap(), Position::End));
+        assert!(matches!(Position::parse("append").unwrap(), Position::End));
+        assert!(matches!(Position::parse(" end ").unwrap(), Position::End));
+        assert!(Position::End.human().contains("end of the parameter list"));
+    }
 
     #[test]
     fn position_parses_valid_anchors() {

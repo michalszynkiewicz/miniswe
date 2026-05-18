@@ -90,9 +90,17 @@ pub async fn run(
         // full agent context. `edit_file` runs an inner focused LLM
         // call which avoids the dilution. Primitives stay available
         // for surgical line-precise edits.
+        // tools.flat: swap grouped `refactor{action,position,...}` for
+        // flat single-purpose refactor tools (no DSL footgun).
+        if config.tools.flat {
+            disabled.push("refactor");
+        }
         tool_defs.retain(|t| !disabled.contains(&t.function.name.as_str()));
         if config.tools.edit_mode == EditMode::Fast {
             tool_defs.extend(tools::fast_mode_tool_definitions());
+        }
+        if config.tools.flat {
+            tool_defs.extend(tools::definitions::flat_refactor_tool_definitions());
         }
         tool_defs.push(tools::definitions::spawn_agents_tool_definition());
     }
@@ -761,8 +769,16 @@ pub async fn run(
                         crate::tools::ToolResult::err("Tool worker dropped edit_file job".into())
                     }
                 }
-            } else if tc.function.name == "refactor" {
-                let args = args.clone();
+            } else if tc.function.name == "refactor"
+                || matches!(
+                    tc.function.name.as_str(),
+                    "add_function_param" | "drop_function_param" | "rename_symbol"
+                )
+            {
+                // Flat refactor tools normalize into the grouped
+                // `refactor` args shape; same executor.
+                let args = tools::definitions::flat_to_refactor_args(&tc.function.name, &args)
+                    .unwrap_or_else(|| args.clone());
                 let config = config.clone();
                 let router = router.clone();
                 let lsp = lsp_client.clone();
