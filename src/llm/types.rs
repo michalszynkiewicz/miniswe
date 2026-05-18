@@ -4,13 +4,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// A chat completion request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatRequest {
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>,
+    /// Per-request override for `max_tokens`, used by callers that need
+    /// more output budget than the model config's default. Skipped from
+    /// serialization — the LLM client merges it into the request body
+    /// directly so we don't need a custom JSON shape.
+    #[serde(skip)]
+    pub max_tokens_override: Option<u64>,
+    /// Server-specific arguments passed to the chat template. Used to
+    /// disable thinking-mode reasoning on Gemma 4 (and similar models)
+    /// where reasoning eats `max_tokens` and never reaches the answer.
+    /// Skipped from default serialization; the LLM client merges this
+    /// into the body under the well-known `chat_template_kwargs` key.
+    #[serde(skip)]
+    pub chat_template_kwargs: Option<Value>,
 }
 
 /// A chat message (system, user, assistant, or tool).

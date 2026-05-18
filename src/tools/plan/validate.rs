@@ -28,17 +28,12 @@ pub fn validate_steps(steps: &[Step]) -> Result<(), String> {
         );
     }
 
-    // Check compile: false steps
+    // compile: false steps must be followed by a compile: true step so
+    // the tree gets restored before the plan ends. We dropped the
+    // separate `reason` field from the public schema (the model can no
+    // longer supply it), so don't require it.
     for (i, step) in steps.iter().enumerate() {
         if !step.compile {
-            // Must have reason
-            if step.reason.as_ref().is_none_or(|r| r.trim().is_empty()) {
-                return Err(format!(
-                    "Step {} has compile: false but no reason. Explain why the tree will be broken.",
-                    i + 1
-                ));
-            }
-            // Must be followed by a compile: true before end
             let has_restore = steps[i + 1..].iter().any(|s| s.compile);
             if !has_restore {
                 return Err(format!(

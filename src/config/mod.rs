@@ -146,32 +146,21 @@ fn default_stream_idle_timeout_secs() -> u64 {
 }
 
 impl ModelConfig {
-    /// True if the model the server is actually serving is in the Devstral
-    /// family. Used to gate model-specific workarounds — Devstral's
-    /// tool-call parser reliably mangles `change_signature` arguments at
-    /// moderate context sizes (verbatim replay shows ~75% schema confusion
-    /// on the same bytes), so we hide that tool for Devstral and route
-    /// signature edits through `edit_file` instead.
-    ///
-    /// Probe-only by design: the user-supplied `model` config string is
-    /// often a generic alias ("devstral-small-2" hard-coded in our bench
-    /// scripts even when the server is serving Gemma or GPT-OSS), so an
-    /// OR with the config string false-positives on every non-Devstral
-    /// run that uses the same config skeleton. Probe failure or any
-    /// non-Devstral identity → not Devstral → keep the tool.
-    pub fn is_devstral_family(&self) -> bool {
-        match &self.probed_model {
-            Some(probed) => probed.to_ascii_lowercase().contains("devstral"),
-            None => false,
-        }
-    }
+    // (Removed `is_devstral_family`: it gated a Devstral-only carve-out —
+    // hide `refactor`, keep `edit_file` — that protected against
+    // `position`-arg mangling from the *old* `change_signature` tool.
+    // The rename to `refactor` fixed the formatting; the gate's only
+    // remaining effect was suppressing refactor adoption. All models now
+    // get the uniform surface and a phase-aware system prompt drives
+    // adoption instead. See context::build_system_prompt's plan_set branch.)
 
     /// True if the served model is Mistral Small 4 (the unified MoE that
     /// folded Magistral/Pixtral/Devstral into one model). Used to gate the
     /// `reasoning_effort` knob: Mistral Small 4 exposes a per-request
     /// reasoning_effort kwarg (`none`/`high`) — we want `high` when the
     /// model is deciding task decomposition (pre-plan) and `none` once
-    /// edits are flowing. Probe-only by the same logic as is_devstral_family.
+    /// edits are flowing. Probe-only: matched against the server-reported
+    /// model identity, not the user-supplied config alias.
     pub fn is_mistral_small_4_family(&self) -> bool {
         match &self.probed_model {
             Some(probed) => {
