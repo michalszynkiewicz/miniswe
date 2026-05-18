@@ -336,6 +336,124 @@ pub fn fast_mode_tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Flat single-purpose refactor tools (`tools.flat`). Replace the
+/// grouped `refactor{action,position,callsite_fill_in}` — no DSL, each
+/// tool one intent with self-evident, all-required params. `after` is
+/// the only optional field; omitted = append at end (footgun-free).
+pub fn flat_refactor_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "add_function_param".into(),
+                description: "Add a parameter to a function and update its definition AND every \
+                    callsite in ONE atomic call (resolved by name via LSP). Use for 'add a flag', \
+                    'thread a context arg', etc. Do not hand-edit callsites for this."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File containing the function DEFINITION (relative to project root)." },
+                        "function": { "type": "string", "description": "Function/method name. Resolved via LSP." },
+                        "param": { "type": "string", "description": "Full new parameter declaration as it appears in the signature, e.g. 'shout: bool'." },
+                        "call_value": { "type": "string", "description": "Literal expression to pass at every existing callsite, e.g. 'false' or an in-scope variable name." },
+                        "after": { "type": "string", "description": "Optional: existing parameter name to insert after. Omit to append at the end (the common case)." },
+                        "line": { "type": "integer", "description": "Optional 1-based line hint to disambiguate overloaded names." }
+                    },
+                    "required": ["path", "function", "param", "call_value"]
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "drop_function_param".into(),
+                description: "Remove a parameter from a function and update its definition AND \
+                    every callsite in ONE atomic call (resolved by name via LSP)."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File containing the function DEFINITION." },
+                        "function": { "type": "string", "description": "Function/method name." },
+                        "param": { "type": "string", "description": "Name of the parameter to remove." },
+                        "line": { "type": "integer", "description": "Optional 1-based line hint." }
+                    },
+                    "required": ["path", "function", "param"]
+                }),
+            },
+        },
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "rename_symbol".into(),
+                description: "Rename a function/method/type/variable across the codebase \
+                    (definition + all references) in ONE atomic call."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "A file where the symbol appears (relative to project root)." },
+                        "line": { "type": "integer", "description": "1-based line where `name` appears." },
+                        "name": { "type": "string", "description": "Current symbol name." },
+                        "new_name": { "type": "string", "description": "New symbol name." }
+                    },
+                    "required": ["path", "line", "name", "new_name"]
+                }),
+            },
+        },
+    ]
+}
+
+/// Normalize a flat refactor tool call into the legacy grouped
+/// `refactor` args shape that `execute_refactor_tool` already consumes.
+/// Returns `None` if `name` is not a flat refactor tool.
+pub fn flat_to_refactor_args(name: &str, a: &serde_json::Value) -> Option<serde_json::Value> {
+    let s = |k: &str| a.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    match name {
+        "add_function_param" => {
+            let after = s("after");
+            let position = if after.is_empty() {
+                "end".to_string()
+            } else {
+                format!("after:{after}")
+            };
+            let mut out = json!({
+                "action": "add_param",
+                "path": s("path"),
+                "name": s("function"),
+                "new_param": s("param"),
+                "callsite_fill_in": s("call_value"),
+                "position": position,
+            });
+            if let Some(l) = a.get("line") {
+                out["line"] = l.clone();
+            }
+            Some(out)
+        }
+        "drop_function_param" => {
+            let mut out = json!({
+                "action": "drop_param",
+                "path": s("path"),
+                "name": s("function"),
+                "param": s("param"),
+            });
+            if let Some(l) = a.get("line") {
+                out["line"] = l.clone();
+            }
+            Some(out)
+        }
+        "rename_symbol" => Some(json!({
+            "action": "rename",
+            "path": s("path"),
+            "line": a.get("line").cloned().unwrap_or(json!(0)),
+            "name": s("name"),
+            "new_name": s("new_name"),
+        })),
+        _ => None,
+    }
+}
+
 /// Return the mcp_use tool definition (only added when MCP servers are configured).
 pub fn mcp_tool_definition() -> ToolDefinition {
     ToolDefinition {
@@ -476,4 +594,54 @@ Available actions for `plan`:
 - refine: Split a step into substeps. Params: step (number), substeps (array)
 - show: View current plan. No params.
 - scratchpad: Save working notes. Params: content (required, must have ## Current Task and ## Plan sections)"
+}
+
+#[cfg(test)]
+mod flat_tests {
+    use super::*;
+
+    #[test]
+    fn add_function_param_maps_to_add_param_end_by_default() {
+        let a =
+            json!({"path":"src/lib.rs","function":"assemble","param":"x: u32","call_value":"0"});
+        let out = flat_to_refactor_args("add_function_param", &a).unwrap();
+        assert_eq!(out["action"], "add_param");
+        assert_eq!(out["name"], "assemble");
+        assert_eq!(out["new_param"], "x: u32");
+        assert_eq!(out["callsite_fill_in"], "0");
+        assert_eq!(out["position"], "end");
+    }
+
+    #[test]
+    fn add_function_param_after_maps_to_after_anchor() {
+        let a = json!({"path":"s","function":"f","param":"p: P","call_value":"v","after":"b","line":42});
+        let out = flat_to_refactor_args("add_function_param", &a).unwrap();
+        assert_eq!(out["position"], "after:b");
+        assert_eq!(out["line"], 42);
+    }
+
+    #[test]
+    fn drop_and_rename_map_correctly() {
+        let d = flat_to_refactor_args(
+            "drop_function_param",
+            &json!({"path":"s","function":"f","param":"p"}),
+        )
+        .unwrap();
+        assert_eq!(d["action"], "drop_param");
+        assert_eq!(d["param"], "p");
+        let r = flat_to_refactor_args(
+            "rename_symbol",
+            &json!({"path":"s","line":7,"name":"old","new_name":"new"}),
+        )
+        .unwrap();
+        assert_eq!(r["action"], "rename");
+        assert_eq!(r["new_name"], "new");
+        assert_eq!(r["line"], 7);
+    }
+
+    #[test]
+    fn non_flat_name_returns_none() {
+        assert!(flat_to_refactor_args("refactor", &json!({})).is_none());
+        assert_eq!(flat_refactor_tool_definitions().len(), 3);
+    }
 }
