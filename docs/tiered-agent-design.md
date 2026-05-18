@@ -8,7 +8,36 @@ gemma-4-26B-A4B, devstral-small-2 (Mistral-family), qwen3-coder-next-80B.
 All numbers below are from the **error-audited, sanitized** harness
 (`sanitize_messages` ported in — see §Corrections).
 
-## TL;DR / decision
+## ⚠ REAL-BENCH VERDICT (2026-05-18, supersedes everything below)
+
+The probe-driven "de-ceremonialize / lean is better" thesis in this
+doc was **refuted by the real docker bench.** Decisive A/B on the
+Qwen3-Coder-Next control (reliably 6/6 historically), same HEAD, same
+harness, only `tools.ceremony` varied:
+
+| ceremony | real-bench result |
+|---|---|
+| **`strict`** (plan-gate enforcement + per-step compile-gated check-off) | **6/6, smoke:PASS** ✅ |
+| `off` (lean: no plan machinery) | 5/6, **smoke:FAIL** |
+| `advise` (lean + advice to decompose, plan optional) | 4/6, test+smoke FAIL |
+
+`smoke` = the feature actually works at runtime — the only check that
+matters. Only **enforced** plan-first ceremony delivers it. Advice is
+not enough; LSP/compile feedback (present in *all* modes) is not
+enough; aider was *not* a reliable counterexample (0–6/6 on this task,
+mostly 3/6, its best unscoped run still smoke:FAIL). The synthetic
+probe could not measure real multi-step value-threading; the bench
+can, and it says the enforcement is load-bearing.
+
+**Shipped decision: default `tools.ceremony = "strict"`** (committed —
+`95e62da`). `off`/`advise` remain opt-in flags, documented here as
+real-bench-refuted, not recommended. The de-ceremonialization work
+(commits `e54588b`, `a6a9790`) is preserved behind the flag, *not*
+the default. Everything in the TL;DR below is the original
+probe-driven reasoning, retained for the record but **wrong as a
+production direction.**
+
+## TL;DR / decision (PROBE-DRIVEN — refuted above, kept for record)
 
 The highest-leverage change is **not** building an aider-style text
 tier. It is **de-ceremonializing the existing tool-call agent**:
