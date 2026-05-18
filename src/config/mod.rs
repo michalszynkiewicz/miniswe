@@ -352,6 +352,12 @@ pub enum CeremonyMode {
     /// it could not measure real multi-step value-threading. See
     /// docs/tiered-agent-design.md §Real-bench refutation.
     Off,
+    /// Lean code path (no gate / nudges / phase, like Off) BUT the
+    /// prompt strongly *advises* outlining the value-threading steps
+    /// before editing. Tests whether decomposition *advice* (not gate
+    /// *enforcement*) is the active ingredient for `smoke`. Opt-in,
+    /// under evaluation — see docs/tiered-agent-design.md.
+    Advise,
     /// Plan-first gating + phase-aware prompt + progress nudges. The
     /// proven-good default: matches Qwen's reliable historical 6/6 and
     /// passes `smoke` (the check that proves the feature works).
