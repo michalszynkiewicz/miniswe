@@ -326,12 +326,12 @@ pub struct ToolsConfig {
     pub plan: bool,
     /// Scratchpad (task_update)
     pub scratchpad: bool,
-    /// Agent ceremony level. `"off"` (default): no plan gate, no
-    /// `PLAN CHECK`/plan-unlock prompt language, no plan/no-plan nudge
-    /// epicycles, all edit tools always visible, one minimal system
-    /// prompt — the evidence-distilled design (see
-    /// `docs/tiered-agent-design.md`). `"strict"`: legacy plan-first
-    /// gating + phase-aware prompt + nudges (opt-in escape hatch).
+    /// Agent ceremony level. `"strict"` (DEFAULT): plan-first gating +
+    /// phase-aware prompt + progress nudges — the proven-good behavior
+    /// (Qwen 6/6, passes `smoke`). `"off"`: leaner/faster minimal
+    /// prompt with no plan machinery, but the real docker bench proved
+    /// it regresses the end-to-end `smoke` check (opt-in only). See
+    /// `docs/tiered-agent-design.md` §Real-bench refutation.
     pub ceremony: CeremonyMode,
     /// Edit-tool surface: `"fast"` (default) exposes the primitive
     /// `replace_range` / `insert_at` / `revert` / `check` surface from
@@ -344,11 +344,18 @@ pub struct ToolsConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CeremonyMode {
-    /// Evidence-distilled default: no plan gate, no `PLAN CHECK`, no
-    /// nudge epicycles, all edit tools visible, one minimal prompt.
-    #[default]
+    /// No plan gate, no `PLAN CHECK`, no nudge epicycles, all edit
+    /// tools visible, one minimal prompt. Leaner and faster, but the
+    /// real docker bench proved it REGRESSES the end-to-end `smoke`
+    /// check (Qwen3-Coder-Next: strict 6/6 vs off 5/6 smoke:FAIL, same
+    /// HEAD/harness). Opt-in only — the synthetic probe that motivated
+    /// it could not measure real multi-step value-threading. See
+    /// docs/tiered-agent-design.md §Real-bench refutation.
     Off,
-    /// Legacy plan-first gating + phase-aware prompt + nudges (opt-in).
+    /// Plan-first gating + phase-aware prompt + progress nudges. The
+    /// proven-good default: matches Qwen's reliable historical 6/6 and
+    /// passes `smoke` (the check that proves the feature works).
+    #[default]
     Strict,
 }
 
@@ -371,7 +378,7 @@ impl Default for ToolsConfig {
             web_tools: true,
             plan: true,
             scratchpad: true,
-            ceremony: CeremonyMode::Off,
+            ceremony: CeremonyMode::Strict,
             edit_mode: EditMode::Fast,
         }
     }
