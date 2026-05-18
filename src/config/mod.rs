@@ -326,11 +326,30 @@ pub struct ToolsConfig {
     pub plan: bool,
     /// Scratchpad (task_update)
     pub scratchpad: bool,
+    /// Agent ceremony level. `"off"` (default): no plan gate, no
+    /// `PLAN CHECK`/plan-unlock prompt language, no plan/no-plan nudge
+    /// epicycles, all edit tools always visible, one minimal system
+    /// prompt — the evidence-distilled design (see
+    /// `docs/tiered-agent-design.md`). `"strict"`: legacy plan-first
+    /// gating + phase-aware prompt + nudges (opt-in escape hatch).
+    pub ceremony: CeremonyMode,
     /// Edit-tool surface: `"fast"` (default) exposes the primitive
     /// `replace_range` / `insert_at` / `revert` / `check` surface from
     /// `src/tools/fast/`; `"smart"` replaces it with `edit_file`, which
     /// delegates to an inner-model planner. See `docs/fast-mode-design.md`.
     pub edit_mode: EditMode,
+}
+
+/// Agent ceremony level — see `ToolsConfig::ceremony`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CeremonyMode {
+    /// Evidence-distilled default: no plan gate, no `PLAN CHECK`, no
+    /// nudge epicycles, all edit tools visible, one minimal prompt.
+    #[default]
+    Off,
+    /// Legacy plan-first gating + phase-aware prompt + nudges (opt-in).
+    Strict,
 }
 
 /// Which edit-tool surface to expose to the outer model.
@@ -352,6 +371,7 @@ impl Default for ToolsConfig {
             web_tools: true,
             plan: true,
             scratchpad: true,
+            ceremony: CeremonyMode::Off,
             edit_mode: EditMode::Fast,
         }
     }

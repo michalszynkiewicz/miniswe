@@ -103,6 +103,7 @@ fn build_system_prompt(
     refactor_available: bool,
     edit_file_available: bool,
     plan_set: bool,
+    ceremony: crate::config::CeremonyMode,
 ) -> String {
     let refactor_blurb = "\
 refactor adds/drops a parameter (action='add_param'/'drop_param') or renames a symbol (action='rename') and updates every callsite in ONE atomic call. Give the target NAME — the tool resolves the location via LSP. add_param example: {\"action\":\"add_param\",\"path\":\"src/lib.rs\",\"name\":\"assemble\",\"new_param\":\"x: u32\",\"position\":\"after:b\",\"callsite_fill_in\":\"0\"}. rename example: {\"action\":\"rename\",\"path\":\"src/lib.rs\",\"line\":42,\"name\":\"assemble\",\"new_name\":\"build_context\"}.\n";
@@ -201,6 +202,30 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
     // once the plan exists. assemble() recomputes this every turn, so the
     // prompt flips automatically at the plan(action='set') boundary (same
     // boundary visible_tool_defs uses to unlock the write tools).
+    // Ceremony=Off (evidence-distilled default): one minimal prompt —
+    // no plan gate, no plan(action=...) language, no phase split, no
+    // "you'll get edit tools after a plan" preview. Keep the
+    // intent-routing + edit contract (those are useful, not ceremony).
+    // See docs/tiered-agent-design.md.
+    if ceremony == crate::config::CeremonyMode::Off {
+        return format!(
+            "You are miniswe, a coding agent. Complete the task using your tools.\n\
+             Tool routing — pick by intent:\n\
+             - Add/remove a parameter, or rename a function/method/type/variable across callsites -> {sig_route}\n\
+             - Insert new lines/code -> insert_at\n\
+             - Replace or delete existing lines -> replace_range\n\
+             - Whole-file rewrite or new file -> write_file\n\
+             For a signature change or rename, {sig_route} updates the definition AND every callsite in ONE call — do NOT hand-edit callsites yourself.\n\
+             Emit ONE tool call per response. Wait for its result before issuing the next one.\n\
+             Tool contract: grouped tools require action plus action-specific params.\n\
+             file read: {{\"action\":\"read\",\"path\":\"README.md\"}}\n\
+             {edit_contract}\n\
+             If a tool says a parameter is missing, retry with the exact required parameter names.\n\
+             Background servers: spawn with `& echo $! > .pid` and kill via that pid before respawning — don't pkill/grep ps.\n\
+             Bound port with no matching process under you: switch ports, don't escalate kills.\n"
+        );
+    }
+
     let preamble = if plan_set {
         format!(
             "You are miniswe, a coding agent. A plan is set — you are in the EDITING phase. Make the changes now.\n\
@@ -337,6 +362,16 @@ pub fn sanitize_messages(messages: &mut Vec<Message>) {
 
         i += 1;
     }
+
+    // Invariant the probe proved load-bearing: Mistral/Devstral's jinja
+    // template hard-raises on consecutive same-role user/assistant
+    // messages (HTTP 500). After sanitize, that must never happen.
+    debug_assert!(
+        messages.windows(2).all(
+            |w| !(w[0].role == w[1].role && matches!(w[0].role.as_str(), "user" | "assistant"))
+        ),
+        "sanitize_messages left consecutive same-role messages (Mistral 500 risk)"
+    );
 }
 
 /// Compress older conversation history into one-line summaries.
@@ -440,6 +475,7 @@ pub fn assemble(
         true,  // refactor available for all models
         false, // edit_file hidden for all models
         crate::tools::plan::plan_exists(config),
+        config.tools.ceremony,
     );
 
     // 1b. Project root (always present)
@@ -514,14 +550,44 @@ pub fn assemble(
 #[cfg(test)]
 mod prompt_phase_tests {
     use super::build_system_prompt;
-    use crate::config::EditMode;
+    use crate::config::{CeremonyMode, EditMode};
 
-    // Production sends (refactor=true, edit_file=false) for every model.
+    // Phase tests target the legacy STRICT path (the only one with a
+    // plan_set phase split). Production default is Off — see
+    // ceremony_off_is_minimal below.
     fn pre() -> String {
-        build_system_prompt(EditMode::Fast, true, false, false)
+        build_system_prompt(EditMode::Fast, true, false, false, CeremonyMode::Strict)
     }
     fn post() -> String {
-        build_system_prompt(EditMode::Fast, true, false, true)
+        build_system_prompt(EditMode::Fast, true, false, true, CeremonyMode::Strict)
+    }
+
+    #[test]
+    fn ceremony_off_is_minimal_no_plan_language() {
+        // The evidence-distilled default: no plan gate / phase / unlock
+        // language, regardless of plan_set; identical for both plan_set
+        // values (no phase split).
+        for ps in [false, true] {
+            let p = build_system_prompt(EditMode::Fast, true, false, ps, CeremonyMode::Off);
+            assert!(!p.contains("WORKFLOW: explore"), "off: no explore→plan");
+            assert!(!p.contains("EDITING phase"), "off: no phase framing");
+            assert!(
+                !p.contains("plan(action="),
+                "off: no plan(action=) language"
+            );
+            assert!(!p.contains("After plan is set"), "off: no unlock preview");
+            assert!(
+                p.contains("Tool routing — pick by intent:"),
+                "off: keeps the useful intent routing"
+            );
+            assert!(p.contains("Emit ONE tool call per response."));
+        }
+        let a = build_system_prompt(EditMode::Fast, true, false, false, CeremonyMode::Off);
+        let b = build_system_prompt(EditMode::Fast, true, false, true, CeremonyMode::Off);
+        assert_eq!(
+            a, b,
+            "off: plan_set must not change the prompt (no phase split)"
+        );
     }
 
     #[test]
