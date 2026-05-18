@@ -207,9 +207,26 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
     // "you'll get edit tools after a plan" preview. Keep the
     // intent-routing + edit contract (those are useful, not ceremony).
     // See docs/tiered-agent-design.md.
-    if ceremony == crate::config::CeremonyMode::Off {
+    // Off and Advise share the lean code path (no gate, no phase, no
+    // nudges — see run.rs `strict`). Advise additionally *encourages*
+    // (does not require) thinking the change through first: the real
+    // bench showed step decomposition — not the gate enforcement — is
+    // what carries multi-step value-threading (smoke). This variant
+    // tests whether advice alone supplies it. See
+    // docs/tiered-agent-design.md.
+    if ceremony != crate::config::CeremonyMode::Strict {
+        let advise = if ceremony == crate::config::CeremonyMode::Advise {
+            "Before editing, think the change through and outline the concrete \
+             steps — which files, and how the value threads end-to-end so the \
+             feature actually works at runtime (not just compiles). You may use \
+             the plan tool to record/track steps; it is optional, not required. \
+             Then implement, verifying each step.\n"
+        } else {
+            ""
+        };
         return format!(
             "You are miniswe, a coding agent. Complete the task using your tools.\n\
+             {advise}\
              Tool routing — pick by intent:\n\
              - Add/remove a parameter, or rename a function/method/type/variable across callsites -> {sig_route}\n\
              - Insert new lines/code -> insert_at\n\
@@ -588,6 +605,35 @@ mod prompt_phase_tests {
             a, b,
             "off: plan_set must not change the prompt (no phase split)"
         );
+    }
+
+    #[test]
+    fn ceremony_advise_encourages_without_gating() {
+        // Advise = lean (no gate/phase language) + a strong advisory to
+        // decompose first. plan_set-invariant like Off.
+        for ps in [false, true] {
+            let p = build_system_prompt(EditMode::Fast, true, false, ps, CeremonyMode::Advise);
+            assert!(
+                !p.contains("WORKFLOW: explore"),
+                "advise: no explore→plan gate"
+            );
+            assert!(!p.contains("EDITING phase"), "advise: no phase framing");
+            assert!(!p.contains("plan(action="), "advise: no plan(action=) gate");
+            assert!(
+                p.contains("think the change through and outline"),
+                "advise: must advise decomposition"
+            );
+            assert!(
+                p.contains("optional, not required"),
+                "advise: planning must be explicitly optional"
+            );
+        }
+        let a = build_system_prompt(EditMode::Fast, true, false, false, CeremonyMode::Advise);
+        let b = build_system_prompt(EditMode::Fast, true, false, true, CeremonyMode::Advise);
+        assert_eq!(a, b, "advise: plan_set must not change the prompt");
+        // And advise must differ from off (the advisory paragraph).
+        let off = build_system_prompt(EditMode::Fast, true, false, false, CeremonyMode::Off);
+        assert_ne!(a, off, "advise must add content vs off");
     }
 
     #[test]
