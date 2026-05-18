@@ -1,0 +1,71 @@
+You are working on miniswe, a CLI coding agent for local LLMs. Your goal is to make the benchmark pass reliably within 1200 seconds, without overfitting changes to the specific benchmark task.
+
+## How the benchmark works
+
+CRITICAL: Understand the two-layer architecture before changing anything.
+
+The benchmark has two separate codebases:
+
+1. The miniswe binary (the agent) — built from the current HEAD of this repo during docker build. This is what you modify.
+2. The target project (the code miniswe works on) — checked out inside the container at a pinned SHA (cc34d2626faf32c1b6dd1b8b33af693fb936b098). This is an older snapshot of this same repo. You must NEVER change this SHA or modify the target project code.
+
+The benchmark flow:
+1. docker build compiles miniswe from HEAD into a Docker image
+2. Container starts, extracts the target project at the pinned SHA via git archive
+3. miniswe runs inside the container, trying to complete the task on the target project
+4. Validation checks: compile, build, --help shows flag, flag parses, cargo test, smoke test (PONG_42)
+5. Up to 3 retry attempts if validation fails (errors fed back to miniswe)
+
+The benchmark task: "Add a CLI flag --system-prompt-override that replaces the default system prompt."
+
+## Commands
+
+- Run benchmark: ./scripts/run-benchmark-docker.sh --timeout 1200
+- Kill running benchmark: ./scripts/kill-benchmark-docker.sh
+- Check progress: docker ps --filter name=miniswe-bench and then tail the most recent stderr file: find benchmark_results -name 'stderr_attempt*.txt' -newer benchmark_results -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2 | xargs tail -30
+- Check results: Look for "=== FINAL: N/N ===" in the most recent container.log
+
+## What to improve
+
+You are modifying the miniswe agent code (src/) to help it complete tasks better. Areas to experiment with:
+
+- System prompt (src/context/mod.rs) — what instructions help the model succeed
+- Tool behavior (src/tools/) — how tools report results, error messages, guardrails
+- Context compression (src/context/compressor.rs) — how old messages are summarized
+- Planning (src/tools/plan.rs, enforcement in src/cli/commands/run.rs) — plan gating, plan-at-compression
+- Stall/loop detection (src/cli/commands/run.rs) — thresholds, warning messages
+- Tool definitions (src/tools/definitions.rs) — how tools are described to the model
+
+## Rules
+
+1. No overfitting. Do not hardcode behavior for the benchmark task. Changes must be general improvements that would help with any coding task. Ask yourself: "would this help on a completely different task too?"
+2. No changing the benchmark SHA or task. The target project and validation are fixed.
+3. Commit and tag promising experiments. When a run shows improvement (more checks passing, fewer rounds, less confusion), commit with a descriptive message and tag it: git tag experiment-DESCRIPTION. This lets us compare and revert.
+4. One change at a time. Make a focused change, run the benchmark, analyze results. Don't bundle multiple unrelated changes.
+5. Analyze before changing. After each benchmark run, read the logs (stderr_attempt*.txt, stdout_attempt*.txt, container.log) to understand what went wrong before making the next change.
+6. The model is devstral-small-2 (24B quantized). It struggles with: multi-file edits, long context, keeping track of what it already did. Design your improvements with these limitations in mind.
+
+## Current state
+
+Recent changes (commit 6cde2ec):
+- Write tools (edit, write_file, replace_all, fix_file) are gated until the model creates a plan
+- When context compression triggers and plan tool is enabled, the model is asked to update its plan before compression happens
+- Plan nudge injected at session start
+
+Known issues from previous benchmark runs:
+- Model sometimes truncates files when using write_file (writes partial content)
+- After compression, model sometimes loses track of what it already did
+- Model can get stuck in read loops (reading same files repeatedly)
+- Model sometimes fails at multi-step edits across several files
+
+## Workflow
+
+1. Read the relevant source files to understand current behavior
+2. Form a hypothesis about what would help
+3. Make a focused change
+4. Run ./scripts/run-benchmark-docker.sh --timeout 1200
+5. Wait for it to finish (check with docker ps --filter name=miniswe-bench) — the benchmark takes 5-20 minutes typically. Do not sit idle — read code or plan your next experiment while waiting.
+6. Analyze results in the most recent benchmark_results/docker_*/ directory
+7. If promising: git add the changed files specifically (not -A) && git commit -m "experiment: what you changed" && git tag experiment-NAME
+8. If not: revert with git checkout -- src/ and try a different approach
+9. Repeat

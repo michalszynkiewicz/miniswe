@@ -42,6 +42,8 @@ async fn llm_client_chat_plain_text() {
         messages: vec![Message::user("hi")],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -73,6 +75,8 @@ async fn llm_client_chat_tool_call() {
         messages: vec![Message::user("read main.rs")],
         tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -107,6 +111,8 @@ async fn llm_client_stream_plain_text() {
         messages: vec![Message::user("hi")],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -144,6 +150,8 @@ async fn llm_client_stream_tool_call() {
         messages: vec![Message::user("write a file")],
         tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -255,6 +263,8 @@ async fn llm_client_stream_idle_timeout_fires_on_hung_connection() {
         messages: vec![Message::user("hi")],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let start = std::time::Instant::now();
@@ -298,6 +308,8 @@ async fn llm_client_stream_idle_timeout_retries_and_eventually_gives_up() {
         messages: vec![Message::user("hi")],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let result = client.chat(&request).await;
@@ -332,6 +344,8 @@ async fn llm_client_chat_stream_idle_timeout_fires_on_hung_connection() {
         messages: vec![Message::user("hi")],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -380,6 +394,8 @@ async fn llm_client_chat_stream_idle_timeout_retries_when_no_progress() {
         messages: vec![Message::user("hi")],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -458,6 +474,8 @@ async fn llm_client_chat_stream_no_retry_after_partial_progress() {
         messages: vec![Message::user("hi")],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -534,6 +552,8 @@ async fn single_tool_call_flow_reads_file() {
         ],
         tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -576,6 +596,8 @@ async fn write_file_flow_creates_file_on_disk() {
         messages: vec![Message::user("create output.txt")],
         tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -634,6 +656,8 @@ async fn invalid_json_args_from_llm() {
         messages: vec![Message::user("do something")],
         tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -688,6 +712,8 @@ async fn llm_api_error_returns_error() {
         messages: vec![Message::user("hi")],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let result = client.chat(&request).await;
@@ -727,6 +753,8 @@ async fn llm_chat_does_not_retry_truncated_tool_call_500() {
         messages: vec![Message::user("hi")],
         tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let err = client
@@ -777,6 +805,8 @@ async fn llm_chat_retries_transient_503_and_succeeds() {
         messages: vec![Message::user("hi")],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -796,6 +826,8 @@ async fn llm_connection_refused() {
         messages: vec![Message::user("hi")],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let result = client.chat(&request).await;
@@ -827,6 +859,8 @@ async fn llm_stream_retries_transient_503_and_succeeds() {
         messages: vec![Message::user("hi")],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -875,6 +909,8 @@ async fn stream_cancellation_via_flag() {
         messages: vec![Message::user("go")],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(true)); // pre-cancelled

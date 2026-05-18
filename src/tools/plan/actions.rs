@@ -81,25 +81,28 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
                 // Structured input: array of step objects
                 let mut parsed = Vec::new();
                 for (i, step_val) in steps_arr.iter().enumerate() {
-                    let desc = step_val["description"]
+                    // Accept both `step` (canonical) and `description` (legacy
+                    // alias) so old prompts/examples don't break. New schema
+                    // advertises only `step`.
+                    let text = step_val["step"]
                         .as_str()
+                        .or_else(|| step_val["description"].as_str())
                         .or_else(|| step_val.as_str())
                         .unwrap_or("")
                         .to_string();
-                    if desc.is_empty() {
+                    if text.is_empty() {
                         return Ok(ToolResult::err(format!(
-                            "Step {} has empty description.",
+                            "Step {} is empty. Each step needs a 'step' field with the action text.",
                             i + 1
                         )));
                     }
                     let compile = step_val["compile"].as_bool().unwrap_or(true);
-                    let reason = step_val["reason"].as_str().map(|s| s.to_string());
                     parsed.push(Step {
                         checked: false,
                         checked_round: None,
-                        description: desc,
+                        step: text,
                         compile,
-                        reason,
+                        reason: None,
                     });
                 }
                 parsed
@@ -127,7 +130,7 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
                         steps.push(Step {
                             checked: trimmed.starts_with("- [x]"),
                             checked_round: None,
-                            description: desc,
+                            step: desc,
                             compile: true,
                             reason: None,
                         });
@@ -141,7 +144,7 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
                             steps.push(Step {
                                 checked: false,
                                 checked_round: None,
-                                description: l.to_string(),
+                                step: l.to_string(),
                                 compile: true,
                                 reason: None,
                             });
@@ -291,25 +294,25 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
             let parent_compile = steps[step_num - 1].compile;
             let mut new_substeps = Vec::new();
             for (i, sv) in substeps_arr.iter().enumerate() {
-                let desc = sv["description"]
+                let text = sv["step"]
                     .as_str()
+                    .or_else(|| sv["description"].as_str())
                     .or_else(|| sv.as_str())
                     .unwrap_or("")
                     .to_string();
-                if desc.is_empty() {
+                if text.is_empty() {
                     return Ok(ToolResult::err(format!(
-                        "Substep {} has empty description.",
+                        "Substep {} is empty. Each substep needs a 'step' field with the action text.",
                         i + 1
                     )));
                 }
                 let compile = sv["compile"].as_bool().unwrap_or(parent_compile);
-                let reason = sv["reason"].as_str().map(|s| s.to_string());
                 new_substeps.push(Step {
                     checked: false,
                     checked_round: None,
-                    description: desc,
+                    step: text,
                     compile,
-                    reason,
+                    reason: None,
                 });
             }
 

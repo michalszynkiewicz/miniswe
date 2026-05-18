@@ -70,21 +70,17 @@ pub async fn run(
         if !config.tools.plan {
             disabled.push("plan");
         }
-        if config.model.is_devstral_family() {
-            // Devstral mangles refactor args (schema confusion on `position`);
-            // route signature edits through edit_file instead.
-            // See ModelConfig::is_devstral_family.
-            disabled.push("refactor");
-        } else {
-            // For every non-Devstral model: hide edit_file. Empirical data
-            // (Gemma Apr 30 fast 6/6 at 291s vs May 11 6/6 at 2195s with
-            // edit_file visible) shows edit_file monopolizes tool choice —
-            // model defaults to it for everything and never reaches for
-            // `refactor` (atomic) or the surgical primitives. Devstral keeps
-            // edit_file because refactor is hidden for it and it needs an
-            // escape hatch beyond replace_range/insert_at.
-            disabled.push("edit_file");
-        }
+        // Uniform across all models: refactor available, edit_file hidden.
+        // The old Devstral carve-out (hide refactor, keep edit_file) was
+        // protecting against `position`-arg mangling from the *old*
+        // `change_signature` tool; the rename to `refactor` fixed the
+        // formatting (replay: clean args when called), and the gate's
+        // real effect was just suppressing adoption. edit_file stays
+        // hidden because it monopolizes tool choice (Gemma Apr 30 fast
+        // 6/6 at 291s vs May 11 6/6 at 2195s with edit_file visible).
+        // Adoption is driven by the phase-aware system prompt (see
+        // context::build_system_prompt's plan_set branch), not the gate.
+        disabled.push("edit_file");
         // In Fast mode we ALSO expose `edit_file` alongside the
         // primitives. Body edits with tricky brace nesting (e.g.
         // wrapping an existing block in `if let Some(x) = ... {} else
@@ -252,6 +248,15 @@ pub async fn run(
     ));
 
     let mut messages = assembled.messages;
+    // The system prompt is phase-aware (pre-plan "explore→plan" vs
+    // post-plan "you are EDITING" + routing). `assemble()` runs once
+    // before the loop, so messages[0] is frozen at the attempt's
+    // starting plan-state. Track it; when plan-state flips mid-loop
+    // (the model calls plan(action='set')) we rebuild messages[0] so
+    // the prompt actually switches — mirroring how visible_tool_defs is
+    // re-evaluated per turn at the same boundary. Without this the
+    // post-plan prompt never activates within an attempt.
+    let mut last_plan_set = tools::plan::plan_exists(&config);
 
     // Nudge the model to plan before editing (if plan tool is available)
     if config.tools.plan {
@@ -335,6 +340,24 @@ pub async fn run(
         // Hide edit tools from the model until a plan exists. See
         // visible_tool_defs for rationale.
         let plan_set = tools::plan::plan_exists(&config);
+        // Plan-state flipped (model just set/cleared a plan): rebuild the
+        // system prompt so its pre-plan vs post-plan phase matches. Happens
+        // at most once per attempt, so the extra assemble() is negligible.
+        if plan_set != last_plan_set {
+            let re = context::assemble(
+                &config,
+                message,
+                &conversation_history,
+                plan_only,
+                mcp_summary.as_deref(),
+            );
+            if let Some(sys) = re.messages.into_iter().next()
+                && !messages.is_empty()
+            {
+                messages[0] = sys;
+            }
+            last_plan_set = plan_set;
+        }
         let visible = visible_tool_defs(&tool_defs, plan_set);
         // Mistral Small 4 honors `reasoning_effort` ("none"/"high"); other
         // models (Gemma, GPT-OSS, Devstral) use `enable_thinking` or
@@ -1001,15 +1024,10 @@ pub async fn run(
         // multi-file exploration has had room to breathe (a few file reads, a
         // search, a goto_definition or two).
         if round >= 12 && !nudged_no_plan && !tools::plan::plan_exists(&config) {
-            // Tool list in the hint must match what the model will actually
-            // see post-unlock — Devstral keeps edit_file (no refactor),
-            // everyone else gets refactor (no edit_file). Mismatch here is
-            // exactly the schema-runtime confusion we work to avoid.
-            let unlock_tools = if config.model.is_devstral_family() {
-                "edit_file, replace_range, insert_at, write_file"
-            } else {
-                "refactor, replace_range, insert_at, write_file"
-            };
+            // Must match the now-uniform post-unlock surface (refactor
+            // for all, edit_file hidden). Mismatch here is exactly the
+            // schema-runtime confusion we work to avoid.
+            let unlock_tools = "refactor, replace_range, insert_at, write_file";
             messages.push(Message::user(&format!(
                 "[Reminder: you've explored for several rounds without a plan. \
                  Call plan(action='set') with your step-by-step approach now — \

@@ -69,26 +69,14 @@ pub fn failure_hint(config: &Config) -> Option<String> {
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .map(|(idx, step)| {
-            format!(
-                "{} {}",
-                idx + 1,
-                crate::truncate_chars(&step.description, 60)
-            )
-        })
+        .map(|(idx, step)| format!("{} {}", idx + 1, crate::truncate_chars(&step.step, 60)))
         .collect::<Vec<_>>();
     let next_preview = steps
         .iter()
         .enumerate()
         .filter(|(_, step)| !step.checked)
         .take(3)
-        .map(|(idx, step)| {
-            format!(
-                "{} {}",
-                idx + 1,
-                crate::truncate_chars(&step.description, 60)
-            )
-        })
+        .map(|(idx, step)| format!("{} {}", idx + 1, crate::truncate_chars(&step.step, 60)))
         .collect::<Vec<_>>();
 
     let mut parts = vec![format!("Plan: {done}/{} done.", steps.len())];

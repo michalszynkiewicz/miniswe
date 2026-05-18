@@ -80,15 +80,9 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
         if !config.tools.plan {
             disabled.push("plan");
         }
-        if config.model.is_devstral_family() {
-            // Devstral mangles refactor args (schema confusion). See run.rs.
-            disabled.push("refactor");
-        } else {
-            // Non-Devstral: hide edit_file. See run.rs for the empirical
-            // case — edit_file monopolizes tool choice on Gemma and crowds
-            // out the more specific refactor + replace_range/insert_at path.
-            disabled.push("edit_file");
-        }
+        // Uniform across all models: refactor available, edit_file hidden.
+        // Devstral carve-out removed — see run.rs for the rationale.
+        disabled.push("edit_file");
         // Fast mode keeps `edit_file` available alongside the
         // primitives — see run.rs for rationale.
         tool_defs.retain(|t| !disabled.contains(&t.function.name.as_str()));

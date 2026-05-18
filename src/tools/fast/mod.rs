@@ -40,4 +40,4 @@ mod show_rev;
 
 pub use dispatch::execute_fast_tool;
 pub use feedback::project_error_count;
-pub use revisions::RevisionStore;
+pub use revisions::{RecordArgs, RevisionStore};

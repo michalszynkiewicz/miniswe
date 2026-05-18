@@ -262,6 +262,8 @@ async fn llm_summarize_timeline(
         ],
         tools: None,
         tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
     };
 
     let mut events = llm_worker.submit_non_streaming(ModelRole::Fast, request);
