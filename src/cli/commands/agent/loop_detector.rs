@@ -20,8 +20,18 @@ pub fn is_mutating_call(tool_name: &str, args: &serde_json::Value) -> bool {
         "show_rev" | "check" => false,
 
         // Top-level mutators
-        "replace_range" | "insert_at" | "revert" | "edit_file" | "write_file" | "delete_file"
-        | "task_update" | "spawn_agents" | "mcp_use" => true,
+        "replace_range"
+        | "insert_at"
+        | "revert"
+        | "edit_file"
+        | "write_file"
+        | "delete_file"
+        | "task_update"
+        | "spawn_agents"
+        | "mcp_use"
+        | "add_function_param"
+        | "drop_function_param"
+        | "rename_symbol" => true,
 
         // Grouped tools — split by action.
         "file" => {

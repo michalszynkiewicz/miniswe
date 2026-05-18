@@ -29,7 +29,14 @@ pub fn is_prunable_refactor_failure(content: &str, success: bool) -> bool {
 pub fn is_file_write(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "edit_file" | "write_file" | "refactor" | "replace_range" | "insert_at"
+        "edit_file"
+            | "write_file"
+            | "refactor"
+            | "replace_range"
+            | "insert_at"
+            | "add_function_param"
+            | "drop_function_param"
+            | "rename_symbol"
     )
 }
 

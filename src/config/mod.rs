@@ -333,6 +333,14 @@ pub struct ToolsConfig {
     /// it regresses the end-to-end `smoke` check (opt-in only). See
     /// `docs/tiered-agent-design.md` §Real-bench refutation.
     pub ceremony: CeremonyMode,
+    /// Flat refactor tools. `false` (default): grouped
+    /// `refactor{action,position,callsite_fill_in}` (proven 6/6).
+    /// `true`: replace it with flat single-purpose
+    /// `add_function_param`/`drop_function_param`/`rename_symbol` (no
+    /// `position`/`callsite_fill_in` DSL — removes the documented
+    /// deterministic Devstral mangling). Under A/B evaluation; see
+    /// `docs/tiered-agent-design.md`.
+    pub flat: bool,
     /// Edit-tool surface: `"fast"` (default) exposes the primitive
     /// `replace_range` / `insert_at` / `revert` / `check` surface from
     /// `src/tools/fast/`; `"smart"` replaces it with `edit_file`, which
@@ -385,6 +393,7 @@ impl Default for ToolsConfig {
             plan: true,
             scratchpad: true,
             ceremony: CeremonyMode::Strict,
+            flat: false,
             edit_mode: EditMode::Fast,
         }
     }
