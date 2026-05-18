@@ -176,6 +176,11 @@ pub async fn run(
 
     let max_rounds = config.context.max_rounds;
     let pause_at = config.context.pause_after_rounds;
+    // Ceremony=Off (default, evidence-distilled): no plan gate, no
+    // plan/no-plan nudges, all edit tools always visible, no phase
+    // rebuild. `strict` re-enables the legacy plan-first machinery.
+    // See docs/tiered-agent-design.md.
+    let strict = config.tools.ceremony == crate::config::CeremonyMode::Strict;
 
     let mut conversation_history: Vec<Message> = Vec::new();
     let mut round = 0;
@@ -258,8 +263,8 @@ pub async fn run(
     // post-plan prompt never activates within an attempt.
     let mut last_plan_set = tools::plan::plan_exists(&config);
 
-    // Nudge the model to plan before editing (if plan tool is available)
-    if config.tools.plan {
+    // Nudge the model to plan before editing (strict/legacy only)
+    if strict && config.tools.plan {
         messages.push(Message::user(
             "[Before making changes, explore the codebase and use the plan tool to outline your approach. \
              Each step has compile: true (default) — the compiler must pass to check it off. \
@@ -343,7 +348,7 @@ pub async fn run(
         // Plan-state flipped (model just set/cleared a plan): rebuild the
         // system prompt so its pre-plan vs post-plan phase matches. Happens
         // at most once per attempt, so the extra assemble() is negligible.
-        if plan_set != last_plan_set {
+        if strict && plan_set != last_plan_set {
             let re = context::assemble(
                 &config,
                 message,
@@ -358,7 +363,9 @@ pub async fn run(
             }
             last_plan_set = plan_set;
         }
-        let visible = visible_tool_defs(&tool_defs, plan_set);
+        // Off: never hide edit tools (pass plan_exists=true). Strict:
+        // legacy hide-until-plan behavior.
+        let visible = visible_tool_defs(&tool_defs, plan_set || !strict);
         // Mistral Small 4 honors `reasoning_effort` ("none"/"high"); other
         // models (Gemma, GPT-OSS, Devstral) use `enable_thinking` or
         // ignore the kwarg entirely. For Mistral 4 we want deep reasoning
@@ -501,7 +508,7 @@ pub async fn run(
                 //      reasoning_effort=high triggered this — read a few
                 //      files, reasoned heavily, then returned empty.
                 // Both deserve one nudge to recover.
-                if !nudged_premature_exit && config.tools.plan {
+                if strict && !nudged_premature_exit && config.tools.plan {
                     let has_unchecked = tools::plan::has_unchecked_steps(&config);
                     let plan_exists = tools::plan::plan_exists(&config);
                     if has_unchecked || !plan_exists {
@@ -644,9 +651,10 @@ pub async fn run(
                 continue;
             }
 
-            // Write gating: require plan before write tools
+            // Write gating: require plan before write tools (strict only)
             let is_write_action = is_file_write(tc.function.name.as_str());
-            if config.tools.plan && !tools::plan::plan_exists(&config) && is_write_action {
+            if strict && config.tools.plan && !tools::plan::plan_exists(&config) && is_write_action
+            {
                 let result_msg = Message::tool_result(
                     &tc.id,
                     "Create a plan first: use plan(action='set') with your step-by-step approach before making changes.",
@@ -964,7 +972,7 @@ pub async fn run(
                 last_call_key = None;
                 same_call_streak = 0;
                 calls_since_last_edit = 0;
-                if config.tools.plan {
+                if strict && config.tools.plan {
                     if tools::plan::plan_exists(&config) {
                         result.content.push('\n');
                         result.content.push_str(PLAN_PROGRESS_NUDGE);
@@ -1023,7 +1031,7 @@ pub async fn run(
         // course correction before it's deeply stuck, but late enough that real
         // multi-file exploration has had room to breathe (a few file reads, a
         // search, a goto_definition or two).
-        if round >= 12 && !nudged_no_plan && !tools::plan::plan_exists(&config) {
+        if strict && round >= 12 && !nudged_no_plan && !tools::plan::plan_exists(&config) {
             // Must match the now-uniform post-unlock surface (refactor
             // for all, edit_file hidden). Mismatch here is exactly the
             // schema-runtime confusion we work to avoid.
@@ -1043,7 +1051,7 @@ pub async fn run(
         // mismatch. Re-fire the plan nudge instead (with a more urgent
         // tone than the round-12 first nudge).
         if calls_since_last_edit >= 20 && calls_since_last_edit.is_multiple_of(20) {
-            let body = if !tools::plan::plan_exists(&config) {
+            let body = if strict && !tools::plan::plan_exists(&config) {
                 "Still no plan set after 20+ exploration calls. \
                  Edit tools cannot appear in your tool list until plan(action='set') is called. \
                  Stop exploring and set a plan now — even an imperfect plan can be refined later. \
