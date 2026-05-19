@@ -53,12 +53,20 @@ async fn classify_is_explore(
     user_message: &str,
     cancelled: &Arc<AtomicBool>,
 ) -> bool {
-    let sys = "You are a strict request classifier. Reply with EXACTLY one \
-        word and nothing else: CODING or EXPLORE. EXPLORE = the user only \
-        wants to read, understand, or answer questions about the codebase \
-        with NO code changes intended. CODING = anything that may involve \
-        writing or modifying code or files, even partially. If there is ANY \
-        doubt, answer CODING.";
+    let sys = "Classify the user's request. Reply with EXACTLY one word, \
+        nothing else: CODING or EXPLORE.\n\
+        Answer CODING for anything that could lead to changing code/files, \
+        INCLUDING: reviewing, auditing, or critiquing code; checking whether \
+        something is correct/buggy/safe; finding or diagnosing bugs; \
+        suggesting or making improvements/fixes/refactors; or any imperative \
+        to write/modify/add/remove. \"Is X correct?\", \"review X\", \"does \
+        X have bugs?\", \"can you improve X?\" are all CODING.\n\
+        Answer EXPLORE ONLY for pure information requests with zero \
+        evaluation and zero change intent — explaining or locating how the \
+        existing code works: \"how does X work\", \"where is X\", \"what \
+        does X do\", \"walk me through X\".\n\
+        If it is not unambiguously a pure how/what/where explanation, answer \
+        CODING.";
     let request = ChatRequest {
         messages: vec![Message::system(sys), Message::user(user_message)],
         tools: None,
