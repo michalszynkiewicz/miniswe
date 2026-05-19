@@ -15,11 +15,17 @@ doc was **refuted by the real docker bench.** Decisive A/B on the
 Qwen3-Coder-Next control (reliably 6/6 historically), same HEAD, same
 harness, only `tools.ceremony` varied:
 
-| ceremony | real-bench result |
+| config | real-bench result |
 |---|---|
-| **`strict`** (plan-gate enforcement + per-step compile-gated check-off) | **6/6, smoke:PASS** ✅ |
+| **`strict` + grouped tools** (plan-gate enforcement + per-step compile-gated check-off) | **6/6, smoke:PASS** ✅ |
 | `off` (lean: no plan machinery) | 5/6, **smoke:FAIL** |
 | `advise` (lean + advice to decompose, plan optional) | 4/6, test+smoke FAIL |
+| `strict` + **`tools.flat`** (flat refactor tools, enforcement kept) | **3/6** (Gemma; help:FAIL→compile:FAIL) — regressed vs strict+grouped 6/6 |
+
+(`strict+flat` Gemma N=1, completed pre-sleep & valid; devstral/qwen
+sleep-corrupted, not re-run — the Gemma regression + the 4-for-4
+pattern made belaboring it the probe-chasing trap. `tools.flat`
+default stays `false`; grouped path byte-unchanged.)
 
 `smoke` = the feature actually works at runtime — the only check that
 matters. Only **enforced** plan-first ceremony delivers it. Advice is
@@ -29,9 +35,14 @@ mostly 3/6, its best unscoped run still smoke:FAIL). The synthetic
 probe could not measure real multi-step value-threading; the bench
 can, and it says the enforcement is load-bearing.
 
-**Shipped decision: default `tools.ceremony = "strict"`** (committed —
-`95e62da`). `off`/`advise` remain opt-in flags, documented here as
-real-bench-refuted, not recommended. The de-ceremonialization work
+**Shipped decision: default `tools.ceremony = "strict"` + grouped
+tools** (`tools.flat = false`). `off`/`advise`/`flat` are all opt-in
+flags, documented here as real-bench-refuted, not recommended. Four
+probe-derived changes were tested on the real bench; **all four
+regressed** while strict+grouped held 6/6. The pattern is the finding:
+the synthetic probe systematically mispredicts the real bench because
+it cannot exercise the actual success metric (end-to-end value-
+threading / `smoke`). The de-ceremonialization work
 (commits `e54588b`, `a6a9790`) is preserved behind the flag, *not*
 the default. Everything in the TL;DR below is the original
 probe-driven reasoning, retained for the record but **wrong as a
