@@ -39,6 +39,73 @@ use crate::tui::app::{App, AppMode, LineStyle};
 use crate::tui::event::{self, AppEvent};
 use crate::tui::ui;
 
+/// Per-turn intent router (REPL only). One isolated, tool-less LLM
+/// round-trip — NOT added to conversation history — classifying the
+/// user's message as code-editing vs read-only investigation.
+///
+/// Fail-safe by design: returns `true` (EXPLORE) ONLY on an
+/// unambiguous one-word EXPLORE; any other output, parse failure,
+/// empty, or LLM error → `false` (CODING, the proven path). The
+/// asymmetric cost (coding→explore misroute drops the load-bearing
+/// plan ceremony, the regression we closed) is why the bias is hard.
+async fn classify_is_explore(
+    llm_worker: &LlmWorkerHandle,
+    user_message: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> bool {
+    let sys = "You are a strict request classifier. Reply with EXACTLY one \
+        word and nothing else: CODING or EXPLORE. EXPLORE = the user only \
+        wants to read, understand, or answer questions about the codebase \
+        with NO code changes intended. CODING = anything that may involve \
+        writing or modifying code or files, even partially. If there is ANY \
+        doubt, answer CODING.";
+    let request = ChatRequest {
+        messages: vec![Message::system(sys), Message::user(user_message)],
+        tools: None,
+        tool_choice: None,
+        max_tokens_override: Some(8),
+        chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+    };
+    let mut events = llm_worker.submit(ModelRole::Default, request, cancelled.clone());
+    let mut out = String::new();
+    while let Some(ev) = events.recv().await {
+        match ev {
+            LlmWorkerEvent::Completed(Ok(r)) => {
+                out = r
+                    .choices
+                    .first()
+                    .and_then(|c| c.message.content.clone())
+                    .unwrap_or_default();
+                break;
+            }
+            LlmWorkerEvent::Completed(Err(_)) => break, // fail-safe → CODING
+            _ => {}
+        }
+    }
+    is_explore_reply(&out)
+}
+
+/// Fail-safe classifier parse: EXPLORE only on a clean leading
+/// EXPLORE; everything else (incl. empty, prose-wrapped, CODING) →
+/// false = CODING. The asymmetric bias is the safety property.
+fn is_explore_reply(s: &str) -> bool {
+    s.trim().to_ascii_uppercase().starts_with("EXPLORE")
+}
+
+/// Read-only tool subset for EXPLORE turns: drop every writer/mutator
+/// (so the model is never *offered* an edit tool) and the plan tool
+/// (no planning in Q&A). Keeps file:read/search, code:* (LSP/repo
+/// map), web, show_rev/check.
+fn read_only_tool_defs(all: &[crate::llm::ToolDefinition]) -> Vec<crate::llm::ToolDefinition> {
+    all.iter()
+        .filter(|t| {
+            let n = t.function.name.as_str();
+            !(is_file_write(n) || matches!(n, "revert" | "delete_file" | "plan" | "spawn_agents"))
+        })
+        .cloned()
+        .collect()
+}
+
 struct ReplTerminalGuard;
 
 impl ReplTerminalGuard {
@@ -408,12 +475,40 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                     (input.clone(), None)
                                 };
 
+                                // Per-turn intent router (fail-safe to
+                                // CODING). EXPLORE turns run a read-only,
+                                // no-plan, Q&A-directed variant; the proven
+                                // coding path is byte-unchanged otherwise.
+                                let is_explore =
+                                    classify_is_explore(&llm_worker, &user_message, &cancelled)
+                                        .await;
+                                let turn_cfg = if is_explore {
+                                    let mut c = config.clone();
+                                    c.tools.plan = false;
+                                    c.tools.ceremony = crate::config::CeremonyMode::Off;
+                                    c
+                                } else {
+                                    config.clone()
+                                };
+                                let turn_tools = if is_explore {
+                                    read_only_tool_defs(&tool_defs)
+                                } else {
+                                    tool_defs.clone()
+                                };
+                                if is_explore {
+                                    app.push_output(
+                                        "[explore] read-only investigation — no edits. \
+                                         Say e.g. \"actually, change it\" to switch to coding.",
+                                        LineStyle::Status,
+                                    );
+                                }
+
                                 // Run the agent loop
                                 let mcp_summary_clone = mcp_summary.clone();
 
                                 // Assemble context
                                 let assembled = context::assemble(
-                                    &config,
+                                    &turn_cfg,
                                     &user_message,
                                     &conversation_history,
                                     false,
@@ -430,6 +525,18 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                 {
                                     content.push_str("\n[ACTIVE SKILL]\n");
                                     content.push_str(reminder);
+                                }
+                                if is_explore
+                                    && let Some(sys_msg) = messages.first_mut()
+                                    && let Some(ref mut content) = sys_msg.content
+                                {
+                                    content.push_str(
+                                        "\n[INVESTIGATION MODE] Read-only. Investigate with the \
+                                         read tools and answer the question precisely, citing \
+                                         file:line. Do NOT modify code or files. If a code change \
+                                         is actually wanted, state that and ask the user to \
+                                         rephrase as an edit request.\n",
+                                    );
                                 }
 
                                 app.is_thinking = true;
@@ -449,8 +556,8 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                     &router,
                                     &llm_worker,
                                     &tool_pool,
-                                    &tool_defs,
-                                    &config,
+                                    &turn_tools,
+                                    &turn_cfg,
                                     perms_ref,
                                     mcp_ref,
                                     &cancelled,
@@ -1634,6 +1741,57 @@ mod tests {
     use ratatui::backend::TestBackend;
     use serde_json::json;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn classifier_parse_is_fail_safe_to_coding() {
+        // EXPLORE only on a clean leading EXPLORE.
+        assert!(is_explore_reply("EXPLORE"));
+        assert!(is_explore_reply("  explore \n"));
+        assert!(is_explore_reply("EXPLORE."));
+        assert!(is_explore_reply("EXPLORE - read only"));
+        // Everything else → CODING (fail-safe), incl. prose-wrapped,
+        // empty, the other label, garbage.
+        assert!(!is_explore_reply("CODING"));
+        assert!(!is_explore_reply(""));
+        assert!(!is_explore_reply("I think this is EXPLORE"));
+        assert!(!is_explore_reply("probably explore?"));
+        assert!(!is_explore_reply("</think> blah"));
+    }
+
+    #[test]
+    fn read_only_filter_drops_writers_and_plan_keeps_readers() {
+        use crate::llm::{FunctionDefinition, ToolDefinition};
+        let td = |n: &str| ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: n.into(),
+                description: String::new(),
+                parameters: json!({}),
+            },
+        };
+        let all = vec![
+            td("file"),
+            td("code"),
+            td("web"),
+            td("show_rev"),
+            td("check"),
+            td("write_file"),
+            td("edit_file"),
+            td("refactor"),
+            td("add_function_param"),
+            td("replace_range"),
+            td("insert_at"),
+            td("revert"),
+            td("delete_file"),
+            td("plan"),
+            td("spawn_agents"),
+        ];
+        let ro: Vec<String> = read_only_tool_defs(&all)
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        assert_eq!(ro, ["file", "code", "web", "show_rev", "check"]);
+    }
 
     #[test]
     fn file_search_summary_uses_pattern_and_path() {
