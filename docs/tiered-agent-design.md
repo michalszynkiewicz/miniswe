@@ -20,12 +20,17 @@ harness, only `tools.ceremony` varied:
 | **`strict` + grouped tools** (plan-gate enforcement + per-step compile-gated check-off) | **6/6, smoke:PASS** ✅ |
 | `off` (lean: no plan machinery) | 5/6, **smoke:FAIL** |
 | `advise` (lean + advice to decompose, plan optional) | 4/6, test+smoke FAIL |
-| `strict` + **`tools.flat`** (flat refactor tools, enforcement kept) | **3/6** (Gemma; help:FAIL→compile:FAIL) — regressed vs strict+grouped 6/6 |
+| `strict` + **`tools.flat`** (flat refactor tools, enforcement kept) | **regressed** — Gemma {0/6, 3/6, 3/6} (N=3), Devstral 3/6; vs strict+grouped 6/6 |
 
-(`strict+flat` Gemma N=1, completed pre-sleep & valid; devstral/qwen
-sleep-corrupted, not re-run — the Gemma regression + the 4-for-4
-pattern made belaboring it the probe-chasing trap. `tools.flat`
-default stays `false`; grouped path byte-unchanged.)
+(`strict+flat` re-checked clean: Gemma ×3 = 0/6, 3/6, 3/6 — high
+variance but entirely within a regressed band, never near 6/6;
+Devstral 3/6. Recurring signature `help:FAIL` — with flat tools the
+agent falls back to primitives and never atomically threads the CLI
+flag. qwen run killed (foregone given Gemma N=3 + Devstral + the
+5-for-5 pattern). `tools.flat` default stays `false`; grouped path
+byte-unchanged. Not "too many tools" — the opposite: the rich grouped
+surface incl. the `refactor` DSL is load-bearing for real multi-step
+threading; every simplification regressed.)
 
 `smoke` = the feature actually works at runtime — the only check that
 matters. Only **enforced** plan-first ceremony delivers it. Advice is
