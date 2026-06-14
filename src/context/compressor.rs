@@ -14,6 +14,21 @@ use crate::context::estimate_tokens;
 use crate::llm::{ChatRequest, Message, ModelRouter};
 use crate::runtime::{LlmWorkerEvent, LlmWorkerHandle};
 
+/// Token cost of one message: content **plus** tool-call argument bytes.
+/// Used for both the compression trigger and the keep/compress split so the
+/// two agree — coding histories are dominated by large tool-call arg blobs,
+/// and counting them in the trigger but not the split made compression keep
+/// more raw history than budgeted.
+fn msg_token_cost(msg: &Message) -> usize {
+    let mut tokens = estimate_tokens(msg.content.as_deref().unwrap_or(""));
+    if let Some(tcs) = &msg.tool_calls {
+        for tc in tcs {
+            tokens += estimate_tokens(&tc.function.arguments) + 5;
+        }
+    }
+    tokens
+}
+
 /// Check if compression is needed without doing it.
 pub fn needs_compression(messages: &[Message], config: &Config, tool_def_tokens: usize) -> bool {
     let context_window = config.model.context_window;
@@ -25,7 +40,7 @@ pub fn needs_compression(messages: &[Message], config: &Config, tool_def_tokens:
     let total_tokens: usize = messages
         .iter()
         .filter(|m| m.role != "system")
-        .map(|m| estimate_tokens(m.content.as_deref().unwrap_or("")))
+        .map(msg_token_cost)
         .sum();
 
     total_tokens > raw_budget
@@ -57,7 +72,7 @@ pub async fn maybe_compress(
         let total: usize = messages
             .iter()
             .filter(|m| m.role != "system")
-            .map(|m| estimate_tokens(m.content.as_deref().unwrap_or("")))
+            .map(msg_token_cost)
             .sum();
 
         if total > raw_budget {
@@ -84,14 +99,9 @@ pub async fn maybe_compress(
             msg_tokens.push(0);
             continue;
         }
-        let tokens = estimate_tokens(msg.content.as_deref().unwrap_or(""));
-        // Add tool call tokens
-        if let Some(tcs) = &msg.tool_calls {
-            for tc in tcs {
-                let tc_tokens = estimate_tokens(&tc.function.arguments) + 5;
-                total_tokens += tc_tokens;
-            }
-        }
+        // Content + tool-call args, so the keep/compress split below (which
+        // sums msg_tokens) agrees with this trigger total.
+        let tokens = msg_token_cost(msg);
         total_tokens += tokens;
         msg_tokens.push(tokens);
     }
@@ -362,31 +372,26 @@ fn archive_messages(messages: &[&Message], config: &Config) {
             continue;
         }
 
+        // Full, untruncated content — the archive is the lossless record on
+        // disk; the in-context summary is the lossy view.
         match role.as_str() {
             "assistant" => {
                 if let Some(tcs) = &msg.tool_calls {
                     for tc in tcs {
                         archive.push_str(&format!(
                             "→ {}({})\n",
-                            tc.function.name,
-                            crate::truncate_chars(&tc.function.arguments, 200)
+                            tc.function.name, tc.function.arguments
                         ));
                     }
                 } else {
-                    archive.push_str(&format!(
-                        "ASSISTANT: {}\n",
-                        crate::truncate_chars(content, 500)
-                    ));
+                    archive.push_str(&format!("ASSISTANT: {content}\n"));
                 }
             }
             "tool" => {
-                archive.push_str(&format!(
-                    "RESULT: {}\n",
-                    crate::truncate_chars(content, 500)
-                ));
+                archive.push_str(&format!("RESULT: {content}\n"));
             }
             "user" => {
-                archive.push_str(&format!("USER: {}\n", crate::truncate_chars(content, 200)));
+                archive.push_str(&format!("USER: {content}\n"));
             }
             _ => {}
         }

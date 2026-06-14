@@ -227,7 +227,8 @@ async fn auto_check(
             let abs_path = config.project_root.join(path);
             if lsp.notify_file_changed(&abs_path).is_ok() {
                 let timeout = std::time::Duration::from_millis(config.lsp.diagnostic_timeout_ms);
-                let diags = lsp.get_diagnostics(&abs_path, timeout).await;
+                let (diags, lsp_confirmed) =
+                    lsp.get_diagnostics_with_status(&abs_path, timeout).await;
                 // Always proceed — get_diagnostics already waited for the timeout
                 {
                     let errors: Vec<&lsp_types::Diagnostic> = diags
@@ -239,7 +240,12 @@ async fn auto_check(
                     // don't flip success on new helper scripts whose
                     // imports happen to be unresolved.
                     let regressed = !is_new_file && errors.len() > baseline_errors;
-                    if errors.is_empty() {
+                    if errors.is_empty() && !lsp_confirmed {
+                        // Diagnostics never settled — don't claim OK (false green).
+                        result.content.push_str(
+                            "\n[lsp] pending — diagnostics didn't settle; run a check to confirm",
+                        );
+                    } else if errors.is_empty() {
                         result.content.push_str("\n[lsp] OK");
                     } else if is_new_file {
                         let capped = errors.len().min(5);
