@@ -178,14 +178,6 @@ impl ModelConfig {
 pub struct ContextConfig {
     /// Token budget for the repo map slice
     pub repo_map_budget: usize,
-    /// Token budget for retrieved code snippets
-    pub snippet_budget: usize,
-    /// Number of raw conversation turns to keep
-    pub history_turns: usize,
-    /// Token budget for conversation history
-    pub history_budget: usize,
-    /// Token budget for the scratchpad
-    pub scratchpad_budget: usize,
     /// Maximum tool call rounds before stopping
     pub max_rounds: usize,
     /// Ask user to confirm continuation after this many rounds
@@ -460,10 +452,6 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             repo_map_budget: 5000,
-            snippet_budget: 12000,
-            history_turns: 5,
-            history_budget: 6000,
-            scratchpad_budget: 1500,
             max_rounds: 100,
             pause_after_rounds: 50,
             providers: ProvidersConfig::default(),

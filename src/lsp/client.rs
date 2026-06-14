@@ -234,6 +234,20 @@ impl LspClient {
     /// "wait until a non-empty diagnostic arrives" heuristic for servers
     /// that don't emit progress at all.
     pub async fn get_diagnostics(&self, path: &Path, timeout: Duration) -> Vec<Diagnostic> {
+        self.get_diagnostics_with_status(path, timeout).await.0
+    }
+
+    /// Like [`Self::get_diagnostics`], but also reports whether the result is
+    /// *confirmed* — the server actually settled (reached idle or published
+    /// for this file) — versus *unconfirmed* (we timed out before analysis
+    /// finished). An empty `Vec` with `confirmed == false` means
+    /// "unknown / still pending", NOT "clean": callers must not claim the file
+    /// is OK on an unconfirmed-empty result.
+    pub async fn get_diagnostics_with_status(
+        &self,
+        path: &Path,
+        timeout: Duration,
+    ) -> (Vec<Diagnostic>, bool) {
         let uri = path_to_uri(path);
 
         // Mark that we're waiting for fresh diagnostics
@@ -256,13 +270,13 @@ impl LspClient {
         //    the legacy "wait for diagnostics" loop below can still soak
         //    up late-arriving messages on servers that don't use progress.
         let idle_budget = timeout / 2;
-        let _ = self.wait_for_idle(idle_budget).await;
+        let idle = self.wait_for_idle(idle_budget).await;
 
-        // 2) Read the cache. If we got something, return it.
+        // 2) A publishDiagnostics for this file is authoritative — confirmed.
         for entry in self.transport.diagnostics.iter() {
             let key = entry.key();
             if key == &uri || key.ends_with(&path_str) {
-                return entry.value().clone();
+                return (entry.value().clone(), true);
             }
         }
 
@@ -277,20 +291,23 @@ impl LspClient {
                 if key == &uri || key.ends_with(&path_str) {
                     let diags = entry.value().clone();
                     if !diags.is_empty() {
-                        return diags;
+                        return (diags, true);
                     }
                     saw_empty = true;
                 }
             }
 
+            // An empty publish arrived → confirmed clean.
             if saw_empty && overall_start.elapsed() > Duration::from_secs(3) {
-                return Vec::new();
+                return (Vec::new(), true);
             }
 
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        Vec::new()
+        // Timed out with no definitive publish. Trust idle: if the server
+        // reached idle, treat empty as clean; otherwise it's unknown/pending.
+        (Vec::new(), idle)
     }
 
     /// Go to definition of symbol at position.

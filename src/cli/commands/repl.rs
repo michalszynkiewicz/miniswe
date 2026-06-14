@@ -164,7 +164,10 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
         if config.tools.edit_mode == EditMode::Fast {
             tool_defs.extend(tools::fast_mode_tool_definitions());
         }
-        tool_defs.push(tools::definitions::spawn_agents_tool_definition());
+        // Only expose spawn_agents when concurrency makes it useful (see run.rs).
+        if config.runtime.llm_concurrency > 1 {
+            tool_defs.push(tools::definitions::spawn_agents_tool_definition());
+        }
     }
 
     // Spawn LSP client (non-blocking)

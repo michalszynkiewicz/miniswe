@@ -102,7 +102,13 @@ pub async fn run(
         if config.tools.flat {
             tool_defs.extend(tools::definitions::flat_refactor_tool_definitions());
         }
-        tool_defs.push(tools::definitions::spawn_agents_tool_definition());
+        // spawn_agents only buys anything when the worker pool can run LLM
+        // calls concurrently. At llm_concurrency=1 (the default) it's an inert
+        // per-round schema tax — and the most complex tool shape — that the
+        // model never benefits from. Hide it unless parallelism is available.
+        if config.runtime.llm_concurrency > 1 {
+            tool_defs.push(tools::definitions::spawn_agents_tool_definition());
+        }
     }
 
     // Clear stale scratchpad/plan from previous sessions — unless this

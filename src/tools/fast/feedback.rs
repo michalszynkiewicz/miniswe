@@ -64,9 +64,15 @@ pub async fn build_feedback(
 
     // Per-file LSP
     let abs_path = config.project_root.join(rel_path);
-    let file_diags = collect_file_diagnostics(&abs_path, config, lsp).await;
+    let (file_diags, lsp_confirmed) = collect_file_diagnostics(&abs_path, config, lsp).await;
     let file_errors = file_diags.len();
-    let file_lsp_line = render_file_diagnostics(&file_diags);
+    let file_lsp_line = if !lsp_confirmed && file_diags.is_empty() {
+        // Don't claim "0 errors" when diagnostics never settled — that false
+        // green is exactly what lets a small model ship a broken change.
+        "[lsp file] pending — diagnostics didn't settle; run a check to confirm".to_string()
+    } else {
+        render_file_diagnostics(&file_diags)
+    };
 
     // Project-wide LSP (a single number + delta)
     let project_errors = collect_project_error_count(lsp).await;
@@ -112,22 +118,23 @@ async fn collect_file_diagnostics(
     abs_path: &std::path::Path,
     config: &Config,
     lsp: Option<&LspClient>,
-) -> Vec<lsp_types::Diagnostic> {
+) -> (Vec<lsp_types::Diagnostic>, bool) {
     let Some(lsp) = lsp else {
-        return Vec::new();
+        return (Vec::new(), true);
     };
     if !lsp.is_ready() || lsp.has_crashed() {
-        return Vec::new();
+        return (Vec::new(), true);
     }
     if lsp.notify_file_changed(abs_path).is_err() {
-        return Vec::new();
+        return (Vec::new(), true);
     }
     let timeout = std::time::Duration::from_millis(config.lsp.diagnostic_timeout_ms);
-    let diags = lsp.get_diagnostics(abs_path, timeout).await;
-    diags
+    let (diags, confirmed) = lsp.get_diagnostics_with_status(abs_path, timeout).await;
+    let errors = diags
         .into_iter()
         .filter(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
-        .collect()
+        .collect();
+    (errors, confirmed)
 }
 
 async fn collect_project_error_count(lsp: Option<&LspClient>) -> usize {

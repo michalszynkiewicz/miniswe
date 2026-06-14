@@ -24,6 +24,10 @@ const CODE_EXTENSIONS: &[&str] = &[
     "yaml", "yml", "json", "md",
 ];
 
+/// Per-line cap so a single absurd line (minified JS, lockfile) can't
+/// dominate a result.
+const MAX_LINE_CHARS: usize = 1000;
+
 pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     let query = match super::args::opt_str(args, "query") {
         Ok(s) => s.unwrap_or(""),
@@ -90,15 +94,33 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         )));
     }
 
+    let output = render_hits(&search_term_owned, &hits, config.tool_output_budget_chars());
+    Ok(ToolResult::ok(output))
+}
+
+/// Render hits within the tool-output byte budget. Search is otherwise the
+/// only result tool with no byte budget (every other result tool caps via
+/// `tool_output_budget_chars`), so without this a single huge result could
+/// flood a small model's context.
+fn render_hits(term: &str, hits: &[String], budget: usize) -> String {
     let match_count = hits.len();
-    let mut output = format!("[search \"{search_term_owned}\": {match_count} matches]\n");
-    for (i, line) in hits.iter().enumerate() {
-        if i > 0 {
-            output.push('\n');
+    let mut output = format!("[search \"{term}\": {match_count} matches]\n");
+    let mut shown = 0;
+    for line in hits {
+        if shown > 0 && output.len() + line.len() + 1 > budget {
+            break;
         }
         output.push_str(line);
+        output.push('\n');
+        shown += 1;
     }
-    Ok(ToolResult::ok(output))
+    if shown < match_count {
+        output.push_str(&format!(
+            "[{} more matches not shown — refine your query]\n",
+            match_count - shown
+        ));
+    }
+    output
 }
 
 fn build_matcher(
@@ -175,9 +197,39 @@ impl Sink for FileSink<'_> {
             .unwrap_or("")
             .trim_end_matches('\n')
             .trim_end_matches('\r');
+        let text = crate::truncate_chars(text, MAX_LINE_CHARS);
         self.hits
             .push(format!("{}:{}:{}", self.rel_path, line_number, text));
         // Keep searching this file unless the global cap was reached.
         Ok(self.hits.len() < self.max_results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_hits;
+
+    #[test]
+    fn render_hits_caps_total_output_to_budget() {
+        let hits: Vec<String> = (0..200)
+            .map(|i| format!("src/f.rs:{i}:{}", "x".repeat(200)))
+            .collect();
+        let budget = 1000;
+        let out = render_hits("needle", &hits, budget);
+        assert!(
+            out.len() <= budget + 120,
+            "output {} exceeds budget+slack",
+            out.len()
+        );
+        assert!(out.contains("more matches not shown"));
+    }
+
+    #[test]
+    fn render_hits_shows_all_when_under_budget() {
+        let hits = vec!["a.rs:1:foo".to_string(), "b.rs:2:bar".to_string()];
+        let out = render_hits("q", &hits, 10_000);
+        assert!(out.contains("a.rs:1:foo"));
+        assert!(out.contains("b.rs:2:bar"));
+        assert!(!out.contains("more matches"));
     }
 }

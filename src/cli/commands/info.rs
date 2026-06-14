@@ -66,10 +66,8 @@ pub async fn run() -> Result<()> {
     eprintln!("  Context window: {} tokens", config.model.context_window);
     eprintln!("  Temperature: {}", config.model.temperature);
     eprintln!(
-        "  Context budget: repo_map={}, snippets={}, history={}",
-        config.context.repo_map_budget,
-        config.context.snippet_budget,
-        config.context.history_budget
+        "  Context budget: repo_map={}",
+        config.context.repo_map_budget
     );
 
     Ok(())
