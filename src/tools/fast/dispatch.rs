@@ -32,7 +32,7 @@ pub async fn execute_fast_tool(
     revisions: &RevisionStore,
     project_baseline_errors: usize,
 ) -> Result<ToolResult> {
-    let result = match name {
+    let mut result = match name {
         "replace_range" => {
             replace_range::execute(args, config, perms, lsp, revisions, project_baseline_errors)
                 .await
@@ -56,6 +56,19 @@ pub async fn execute_fast_tool(
         && let Some(path) = args.get("path").and_then(|p| p.as_str())
     {
         super::super::edit_orchestration::reindex_changed_file(path, config);
+
+        // EXPERIMENTAL: break the AST-break cascade. Only structural line
+        // edits can dig the brace-mismatch hole; `revert`/`check`/`show_rev`
+        // can't, so we scope the guard to them. Reindex again inside
+        // `maybe_break_cascade` if it reverts.
+        if config.tools.auto_revert_ast_cascade
+            && matches!(name, "replace_range" | "insert_at")
+            && let Ok(r) = result.as_mut()
+            && let Some(msg) =
+                super::auto_revert::maybe_break_cascade(path, config, lsp, revisions).await
+        {
+            r.content.push_str(&msg);
+        }
     }
 
     result

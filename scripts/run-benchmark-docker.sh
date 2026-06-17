@@ -169,6 +169,10 @@ diagnostic_timeout_ms = 2000
 web_tools = $(_dis web_tools)
 plan = $(_dis plan)
 scratchpad = $(_dis scratchpad)
+# EXPERIMENTAL A/B knob. Default false = pure fast-mode (baseline). Launch with
+# AUTO_REVERT=true ./scripts/run-benchmark-docker.sh ... to force-revert the
+# brace-cascade loop (3+ consecutive broken-AST edits → revert to last clean rev).
+auto_revert_ast_cascade = ${AUTO_REVERT:-false}
 
 [logging]
 level = "trace"

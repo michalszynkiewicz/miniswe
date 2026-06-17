@@ -374,6 +374,15 @@ pub struct ToolsConfig {
     /// `src/tools/fast/`; `"smart"` replaces it with `edit_file`, which
     /// delegates to an inner-model planner. See `docs/fast-mode-design.md`.
     pub edit_mode: EditMode,
+    /// EXPERIMENTAL (fast mode only). When `true`, after a structural edit
+    /// (`replace_range` / `insert_at`) leaves the file's AST broken for
+    /// `CASCADE_THRESHOLD` consecutive edits in a row, the file is forcibly
+    /// reverted to the most recent AST-clean revision and the model is told
+    /// to stop digging and make one balanced edit. Targets the observed
+    /// brace-cascade loop (small models patch line-by-line into ever-deeper
+    /// breakage). `false` (default) preserves the pure fast-mode philosophy
+    /// of tolerating transient broken AST. Under A/B evaluation on Gemma 4.
+    pub auto_revert_ast_cascade: bool,
 }
 
 /// Agent ceremony level — see `ToolsConfig::ceremony`.
@@ -423,6 +432,7 @@ impl Default for ToolsConfig {
             ceremony: CeremonyMode::Strict,
             flat: false,
             edit_mode: EditMode::Fast,
+            auto_revert_ast_cascade: false,
         }
     }
 }

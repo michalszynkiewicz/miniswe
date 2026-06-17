@@ -27,6 +27,7 @@
 //! primitives above are offered instead.
 
 mod ast;
+mod auto_revert;
 mod dispatch;
 mod feedback;
 mod lines;
