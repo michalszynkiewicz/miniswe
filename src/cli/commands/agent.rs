@@ -6,6 +6,7 @@
 //! disagreed between the two on several cases (file/read line ranges,
 //! fast-mode tool formatting). This module is the single source of truth.
 
+pub mod debugger;
 pub mod display;
 pub mod hints;
 pub mod loop_detector;

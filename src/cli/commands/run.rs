@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 
 use anyhow::Result;
 
+use crate::cli::commands::agent::debugger;
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
     PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
@@ -219,6 +220,8 @@ pub async fn run(
     // that believes the check is wrong has an auditable voice (bounded by
     // max_retries; never a silent free pass).
     let mut validation_disputes: Vec<String> = Vec::new();
+    // The reactive debugger sub-agent fires at most once per turn.
+    let mut debugger_fired = false;
 
     // Ctrl+C cancellation flag. The handler fires once and exits — no
     // loop, because `ctrl_c().await` resolves immediately after the
@@ -579,6 +582,49 @@ pub async fn run(
                                 validation_disputes.push(rationale.to_string());
                             }
                             tui::print_status("Behavioral check failed — not done yet.");
+
+                            // Reactive debugger (opt-in): once the primary
+                            // agent has failed the gate a couple times on its
+                            // own, hand the SPECIFIC failure to a fresh-context
+                            // sub-agent. Fires once per turn; its fix lands in
+                            // the shared revision store, so the next gate
+                            // re-check (continue below) validates it.
+                            if config.tools.reactive_debugger
+                                && !debugger_fired
+                                && validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
+                            {
+                                debugger_fired = true;
+                                tui::print_status(
+                                    "Still failing — spinning up a fresh-context debugger sub-agent…",
+                                );
+                                let report = debugger::run_debugger(
+                                    &output,
+                                    &config,
+                                    &llm_worker,
+                                    &tool_pool,
+                                    &tool_defs,
+                                    &perms,
+                                    &mcp_registry,
+                                    &lsp_client,
+                                    &fast_revisions,
+                                    fast_baseline_errors,
+                                    &cancelled,
+                                )
+                                .await;
+                                let body = report.unwrap_or_else(|| {
+                                    "(the debugger sub-agent finished without a report)".to_string()
+                                });
+                                let msg = Message::user(&format!(
+                                    "[A fresh-context debugger sub-agent was given the failing \
+                                     check and attempted a focused fix. Its report:\n{body}\n\
+                                     The verification will now re-run. If it passes you are done; \
+                                     otherwise continue from here.]"
+                                ));
+                                messages.push(msg.clone());
+                                conversation_history.push(msg);
+                                continue;
+                            }
+
                             let msg = Message::user(&format!(
                                 "[Verification failed — do NOT finish yet. A check that exercises \
                                  the change end-to-end exited non-zero; the output below shows what \
@@ -857,6 +903,7 @@ pub async fn run(
                 let lsp = lsp_client.clone();
                 let log_for_job = log.clone();
                 let revisions_for_job = fast_revisions.clone();
+                let cancelled = cancelled.clone();
                 match tool_pool
                     .submit(move || {
                         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -872,6 +919,7 @@ pub async fn run(
                                     lsp.as_deref(),
                                     Some(log_for_job.as_ref()),
                                     revisions_for_job.as_deref(),
+                                    Some(cancelled.as_ref()),
                                 )
                                 .await
                             })
