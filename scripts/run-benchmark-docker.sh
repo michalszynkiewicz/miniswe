@@ -125,9 +125,6 @@ generate_config() {
     # has a retry-on-leak path; budget starvation is the bigger problem.
     local CTX_WINDOW=60000
     local REPO_MAP_BUDGET=5000
-    local SNIPPET_BUDGET=12000
-    local HISTORY_TURNS=5
-    local HISTORY_BUDGET=6000
 
     cat <<TOML
 [model]
@@ -136,14 +133,10 @@ endpoint = "http://localhost:8464"
 model = "${MODEL}"
 context_window = ${CTX_WINDOW}
 temperature = ${TEMPERATURE}
-max_output_tokens = 4096
+max_output_tokens = 8000
 
 [context]
 repo_map_budget = ${REPO_MAP_BUDGET}
-snippet_budget = ${SNIPPET_BUDGET}
-history_turns = ${HISTORY_TURNS}
-history_budget = ${HISTORY_BUDGET}
-scratchpad_budget = 1500
 max_rounds = ${MAX_ROUNDS}
 pause_after_rounds = 99999
 
@@ -180,6 +173,19 @@ scratchpad = $(_dis scratchpad)
 [logging]
 level = "trace"
 enabled = true
+
+[validation]
+# Behavioral done-gate (see docs/success-validation-design.md). Sentinel check
+# derived by Gemma 4 (instruct a unique token via the override, run, grep),
+# wrapped to be DIAGNOSTIC: distinguishes a COMPILE failure from a runtime
+# "override NOT consumed" failure and prints the ACTUAL error/output, so the
+# model fixes the real problem instead of a misattributed one (a 2/6 run failed
+# because a brace error was reported as 'value not threaded'). TOKEN_XYZ is NOT
+# the grader's PONG_42 (grader stays independent); MINISWE_SKIP_VALIDATION=1
+# stops the gate recursing into the inner run. \$ is escaped for the heredoc.
+command = "out=\$(cargo build 2>&1) || { echo \"DOES NOT COMPILE:\"; echo \"\$out\" | tail -20; exit 1; }; run=\$(MINISWE_SKIP_VALIDATION=1 ./target/debug/miniswe --system-prompt-override 'Respond only with TOKEN_XYZ and nothing else' --yes hello 2>&1); echo \"\$run\" | grep -q TOKEN_XYZ || { echo \"COMPILES but override NOT consumed. Expected TOKEN_XYZ, GOT: \$run\"; exit 1; }"
+timeout_secs = 180
+max_retries = 3
 TOML
 }
 
@@ -389,7 +395,10 @@ HINT: These tests compiled but their assertions failed. Re-read the failing test
     TOTAL=$((TOTAL + 1))
     if [ -f "${BINARY}" ] && [ -n "${FLAG}" ] && [ "$PASS" -ge 4 ]; then
         SMOKE_OVERRIDE='You must respond with exactly the text PONG_42 and nothing else. No explanation, no formatting, just PONG_42.'
-        SMOKE_OUTPUT=$(timeout 120 "${BINARY}" \
+        # MINISWE_SKIP_VALIDATION: the edited binary may carry the done-gate;
+        # this smoke run is a utility invocation, not a coding task, so it must
+        # not re-enter the gate.
+        SMOKE_OUTPUT=$(MINISWE_SKIP_VALIDATION=1 timeout 120 "${BINARY}" \
             ${FLAG} "${SMOKE_OVERRIDE}" \
             --yes "ping" 2>/output/smoke_stderr.txt || true)
         echo "${SMOKE_OUTPUT}" > /output/smoke_output.txt

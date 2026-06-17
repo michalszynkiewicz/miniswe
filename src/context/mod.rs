@@ -110,12 +110,13 @@ fn build_system_prompt(
     // grouped `refactor` DSL for flat single-purpose tools).
     let refactor_blurb = if flat {
         "add_function_param / drop_function_param / rename_symbol each update a function's \
-definition AND every callsite in ONE atomic call (resolved by NAME via LSP). \
+definition AND every callsite in ONE atomic call, finding ALL callsites themselves by NAME via LSP \
+— so do NOT search for the callsites or hand-edit them first; use these immediately on any signature change or rename. \
 add_function_param example: {\"path\":\"src/lib.rs\",\"function\":\"assemble\",\"param\":\"x: u32\",\"call_value\":\"0\"} (appends at end; pass \"after\":\"b\" to place after a param). \
 rename_symbol example: {\"path\":\"src/lib.rs\",\"line\":42,\"name\":\"assemble\",\"new_name\":\"build_context\"}.\n"
     } else {
         "\
-refactor adds/drops a parameter (action='add_param'/'drop_param') or renames a symbol (action='rename') and updates every callsite in ONE atomic call. Give the target NAME — the tool resolves the location via LSP. add_param example: {\"action\":\"add_param\",\"path\":\"src/lib.rs\",\"name\":\"assemble\",\"new_param\":\"x: u32\",\"position\":\"after:b\",\"callsite_fill_in\":\"0\"}. rename example: {\"action\":\"rename\",\"path\":\"src/lib.rs\",\"line\":42,\"name\":\"assemble\",\"new_name\":\"build_context\"}.\n"
+refactor adds/drops a parameter (action='add_param'/'drop_param') or renames a symbol (action='rename') and updates every callsite in ONE atomic call. Give the target NAME — refactor finds and updates ALL callsites itself via LSP, so do NOT search for the callsites or hand-edit them first; reach for refactor immediately on any signature change or rename. add_param example: {\"action\":\"add_param\",\"path\":\"src/lib.rs\",\"name\":\"assemble\",\"new_param\":\"x: u32\",\"position\":\"after:b\",\"callsite_fill_in\":\"0\"}. rename example: {\"action\":\"rename\",\"path\":\"src/lib.rs\",\"line\":42,\"name\":\"assemble\",\"new_name\":\"build_context\"}.\n"
     };
     let cs_smart = match (refactor_available, edit_file_available) {
         (true, true) => format!(

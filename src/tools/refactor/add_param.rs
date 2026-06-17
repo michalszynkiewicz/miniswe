@@ -341,13 +341,12 @@ pub async fn execute(
     commit_staged(&staged, config, revisions, "change_signature.add_param")?;
 
     // 4. Format the report.
-    let edited_files = staged.len();
     let total = callsites.len();
     let succeeded = report.len();
     let mut out = String::new();
     if callsite_failures.is_empty() {
         out.push_str(&format!(
-            "✓ add_param: signature + {succeeded}/{total} callsite(s) rewritten across {edited_files} file(s).\n",
+            "✓ COMPLETE — definition and all {total} callsites are now consistent.\n",
         ));
     } else if succeeded == 0 {
         out.push_str(&format!(

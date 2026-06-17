@@ -219,7 +219,7 @@ pub async fn execute(
     let mut out = String::new();
     if callsite_failures.is_empty() && side_effect_warnings.is_empty() {
         out.push_str(&format!(
-            "✓ drop_param: signature + {succeeded}/{total} callsite(s) rewritten.\n",
+            "✓ COMPLETE — definition and all {total} callsites are now consistent.\n",
         ));
     } else if succeeded == 0 {
         out.push_str(&format!(

@@ -176,7 +176,7 @@ mod tests {
     fn prunable_failure_rejects_non_validator_failures() {
         // Tool succeeded → never prune.
         assert!(!is_prunable_refactor_failure(
-            "✓ add_param: signature + 2/2 callsite(s) rewritten.",
+            "✓ COMPLETE — definition and all 2 callsites are now consistent.",
             true,
         ));
         // Different tool prefix.
