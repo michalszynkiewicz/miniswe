@@ -109,6 +109,18 @@ pub struct ModelConfig {
     /// producing tokens steadily, even slowly, is *not* idle.
     #[serde(default = "default_stream_idle_timeout_secs")]
     pub stream_idle_timeout_secs: u64,
+    /// Absolute wall-clock deadline (seconds) for a single logical LLM
+    /// call, spanning all internal retries. A BACKSTOP, not the primary
+    /// guard: the idle timeout (above) catches normal stalls in seconds,
+    /// but it measures inter-token *silence* — a wedged server that keeps
+    /// the connection alive with keep-alive bytes can reset it forever
+    /// (observed: a refactor inner-call hung ~47min with no timeout). This
+    /// ceiling fires regardless. Must clear the worst-case *legitimate*
+    /// full generation (max_output_tokens at the model's slowest healthy
+    /// rate) or it false-kills good requests — default 600s is ~2-3x the
+    /// ~200-300s worst case for an 8k-token Gemma-4 response on a 3090.
+    #[serde(default = "default_request_deadline_secs")]
+    pub request_deadline_secs: u64,
     /// Maximum number of transient retry attempts for LLM requests.
     pub max_retries: usize,
     /// Server-reported model identity from `/v1/models`, populated at
@@ -144,6 +156,10 @@ pub enum ToolCallFormat {
 
 fn default_stream_idle_timeout_secs() -> u64 {
     30
+}
+
+fn default_request_deadline_secs() -> u64 {
+    600
 }
 
 impl ModelConfig {
@@ -383,6 +399,15 @@ pub struct ToolsConfig {
     /// breakage). `false` (default) preserves the pure fast-mode philosophy
     /// of tolerating transient broken AST. Under A/B evaluation on Gemma 4.
     pub auto_revert_ast_cascade: bool,
+    /// EXPERIMENTAL. When `true`, after the behavioral done-gate
+    /// (`[validation]`) blocks completion `DEBUGGER_TRIGGER_BLOCKS` times in a
+    /// turn, spin up a fresh-context "debugger" sub-agent handed only the
+    /// specific failing check output + the changed files and told to fix only
+    /// that. The bet (see GitHub #40) is *attention reset / fresh eyes* on a
+    /// "knows-it's-wrong-but-can't-recover" stall — not extra capability
+    /// (same weights). `false` (default) keeps the gate's plain retry-nudge
+    /// loop. Requires a `[validation]` command to do anything. A/B only.
+    pub reactive_debugger: bool,
 }
 
 /// Agent ceremony level — see `ToolsConfig::ceremony`.
@@ -433,6 +458,7 @@ impl Default for ToolsConfig {
             flat: false,
             edit_mode: EditMode::Fast,
             auto_revert_ast_cascade: false,
+            reactive_debugger: false,
         }
     }
 }
@@ -488,6 +514,7 @@ impl Default for ModelConfig {
             max_output_tokens: 16384,
             request_timeout_secs: 120,
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            request_deadline_secs: default_request_deadline_secs(),
             max_retries: 6,
             probed_model: None,
             tool_call_format: ToolCallFormat::Auto,

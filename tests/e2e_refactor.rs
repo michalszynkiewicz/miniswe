@@ -192,9 +192,10 @@ async fn add_param_updates_signature_and_callsites() {
         "position": "after:b",
         "callsite_fill_in": "0",
     });
-    let result = tools::execute_refactor_tool(&args, &config, &router, Some(&lsp), None, None)
-        .await
-        .unwrap();
+    let result =
+        tools::execute_refactor_tool(&args, &config, &router, Some(&lsp), None, None, None)
+            .await
+            .unwrap();
 
     assert!(result.success, "tool failed: {}", result.content);
 
@@ -251,9 +252,10 @@ async fn add_param_reports_failure_when_model_skips() {
         "position": "after:b",
         "callsite_fill_in": "0",
     });
-    let result = tools::execute_refactor_tool(&args, &config, &router, Some(&lsp), None, None)
-        .await
-        .unwrap();
+    let result =
+        tools::execute_refactor_tool(&args, &config, &router, Some(&lsp), None, None, None)
+            .await
+            .unwrap();
 
     assert!(!result.success);
     assert!(
@@ -310,9 +312,10 @@ async fn rename_via_lsp_updates_definition_and_callers() {
         "new_name": "build_context",
     });
     let router = miniswe::llm::ModelRouter::new(&config);
-    let result = tools::execute_refactor_tool(&args, &config, &router, Some(&lsp), None, None)
-        .await
-        .unwrap();
+    let result =
+        tools::execute_refactor_tool(&args, &config, &router, Some(&lsp), None, None, None)
+            .await
+            .unwrap();
 
     assert!(result.success, "rename failed: {}", result.content);
 
@@ -405,9 +408,10 @@ async fn drop_param_updates_signature_and_callsites() {
         "name": "assemble",
         "param": "b",
     });
-    let result = tools::execute_refactor_tool(&args, &config, &router, Some(&lsp), None, None)
-        .await
-        .unwrap();
+    let result =
+        tools::execute_refactor_tool(&args, &config, &router, Some(&lsp), None, None, None)
+            .await
+            .unwrap();
 
     assert!(result.success, "drop_param failed: {}", result.content);
     let lib_after = fs::read_to_string(config.project_root.join("src/lib.rs")).unwrap();
@@ -440,6 +444,7 @@ async fn refactor_help_returns_usage() {
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -462,7 +467,7 @@ async fn refactor_without_lsp_returns_clear_error() {
         "position": "after:b",
         "callsite_fill_in": "0",
     });
-    let result = tools::execute_refactor_tool(&args, &config, &router, None, None, None)
+    let result = tools::execute_refactor_tool(&args, &config, &router, None, None, None, None)
         .await
         .unwrap();
     assert!(!result.success);
@@ -485,7 +490,7 @@ async fn rename_without_lsp_returns_clear_error() {
         "new_name": "foo",
     });
     let router = miniswe::llm::ModelRouter::new(&config);
-    let result = tools::execute_refactor_tool(&args, &config, &router, None, None, None)
+    let result = tools::execute_refactor_tool(&args, &config, &router, None, None, None, None)
         .await
         .unwrap();
     assert!(!result.success);

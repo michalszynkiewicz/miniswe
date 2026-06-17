@@ -173,6 +173,10 @@ scratchpad = $(_dis scratchpad)
 # AUTO_REVERT=true ./scripts/run-benchmark-docker.sh ... to force-revert the
 # brace-cascade loop (3+ consecutive broken-AST edits → revert to last clean rev).
 auto_revert_ast_cascade = ${AUTO_REVERT:-false}
+# EXPERIMENTAL A/B knob (GitHub #40). Default false. Launch with
+# REACTIVE_DEBUGGER=true ./scripts/run-benchmark-docker.sh ... to spin up a
+# fresh-context debugger sub-agent after the done-gate blocks twice in a turn.
+reactive_debugger = ${REACTIVE_DEBUGGER:-false}
 
 [logging]
 level = "trace"

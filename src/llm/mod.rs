@@ -72,10 +72,16 @@ pub struct LlmClient {
 
 impl LlmClient {
     pub fn new(config: ModelConfig) -> Self {
-        Self {
-            client: Client::new(),
-            config,
-        }
+        // Transport-level wall-clock ceiling per request, set to the same
+        // deadline the app-level wrapper enforces. Unlike the idle-timeout
+        // (which a keep-alive-dribbling wedged server can reset forever),
+        // this total-request cap is never reset by incoming bytes. Falls
+        // back to an untimed client only if the builder somehow fails.
+        let client = Client::builder()
+            .timeout(Duration::from_secs(config.request_deadline_secs))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { client, config }
     }
 
     /// Build the API URL based on provider type.
@@ -181,7 +187,20 @@ impl LlmClient {
         let mut attempt = 0usize;
         let mut cache_busted = false;
         let mut noop = |_: &str| {};
+        // Absolute deadline across all retries. The reqwest client caps each
+        // attempt in-flight (the load-bearing guard, never reset by keep-alive
+        // bytes); this between-attempts check stops a near-deadline failure
+        // from being retried into a multiplied stall. Fast-failing transients
+        // (well under the deadline) still retry normally.
+        let deadline = Duration::from_secs(self.config.request_deadline_secs);
+        let deadline_start = std::time::Instant::now();
         loop {
+            if deadline_start.elapsed() >= deadline {
+                bail!(
+                    "LLM request exceeded {}s deadline across retries",
+                    self.config.request_deadline_secs
+                );
+            }
             let result = self
                 .stream_once_assembled(
                     &url,
@@ -551,7 +570,18 @@ impl LlmClient {
         let idle_timeout = Duration::from_secs(self.config.stream_idle_timeout_secs);
 
         let mut attempt = 0usize;
+        // Absolute deadline across retries — see chat_with_cancel. The
+        // reqwest client caps each attempt in-flight; this stops a
+        // near-deadline failure from being retried into a multiplied stall.
+        let deadline = Duration::from_secs(self.config.request_deadline_secs);
+        let deadline_start = std::time::Instant::now();
         loop {
+            if deadline_start.elapsed() >= deadline {
+                bail!(
+                    "LLM request exceeded {}s deadline across retries",
+                    self.config.request_deadline_secs
+                );
+            }
             let mut had_progress = false;
             let result = {
                 let mut wrapped = |token: &str| {
