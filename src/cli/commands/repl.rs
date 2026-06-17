@@ -1347,6 +1347,7 @@ async fn run_agent_loop(
                 let lsp = lsp.clone();
                 let log_for_job = log.clone();
                 let revisions_for_job = fast_revisions.clone();
+                let cancelled_for_job = cancelled.clone();
                 let mut result_rx = tool_pool.submit(move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -1361,6 +1362,7 @@ async fn run_agent_loop(
                                 lsp.as_deref(),
                                 Some(log_for_job.as_ref()),
                                 revisions_for_job.as_deref(),
+                                Some(cancelled_for_job.as_ref()),
                             )
                             .await
                         })

@@ -7,6 +7,8 @@
 //! if the model paraphrases the OLD block, replacement won't match and we
 //! report failure rather than mis-edit somewhere else.
 
+use std::sync::atomic::AtomicBool;
+
 use anyhow::{Result, anyhow, bail};
 
 use crate::config::ModelRole;
@@ -59,8 +61,9 @@ pub async fn ask_rewrite(
     tag: &str,
     instruction: &str,
     window: &str,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Option<SnippetRewrite>> {
-    ask_rewrite_validated(router, log, tag, instruction, window, |_| {
+    ask_rewrite_validated(router, log, tag, instruction, window, cancelled, |_| {
         Ok::<(), anyhow::Error>(())
     })
     .await
@@ -80,6 +83,7 @@ pub async fn ask_rewrite_validated<V, E>(
     tag: &str,
     instruction: &str,
     window: &str,
+    cancelled: Option<&AtomicBool>,
     validate: V,
 ) -> Result<Option<SnippetRewrite>>
 where
@@ -126,7 +130,7 @@ where
                 "{base_prompt}\n\n(reminder: close OLD with END_OLD and NEW with END_NEW; output nothing outside the OLD/NEW block.)"
             )
         };
-        match try_ask_once(router, log, tag, attempt, &prompt, &prefill).await {
+        match try_ask_once(router, log, tag, attempt, &prompt, &prefill, cancelled).await {
             Ok(Some(rewrite)) => match validate(&rewrite) {
                 Ok(()) => return Ok(Some(rewrite)),
                 Err(e) => {
@@ -180,6 +184,7 @@ async fn try_ask_once(
     attempt: u32,
     prompt: &str,
     prefill: &str,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Option<SnippetRewrite>> {
     let request = ChatRequest {
         messages: vec![
@@ -200,7 +205,10 @@ async fn try_ask_once(
         // recognise the field ignore it.
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
     };
-    let response = match router.chat(ModelRole::Fast, &request).await {
+    let response = match router
+        .chat_with_cancel(ModelRole::Fast, &request, cancelled)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             if let Some(log) = log {

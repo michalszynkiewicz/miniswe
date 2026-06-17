@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -122,6 +123,7 @@ pub async fn execute(
     lsp: Option<&LspClient>,
     log: Option<&SessionLog>,
     revisions: Option<&RevisionStore>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<ToolResult> {
     // Run schema validation and position-format check together so the
     // model gets both problems in one error. Devstral has been seen to
@@ -215,6 +217,7 @@ pub async fn execute(
         &format!("signature:{path_str}:{resolved_line_1}"),
         &sig_instruction,
         &sig_window.text,
+        cancelled,
         |r| apply_rewrite(&original_signature_source, r, line_0).map(|_| ()),
     )
     .await
@@ -313,6 +316,7 @@ pub async fn execute(
             &format!("callsite:{rel}:{}", site.line + 1),
             &instruction,
             &site.window,
+            cancelled,
             |r| apply_rewrite(&src, r, site.line).map(|_| ()),
         )
         .await

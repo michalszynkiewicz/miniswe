@@ -1,5 +1,7 @@
 //! Top-level dispatch for the `refactor` and `rename` tools.
 
+use std::sync::atomic::AtomicBool;
+
 use anyhow::Result;
 use serde_json::Value;
 
@@ -73,6 +75,7 @@ pub async fn execute_refactor_tool(
     lsp: Option<&LspClient>,
     log: Option<&SessionLog>,
     revisions: Option<&RevisionStore>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<ToolResult> {
     let action = match args::require_str(args, "action") {
         Ok(a) => a,
@@ -84,8 +87,12 @@ pub async fn execute_refactor_tool(
                 "{REFACTOR_HELP}\n\n--- rename action ---\n{RENAME_HELP}"
             )));
         }
-        "add_param" => add_param::execute(args, config, router, lsp, log, revisions).await,
-        "drop_param" => drop_param::execute(args, config, router, lsp, log, revisions).await,
+        "add_param" => {
+            add_param::execute(args, config, router, lsp, log, revisions, cancelled).await
+        }
+        "drop_param" => {
+            drop_param::execute(args, config, router, lsp, log, revisions, cancelled).await
+        }
         "rename" => rename::execute(args, config, lsp).await,
         _ => {
             return Ok(ToolResult::err(format!(
