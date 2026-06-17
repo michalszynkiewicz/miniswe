@@ -26,6 +26,7 @@ fi
 
 exec "$(dirname "$0")/scripts/run-llama-cuda.sh" \
     --jinja \
+    --reasoning-budget 2000 \
     -m "$MODEL_FILE" \
     -c 60000 \
     --cache-type-k q4_0 \

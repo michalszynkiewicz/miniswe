@@ -23,6 +23,7 @@ use crate::cli::commands::agent::hints::{
     loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{is_mutating_call, loop_call_key};
+use crate::cli::commands::agent::validation;
 use crate::config::{Config, EditMode, ModelRole};
 use crate::context;
 use crate::llm::{ChatRequest, Message, ModelRouter, is_truncated_tool_call_error};
@@ -212,6 +213,12 @@ pub async fn run(
     let mut plan_update_requested = false;
     let mut nudged_premature_exit = false;
     let mut nudged_no_plan = false;
+    // How many times the behavioral done-gate has blocked completion this turn.
+    let mut validation_blocks: usize = 0;
+    // The model's stated rationale each time the gate blocked it — so a model
+    // that believes the check is wrong has an auditable voice (bounded by
+    // max_retries; never a silent free pass).
+    let mut validation_disputes: Vec<String> = Vec::new();
 
     // Ctrl+C cancellation flag. The handler fires once and exits — no
     // loop, because `ctrl_c().await` resolves immediately after the
@@ -541,6 +548,66 @@ pub async fn run(
                         conversation_history.push(nudge);
                         continue;
                     }
+                }
+                // Behavioral done-gate: before accepting completion, verify the
+                // change actually works at runtime. A configured check that
+                // exits non-zero blocks the exit and feeds its output back so
+                // the model can fix a plumbed-but-not-consumed change (the
+                // change compiles + tests pass but the feature doesn't work).
+                // Default config has no command → this is a no-op.
+                // See docs/success-validation-design.md.
+                if validation_blocks < config.validation.max_retries
+                    && config.validation.command().is_some()
+                {
+                    match validation::run_behavioral_check(&config).await {
+                        validation::CheckOutcome::Fail(output) => {
+                            validation_blocks += 1;
+                            // Record the model's completion rationale (its
+                            // no-tool-call exit content). If it believes the
+                            // check is wrong, this is its bounded, auditable
+                            // voice — it counts as a block, not a free pass.
+                            if let Some(rationale) = assistant_msg
+                                .content
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|c| !c.is_empty())
+                            {
+                                tracing::warn!(
+                                    "[validation] blocked completion (attempt {validation_blocks}); model rationale: {}",
+                                    crate::truncate_chars(rationale, 300)
+                                );
+                                validation_disputes.push(rationale.to_string());
+                            }
+                            tui::print_status("Behavioral check failed — not done yet.");
+                            let msg = Message::user(&format!(
+                                "[Verification failed — do NOT finish yet. A check that exercises \
+                                 the change end-to-end exited non-zero; the output below shows what \
+                                 is actually wrong. Read it carefully and fix the SPECIFIC problem \
+                                 it reports (it may be a compile error, not a logic error), then \
+                                 continue. (If you are certain the check itself is wrong, finish \
+                                 anyway and state the specific reason — it will be recorded.)\n\
+                                 Check output:\n{output}]"
+                            ));
+                            messages.push(msg.clone());
+                            conversation_history.push(msg);
+                            continue;
+                        }
+                        validation::CheckOutcome::Pass | validation::CheckOutcome::Skipped => {}
+                    }
+                }
+                // Exiting now. If the gate blocked the model along the way,
+                // surface its recorded rationale(s) for audit — whether it
+                // ultimately fixed the change or exhausted the retry budget.
+                if !validation_disputes.is_empty() {
+                    tui::print_status(&format!(
+                        "Completed after {} blocked verification(s); model's reasons recorded in the log.",
+                        validation_disputes.len()
+                    ));
+                    tracing::warn!(
+                        "[validation] turn completed over {} blocked check(s); model rationale(s): {}",
+                        validation_disputes.len(),
+                        validation_disputes.join(" | ")
+                    );
                 }
                 break;
             }

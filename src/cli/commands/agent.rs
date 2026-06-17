@@ -11,3 +11,4 @@ pub mod hints;
 pub mod loop_detector;
 pub mod permissions;
 pub mod subagent;
+pub mod validation;
