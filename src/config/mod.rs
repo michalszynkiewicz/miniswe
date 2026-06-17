@@ -32,6 +32,7 @@ pub struct Config {
     pub logging: LogConfig,
     pub lsp: LspConfig,
     pub tools: ToolsConfig,
+    pub validation: ValidationConfig,
     /// Resolved project root directory (not serialized).
     #[serde(skip)]
     pub project_root: PathBuf,
@@ -294,6 +295,41 @@ pub struct RuntimeConfig {
     pub llm_concurrency: usize,
 }
 
+/// Behavioral "done-gate" validation. When `command` is non-empty it runs
+/// when the agent would otherwise finish; a non-zero exit blocks completion
+/// and feeds the command's output back to the model so it can fix a change
+/// that compiles/tests-green but doesn't actually work at runtime.
+/// Default: empty command = gate disabled (no behavior change).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ValidationConfig {
+    /// Shell command exercising the feature end-to-end. Empty = disabled.
+    pub command: String,
+    /// Timeout in seconds for the validation command.
+    pub timeout_secs: u64,
+    /// How many times to block-and-retry before accepting completion anyway,
+    /// so a model that cannot fix it doesn't loop forever.
+    pub max_retries: usize,
+}
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            timeout_secs: 120,
+            max_retries: 3,
+        }
+    }
+}
+
+impl ValidationConfig {
+    /// The configured behavioral check, or `None` when disabled.
+    pub fn command(&self) -> Option<&str> {
+        let c = self.command.trim();
+        if c.is_empty() { None } else { Some(c) }
+    }
+}
+
 /// LSP integration configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -416,6 +452,7 @@ impl Default for Config {
             logging: LogConfig::default(),
             lsp: LspConfig::default(),
             tools: ToolsConfig::default(),
+            validation: ValidationConfig::default(),
             project_root: PathBuf::from("."),
         }
     }
