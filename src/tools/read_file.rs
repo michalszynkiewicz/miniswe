@@ -83,8 +83,14 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         // Compressed output: strip comments + std imports, preserve line numbers
         let compressed = compress::compress_for_reading(&content, ext);
 
-        // Count how many lines were stripped
-        let stripped_count = compressed[start_line.saturating_sub(1)..end_line]
+        // Count how many lines were stripped. Clamp to the compressed vec's
+        // length: `end_line` is bounded by `content.lines().count()`, but the
+        // compressor can return a different number of entries, so slicing with
+        // the raw `end_line` would panic out of bounds (it did, on a debugger
+        // read). The display loop below already uses `.get()`, so it's safe.
+        let slice_end = end_line.min(compressed.len());
+        let slice_start = start_line.saturating_sub(1).min(slice_end);
+        let stripped_count = compressed[slice_start..slice_end]
             .iter()
             .filter(|l| l.is_none())
             .count();
