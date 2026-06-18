@@ -612,13 +612,14 @@ pub async fn run(
                                 )
                                 .await;
                                 let body = report.unwrap_or_else(|| {
-                                    "(the debugger sub-agent finished without a report)".to_string()
+                                    "(the debugger produced no diagnosis)".to_string()
                                 });
                                 let msg = Message::user(&format!(
-                                    "[A fresh-context debugger sub-agent was given the failing \
-                                     check and attempted a focused fix. Its report:\n{body}\n\
-                                     The verification will now re-run. If it passes you are done; \
-                                     otherwise continue from here.]"
+                                    "[A read-only debugger with fresh eyes investigated the failing \
+                                     check and produced this DIAGNOSIS. It did not edit anything — \
+                                     YOU must apply the fix. Diagnosis:\n{body}\n\
+                                     Make the change it identifies, then finish; the verification \
+                                     will re-run.]"
                                 ));
                                 messages.push(msg.clone());
                                 conversation_history.push(msg);
