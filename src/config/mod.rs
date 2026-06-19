@@ -408,6 +408,25 @@ pub struct ToolsConfig {
     /// (same weights). `false` (default) keeps the gate's plain retry-nudge
     /// loop. Requires a `[validation]` command to do anything. A/B only.
     pub reactive_debugger: bool,
+    /// EXPERIMENTAL (fast mode). When `true`, detect a *revert-loop* spiral —
+    /// the agent reverting the same file to a clean revision
+    /// `SPIRAL_REVERT_THRESHOLD` times in a turn (it's cycling: re-trying the
+    /// same failing edits and undoing them). On detection, inject a reset
+    /// message that names what was tried, says it failed, and forces a
+    /// `plan(action='set'/'refine')` with a concrete redirection (use
+    /// `refactor` for signature/callsite changes; one balanced edit for a
+    /// thrashed region). API-probe on Gemma 4: silent revert 0/8 vs this
+    /// framing ~8/8 at making it switch approach. `false` (default). A/B only.
+    pub spiral_reset: bool,
+    /// EXPERIMENTAL. When `true`, after the done-gate (`[validation]`) blocks
+    /// `GATE_RESET_AFTER_BLOCKS` times in a turn, replace its in-context retry
+    /// grinding with a CONTEXT RESET: drop the polluted conversation history and
+    /// re-assemble a clean context (files persist on disk) — the in-session
+    /// equivalent of a best-of-3 fresh attempt. Motivated by: in-context
+    /// grinding thrashes in the failure-primed context (qwen: 121 rounds over 3
+    /// blocks, still failed) while a fresh attempt fixed it fast (53 rounds).
+    /// `false` (default) keeps plain retry-nudges. A/B only.
+    pub gate_context_reset: bool,
 }
 
 /// Agent ceremony level — see `ToolsConfig::ceremony`.
@@ -459,6 +478,8 @@ impl Default for ToolsConfig {
             edit_mode: EditMode::Fast,
             auto_revert_ast_cascade: false,
             reactive_debugger: false,
+            spiral_reset: false,
+            gate_context_reset: false,
         }
     }
 }
