@@ -24,6 +24,7 @@ use crate::cli::commands::agent::hints::{
     loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{is_mutating_call, loop_call_key};
+use crate::cli::commands::agent::spiral;
 use crate::cli::commands::agent::validation;
 use crate::config::{Config, EditMode, ModelRole};
 use crate::context;
@@ -222,6 +223,13 @@ pub async fn run(
     let mut validation_disputes: Vec<String> = Vec::new();
     // The reactive debugger sub-agent fires at most once per turn.
     let mut debugger_fired = false;
+    // Gate-triggered context resets fired this turn (bounded — don't loop).
+    let mut gate_resets: usize = 0;
+    // Spiral-reset: per-file revert counts this turn + how many resets fired,
+    // to detect a revert-loop (agent cycling on the same failing edits).
+    let mut revert_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut spiral_resets: usize = 0;
 
     // Ctrl+C cancellation flag. The handler fires once and exits — no
     // loop, because `ctrl_c().await` resolves immediately after the
@@ -623,6 +631,36 @@ pub async fn run(
                                 ));
                                 messages.push(msg.clone());
                                 conversation_history.push(msg);
+                                continue;
+                            }
+
+                            // Gate context-reset (opt-in): instead of grinding
+                            // in-context after repeated gate blocks, drop the
+                            // polluted history and re-assemble a clean context —
+                            // the in-session equivalent of a best-of-3 fresh
+                            // attempt (files persist on disk). Bounded per turn.
+                            if config.tools.gate_context_reset
+                                && gate_resets < spiral::MAX_GATE_RESETS
+                                && validation_blocks >= spiral::GATE_RESET_AFTER_BLOCKS
+                            {
+                                gate_resets += 1;
+                                validation_blocks = 0; // fresh gate budget for the clean restart
+                                let fresh = spiral::build_gate_reset_prompt(message, &output);
+                                let assembled = context::assemble(
+                                    &config,
+                                    &fresh,
+                                    &[],
+                                    plan_only,
+                                    mcp_summary.as_deref(),
+                                );
+                                messages = assembled.messages;
+                                tui::print_status(
+                                    "Gate context-reset — fresh start (history cleared, files kept).",
+                                );
+                                log.tool_debug(
+                                    "agent",
+                                    "gate context-reset: re-assembled clean context after repeated gate blocks",
+                                );
                                 continue;
                             }
 
@@ -1134,6 +1172,39 @@ pub async fn run(
             let result_msg = Message::tool_result(&tc.id, &result.content);
             messages.push(result_msg.clone());
             conversation_history.push(result_msg);
+
+            // Spiral-reset: a revert-loop (same file reverted repeatedly) means
+            // the agent is cycling on the same failing edits. A bare revert
+            // won't break it — its context keeps dragging it back. Inject a
+            // cognitive reset (names what failed + forces a replan + concrete
+            // redirection). API-probe-validated framing; see agent::spiral.
+            if config.tools.spiral_reset
+                && result.success
+                && tc.function.name == "revert"
+                && config.tools.edit_mode == EditMode::Fast
+                && spiral_resets < spiral::MAX_RESETS_PER_TURN
+                && let Some(path) = args.get("path").and_then(|p| p.as_str())
+            {
+                let count = revert_counts.entry(path.to_string()).or_insert(0);
+                *count += 1;
+                if *count >= spiral::SPIRAL_REVERT_THRESHOLD {
+                    let n = *count;
+                    *count = 0;
+                    spiral_resets += 1;
+                    let tried = fast_revisions
+                        .as_deref()
+                        .map(|r| spiral::tried_edit_labels(r, path, 4))
+                        .unwrap_or_default();
+                    let reset = Message::user(&spiral::build_reset_message(path, n, &tried));
+                    messages.push(reset.clone());
+                    conversation_history.push(reset);
+                    tui::print_status("Spiral detected (revert-loop) — reset + replan injected.");
+                    log.tool_debug(
+                        "agent",
+                        &format!("spiral-reset fired for {path} after {n} reverts"),
+                    );
+                }
+            }
         }
 
         // History pruning: if every tool call in this assistant message was

@@ -177,6 +177,14 @@ auto_revert_ast_cascade = ${AUTO_REVERT:-false}
 # REACTIVE_DEBUGGER=true ./scripts/run-benchmark-docker.sh ... to spin up a
 # fresh-context debugger sub-agent after the done-gate blocks twice in a turn.
 reactive_debugger = ${REACTIVE_DEBUGGER:-false}
+# EXPERIMENTAL A/B knob. Default false. Launch with SPIRAL_RESET=true to detect a
+# revert-loop (same file reverted 3+×/turn) and inject a reset + forced replan.
+spiral_reset = ${SPIRAL_RESET:-false}
+# EXPERIMENTAL. Default TRUE for this experiment: after the done-gate blocks twice
+# in a turn, drop the polluted history + re-assemble a clean context (fresh-attempt
+# in-session) instead of grinding. Override with GATE_CONTEXT_RESET=false for the
+# A/B baseline.
+gate_context_reset = ${GATE_CONTEXT_RESET:-true}
 
 [logging]
 level = "trace"
