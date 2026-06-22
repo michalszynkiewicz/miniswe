@@ -112,6 +112,19 @@ pub async fn execute(
 
     let new_content = join_with_trailing_nl(&new_lines, had_nl);
 
+    // No-op guard (cf. Aider's "those lines are already present"): if the
+    // splice changes nothing, the model is re-applying an edit already in place.
+    // Say so instead of recording a duplicate revision and implying success —
+    // a small model that gets "applied" here will think the fix landed when it
+    // didn't, and churn.
+    if new_content == original {
+        return Ok(ToolResult::err(format!(
+            "replace_range: lines L{start}-{end} of {path} already match the content you provided — \
+             nothing changed. The edit is already in place; re-read the file and look elsewhere if \
+             something still isn't right."
+        )));
+    }
+
     if let Err(e) = std::fs::write(&abs_path, &new_content) {
         return Ok(ToolResult::err(format!(
             "replace_range: write failed for {path}: {e}"
@@ -250,6 +263,32 @@ mod tests {
         assert!(r.success, "{}", r.content);
         let disk = std::fs::read_to_string(tmp.path().join("f.rs")).unwrap();
         assert_eq!(disk, "1\n4\n");
+    }
+
+    #[tokio::test]
+    async fn noop_replacement_is_flagged_not_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = scratch_config(tmp.path());
+        std::fs::write(tmp.path().join("f.rs"), "a\nb\nc\n").unwrap();
+        let store = RevisionStore::with_cap(20);
+
+        // Replace line 2 ("b") with "b" — a no-op.
+        let r = run(
+            serde_json::json!({ "path": "f.rs", "start": 2, "end": 2, "content": "b" }),
+            &cfg,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert!(!r.success, "no-op should be flagged: {}", r.content);
+        assert!(r.content.contains("already match"));
+        // No revision recorded for a no-op.
+        assert_eq!(store.current("f.rs"), None);
+        // Disk unchanged.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("f.rs")).unwrap(),
+            "a\nb\nc\n"
+        );
     }
 
     #[tokio::test]

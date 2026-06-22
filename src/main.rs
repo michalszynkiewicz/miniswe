@@ -28,15 +28,36 @@ async fn main() -> Result<()> {
         }
         Some(Command::Plan { message }) => {
             let config = Config::load()?;
-            miniswe::cli::commands::run::run(config, &message, true, cli.yes, cli.r#continue)
+            miniswe::cli::commands::run::run(config, &message, true, cli.yes, cli.r#continue, None)
                 .await?;
         }
         None => {
             let config = Config::load()?;
-            if let Some(message) = cli.message {
+            if let Some(replay) = cli.replay_context {
+                // Replay mode: the captured context drives the loop; the message
+                // arg is a placeholder (the real prompt is the trailing captured
+                // gate message).
+                let msg = cli.message.unwrap_or_else(|| "[replay]".to_string());
+                miniswe::cli::commands::run::run(
+                    config,
+                    &msg,
+                    false,
+                    cli.yes,
+                    cli.r#continue,
+                    Some(replay),
+                )
+                .await?;
+            } else if let Some(message) = cli.message {
                 // Single-shot mode
-                miniswe::cli::commands::run::run(config, &message, false, cli.yes, cli.r#continue)
-                    .await?;
+                miniswe::cli::commands::run::run(
+                    config,
+                    &message,
+                    false,
+                    cli.yes,
+                    cli.r#continue,
+                    None,
+                )
+                .await?;
             } else {
                 // Interactive REPL
                 miniswe::cli::commands::repl::run(config, cli.yes, cli.r#continue).await?;

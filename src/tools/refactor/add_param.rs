@@ -186,6 +186,32 @@ pub async fn execute(
     let original_signature_source = std::fs::read_to_string(&abs_path)
         .with_context(|| format!("read function file {path_str}"))?;
 
+    // Idempotency guard: re-adding a parameter that already exists stacks a
+    // duplicate argument at EVERY callsite. Observed churn (seeded bench): a
+    // small model calls add_param on the same function repeatedly and the call
+    // sites balloon to 8–12 args until the file won't compile. If the param is
+    // already present, refuse and point at the actual fix — editing the one
+    // callsite that should carry the real value, not re-adding the parameter.
+    let new_param_name = new_param
+        .split(':')
+        .next()
+        .unwrap_or(new_param)
+        .trim()
+        .trim_start_matches("mut ")
+        .trim();
+    if !new_param_name.is_empty()
+        && signature_has_param(&original_signature_source, line_0 as usize, new_param_name)
+    {
+        return Ok(ToolResult::err(format!(
+            "✗ add_param: `{function_name}` already has a parameter named `{new_param_name}` — \
+             not adding a duplicate (that would stack another `{default_value}` argument at every \
+             callsite and break the build). If a value is not being threaded through, the fix is \
+             NOT to add the parameter again: EDIT the specific callsite that should pass the real \
+             value (replace its `{default_value}` placeholder with the actual expression), then \
+             re-run your check."
+        )));
+    }
+
     // 1. Update the signature itself. The snippet starts at the function's
     // own definition line so the model has zero ambiguity about which
     // construct to edit.
@@ -333,7 +359,12 @@ pub async fn execute(
         match apply_rewrite(&src, &rewrite, site.line) {
             Ok(updated) => {
                 staged.insert(site.path.clone(), StagedEdit { original, updated });
-                report.push(format!("  • {}:{} updated", rel, site.line + 1));
+                report.push(format!(
+                    "  • {}:{} now passes `{}`",
+                    rel,
+                    site.line + 1,
+                    default_value
+                ));
             }
             Err(e) => {
                 callsite_failures.push(format!("{}:{}: {}", rel, site.line + 1, e));
@@ -349,9 +380,25 @@ pub async fn execute(
     let succeeded = report.len();
     let mut out = String::new();
     if callsite_failures.is_empty() {
-        out.push_str(&format!(
-            "✓ COMPLETE — definition and all {total} callsites are now consistent.\n",
-        ));
+        // A/B knob: MINISWE_ADDPARAM_LEGACY_MSG=1 restores the old "✓ COMPLETE"
+        // wording so the honest-stub message can be benchmarked against it.
+        let legacy_msg = matches!(
+            std::env::var("MINISWE_ADDPARAM_LEGACY_MSG").as_deref(),
+            Ok("1")
+        );
+        if legacy_msg {
+            out.push_str(&format!(
+                "✓ COMPLETE — definition and all {total} callsites are now consistent.\n",
+            ));
+        } else {
+            out.push_str(&format!(
+                "✓ Signature updated — definition and all {total} callsite(s) now compile. \
+                 Each callsite was filled with the placeholder `{default_value}` you specified. \
+                 That is a compile-correct STUB, not necessarily finished wiring: any callsite that \
+                 should receive a real value (rather than `{default_value}`) still needs to be edited \
+                 to pass it.\n",
+            ));
+        }
     } else if succeeded == 0 {
         out.push_str(&format!(
             "✗ add_param FAILED: signature was rewritten on disk, but 0 of {total} callsite(s) \
@@ -379,7 +426,7 @@ pub async fn execute(
         out.push('\n');
     }
     if !report.is_empty() {
-        out.push_str("Edits:\n");
+        out.push_str("Callsites updated (each now passes the placeholder — edit any that should carry the real value):\n");
         for line in &report {
             out.push_str(line);
             out.push('\n');
@@ -407,9 +454,71 @@ fn display_path(p: &std::path::Path, config: &Config) -> String {
         .to_string()
 }
 
+/// Best-effort check: does the function whose signature starts at `from_line`
+/// (0-based) already have a parameter named `param_name`? Used to make
+/// add_param idempotent. Scans the first balanced `(...)` after the definition
+/// line and compares the binding name (the text before `:`) of each parameter.
+///
+/// Conservative by design: splitting the parameter list on `,` can mis-split
+/// generic types like `HashMap<K, V>`, but since we only match a fragment whose
+/// pre-`:` text *equals* `param_name`, that can only cause a missed detection
+/// (no-op, same as today) — never a false positive that wrongly blocks a add.
+fn signature_has_param(source: &str, from_line: usize, param_name: &str) -> bool {
+    let tail: String = source
+        .lines()
+        .skip(from_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Some(open) = tail.find('(') else {
+        return false;
+    };
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, c) in tail[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return false;
+    };
+    let params = &tail[open + 1..close];
+    params.split(',').any(|p| {
+        let p = p.trim().trim_start_matches("mut ").trim();
+        p.split(':').next().map(str::trim) == Some(param_name)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signature_has_param_detects_existing_and_ignores_absent() {
+        // multi-line signature like assemble()/run() in the bench
+        let src = "fn assemble(\n    config: &Config,\n    user_message: &str,\n    system_prompt_override: Option<String>,\n) -> X {\n    body\n}";
+        assert!(signature_has_param(src, 0, "system_prompt_override"));
+        assert!(signature_has_param(src, 0, "config"));
+        assert!(!signature_has_param(src, 0, "headless")); // not present
+    }
+
+    #[test]
+    fn signature_has_param_not_fooled_by_generic_commas() {
+        // a generic type with an internal comma must not produce a false positive
+        let src = "fn f(map: HashMap<K, V>, name: String) {}";
+        assert!(signature_has_param(src, 0, "map"));
+        assert!(signature_has_param(src, 0, "name"));
+        assert!(!signature_has_param(src, 0, "V")); // generic param, not a binding
+        assert!(!signature_has_param(src, 0, "K"));
+    }
 
     #[test]
     fn position_parses_end_append() {
