@@ -9,6 +9,7 @@
 //! 6. Feed results back and repeat
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -46,6 +47,7 @@ pub async fn run(
     plan_only: bool,
     headless: bool,
     continue_session: bool,
+    replay_context: Option<PathBuf>,
 ) -> Result<()> {
     let log = Arc::new(SessionLog::new(&config));
     log.user_message(message);
@@ -285,6 +287,27 @@ pub async fn run(
     ));
 
     let mut messages = assembled.messages;
+    // Replay mode: replace the freshly-assembled context with a captured one
+    // (faithful "context we had then"). The fixture's messages already end with
+    // the gate rejection the agent must respond to, so the loop's first LLM call
+    // resumes exactly where the original run was before its first fix.
+    // See docs/replay-mode-design.md. (Run with gate_context_reset=false so a
+    // mid-loop reset can't clobber the seeded context.)
+    let replay_mode = replay_context.is_some();
+    if let Some(ref path) = replay_context {
+        let raw = std::fs::read_to_string(path)?;
+        let v: serde_json::Value = serde_json::from_str(&raw)?;
+        let captured: Vec<Message> = serde_json::from_value(v["messages"].clone())?;
+        if captured.is_empty() {
+            anyhow::bail!("replay context {} has no messages", path.display());
+        }
+        tui::print_status(&format!(
+            "Replay: seeded {} captured messages from {}",
+            captured.len(),
+            path.display()
+        ));
+        messages = captured;
+    }
     // The system prompt is phase-aware (pre-plan "explore→plan" vs
     // post-plan "you are EDITING" + routing). `assemble()` runs once
     // before the loop, so messages[0] is frozen at the attempt's
@@ -295,8 +318,10 @@ pub async fn run(
     // post-plan prompt never activates within an attempt.
     let mut last_plan_set = tools::plan::plan_exists(&config);
 
-    // Nudge the model to plan before editing (strict/legacy only)
-    if strict && config.tools.plan {
+    // Nudge the model to plan before editing (strict/legacy only). Skipped in
+    // replay mode — the captured context already reflects whatever planning the
+    // original run did; injecting a fresh nudge would corrupt the resume.
+    if strict && config.tools.plan && !replay_mode {
         messages.push(Message::user(
             "[Before making changes, explore the codebase and use the plan tool to outline your approach. \
              Each step has compile: true (default) — the compiler must pass to check it off. \

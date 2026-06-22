@@ -81,6 +81,27 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Optional seed patch: a half-wired starting state applied right after checkout,
+# so every run begins already FAILING the done-gate's value-thread check (the
+# flag parses and the code compiles, but the override is not consumed). This
+# reliably reproduces the conditions gate_context_reset targets — instead of
+# waiting for a stochastic from-scratch failure. See scripts/seeds/.
+SEED_PATCH="${SEED_PATCH:-}"
+if [[ -n "${SEED_PATCH}" ]]; then
+    # docker -v needs an ABSOLUTE host path (a relative one is read as a volume
+    # NAME and rejected). Resolve relative paths against repo root.
+    if [[ "${SEED_PATCH}" != /* ]]; then
+        SEED_PATCH="${REPO_DIR}/${SEED_PATCH}"
+    fi
+    if [[ ! -f "${SEED_PATCH}" ]]; then
+        echo "ERROR: SEED_PATCH not found: ${SEED_PATCH}" >&2
+        exit 1
+    fi
+    # A seeded run is "finish the half-wired feature", not "add it from scratch".
+    # Override the task unless the caller passed an explicit SEED_TASK.
+    TASK="${SEED_TASK:-The --system-prompt-override (-s) CLI flag is already partially wired: it parses and the code compiles, but the override text is currently IGNORED — the agent still uses the default system prompt. Finish wiring it so the provided text REPLACES the system prompt (skipping all context providers) for both single-shot and interactive modes.}"
+fi
+
 mkdir -p "${RESULTS_DIR}"
 
 echo "=== Docker-isolated provider benchmark ==="
@@ -91,6 +112,7 @@ echo "Timeout:  ${TIMEOUT}s"
 echo "Rounds:   ${MAX_ROUNDS}"
 echo "Attempts: ${MAX_ATTEMPTS}"
 echo "Results:  ${RESULTS_DIR}"
+echo "Seed:     ${SEED_PATCH:-none}"
 echo "Task:     ${TASK:0:80}..."
 echo ""
 
@@ -241,6 +263,20 @@ MAX_ATTEMPTS="$4"
 cd /work
 git -C /repo archive "${SHA}" | tar -x
 rm -rf target .miniswe
+
+# Optional seed patch: apply a half-wired starting state BEFORE the baseline
+# commit, so the agent's diff reflects only its own fix and the very first
+# done-gate hit already fails the value-thread check. git apply works on a
+# plain (non-repo) working tree, which /work is at this point.
+if [ -f /config/seed.patch ]; then
+    echo "=== Applying seed patch (half-wired start) ==="
+    if git apply -v /config/seed.patch; then
+        echo "seed patch applied OK"
+    else
+        echo "ERROR: seed patch failed to apply"
+        exit 1
+    fi
+fi
 
 # Fix LFS pointer files (git archive doesn't resolve LFS) and make sure the
 # .miniswe symlink created below is always ignored (git would otherwise try
@@ -485,6 +521,12 @@ SCRIPT
 
     ACTIVE_CONTAINER_NAME="${container_name}"
 
+    # Mount the seed patch into the container only when one is configured.
+    local seed_mount=()
+    if [[ -n "${SEED_PATCH}" ]]; then
+        seed_mount=(-v "${SEED_PATCH}:/config/seed.patch:ro")
+    fi
+
     # MINISWE_LLM_DUMP_DIR captures every outgoing /v1/chat/completions
     # body to /output/llm_dumps/req-NNNNNN.json so we can replay the
     # exact request that produced a malformed response (the in-band
@@ -494,7 +536,9 @@ SCRIPT
         -v "${variant_dir}:/output" \
         -v "${variant_dir}/config.toml:/config/config.toml:ro" \
         -v "${tmp_script}:/run.sh:ro" \
+        "${seed_mount[@]}" \
         -e MINISWE_LLM_DUMP_DIR=/output/llm_dumps \
+        -e "MINISWE_ADDPARAM_LEGACY_MSG=${MINISWE_ADDPARAM_LEGACY_MSG:-}" \
         --name "${container_name}" \
         "${IMAGE_NAME}" \
         bash /run.sh "${BASELINE_SHA}" "${TASK}" "${TIMEOUT}" "${MAX_ATTEMPTS}" \

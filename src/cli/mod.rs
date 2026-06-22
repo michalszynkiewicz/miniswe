@@ -1,5 +1,7 @@
 pub mod commands;
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 /// miniswe — A lightweight CLI coding agent for local LLMs
@@ -16,6 +18,12 @@ pub struct Cli {
     /// Non-interactive mode: auto-approve all permissions, no prompts
     #[arg(long, short = 'y')]
     pub yes: bool,
+
+    /// Replay mode: seed the agent loop from a captured context fixture
+    /// (a context.json from scripts/replay/extract-fixture.py) instead of a
+    /// fresh assemble. The working tree should already be the matching state.
+    #[arg(long, value_name = "CONTEXT_JSON")]
+    pub replay_context: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
