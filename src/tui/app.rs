@@ -31,6 +31,16 @@ pub enum LineStyle {
     Thinking,
 }
 
+/// One step of the live plan, as a pure view-model. The REPL parses
+/// `.miniswe/plan.md` (the single source of truth) and feeds these in via
+/// [`App::set_plan`]; the TUI never reads plan state itself.
+#[derive(Debug, Clone)]
+pub struct PlanStepView {
+    pub checked: bool,
+    pub checked_round: Option<usize>,
+    pub text: String,
+}
+
 /// UI mode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
@@ -76,6 +86,14 @@ pub struct App {
     pub pending_permission: Option<String>,
     /// User's response to the permission prompt
     pub permission_response: Option<String>,
+    /// Live plan panel: the task title for the current turn (the user's
+    /// message), or None when no plan exists yet.
+    pub plan_task: Option<String>,
+    /// Live plan steps (projection of `.miniswe/plan.md`). Empty = the model
+    /// is still exploring / hasn't set a plan.
+    pub plan_steps: Vec<PlanStepView>,
+    /// Current agent round (panel stall signal). 0 = idle.
+    pub round: usize,
 }
 
 impl Default for App {
@@ -104,7 +122,58 @@ impl App {
             tool_results: Vec::new(),
             pending_permission: None,
             permission_response: None,
+            plan_task: None,
+            plan_steps: Vec::new(),
+            round: 0,
         }
+    }
+
+    /// Update the live-plan view-model. Called by the REPL each round after
+    /// re-reading `plan.md`. `task` is the current turn's user message;
+    /// `steps` is the parsed plan (empty while exploring). A panel is shown
+    /// whenever `task` is set, even before steps exist ("exploring...").
+    pub fn set_plan(&mut self, task: Option<String>, steps: Vec<PlanStepView>, round: usize) {
+        self.plan_task = task;
+        self.plan_steps = steps;
+        self.round = round;
+    }
+
+    /// Clear the plan panel (turn ended / no active task).
+    pub fn clear_plan(&mut self) {
+        self.plan_task = None;
+        self.plan_steps.clear();
+        self.round = 0;
+    }
+
+    /// Index of the current step — the model's progress *frontier*: the first
+    /// unchecked step at or after the last checked one. For an in-order plan
+    /// this is just "the first unchecked step". But models sometimes check
+    /// steps out of order or skip one (e.g. check 2–5, leave 1 unchecked); a
+    /// naive "first unchecked" would then mark the skipped step 1 as current
+    /// even though the model has clearly moved past it. Anchoring to the
+    /// frontier keeps ▸ on what the model is actually working on, and lets
+    /// skipped earlier steps render as plain "todo" (honestly flagging that
+    /// they were left undone). Returns None when nothing remains at/after the
+    /// frontier (plan effectively complete, any earlier gaps notwithstanding).
+    pub fn current_plan_step(&self) -> Option<usize> {
+        let frontier = self
+            .plan_steps
+            .iter()
+            .rposition(|s| s.checked)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        self.plan_steps
+            .iter()
+            .enumerate()
+            .skip(frontier)
+            .find(|(_, s)| !s.checked)
+            .map(|(i, _)| i)
+    }
+
+    /// (done, total) step counts.
+    pub fn plan_progress(&self) -> (usize, usize) {
+        let done = self.plan_steps.iter().filter(|s| s.checked).count();
+        (done, self.plan_steps.len())
     }
 
     /// Load input history from file.
@@ -300,5 +369,68 @@ impl App {
         if self.tool_results.len() > 50 {
             self.tool_results.remove(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step(checked: bool) -> PlanStepView {
+        PlanStepView {
+            checked,
+            checked_round: None,
+            text: "s".into(),
+        }
+    }
+
+    fn app_with(checked: &[bool]) -> App {
+        let mut a = App::new();
+        a.plan_steps = checked.iter().map(|&c| step(c)).collect();
+        a
+    }
+
+    #[test]
+    fn current_is_first_unchecked_in_order() {
+        // ✓ ✓ _ _ → current is index 2
+        assert_eq!(
+            app_with(&[true, true, false, false]).current_plan_step(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn current_tracks_frontier_when_steps_skipped() {
+        // _ ✓ ✓ ✓ ✓  (model checked 2–5, skipped 1) → frontier is past the end,
+        // so NO current marker lands on the skipped step 1.
+        assert_eq!(
+            app_with(&[false, true, true, true, true]).current_plan_step(),
+            None
+        );
+        // skipped step 1 renders as plain "todo", not "current"
+    }
+
+    #[test]
+    fn current_after_frontier_with_earlier_gap() {
+        // _ ✓ ✓ _  → last checked is idx 2, frontier idx 3 unchecked → current 3
+        assert_eq!(
+            app_with(&[false, true, true, false]).current_plan_step(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn current_none_when_all_checked() {
+        assert_eq!(app_with(&[true, true]).current_plan_step(), None);
+    }
+
+    #[test]
+    fn current_is_first_when_none_checked() {
+        assert_eq!(app_with(&[false, false]).current_plan_step(), Some(0));
+    }
+
+    #[test]
+    fn progress_counts() {
+        assert_eq!(app_with(&[true, false, true]).plan_progress(), (2, 3));
     }
 }

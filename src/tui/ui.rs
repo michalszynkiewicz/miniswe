@@ -36,26 +36,145 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-/// Normal mode: output pane + input line + optional permission prompt.
+/// Normal mode: optional plan panel + output pane + input line.
 fn draw_normal(frame: &mut Frame, app: &App) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(BG_MAIN)), area);
+
+    // The plan panel appears whenever the current turn has a task. Height
+    // auto-sizes to the plan (task line + steps + borders), capped so the
+    // output pane always keeps room; long plans window around the current step.
+    let plan_height: u16 = if app.plan_task.is_some() {
+        let steps = app.plan_steps.len().max(1) as u16; // ≥1 for the "exploring" line
+        let want = steps + 1 /*task*/ + 2 /*borders*/;
+        let cap = (area.height / 2).max(4); // never eat more than half the screen
+        want.clamp(4, cap.min(16))
+    } else {
+        0
+    };
+
+    let mut constraints = vec![Constraint::Length(3)]; // top bar
+    if plan_height > 0 {
+        constraints.push(Constraint::Length(plan_height)); // plan panel
+    }
+    constraints.push(Constraint::Min(5)); // output
+    constraints.push(Constraint::Length(3)); // input
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // top bar
-            Constraint::Min(5),    // output
-            Constraint::Length(3), // input
-        ])
+        .constraints(constraints)
         .split(area);
 
-    draw_topbar(frame, app, chunks[0]);
-    draw_output(frame, app, chunks[1]);
-    draw_input(frame, app, chunks[2]);
+    let mut i = 0;
+    draw_topbar(frame, app, chunks[i]);
+    i += 1;
+    if plan_height > 0 {
+        draw_plan_panel(frame, app, chunks[i]);
+        i += 1;
+    }
+    draw_output(frame, app, chunks[i]);
+    i += 1;
+    draw_input(frame, app, chunks[i]);
 
     if app.pending_permission.is_some() {
         draw_permission_modal(frame, app, area);
     }
+}
+
+/// Live plan panel: a projection of `.miniswe/plan.md`. Done steps are green,
+/// the current (first unchecked) step is yellow, upcoming steps are blue.
+fn draw_plan_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let (done, total) = app.plan_progress();
+    let current = app.current_plan_step();
+
+    let header_right = if total > 0 {
+        format!(" round {} · {}/{} ", app.round, done, total)
+    } else {
+        format!(" round {} ", app.round)
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(BG_PANEL))
+        .title(Span::styled(
+            " Plan ",
+            Style::default()
+                .fg(ACCENT_CYAN)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title(
+            Line::from(Span::styled(
+                header_right,
+                Style::default().fg(TEXT_SECONDARY),
+            ))
+            .right_aligned(),
+        );
+
+    let inner_h = area.height.saturating_sub(2) as usize; // minus borders
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Task line.
+    if let Some(task) = &app.plan_task {
+        lines.push(Line::from(vec![
+            Span::styled("Task: ", Style::default().fg(TEXT_MUTED)),
+            Span::styled(
+                crate::truncate_chars(task, area.width.saturating_sub(8) as usize),
+                Style::default().fg(TEXT_SOFT),
+            ),
+        ]));
+    }
+
+    if app.plan_steps.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(exploring — no plan set yet)",
+            Style::default()
+                .fg(TEXT_MUTED)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        // Window the steps around the current one so long plans still fit.
+        let budget = inner_h.saturating_sub(1).max(1); // minus the task line
+        let total_steps = app.plan_steps.len();
+        let start = if total_steps <= budget {
+            0
+        } else {
+            let cur = current.unwrap_or(0);
+            cur.saturating_sub(budget / 2).min(total_steps - budget)
+        };
+        let end = (start + budget).min(total_steps);
+        for (idx, step) in app.plan_steps.iter().enumerate().take(end).skip(start) {
+            let is_current = current == Some(idx);
+            let (marker, color) = if step.checked {
+                ("✓", SUCCESS) // done → green
+            } else if is_current {
+                ("▸", WARNING) // in progress → yellow
+            } else {
+                (" ", USER_LINE) // todo → blue
+            };
+            let num = format!("{:>2}", idx + 1);
+            let suffix = if step.checked {
+                step.checked_round
+                    .map(|r| format!("  (r{r})"))
+                    .unwrap_or_default()
+            } else if is_current {
+                "  ← current".to_string()
+            } else {
+                String::new()
+            };
+            let text_budget = area.width.saturating_sub(8 + suffix.len() as u16) as usize;
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {marker} {num} "), Style::default().fg(color)),
+                Span::styled(
+                    crate::truncate_chars(&step.text, text_budget.max(8)),
+                    Style::default().fg(color),
+                ),
+                Span::styled(suffix, Style::default().fg(TEXT_MUTED)),
+            ]));
+        }
+    }
+
+    let widget = Paragraph::new(lines).block(block);
+    frame.render_widget(widget, area);
 }
 
 fn draw_topbar(frame: &mut Frame, app: &App, area: Rect) {
