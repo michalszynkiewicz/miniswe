@@ -35,7 +35,7 @@ use crate::runtime::{
 };
 use crate::tools;
 use crate::tools::permissions::{Action, PermissionManager};
-use crate::tui::app::{App, AppMode, LineStyle};
+use crate::tui::app::{App, AppMode, LineStyle, PlanStepView};
 use crate::tui::event::{self, AppEvent};
 use crate::tui::ui;
 
@@ -43,30 +43,28 @@ use crate::tui::ui;
 /// round-trip — NOT added to conversation history — classifying the
 /// user's message as code-editing vs read-only investigation.
 ///
-/// Fail-safe by design: returns `true` (EXPLORE) ONLY on an
-/// unambiguous one-word EXPLORE; any other output, parse failure,
-/// empty, or LLM error → `false` (CODING, the proven path). The
-/// asymmetric cost (coding→explore misroute drops the load-bearing
-/// plan ceremony, the regression we closed) is why the bias is hard.
+/// Biased toward EXPLORE for *questions* (the prompt routes
+/// explain/summarize/why/what/where/how to EXPLORE) so a plain question
+/// doesn't tip into execution; CODING is reserved for a clear instruction
+/// to change code. The one hard safety rule kept from the original: a
+/// parse failure / empty / LLM error → `false` (CODING), so on genuine
+/// uncertainty we never silently swallow an edit request into read-only
+/// mode. Normal-path bias is the prompt's job; the error-path default is
+/// CODING.
 async fn classify_is_explore(
     llm_worker: &LlmWorkerHandle,
     user_message: &str,
     cancelled: &Arc<AtomicBool>,
 ) -> bool {
-    let sys = "Classify the user's request. Reply with EXACTLY one word, \
-        nothing else: CODING or EXPLORE.\n\
-        Answer CODING for anything that could lead to changing code/files, \
-        INCLUDING: reviewing, auditing, or critiquing code; checking whether \
-        something is correct/buggy/safe; finding or diagnosing bugs; \
-        suggesting or making improvements/fixes/refactors; or any imperative \
-        to write/modify/add/remove. \"Is X correct?\", \"review X\", \"does \
-        X have bugs?\", \"can you improve X?\" are all CODING.\n\
-        Answer EXPLORE ONLY for pure information requests with zero \
-        evaluation and zero change intent — explaining or locating how the \
-        existing code works: \"how does X work\", \"where is X\", \"what \
-        does X do\", \"walk me through X\".\n\
-        If it is not unambiguously a pure how/what/where explanation, answer \
-        CODING.";
+    // Short by design: an experiment (scripts/classifier-prompt-probe, 3×
+    // reps on gemma) found this 178-char prompt matches a 1001-char version
+    // 16/16 on a both-directions battery — questions→EXPLORE, every edit
+    // request→CODING — while a still-shorter variant collapsed questions
+    // back to CODING. Don't trim further without re-running that probe.
+    let sys = "Reply one word: CODING or EXPLORE. \
+        CODING = the user tells you to change/add/fix/refactor code. \
+        EXPLORE = the user asks about or wants to understand/review code. \
+        Default EXPLORE.";
     let request = ChatRequest {
         messages: vec![Message::system(sys), Message::user(user_message)],
         tools: None,
@@ -551,6 +549,15 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                 }
 
                                 app.is_thinking = true;
+                                // Live plan panel: show it for coding turns
+                                // (it fills in as the model sets/checks steps).
+                                // Suppressed for read-only Q&A (no plan there).
+                                app.plan_task = if is_explore {
+                                    None
+                                } else {
+                                    Some(input.clone())
+                                };
+                                app.plan_steps.clear();
 
                                 let max_rounds = config.context.max_rounds;
                                 let perms_ref = &perms;
@@ -620,6 +627,14 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                 // fully done — flush tokens, draw the
                                 // separator, flip `is_thinking=false`, redraw.
                                 finish_completed_turn(&mut app, &mut terminal, None, None)?;
+
+                                // Turns that never produced a plan (the model
+                                // answered without planning) shouldn't leave an
+                                // empty "(exploring…)" panel lingering. Keep the
+                                // panel only when a real plan exists.
+                                if app.plan_steps.is_empty() {
+                                    app.clear_plan();
+                                }
 
                                 // Discard any keys / ticks that queued up
                                 // while `is_thinking` was true. If we don't,
@@ -721,6 +736,25 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
 }
 
 /// Run the agent loop (LLM call → tool execution → repeat).
+/// Refresh the live plan panel from `plan.md` (the single source of truth).
+/// No-op when no task is active (Q&A turns). Called both at the top of each
+/// round and immediately after the plan tool runs, so a checked-off step shows
+/// the instant `plan(check)` returns rather than lagging to the next round.
+fn refresh_plan_panel(app: &mut App, config: &Config, round: usize) {
+    if app.plan_task.is_none() {
+        return;
+    }
+    app.plan_steps = tools::plan::parsed_steps(config)
+        .into_iter()
+        .map(|(checked, checked_round, text)| PlanStepView {
+            checked,
+            checked_round,
+            text,
+        })
+        .collect();
+    app.round = round;
+}
+
 /// This runs inline in the main loop, processing events between rounds.
 async fn run_agent_loop(
     app: &mut App,
@@ -766,6 +800,9 @@ async fn run_agent_loop(
             app.push_output("Maximum tool rounds reached.", LineStyle::Error);
             break;
         }
+
+        // Refresh the live plan panel from plan.md (single source of truth).
+        refresh_plan_panel(app, config, round);
 
         // Observation masking — budget = half the context window
         let tool_result_budget = config.model.context_window / 2;
@@ -1329,17 +1366,26 @@ async fn run_agent_loop(
                 await_tool_job_ui(rx, terminal, app, "edit_file", &mut result_rx, cancelled).await
             } else if tc.function.name == "plan" {
                 let args = args.clone();
-                let config = config.clone();
+                let config_for_job = config.clone();
                 let mut result_rx = tool_pool.submit(move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .map_err(|e| e.to_string())?;
                     runtime
-                        .block_on(async move { tools::plan::execute(&args, &config, round).await })
+                        .block_on(async move {
+                            tools::plan::execute(&args, &config_for_job, round).await
+                        })
                         .map_err(|e| format!("plan error: {e}"))
                 });
-                await_tool_job_ui(rx, terminal, app, "plan", &mut result_rx, cancelled).await
+                let r =
+                    await_tool_job_ui(rx, terminal, app, "plan", &mut result_rx, cancelled).await;
+                // The plan tool just mutated plan.md mid-round — refresh the
+                // panel and redraw now so a checked/added/refined step appears
+                // immediately instead of lagging to the next round's refresh.
+                refresh_plan_panel(app, config, round);
+                let _ = terminal.draw(|frame| ui::draw(frame, app));
+                r
             } else if tc.function.name == "refactor" {
                 let args = args.clone();
                 let config = config.clone();
