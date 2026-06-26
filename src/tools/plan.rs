@@ -39,6 +39,20 @@ pub fn has_unchecked_steps(config: &Config) -> bool {
     step::parse_steps(&content).iter().any(|s| !s.checked)
 }
 
+/// Parsed plan steps for the live REPL panel: `(checked, checked_round, text)`
+/// per step, in order. Empty when no plan exists. A projection of `plan.md`
+/// (the single source of truth) — the UI never parses plan markdown itself.
+pub fn parsed_steps(config: &Config) -> Vec<(bool, Option<usize>, String)> {
+    load_plan(config)
+        .map(|c| {
+            step::parse_steps(&c)
+                .into_iter()
+                .map(|s| (s.checked, s.checked_round, s.step))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Load the current plan for context injection.
 pub fn load_plan(config: &Config) -> Option<String> {
     let plan_path = config.miniswe_dir().join("plan.md");
