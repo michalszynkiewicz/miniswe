@@ -201,6 +201,36 @@ pub struct ContextConfig {
     pub pause_after_rounds: usize,
     /// Toggle individual context providers on/off.
     pub providers: ProvidersConfig,
+    /// Conversation-compaction strategy — how over-budget history is reduced.
+    pub compaction: CompactionStrategy,
+}
+
+/// Conversation-compaction strategy: how the agent reduces conversation
+/// history once it exceeds the raw-history token budget.
+///
+/// All strategies fire at the **same** trigger threshold (`raw_budget`, see
+/// `compressor::needs_compression`); they differ only in the *action* taken,
+/// so they can be A/B'd cleanly. `Unified` is miniswe's production behavior;
+/// the others are canonical baselines used for benchmarking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionStrategy {
+    /// miniswe production: rolling LLM summary anchored on the plan, keeping
+    /// recent turns raw, with the full pre-compression text archived to
+    /// `.miniswe/session_archive.md` (and a pointer to it in the summary).
+    #[default]
+    Unified,
+    /// Pure truncation: drop the oldest turns, keep the most-recent turns
+    /// within budget. No summary, no LLM call, no archive.
+    SlidingWindow,
+    /// Textbook rolling LLM summarization: summarize the old turns into a
+    /// running summary and keep recent turns raw. No plan-anchor, no disk
+    /// archive, neutral summarization prompt.
+    RollingSummary,
+    /// Observation masking: keep the full action trajectory (assistant
+    /// messages, tool calls, user turns) but replace old tool *observations*
+    /// (results) with a short placeholder, keeping the last few raw. No LLM.
+    ObservationMasking,
 }
 
 /// Which context providers are enabled.
@@ -550,6 +580,7 @@ impl Default for ContextConfig {
             max_rounds: 100,
             pause_after_rounds: 50,
             providers: ProvidersConfig::default(),
+            compaction: CompactionStrategy::default(),
         }
     }
 }
@@ -688,5 +719,36 @@ impl Config {
     /// Whether multiple distinct models are configured.
     pub fn is_multi_model(&self) -> bool {
         self.models.as_ref().is_some_and(|m| m.len() > 1)
+    }
+}
+
+#[cfg(test)]
+mod compaction_strategy_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_unified() {
+        assert_eq!(
+            ContextConfig::default().compaction,
+            CompactionStrategy::Unified
+        );
+    }
+
+    #[test]
+    fn parses_snake_case_from_toml() {
+        let c: ContextConfig = toml::from_str("compaction = \"sliding_window\"").unwrap();
+        assert_eq!(c.compaction, CompactionStrategy::SlidingWindow);
+        let c: ContextConfig = toml::from_str("compaction = \"observation_masking\"").unwrap();
+        assert_eq!(c.compaction, CompactionStrategy::ObservationMasking);
+        let c: ContextConfig = toml::from_str("compaction = \"rolling_summary\"").unwrap();
+        assert_eq!(c.compaction, CompactionStrategy::RollingSummary);
+    }
+
+    #[test]
+    fn missing_field_keeps_default() {
+        // Old configs with no `compaction` key still parse (struct-level serde default).
+        let c: ContextConfig = toml::from_str("repo_map_budget = 1234").unwrap();
+        assert_eq!(c.compaction, CompactionStrategy::Unified);
+        assert_eq!(c.repo_map_budget, 1234);
     }
 }
