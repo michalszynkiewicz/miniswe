@@ -161,6 +161,10 @@ max_output_tokens = 8000
 repo_map_budget = ${REPO_MAP_BUDGET}
 max_rounds = ${MAX_ROUNDS}
 pause_after_rounds = 99999
+# Conversation-compaction strategy A/B knob. Default unified = current
+# production behavior. COMPACTION=sliding_window|rolling_summary|observation_masking
+# ./scripts/run-benchmark-docker.sh ... to compare. See run-compaction-bench.sh.
+compaction = "${COMPACTION:-unified}"
 
 [context.providers]
 profile = $(_dis profile)
