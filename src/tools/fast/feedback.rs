@@ -74,13 +74,40 @@ pub async fn build_feedback(
         render_file_diagnostics(&file_diags)
     };
 
-    // Project-wide LSP (a single number + delta)
+    // Project-wide LSP. When an edit INCREASES the error count, don't just show
+    // a bare "+N" — surface WHERE the new errors are, especially in files OTHER
+    // than the one just edited. A cross-file break (e.g. editing config.rs breaks
+    // a call site in context.rs) otherwise shows up here as "+1" with no
+    // location, so the model can't tell where it broke things and keeps patching
+    // the file it edited. See run2 dissection (`providers: bool`).
     let project_errors = collect_project_error_count(lsp).await;
     let delta = project_errors as isize - project_baseline_errors as isize;
-    let project_lsp_line = format!(
-        "[lsp project] {project_errors} error(s) ({sign}{delta} from baseline)",
-        sign = if delta >= 0 { "+" } else { "" }
-    );
+    // Surface cross-file error locations whenever the project sits ABOVE
+    // baseline — not only on the single edit that pushed it up. A break the
+    // model introduced but didn't fix the same round must stay visible (and
+    // navigable) every round until resolved, otherwise it goes blind exactly
+    // like run2 (`providers: bool` broke context/mod.rs:322, never re-surfaced).
+    let project_lsp_line = if delta > 0 {
+        let others =
+            collect_other_file_errors(lsp, &config.project_root, &abs_path, MAX_OTHER_FILE_ERRORS);
+        let mut s = format!("[lsp project] {project_errors} error(s) — {delta} above baseline");
+        if !others.is_empty() {
+            s.push_str(
+                "\n  ↳ error(s) in files you did NOT just edit — look here too, not only the file you edited:",
+            );
+            for e in &others {
+                s.push_str(&format!("\n    {e}"));
+            }
+            s.push_str(
+                "\n  If one of your edits caused these, revert it (see revisions below); otherwise go fix them there.",
+            );
+        }
+        s
+    } else if delta < 0 {
+        format!("[lsp project] {project_errors} error(s) ({delta} from baseline — improving)")
+    } else {
+        format!("[lsp project] {project_errors} error(s) (no change from baseline)")
+    };
 
     // Revision table
     let revs = revisions.list(rel_path);
@@ -153,6 +180,57 @@ async fn collect_project_error_count(lsp: Option<&LspClient>) -> usize {
         }
     }
     count
+}
+
+/// Max cross-file error locations listed in the project feedback line.
+const MAX_OTHER_FILE_ERRORS: usize = 5;
+
+/// Error locations (`rel/path.rs:line:col: message`) for files OTHER than
+/// `skip_abs` (the just-edited file, already shown in `[lsp file]`). Reads the
+/// cached diagnostics snapshot — this is what turns a bare project "+N" into an
+/// actionable cross-file location the model can navigate to.
+fn collect_other_file_errors(
+    lsp: Option<&LspClient>,
+    project_root: &std::path::Path,
+    skip_abs: &std::path::Path,
+    max: usize,
+) -> Vec<String> {
+    let Some(lsp) = lsp else {
+        return Vec::new();
+    };
+    if !lsp.is_ready() || lsp.has_crashed() {
+        return Vec::new();
+    }
+    let skip = skip_abs.to_string_lossy();
+    let mut out = Vec::new();
+    for (uri, diags) in lsp.diagnostics_snapshot() {
+        if uri.contains(skip.as_ref()) {
+            continue; // already surfaced in [lsp file]
+        }
+        let rel = uri_to_rel(&uri, project_root);
+        for d in &diags {
+            if d.severity == Some(lsp_types::DiagnosticSeverity::ERROR) {
+                let line = d.range.start.line + 1;
+                let col = d.range.start.character + 1;
+                out.push(format!("{rel}:{line}:{col}: {}", d.message));
+                if out.len() >= max {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Turn a `file://` diagnostic URI into a project-relative path (best-effort;
+/// falls back to the absolute path). Assumes un-percent-encoded paths, which
+/// holds for normal repo layouts.
+fn uri_to_rel(uri: &str, project_root: &std::path::Path) -> String {
+    let p = uri.strip_prefix("file://").unwrap_or(uri);
+    std::path::Path::new(p)
+        .strip_prefix(project_root)
+        .map(|r| r.display().to_string())
+        .unwrap_or_else(|_| p.to_string())
 }
 
 fn render_file_diagnostics(diags: &[lsp_types::Diagnostic]) -> String {
@@ -372,6 +450,19 @@ fn render_label(r: &Revision) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uri_to_rel_maps_file_uri_to_project_relative() {
+        let root = std::path::Path::new("/home/u/repo");
+        assert_eq!(
+            uri_to_rel("file:///home/u/repo/src/context/mod.rs", root),
+            "src/context/mod.rs"
+        );
+        // Outside the project root → falls back to the absolute path.
+        assert_eq!(uri_to_rel("file:///etc/hosts", root), "/etc/hosts");
+        // Non-file URI → unchanged-ish (no panic).
+        assert_eq!(uri_to_rel("/already/abs.rs", root), "/already/abs.rs");
+    }
 
     fn rev(n: usize, label: &str, added: usize, removed: usize, fe: usize, pe: usize) -> Revision {
         Revision {

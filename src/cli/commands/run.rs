@@ -40,6 +40,20 @@ use crate::tools;
 use crate::tools::permissions::{Action, PermissionManager};
 use crate::tui;
 
+/// Project-relative paths touched by a unified-diff patch file (parsed from
+/// its `+++ b/<path>` headers). Used by replay mode to notify the LSP of files
+/// changed out-of-band by `--replay-apply`. Best-effort: returns `[]` on read error.
+fn changed_paths_in_patch(patch: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(patch) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| l.strip_prefix("+++ b/"))
+        .map(|p| p.trim().to_string())
+        .filter(|p| p != "/dev/null")
+        .collect()
+}
+
 /// Run the agent for a single message.
 pub async fn run(
     mut config: Config,
@@ -48,6 +62,7 @@ pub async fn run(
     headless: bool,
     continue_session: bool,
     replay_context: Option<PathBuf>,
+    replay_apply: Option<PathBuf>,
 ) -> Result<()> {
     let log = Arc::new(SessionLog::new(&config));
     log.user_message(message);
@@ -308,6 +323,36 @@ pub async fn run(
         ));
         messages = captured;
     }
+    // Replay helper: apply the captured prior-edits patch to the working tree
+    // now — AFTER snapshot init (so round 0 stays the clean baseline) and after
+    // baseline-error capture (= 0 on the clean tree), so `revert_to_green` can
+    // restore the clean state the resumed agent never reached on its own. The
+    // agent still resumes ON the broken tree.
+    if let Some(ref patch) = replay_apply {
+        let abs = std::fs::canonicalize(patch).unwrap_or_else(|_| patch.clone());
+        let status = std::process::Command::new("git")
+            .arg("apply")
+            .arg(&abs)
+            .current_dir(&config.project_root)
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                tui::print_status(&format!(
+                    "Replay: applied working-tree patch {}",
+                    patch.display()
+                ));
+                // Tell the LSP the patched files changed so the revert-to-green
+                // green-check reads the resumed broken tree, not a stale clean
+                // snapshot. Best-effort; rust-analyzer file-watching also catches it.
+                if let Some(ref lsp) = lsp_client {
+                    for rel in changed_paths_in_patch(&abs) {
+                        let _ = lsp.notify_file_changed(&config.project_root.join(rel));
+                    }
+                }
+            }
+            _ => anyhow::bail!("replay: failed to apply patch {}", patch.display()),
+        }
+    }
     // The system prompt is phase-aware (pre-plan "explore→plan" vs
     // post-plan "you are EDITING" + routing). `assemble()` runs once
     // before the loop, so messages[0] is frozen at the attempt's
@@ -331,6 +376,15 @@ pub async fn run(
         ));
     }
 
+    // revert-to-green state (opt-in `tools.revert_to_green`): the last round
+    // whose start-of-round snapshot was green (project errors ≤ baseline) and
+    // how many consecutive rounds the project has stayed broken. A stuck agent
+    // that keeps the tree red for REVERT_TO_GREEN_BLOCKS rounds gets the whole
+    // tree reset to that last green snapshot (see below).
+    const REVERT_TO_GREEN_BLOCKS: usize = 6;
+    let mut last_green_round: usize = 0;
+    let mut red_streak: usize = 0;
+
     loop {
         if had_error {
             break;
@@ -342,6 +396,52 @@ pub async fn run(
         if let Some(ref snap) = snapshots {
             let mut guard = snap.lock();
             let _ = guard.begin_round(round);
+        }
+
+        // revert-to-green: this round STARTS from the state the previous round
+        // left (just snapshotted above). If the project has been broken above
+        // baseline for REVERT_TO_GREEN_BLOCKS rounds, the agent is digging
+        // deeper, not recovering — reset the whole tree to the last green
+        // snapshot and tell it to start over from a clean base.
+        if config.tools.revert_to_green
+            && config.tools.edit_mode == EditMode::Fast
+            && let Some(ref snap) = snapshots
+        {
+            {
+                let errs = tools::fast::project_error_count(lsp_client.as_deref()).await;
+                if errs <= fast_baseline_errors {
+                    last_green_round = round;
+                    red_streak = 0;
+                } else {
+                    red_streak += 1;
+                    if red_streak >= REVERT_TO_GREEN_BLOCKS {
+                        let result = {
+                            let guard = snap.lock();
+                            guard.revert_to_round(last_green_round)
+                        };
+                        match result {
+                            Ok(m) => {
+                                tui::print_status(&format!(
+                                    "[revert-to-green] stuck {red_streak} rounds; {m}"
+                                ));
+                                messages.push(Message::user(&format!(
+                                    "[auto-revert-to-green] The project has had compile errors for \
+                                     {red_streak} rounds straight and you are not converging — you are \
+                                     digging deeper, not recovering. I reverted the ENTIRE working tree \
+                                     to round {last_green_round}, the last state that compiled cleanly. \
+                                     Your edits since then are GONE; do not replay them. Start over from \
+                                     this clean base: re-read the relevant code, make ONE small complete \
+                                     change, and run a check before continuing."
+                                )));
+                                red_streak = 0;
+                            }
+                            Err(e) => {
+                                tui::print_status(&format!("[revert-to-green] revert failed: {e}"));
+                            }
+                        }
+                    }
+                }
+            }
         }
         if round > max_rounds {
             tui::print_error("Maximum tool rounds reached. Stopping.");

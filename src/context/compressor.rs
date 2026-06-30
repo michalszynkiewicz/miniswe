@@ -157,17 +157,68 @@ pub async fn maybe_compress(
                 llm_worker,
                 tool_def_tokens,
                 plan_update_requested,
+                "unified",
             )
             .await
         }
         CompactionStrategy::RollingSummary => {
-            compact_rolling_summary(messages, config, router, llm_worker, tool_def_tokens).await
+            compact_rolling_summary(
+                messages,
+                config,
+                router,
+                llm_worker,
+                tool_def_tokens,
+                "rolling_summary",
+            )
+            .await
         }
         CompactionStrategy::SlidingWindow => {
             compact_sliding_window(messages, config, tool_def_tokens)
         }
         CompactionStrategy::ObservationMasking => {
             compact_observation_masking(messages, config, tool_def_tokens)
+        }
+        // Tiered variants: mask → summary fallback. `rolling_cap` picks the
+        // fallback (unified summary+archive vs rolling summary); TieredSmart
+        // additionally adds a scratchpad nudge in build_system_prompt.
+        CompactionStrategy::Tiered => {
+            compact_tiered(
+                messages,
+                config,
+                router,
+                llm_worker,
+                tool_def_tokens,
+                plan_update_requested,
+                "tiered",
+                false,
+            )
+            .await
+        }
+        CompactionStrategy::TieredRolling => {
+            compact_tiered(
+                messages,
+                config,
+                router,
+                llm_worker,
+                tool_def_tokens,
+                plan_update_requested,
+                "tiered_rolling",
+                true,
+            )
+            .await
+        }
+        CompactionStrategy::TieredSmart => {
+            compact_tiered(
+                messages,
+                config,
+                router,
+                llm_worker,
+                tool_def_tokens,
+                plan_update_requested,
+                "tiered_smart",
+                false,
+            )
+            .await
         }
     }
 }
@@ -184,6 +235,7 @@ async fn compact_unified(
     llm_worker: &LlmWorkerHandle,
     tool_def_tokens: usize,
     plan_update_requested: &mut bool,
+    label: &str,
 ) {
     let (raw_budget, summary_budget) = budgets(config, tool_def_tokens);
 
@@ -280,7 +332,7 @@ async fn compact_unified(
     messages.extend(after_split);
 
     emit_compaction_metric(
-        "unified",
+        label,
         total_tokens,
         history_token_total(messages),
         msgs_before,
@@ -297,6 +349,7 @@ async fn compact_rolling_summary(
     router: &ModelRouter,
     llm_worker: &LlmWorkerHandle,
     tool_def_tokens: usize,
+    label: &str,
 ) {
     const MARKER: &str = "[Summary of earlier conversation]";
     let (raw_budget, summary_budget) = budgets(config, tool_def_tokens);
@@ -361,7 +414,7 @@ async fn compact_rolling_summary(
     messages.extend(after_split);
 
     emit_compaction_metric(
-        "rolling_summary",
+        label,
         total_tokens,
         history_token_total(messages),
         msgs_before,
@@ -407,25 +460,16 @@ fn compact_sliding_window(messages: &mut Vec<Message>, config: &Config, tool_def
     );
 }
 
-/// Observation masking: keep the full action trajectory (assistant messages,
-/// tool calls, user turns) but replace old tool *observations* (results) with a
-/// short placeholder, oldest-first, until back within budget — always keeping
-/// the last `KEEP_RAW_OBS` observations in full. No LLM call.
-fn compact_observation_masking(
-    messages: &mut Vec<Message>,
-    config: &Config,
-    tool_def_tokens: usize,
-) {
-    const KEEP_RAW_OBS: usize = 3;
-    const PLACEHOLDER: &str = "[earlier tool output elided to save context]";
-    let (raw_budget, _) = budgets(config, tool_def_tokens);
+/// Placeholder swapped in for an elided old tool observation.
+const OBS_PLACEHOLDER: &str = "[earlier tool output elided to save context]";
+/// Number of most-recent observations always kept raw.
+const KEEP_RAW_OBS: usize = 3;
 
-    let total_tokens = history_token_total(messages);
-    if total_tokens <= raw_budget {
-        return;
-    }
-
-    // Tool-result message indices, oldest first.
+/// Mask old tool observations (oldest-first) down to [`OBS_PLACEHOLDER`] until
+/// within `raw_budget`, always keeping the last [`KEEP_RAW_OBS`] raw. Mutates in
+/// place; returns true if it masked anything. Shared by `observation_masking`
+/// and the tiered hybrid's cheap first tier.
+fn mask_old_observations(messages: &mut [Message], raw_budget: usize) -> bool {
     let tool_idxs: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -433,31 +477,45 @@ fn compact_observation_masking(
         .map(|(i, _)| i)
         .collect();
     if tool_idxs.len() <= KEEP_RAW_OBS {
-        return; // nothing old enough to mask
+        return false; // nothing old enough to mask
     }
-
     let maskable = &tool_idxs[..tool_idxs.len() - KEEP_RAW_OBS];
-    let placeholder_tokens = estimate_tokens(PLACEHOLDER);
-    let mut running = total_tokens;
+    let placeholder_tokens = estimate_tokens(OBS_PLACEHOLDER);
+    let mut running = history_token_total(messages);
     let mut masked_any = false;
     for &i in maskable {
         if running <= raw_budget {
             break;
         }
         let content = messages[i].content.as_deref().unwrap_or("");
-        if content == PLACEHOLDER {
+        if content == OBS_PLACEHOLDER {
             continue; // already masked on a prior pass
         }
         let saved = msg_token_cost(&messages[i]).saturating_sub(placeholder_tokens);
-        messages[i].content = Some(PLACEHOLDER.to_string());
+        messages[i].content = Some(OBS_PLACEHOLDER.to_string());
         running = running.saturating_sub(saved);
         masked_any = true;
     }
+    masked_any
+}
 
-    if !masked_any {
+/// Observation masking: keep the full action trajectory (assistant messages,
+/// tool calls, user turns) but replace old tool *observations* (results) with a
+/// short placeholder, oldest-first, until back within budget — always keeping
+/// the last [`KEEP_RAW_OBS`] observations in full. No LLM call.
+fn compact_observation_masking(
+    messages: &mut Vec<Message>,
+    config: &Config,
+    tool_def_tokens: usize,
+) {
+    let (raw_budget, _) = budgets(config, tool_def_tokens);
+    let total_tokens = history_token_total(messages);
+    if total_tokens <= raw_budget {
         return;
     }
-
+    if !mask_old_observations(messages, raw_budget) {
+        return;
+    }
     let msgs = messages.len();
     emit_compaction_metric(
         "observation_masking",
@@ -466,6 +524,68 @@ fn compact_observation_masking(
         msgs,
         msgs, // masking preserves message count; only tool contents shrink
     );
+}
+
+/// Tiered hybrid: mask old observations first (cheap, free); only if that
+/// doesn't get under budget, fall through to the `Unified` summary + archive
+/// (the hard cap). Avoids observation-masking's edit-heavy thrash — when the
+/// bulk is in tool-call args (edit bodies) that masking can't touch, the summary
+/// tier collapses them — while staying cheap when observations dominate.
+///
+/// `label` distinguishes the flavor in the metric stream. `rolling_cap` selects
+/// the tier-2 fallback: `false` → `unified` (summary + disk archive), `true` →
+/// `rolling_summary` (running summary, no archive).
+#[allow(clippy::too_many_arguments)]
+async fn compact_tiered(
+    messages: &mut Vec<Message>,
+    config: &Config,
+    router: &ModelRouter,
+    llm_worker: &LlmWorkerHandle,
+    tool_def_tokens: usize,
+    plan_update_requested: &mut bool,
+    label: &str,
+    rolling_cap: bool,
+) {
+    let (raw_budget, _) = budgets(config, tool_def_tokens);
+    let before_tokens = history_token_total(messages);
+    if before_tokens <= raw_budget {
+        return;
+    }
+
+    // Tier 1: mask old observations (free, preserves the action trace).
+    let masked = mask_old_observations(messages, raw_budget);
+
+    if history_token_total(messages) <= raw_budget {
+        // Masking alone capped it — no LLM call needed.
+        if masked {
+            let msgs = messages.len();
+            emit_compaction_metric(
+                label,
+                before_tokens,
+                history_token_total(messages),
+                msgs,
+                msgs,
+            );
+        }
+        return;
+    }
+
+    // Tier 2: still over budget (e.g. edit bodies dominate) → a summary tier
+    // caps it. The fallback emits its own (post-mask) metric under `label`.
+    if rolling_cap {
+        compact_rolling_summary(messages, config, router, llm_worker, tool_def_tokens, label).await;
+    } else {
+        compact_unified(
+            messages,
+            config,
+            router,
+            llm_worker,
+            tool_def_tokens,
+            plan_update_requested,
+            label,
+        )
+        .await;
+    }
 }
 
 /// Summarization prompt flavor. `Structured` is miniswe's production
@@ -717,7 +837,7 @@ mod compaction_tests {
     }
 
     const SLIDING_MARKER: &str = "[Older conversation turns dropped to fit the context window.]";
-    const OBS_PLACEHOLDER: &str = "[earlier tool output elided to save context]";
+    // OBS_PLACEHOLDER comes from super::*
 
     #[test]
     fn sliding_window_drops_old_keeps_recent_and_marker() {
@@ -825,5 +945,34 @@ mod compaction_tests {
         for (a, b) in msgs.iter().zip(before.iter()) {
             assert_eq!(a.content, b.content, "≤ KEEP_RAW_OBS: untouched");
         }
+    }
+
+    #[test]
+    fn mask_helper_returns_true_only_when_it_masks() {
+        // The tiered hybrid uses this bool to decide tier-1-only vs tier-2.
+        // raw_budget at the test cfg ≈ 333; 6×100-tok tool results blow it.
+        let mut msgs = vec![Message::system("sys")];
+        for i in 0..6 {
+            msgs.push(Message::assistant(&format!("call{i}")));
+            msgs.push(Message::tool_result(&format!("id{i}"), &blob()));
+        }
+        let raw_budget = budgets(&cfg(), 0).0;
+        assert!(
+            mask_old_observations(&mut msgs, raw_budget),
+            "should mask when >KEEP_RAW_OBS observations exceed budget"
+        );
+        // Idempotent-ish: a second pass with everything maskable already masked
+        // (and now under budget) masks nothing more.
+        assert!(
+            !mask_old_observations(&mut msgs, raw_budget),
+            "nothing left to mask on the second pass"
+        );
+
+        // Too few observations → never masks (tier-1 is a no-op, tier-2 decides).
+        let mut few = vec![Message::system("sys")];
+        for i in 0..3 {
+            few.push(Message::tool_result(&format!("id{i}"), &blob()));
+        }
+        assert!(!mask_old_observations(&mut few, 1));
     }
 }

@@ -231,6 +231,19 @@ pub enum CompactionStrategy {
     /// messages, tool calls, user turns) but replace old tool *observations*
     /// (results) with a short placeholder, keeping the last few raw. No LLM.
     ObservationMasking,
+    /// Tiered hybrid: mask old observations first (cheap, free), and only if
+    /// that doesn't get under budget fall through to the `Unified` summary +
+    /// archive (the hard cap). Avoids observation-masking's edit-heavy thrash
+    /// while keeping its cheapness when observations dominate.
+    Tiered,
+    /// Like `Tiered`, but the tier-2 cap is `RollingSummary` (running summary,
+    /// no plan-anchor, no disk archive) instead of `Unified`.
+    TieredRolling,
+    /// `Tiered` plus a system-prompt nudge telling the model to record
+    /// non-re-derivable findings (command output, search results, errors) to
+    /// its scratchpad before they're elided. Same compaction behavior as
+    /// `Tiered`; differs only in the prompt.
+    TieredSmart,
 }
 
 /// Which context providers are enabled.
@@ -261,12 +274,17 @@ pub struct ProvidersConfig {
 impl Default for ProvidersConfig {
     fn default() -> Self {
         Self {
-            profile: false,       // available via get_project_info() tool
-            guide: false,         // available via get_project_info() tool
-            project_notes: false, // available via get_architecture_notes() tool
+            // Auto-injected by default: the compaction benchmark (2026-06-27)
+            // showed leaving these off costs gemma-4 the 6/6 (5/6 -> 6/6 when on)
+            // — the codebase orientation + lessons help the model thread a change
+            // end-to-end. Each is a no-op when its source file is absent, and all
+            // remain fetchable on demand via the get_project_info()/notes tools.
+            profile: true,
+            guide: true,
+            project_notes: true,
             plan: true,
-            lessons: false,  // available via get_project_info() tool
-            repo_map: false, // available via get_repo_map() tool
+            lessons: true,
+            repo_map: false, // still on-demand via code(action='repo_map')
             mcp: true,
             scratchpad: true,
             usage_guide: true,
@@ -426,8 +444,11 @@ pub struct ToolsConfig {
     /// reverted to the most recent AST-clean revision and the model is told
     /// to stop digging and make one balanced edit. Targets the observed
     /// brace-cascade loop (small models patch line-by-line into ever-deeper
-    /// breakage). `false` (default) preserves the pure fast-mode philosophy
-    /// of tolerating transient broken AST. Under A/B evaluation on Gemma 4.
+    /// breakage). On by default: a 10-run Gemma-4 A/B showed it removes the
+    /// catastrophic tail (ON ~5.8 with no 0/6 vs OFF ~3.75 incl. a 17-broken
+    /// 0/6); set `false` for the pure fast-mode philosophy of tolerating
+    /// transient broken AST. Triggers only on `CASCADE_THRESHOLD` *consecutive*
+    /// broken-AST edits, so a deliberate 1–2-step broken intermediate is safe.
     pub auto_revert_ast_cascade: bool,
     /// EXPERIMENTAL. When `true`, after the behavioral done-gate
     /// (`[validation]`) blocks completion `DEBUGGER_TRIGGER_BLOCKS` times in a
@@ -455,8 +476,22 @@ pub struct ToolsConfig {
     /// equivalent of a best-of-3 fresh attempt. Motivated by: in-context
     /// grinding thrashes in the failure-primed context (qwen: 121 rounds over 3
     /// blocks, still failed) while a fresh attempt fixed it fast (53 rounds).
-    /// `false` (default) keeps plain retry-nudges. A/B only.
+    /// `false` by default: a controlled gemma-4 A/B (2026-06-29, 3 runs each,
+    /// auto_revert on, unified) showed OFF is strictly better — 6.0 vs 5.67 and
+    /// ~1.6× faster (≈839s vs ≈1380s). The reset fired 2–4×/run and caused
+    /// re-work churn (≈336 vs ≈199 rounds) with no reliability payoff. The qwen
+    /// motivation above may still hold on harder/long-repo tasks; opt in there.
     pub gate_context_reset: bool,
+    /// EXPERIMENTAL (fast mode + snapshots). When `true`, if the project's LSP
+    /// error count stays ABOVE the session baseline for `REVERT_TO_GREEN_BLOCKS`
+    /// consecutive rounds (the agent is stuck not converging), revert the ENTIRE
+    /// working tree to the last round that was green (compiled ≤ baseline) and
+    /// tell the agent to restart from that clean base. Unlike
+    /// `auto_revert_ast_cascade` (per-file, AST-syntax only), this is tree-wide
+    /// and triggers on SEMANTIC breaks (type errors, deleted methods) that parse
+    /// fine. Motivated by run2 (deleted `is_enabled`, broke a caller, ground 100+
+    /// rounds unable to untangle its own change). `false` (default). A/B only.
+    pub revert_to_green: bool,
 }
 
 /// Agent ceremony level — see `ToolsConfig::ceremony`.
@@ -506,10 +541,14 @@ impl Default for ToolsConfig {
             ceremony: CeremonyMode::Strict,
             flat: false,
             edit_mode: EditMode::Fast,
-            auto_revert_ast_cascade: false,
+            auto_revert_ast_cascade: true,
             reactive_debugger: false,
             spiral_reset: false,
+            // Off: the controlled gemma A/B (2026-06-29) showed OFF is strictly
+            // better (6.0 vs 5.67, ~1.6× faster) — the reset causes re-work churn
+            // with no reliability gain on this task. See the field doc above.
             gate_context_reset: false,
+            revert_to_green: false,
         }
     }
 }
@@ -742,6 +781,12 @@ mod compaction_strategy_tests {
         assert_eq!(c.compaction, CompactionStrategy::ObservationMasking);
         let c: ContextConfig = toml::from_str("compaction = \"rolling_summary\"").unwrap();
         assert_eq!(c.compaction, CompactionStrategy::RollingSummary);
+        let c: ContextConfig = toml::from_str("compaction = \"tiered\"").unwrap();
+        assert_eq!(c.compaction, CompactionStrategy::Tiered);
+        let c: ContextConfig = toml::from_str("compaction = \"tiered_smart\"").unwrap();
+        assert_eq!(c.compaction, CompactionStrategy::TieredSmart);
+        let c: ContextConfig = toml::from_str("compaction = \"tiered_rolling\"").unwrap();
+        assert_eq!(c.compaction, CompactionStrategy::TieredRolling);
     }
 
     #[test]

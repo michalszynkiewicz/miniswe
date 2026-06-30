@@ -551,6 +551,20 @@ pub fn assemble(
         system_context.push('\n');
     }
 
+    // TieredSmart compaction: nudge the model to externalize non-re-derivable
+    // findings to the (compaction-surviving) scratchpad before old tool outputs
+    // are elided. Only meaningful for this strategy; no-op otherwise.
+    if config.context.compaction == crate::config::CompactionStrategy::TieredSmart {
+        system_context.push_str(
+            "\n[NOTE-TAKING] Older tool outputs are periodically elided from context to save space. \
+             When a tool result holds something you'll need later that you CANNOT cheaply re-derive \
+             (a command's output, search results, an error message — not a file you can just re-read), \
+             save it now to your scratchpad with plan(action='scratchpad', content=...) — keep a running \
+             notes section there (alongside the required ## Current Task and ## Plan sections) so it \
+             survives compaction.\n",
+        );
+    }
+
     messages.push(Message::system(&system_context));
     used_tokens += estimate_tokens(&system_context);
 

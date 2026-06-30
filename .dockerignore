@@ -1,1 +1,6 @@
-/ /
+# Keep the build context small. NB: .git is deliberately NOT ignored —
+# Dockerfile.benchmark copies it to /repo for `git archive` (line 37).
+/target/
+/benchmark_results/
+*.log
+.miniswe/

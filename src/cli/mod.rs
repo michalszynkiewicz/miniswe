@@ -25,6 +25,14 @@ pub struct Cli {
     #[arg(long, value_name = "CONTEXT_JSON")]
     pub replay_context: Option<PathBuf>,
 
+    /// Replay helper: a git patch applied to the working tree AFTER snapshot
+    /// init but before the loop. Represents the resumed run's prior
+    /// (unsnapshotted) edits, so round 0 stays the clean baseline and
+    /// `revert_to_green` has a green state to return to. Use with
+    /// --replay-context; the fixture tree should be the CLEAN pre-edit state.
+    #[arg(long, value_name = "PATCH")]
+    pub replay_apply: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
