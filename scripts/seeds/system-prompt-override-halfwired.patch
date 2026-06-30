@@ -1,0 +1,70 @@
+diff --git a/src/cli/commands/run.rs b/src/cli/commands/run.rs
+index 2f7e681..358c86c 100644
+--- a/src/cli/commands/run.rs
++++ b/src/cli/commands/run.rs
+@@ -38,7 +38,13 @@ fn mask_keep_count(tool_name: &str) -> usize {
+ }
+ 
+ /// Run the agent for a single message.
+-pub async fn run(config: Config, message: &str, plan_only: bool, headless: bool) -> Result<()> {
++pub async fn run(
++    config: Config,
++    message: &str,
++    plan_only: bool,
++    headless: bool,
++    system_prompt_override: Option<String>,
++) -> Result<()> {
+     let log = SessionLog::new(&config);
+     log.user_message(message);
+ 
+diff --git a/src/cli/mod.rs b/src/cli/mod.rs
+index cfd60db..90a1a72 100644
+--- a/src/cli/mod.rs
++++ b/src/cli/mod.rs
+@@ -17,6 +17,10 @@ pub struct Cli {
+     #[arg(long, short = 'y')]
+     pub yes: bool,
+ 
++    /// Replace the default system prompt with this text (skips context providers)
++    #[arg(long, short = 's')]
++    pub system_prompt_override: Option<String>,
++
+     #[command(subcommand)]
+     pub command: Option<Command>,
+ }
+diff --git a/src/main.rs b/src/main.rs
+index bb0a106..9af8f39 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -28,7 +28,14 @@ async fn main() -> Result<()> {
+         }
+         Some(Command::Plan { message }) => {
+             let config = Config::load()?;
+-            miniswe::cli::commands::run::run(config, &message, true, cli.yes).await?;
++            miniswe::cli::commands::run::run(
++                config,
++                &message,
++                true,
++                cli.yes,
++                cli.system_prompt_override.clone(),
++            )
++            .await?;
+         }
+         Some(Command::Docs { subcommand }) => {
+             miniswe::cli::commands::docs::run(subcommand).await?;
+@@ -37,7 +44,14 @@ async fn main() -> Result<()> {
+             let config = Config::load()?;
+             if let Some(message) = cli.message {
+                 // Single-shot mode
+-                miniswe::cli::commands::run::run(config, &message, false, cli.yes).await?;
++                miniswe::cli::commands::run::run(
++                    config,
++                    &message,
++                    false,
++                    cli.yes,
++                    cli.system_prompt_override,
++                )
++                .await?;
+             } else {
+                 // Interactive REPL
+                 miniswe::cli::commands::repl::run(config, cli.yes).await?;
