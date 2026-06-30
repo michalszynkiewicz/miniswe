@@ -28,8 +28,16 @@ async fn main() -> Result<()> {
         }
         Some(Command::Plan { message }) => {
             let config = Config::load()?;
-            miniswe::cli::commands::run::run(config, &message, true, cli.yes, cli.r#continue, None)
-                .await?;
+            miniswe::cli::commands::run::run(
+                config,
+                &message,
+                true,
+                cli.yes,
+                cli.r#continue,
+                None,
+                None,
+            )
+            .await?;
         }
         None => {
             let config = Config::load()?;
@@ -45,6 +53,7 @@ async fn main() -> Result<()> {
                     cli.yes,
                     cli.r#continue,
                     Some(replay),
+                    cli.replay_apply,
                 )
                 .await?;
             } else if let Some(message) = cli.message {
@@ -55,6 +64,7 @@ async fn main() -> Result<()> {
                     false,
                     cli.yes,
                     cli.r#continue,
+                    None,
                     None,
                 )
                 .await?;
