@@ -459,6 +459,15 @@ pub struct ToolsConfig {
     /// (same weights). `false` (default) keeps the gate's plain retry-nudge
     /// loop. Requires a `[validation]` command to do anything. A/B only.
     pub reactive_debugger: bool,
+    /// EXPERIMENTAL. Requires `reactive_debugger`. When `true`, the debugger may
+    /// re-fire WITHIN a turn — but only when the gate's failure SIGNATURE changes
+    /// (e.g. compile error fixed, now a runtime/smoke failure), so it walks the
+    /// failure chain one fresh diagnosis per distinct failure instead of
+    /// re-diagnosing the same thing. `false` (default) keeps single-fire. The
+    /// blunt "fire ≤N×/turn" variant regressed before (scattered diagnoses the
+    /// small model couldn't integrate); the distinct-signature gate is the
+    /// difference. A/B only.
+    pub debugger_multifire: bool,
     /// EXPERIMENTAL (fast mode). When `true`, detect a *revert-loop* spiral —
     /// the agent reverting the same file to a clean revision
     /// `SPIRAL_REVERT_THRESHOLD` times in a turn (it's cycling: re-trying the
@@ -492,6 +501,34 @@ pub struct ToolsConfig {
     /// fine. Motivated by run2 (deleted `is_enabled`, broke a caller, ground 100+
     /// rounds unable to untangle its own change). `false` (default). A/B only.
     pub revert_to_green: bool,
+    /// EXPERIMENTAL. When `true`, the first time the behavioral done-gate
+    /// (`[validation]`) blocks, inject the ORIGINAL task goal and force a fresh
+    /// `plan(action='set')` re-derived from it. Motivated by the run2 recovery
+    /// dissection: under compile-firefighting the agent's plan DEGRADES from
+    /// "build the feature" to "make it compile", dropping the behavior step; it
+    /// then repairs to "compiles" and stops, never implementing the missing
+    /// consumption. Re-anchoring on the goal counters that drift. Fires once per
+    /// turn; needs a `[validation]` command. `false` (default). A/B only.
+    pub gate_replan: bool,
+    /// EXPERIMENTAL. When `true`, the first time the done-gate blocks, ABANDON
+    /// the current (possibly off-path/poisoned) attempt entirely: revert the
+    /// whole working tree to the clean baseline (round 0) AND reset the context
+    /// to a fresh from-scratch attempt at the task. Tests the detect-and-restart
+    /// hypothesis — a stuck/off-path state (run2: 259 rounds, tree broken, edits
+    /// misdirected into config/ instead of the consumption in context/) is worse
+    /// than a clean start, so scrapping it dominates recovery. Unlike
+    /// `gate_context_reset` (context only) this also reverts the TREE, which is
+    /// the actual poison. Fires once per turn. `false` (default). A/B only.
+    pub gate_restart: bool,
+    /// EXPERIMENTAL. Debugger-as-judge: when the done-gate blocks, the fresh-
+    /// context read-only debugger DECIDES `SCRAP` vs `CONTINUE` (given the goal).
+    /// SCRAP → the loop reverts the tree to the clean baseline + resets context
+    /// (the proven restart); CONTINUE → its diagnosis + anchored plan is injected
+    /// for the main agent to apply. Unifies the restart trigger, the debugger,
+    /// and goal re-anchoring into ONE fresh-eyes decision the loop executes (the
+    /// stuck agent never has to decide). Fires once per turn; needs a
+    /// `[validation]` command. `false` (default). A/B only.
+    pub debugger_judge: bool,
 }
 
 /// Agent ceremony level — see `ToolsConfig::ceremony`.
@@ -543,12 +580,16 @@ impl Default for ToolsConfig {
             edit_mode: EditMode::Fast,
             auto_revert_ast_cascade: true,
             reactive_debugger: false,
+            debugger_multifire: false,
             spiral_reset: false,
             // Off: the controlled gemma A/B (2026-06-29) showed OFF is strictly
             // better (6.0 vs 5.67, ~1.6× faster) — the reset causes re-work churn
             // with no reliability gain on this task. See the field doc above.
             gate_context_reset: false,
             revert_to_green: false,
+            gate_replan: false,
+            gate_restart: false,
+            debugger_judge: false,
         }
     }
 }
