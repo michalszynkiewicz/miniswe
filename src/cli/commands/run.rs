@@ -54,6 +54,24 @@ fn changed_paths_in_patch(patch: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// Stable signature of a gate failure, used by `debugger_multifire` to decide
+/// whether the failure CHANGED since the last diagnosis (so the debugger walks
+/// compile→smoke rather than re-diagnosing the same failure). The validation
+/// command leads each failure mode with a distinct line ("DOES NOT COMPILE:" vs
+/// "COMPILES but override NOT consumed…"), so the first non-empty line is a
+/// good discriminator; lowercased + truncated to absorb variable tails.
+fn failure_key(output: &str) -> String {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .chars()
+        .take(80)
+        .collect()
+}
+
 /// Run the agent for a single message.
 pub async fn run(
     mut config: Config,
@@ -239,7 +257,14 @@ pub async fn run(
     // max_retries; never a silent free pass).
     let mut validation_disputes: Vec<String> = Vec::new();
     // The reactive debugger sub-agent fires at most once per turn.
-    let mut debugger_fired = false;
+    let mut replan_fired = false;
+    let mut restart_fired = false;
+    let mut debugger_fires = 0usize;
+    // Signature of the last failure the debugger was handed. With
+    // `debugger_multifire`, the debugger re-fires only when this CHANGES — so it
+    // walks compile→smoke one diagnosis per distinct failure, never re-diagnosing
+    // the same one (the blunt fire-≤N× variant regressed by doing exactly that).
+    let mut last_debugged_failure: Option<String> = None;
     // Gate-triggered context resets fired this turn (bounded — don't loop).
     let mut gate_resets: usize = 0;
     // Spiral-reset: per-file revert counts this turn + how many resets fired,
@@ -716,22 +741,111 @@ pub async fn run(
                             }
                             tui::print_status("Behavioral check failed — not done yet.");
 
+                            // Full restart (opt-in `tools.gate_restart`): on the
+                            // FIRST gate block, ABANDON the (possibly poisoned)
+                            // attempt — revert the WHOLE tree to the clean baseline
+                            // (round 0) AND reset the context to a fresh from-scratch
+                            // attempt at the task, clearing the degraded plan. Tests
+                            // detect-and-restart: a stuck/off-path state is worse than
+                            // a clean start (run2), so scrap it. Fires once per turn.
+                            if config.tools.gate_restart && !restart_fired {
+                                restart_fired = true;
+                                if let Some(ref snap) = snapshots {
+                                    let guard = snap.lock();
+                                    match guard.revert_to_round(0) {
+                                        Ok(m) => tui::print_status(&format!("[gate-restart] {m}")),
+                                        Err(e) => tui::print_status(&format!(
+                                            "[gate-restart] tree revert failed: {e}"
+                                        )),
+                                    }
+                                }
+                                // Whole-tree revert changed many files outside the
+                                // per-edit reindex path — resync the symbol index /
+                                // repo-map to the clean baseline so the fresh agent
+                                // doesn't see the reverted-away structure.
+                                tools::reindex_project_incremental(&config);
+                                let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+                                let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+                                let assembled = context::assemble(
+                                    &config,
+                                    message,
+                                    &[],
+                                    plan_only,
+                                    mcp_summary.as_deref(),
+                                );
+                                messages = assembled.messages;
+                                conversation_history.clear();
+                                validation_blocks = 0;
+                                last_plan_set = false;
+                                tui::print_status(
+                                    "[gate-restart] scrapped the stuck state — tree at clean baseline + fresh context; restarting from scratch.",
+                                );
+                                continue;
+                            }
+
+                            // Goal re-anchor (opt-in `tools.gate_replan`): the first
+                            // time the gate blocks on BEHAVIOR (the tree compiles but
+                            // the feature doesn't work), the agent may be running a
+                            // degraded compile-repair plan that dropped the feature
+                            // objective (run2: it fixes the compile and stops at
+                            // "compiles", never writing the consumption its original
+                            // plan called for). Re-anchor on the ORIGINAL goal and
+                            // force a fresh plan. Fires once per turn. CRUCIAL: skip
+                            // when the block is a COMPILE failure — re-anchoring the
+                            // agent to "add the behavior" on a broken tree just makes
+                            // it dig deeper; only fire once the compile is green.
+                            let is_compile_fail = output.contains("DOES NOT COMPILE")
+                                || output.contains("could not compile")
+                                || output.contains("error[E");
+                            if config.tools.gate_replan && !replan_fired && !is_compile_fail {
+                                replan_fired = true;
+                                tui::print_status(
+                                    "Re-anchoring on the original goal — re-plan from the task…",
+                                );
+                                let msg = Message::user(&format!(
+                                    "[A check that exercises the change end-to-end FAILED — it \
+                                     COMPILES but does not yet BEHAVE as required. After fixing \
+                                     errors it is easy to lose the original goal and stop at \"it \
+                                     compiles\". Re-anchor on the task: \"{message}\". Use \
+                                     plan(action='set') to re-derive the FULL plan from that goal — \
+                                     list every step the feature needs end-to-end, INCLUDING the \
+                                     code that actually USES the new input to change behavior (not \
+                                     just declaring or plumbing it). For each step, confirm it is \
+                                     DONE in the code, not merely compiling — then implement \
+                                     whatever is missing before finishing.\nCheck output:\n{output}]"
+                                ));
+                                messages.push(msg.clone());
+                                conversation_history.push(msg);
+                                continue;
+                            }
+
                             // Reactive debugger (opt-in): once the primary
                             // agent has failed the gate a couple times on its
                             // own, hand the SPECIFIC failure to a fresh-context
-                            // sub-agent. Fires once per turn; its fix lands in
-                            // the shared revision store, so the next gate
-                            // re-check (continue below) validates it.
-                            if config.tools.reactive_debugger
-                                && !debugger_fired
+                            // sub-agent. Its fix lands in the shared revision
+                            // store, so the next gate re-check (continue below)
+                            // validates it. Single-fire by default; with
+                            // `debugger_multifire` it re-fires only on a CHANGED
+                            // failure signature (walk compile→smoke).
+                            let fkey = failure_key(&output);
+                            let may_fire = if config.tools.debugger_multifire {
+                                debugger_fires < debugger::MAX_DEBUGGER_FIRES
+                                    && last_debugged_failure.as_deref() != Some(fkey.as_str())
+                            } else {
+                                debugger_fires == 0
+                            };
+                            if (config.tools.reactive_debugger || config.tools.debugger_judge)
+                                && may_fire
                                 && validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
                             {
-                                debugger_fired = true;
+                                debugger_fires += 1;
+                                last_debugged_failure = Some(fkey);
                                 tui::print_status(
                                     "Still failing — spinning up a fresh-context debugger sub-agent…",
                                 );
                                 let report = debugger::run_debugger(
                                     &output,
+                                    message,
                                     &config,
                                     &llm_worker,
                                     &tool_pool,
@@ -747,12 +861,60 @@ pub async fn run(
                                 let body = report.unwrap_or_else(|| {
                                     "(the debugger produced no diagnosis)".to_string()
                                 });
+
+                                // Debugger-as-judge: if it voted SCRAP, the LOOP
+                                // executes the restart (revert tree to clean
+                                // baseline + reset context) — the stuck agent never
+                                // decides. Fires once. Anything else = CONTINUE →
+                                // inject its diagnosis + plan for the main agent.
+                                let scrap = config.tools.debugger_judge
+                                    && !restart_fired
+                                    && body.lines().take(3).any(|l| {
+                                        let u = l.to_ascii_uppercase();
+                                        u.contains("DECISION") && u.contains("SCRAP")
+                                    });
+                                if scrap {
+                                    restart_fired = true;
+                                    if let Some(ref snap) = snapshots {
+                                        let guard = snap.lock();
+                                        match guard.revert_to_round(0) {
+                                            Ok(m) => tui::print_status(&format!(
+                                                "[debugger-judge] SCRAP — {m}"
+                                            )),
+                                            Err(e) => tui::print_status(&format!(
+                                                "[debugger-judge] SCRAP — tree revert failed: {e}"
+                                            )),
+                                        }
+                                    }
+                                    // Resync the symbol index / repo-map to the clean
+                                    // baseline after the whole-tree revert (the
+                                    // per-edit reindex path doesn't cover it).
+                                    tools::reindex_project_incremental(&config);
+                                    let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+                                    let _ =
+                                        std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+                                    let assembled = context::assemble(
+                                        &config,
+                                        message,
+                                        &[],
+                                        plan_only,
+                                        mcp_summary.as_deref(),
+                                    );
+                                    messages = assembled.messages;
+                                    conversation_history.clear();
+                                    validation_blocks = 0;
+                                    last_plan_set = false;
+                                    tui::print_status(
+                                        "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
+                                    );
+                                    continue;
+                                }
+
                                 let msg = Message::user(&format!(
                                     "[A read-only debugger with fresh eyes investigated the failing \
                                      check and produced this DIAGNOSIS. It did not edit anything — \
-                                     YOU must apply the fix. Diagnosis:\n{body}\n\
-                                     Make the change it identifies, then finish; the verification \
-                                     will re-run.]"
+                                     YOU must apply the fix and finish the plan it lays out:\n{body}\n\
+                                     Make the change(s), then finish; the verification will re-run.]"
                                 ));
                                 messages.push(msg.clone());
                                 conversation_history.push(msg);

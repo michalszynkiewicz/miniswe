@@ -23,15 +23,24 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE_NAME="miniswe-bench"
 GEMMA_NAME="miniswe-bench-gemma"
+# The original task — passed to the replay as the message/goal so gate_replan can
+# re-anchor on it (the captured context has the task compacted away, and replay's
+# default message is the useless placeholder "[replay]").
+TASK="Add a CLI flag --system-prompt-override (short: -s) that takes a string and replaces the default system prompt with the provided text. When this flag is set, skip all context providers and just use the override text as the system message. Make sure it works for both single-shot and interactive modes."
 LLAMA_ENDPOINT="${LLAMA_ENDPOINT:-http://localhost:8464}"
 MODEL="gemma-4-26B-A4B-it"
 
 FIXTURE=""; RUNS=3; TIMEOUT=1800
 ARMS=(control temp00 temp035 debugger revert_green)
+MAX_ROUNDS="${MAX_ROUNDS:-80}"
+MAX_RETRIES="${MAX_RETRIES:-3}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --runs)    RUNS="$2";    shift 2 ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
+        --arms)    IFS=' ' read -ra ARMS <<< "$2"; shift 2 ;;
+        --max-rounds)  MAX_ROUNDS="$2";  shift 2 ;;
+        --max-retries) MAX_RETRIES="$2"; shift 2 ;;
         -*) echo "Unknown: $1" >&2; exit 1 ;;
         *)  FIXTURE="$1"; shift ;;
     esac
@@ -41,9 +50,11 @@ done
 [[ -f "$FIXTURE/context.json" && -d "$FIXTURE/tree" && -f "$FIXTURE/corruption.patch" ]] \
     || { echo "fixture needs context.json + tree/ + corruption.patch: $FIXTURE" >&2; exit 1; }
 
-MODEL_TAG="$(curl -fsS --max-time 3 "${LLAMA_ENDPOINT}/v1/models" 2>/dev/null \
+# Best-effort — gemma may be down at start (the runner restarts it per run), so
+# tolerate a failed probe under `set -euo pipefail` instead of silently exiting.
+MODEL_TAG="$( { curl -fsS --max-time 3 "${LLAMA_ENDPOINT}/v1/models" 2>/dev/null \
     | python3 -c "import json,sys;print((json.load(sys.stdin).get('data') or [{}])[0].get('id','?'))" 2>/dev/null \
-    | sed -E 's/\.gguf$//; s/[^A-Za-z0-9._-]/_/g' | cut -c1-40)"
+    | sed -E 's/\.gguf$//; s/[^A-Za-z0-9._-]/_/g' | cut -c1-40; } || true)"
 RESULTS_DIR="${REPO_DIR}/benchmark_results/replaymatrix_$(date +%Y%m%d_%H%M%S)_${MODEL_TAG:-unknown}"
 mkdir -p "$RESULTS_DIR"
 ACTIVE_CONTAINER=""
@@ -85,7 +96,11 @@ gen_config() {  # $1 = arm
         temp00)       temp="0.0" ;;
         temp035)      temp="0.35" ;;
         debugger)     temp="0.2"; tools_extra="reactive_debugger = true" ;;
+        debugger_mf)  temp="0.2"; tools_extra=$'reactive_debugger = true\ndebugger_multifire = true' ;;
         revert_green) temp="0.2"; tools_extra="revert_to_green = true" ;;
+        replan)       temp="0.2"; tools_extra="gate_replan = true" ;;
+        restart)      temp="0.2"; tools_extra="gate_restart = true" ;;
+        judge)        temp="0.2"; tools_extra="debugger_judge = true" ;;
     esac
 cat <<TOML
 [model]
@@ -97,7 +112,7 @@ temperature = $temp
 max_output_tokens = 8000
 [context]
 repo_map_budget = 5000
-max_rounds = 80
+max_rounds = $MAX_ROUNDS
 pause_after_rounds = 99999
 [context.providers]
 repo_map = false
@@ -117,7 +132,7 @@ enabled = true
 [validation]
 command = "out=\$(cargo build 2>&1) || { echo \"DOES NOT COMPILE:\"; echo \"\$out\" | tail -20; exit 1; }; run=\$(MINISWE_SKIP_VALIDATION=1 ./target/debug/miniswe --system-prompt-override 'Respond only with TOKEN_XYZ and nothing else' --yes hello 2>&1); echo \"\$run\" | grep -q TOKEN_XYZ || { echo \"COMPILES but override NOT consumed. Expected TOKEN_XYZ, GOT: \$run\"; exit 1; }"
 timeout_secs = 180
-max_retries = 3
+max_retries = $MAX_RETRIES
 TOML
 }
 
@@ -126,6 +141,7 @@ CONTAINER_SCRIPT=$(cat <<'SCRIPT'
 #!/bin/bash
 set -uo pipefail
 TIMEOUT="$1"
+TASK="$2"
 cd /work
 cp -a /fixture/tree/. /work/           # CLEAN baseline tree
 rm -rf target .miniswe
@@ -139,7 +155,7 @@ git config --global --add safe.directory /work
 git init -q && git add -A && git commit -q -m baseline 2>/dev/null
 
 echo "=== REPLAY (resume from captured context; corruption applied post-snapshot) ==="
-timeout "$TIMEOUT" miniswe --yes \
+timeout "$TIMEOUT" miniswe --yes "$TASK" \
     --replay-context /fixture/context.json \
     --replay-apply /fixture/corruption.patch \
     > /output/stdout.txt 2> /output/stderr.txt || true
@@ -176,7 +192,7 @@ run_one() {  # $1=arm $2=run
         -v "$tmp:/run.sh:ro" \
         -e MINISWE_LLM_DUMP_DIR=/output/llm_dumps \
         --name "$cname" "$IMAGE_NAME" \
-        bash /run.sh "$TIMEOUT" > "$vdir/container.log" 2>&1 || true
+        bash /run.sh "$TIMEOUT" "$TASK" > "$vdir/container.log" 2>&1 || true
     echo $(( $(date +%s) - t0 )) > "$vdir/wall_s.txt"
     rm -f "$tmp"; ACTIVE_CONTAINER=""
     local res; res=$(grep -oE "=== FINAL: [0-9]+/[0-9]+" "$vdir/container.log" 2>/dev/null | tail -1 | grep -oE "[0-9]+/[0-9]+" || echo "?/?")
