@@ -21,6 +21,16 @@
 //!
 //! The value is *attention reset / fresh eyes on the diagnosis*, not extra
 //! capability (same weights) and not an extra editor.
+//!
+//! `tools.debugger_judge` extends this into a ROUTER: given the goal + the FULL
+//! diff, the same fresh-context sub-agent first DECIDES `SCRAP` vs `CONTINUE`.
+//! SCRAP → the loop reverts the tree to the clean baseline and restarts from
+//! scratch (a stuck/off-path attempt is negative equity — cheaper to redo than
+//! recover); CONTINUE → it emits the diagnosis + an anchored plan. The stuck
+//! agent never makes the call; a fresh judge does and the loop executes it. The
+//! full diff is essential — investigating only the failing location makes the
+//! judge myopic (it sees a small local fix and votes CONTINUE on an off-path
+//! attempt).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +51,11 @@ use crate::tools::permissions::PermissionManager;
 /// Two lets the primary agent take its own swings first (the cheap path);
 /// the debugger is the escalation when those swings keep missing.
 pub const DEBUGGER_TRIGGER_BLOCKS: usize = 2;
+
+/// Max debugger fires per turn when `debugger_multifire` is on. Bounds the
+/// walk down the failure chain (compile → smoke → …) so a pathological
+/// flapping failure can't spawn unbounded sub-agents.
+pub const MAX_DEBUGGER_FIRES: usize = 3;
 
 /// Read-only investigation budget. Diagnosis doesn't need many rounds; a
 /// final forced report turn happens after this regardless.
@@ -74,6 +89,32 @@ a broken edit. Say e.g. \"thread the override into the assemble() call instead o
 that parameter's type\" — NOT a literal code snippet. Let the main agent write code that matches \
 the real signatures. Do not edit anything.";
 
+/// The debugger's JUDGE prompt (`tools.debugger_judge`): same read-only, fresh-
+/// eyes stance, but it first DECIDES whether the attempt is salvageable. SCRAP
+/// (loop reverts + restarts) vs CONTINUE (emit the recovery report + plan).
+/// Validated to discriminate: SCRAP a poisoned/off-path state, CONTINUE a
+/// healthy on-path one.
+const DEBUGGER_JUDGE_PROMPT: &str = "\
+You are a READ-ONLY analyst with fresh eyes on a STUCK coding task. You have ONLY \
+read/search/inspect tools — you CANNOT edit files, run shell, set a plan, or use a scratchpad. \
+Do NOT plan and do NOT try to edit.\n\
+Investigate the failure and the changes made so far (the failing location, the relevant \
+definitions/callsites, and whether the changes are even in the right place for the GOAL). Then \
+DECIDE whether this attempt is worth continuing:\n\
+- SCRAP: the changes are misdirected, damaged, or off-path — editing the wrong places for the \
+GOAL, or broken in ways the GOAL did not require. Reverting everything to the clean original and \
+starting fresh would be faster and more reliable. IGNORE effort already spent.\n\
+- CONTINUE: the changes are on the path to the GOAL and nearly working; only a focused fix remains.\n\
+Output your decision on the FIRST line, exactly one of:\n\
+DECISION: SCRAP\n\
+DECISION: CONTINUE\n\
+If SCRAP: add one line — REASON: <the single most important reason> — and STOP.\n\
+If CONTINUE: produce the recovery report the main agent will apply —\n\
+ROOT CAUSE: <the precise reason the check fails>\n\
+FIX: <where and what must change, described conceptually — NOT verbatim code you cannot compile-check>\n\
+PLAN: <the concrete remaining steps to finish the GOAL, including the step that makes the feature \
+actually work at runtime, not merely compile>";
+
 /// Run the read-only debugger sub-agent against a blocking check failure.
 /// Returns its diagnosis report (to inject into the primary agent), or `None`
 /// if it produced nothing usable. It makes **no edits** — the report is the
@@ -81,6 +122,7 @@ the real signatures. Do not edit anything.";
 #[allow(clippy::too_many_arguments)]
 pub async fn run_debugger(
     failure_output: &str,
+    goal: &str,
     config: &Config,
     llm_worker: &LlmWorkerHandle,
     _tool_pool: &ToolWorkerPool,
@@ -96,9 +138,21 @@ pub async fn run_debugger(
     let changed = changed_files(config);
     // Minimal, debugger-only context — NOT context::assemble (which would
     // inject the full plan-first/edit ceremony, see DEBUGGER_SYSTEM_PROMPT).
+    let system_prompt = if config.tools.debugger_judge {
+        DEBUGGER_JUDGE_PROMPT
+    } else {
+        DEBUGGER_SYSTEM_PROMPT
+    };
+    // The judge needs the whole diff to see off-path-ness; the plain
+    // diagnostician stays failure-location-focused (empty diff).
+    let diff = if config.tools.debugger_judge {
+        changed_diff(config, 500)
+    } else {
+        String::new()
+    };
     let mut messages = vec![
-        Message::system(DEBUGGER_SYSTEM_PROMPT),
-        Message::user(&build_prompt(failure_output, &changed)),
+        Message::system(system_prompt),
+        Message::user(&build_prompt(goal, failure_output, &changed, &diff)),
     ];
     let mut report = String::new();
 
@@ -281,7 +335,7 @@ fn parse_porcelain(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-fn build_prompt(failure_output: &str, changed: &[String]) -> String {
+fn build_prompt(goal: &str, failure_output: &str, changed: &[String], diff: &str) -> String {
     let files = if changed.is_empty() {
         "(could not list changed files — use file(action='search') to locate the relevant code)"
             .to_string()
@@ -292,18 +346,64 @@ fn build_prompt(failure_output: &str, changed: &[String]) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    // The JUDGE needs the WHOLE diff to assess on-path-ness — investigating only
+    // the failing location makes it myopic (it sees a small local fix and votes
+    // CONTINUE even when the overall attempt is off-path). Empty for the plain
+    // diagnostician, which is deliberately failure-location-focused.
+    let diff_section = if diff.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nThe FULL diff of the changes so far (vs the clean original) — review ALL of it to \
+             judge whether the work is on-path for the GOAL, not just the failing spot:\n\
+             ```diff\n{diff}\n```\n"
+        )
+    };
 
     format!(
-        "A verification check is BLOCKING task completion. It failed with this output:\n\
+        "GOAL (the task the agent is trying to accomplish):\n\
+         {goal}\n\
+         \n\
+         A verification check is BLOCKING task completion. It failed with this output:\n\
          ----------------------------------------\n\
          {failure_output}\n\
          ----------------------------------------\n\
          \n\
          Files changed so far this session:\n\
          {files}\n\
+         {diff_section}\
          \n\
-         Investigate the cause and produce your ROOT CAUSE + FIX report."
+         Investigate the cause, then act per your instructions."
     )
+}
+
+/// The full working-tree diff vs the session baseline commit, capped to keep the
+/// sub-agent prompt bounded. Lets the JUDGE see the whole scope of changes (not
+/// just the failing location) to assess on-path-ness. Empty on error.
+fn changed_diff(config: &Config, max_lines: usize) -> String {
+    let Ok(out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&config.project_root)
+        .args(["diff", "--no-color"])
+        .output()
+    else {
+        return String::new();
+    };
+    if !out.status.success() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() > max_lines {
+        let mut s = lines[..max_lines].join("\n");
+        s.push_str(&format!(
+            "\n… (diff truncated at {max_lines} of {} lines)",
+            lines.len()
+        ));
+        s
+    } else {
+        text.into_owned()
+    }
 }
 
 #[cfg(test)]
@@ -384,10 +484,15 @@ mod tests {
 
     #[test]
     fn build_prompt_carries_failure_and_files() {
-        let p = build_prompt("EXPECTED foo GOT bar", &["src/a.rs".to_string()]);
+        let p = build_prompt(
+            "BUILD A WIDGET",
+            "EXPECTED foo GOT bar",
+            &["src/a.rs".to_string()],
+            "",
+        );
         assert!(p.contains("EXPECTED foo GOT bar"));
         assert!(p.contains("src/a.rs"));
-        assert!(p.contains("ROOT CAUSE"));
+        assert!(p.contains("BUILD A WIDGET"));
     }
 
     #[test]
@@ -402,7 +507,7 @@ mod tests {
 
     #[test]
     fn build_prompt_handles_no_changed_files() {
-        let p = build_prompt("boom", &[]);
+        let p = build_prompt("goal", "boom", &[], "");
         assert!(p.contains("could not list changed files"));
     }
 }
