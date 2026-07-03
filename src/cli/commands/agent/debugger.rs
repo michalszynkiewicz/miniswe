@@ -115,10 +115,64 @@ FIX: <where and what must change, described conceptually — NOT verbatim code y
 PLAN: <the concrete remaining steps to finish the GOAL, including the step that makes the feature \
 actually work at runtime, not merely compile>";
 
+/// The debugger's JUDGE+REWIND prompt (`tools.debugger_judge_rewind`, requires
+/// `debugger_judge`): used INSTEAD of `DEBUGGER_JUDGE_PROMPT` only when a
+/// mechanical scan (`find_rewind_candidate`) found a single-file rewind
+/// candidate. A tier-1 probe found the judge basically never proposes a
+/// targeted revert itself even when explicitly offered the option and shown
+/// the full revision tables (0/24) — but given a MECHANICALLY computed
+/// candidate and asked only to accept or reject it, hit rate rose to 13/24.
+/// So the candidate is computed in code and named here; the model only picks.
+const DEBUGGER_JUDGE_REWIND_PROMPT: &str = "\
+You are a READ-ONLY analyst with fresh eyes on a STUCK coding task. You have ONLY \
+read/search/inspect tools — you CANNOT edit files, run shell, set a plan, or use a scratchpad. \
+Do NOT plan and do NOT try to edit.\n\
+Investigate the failure and the changes made so far. A mechanical scan of the edit history has \
+already found ONE candidate: a specific file that regressed from a much cleaner earlier revision \
+to its current, more broken state (shown below, under CANDIDATE REWIND POINT). You do not need to \
+find it yourself — decide whether taking it is the right move.\n\
+Choose EXACTLY ONE:\n\
+(a) RESET — the damage is not limited to that one file; the whole attempt is misdirected or \
+damaged everywhere, and reverting the ENTIRE tree to the clean original and starting fresh would \
+be faster and more reliable. IGNORE effort already spent.\n\
+(b) REWIND — the candidate is correct: reverting JUST that file to the proposed revision recovers \
+real progress, and the rest of the tree (outside that file) is fine or close to fine as it stands.\n\
+(c) CONTINUE — no revert is needed anywhere; the current state (including that file as-is) is on \
+the path to the GOAL and only a focused forward fix remains. A high current error count or a \
+compile failure is evidence AGAINST this option, not something to wave away as \"simple\" — the \
+same forward-fix instinct already failed once to reach this diagnosis.\n\
+Output your choice on the FIRST line, exactly one of:\n\
+CHOICE: (a)\n\
+CHOICE: (b)\n\
+CHOICE: (c)\n\
+Then one line — REASON: <the single most important reason>.\n\
+If (a): STOP after REASON.\n\
+If (b): STOP after REASON — the loop performs the revert, you do not.\n\
+If (c): produce the recovery report the main agent will apply —\n\
+ROOT CAUSE: <the precise reason the check fails>\n\
+FIX: <where and what must change, described conceptually — NOT verbatim code you cannot compile-check>\n\
+PLAN: <the concrete remaining steps to finish the GOAL, including the step that makes the feature \
+actually work at runtime, not merely compile>";
+
+/// What the debugger sub-agent decided the primary agent (or the loop)
+/// should do next.
+#[derive(Debug, Clone)]
+pub enum DebuggerVerdict {
+    /// Inject this text for the primary agent: a diagnosis report (plain
+    /// mode), a judge CONTINUE, or a judge (c) after a rewind was offered
+    /// and declined.
+    Report(String),
+    /// Judge voted SCRAP, or (a) RESET in rewind mode: the loop reverts the
+    /// WHOLE tree and restarts.
+    Scrap,
+    /// Judge voted (b) REWIND: the loop reverts JUST this one file to the
+    /// mechanically-computed candidate revision.
+    Rewind(tools::RewindCandidate),
+}
+
 /// Run the read-only debugger sub-agent against a blocking check failure.
-/// Returns its diagnosis report (to inject into the primary agent), or `None`
-/// if it produced nothing usable. It makes **no edits** — the report is the
-/// entire deliverable.
+/// It makes **no edits** — its output is a verdict for the loop to execute
+/// (SCRAP/Rewind) or a report to inject (Report).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_debugger(
     failure_output: &str,
@@ -133,12 +187,27 @@ pub async fn run_debugger(
     fast_revisions: &Option<Arc<tools::RevisionStore>>,
     fast_baseline_errors: usize,
     cancelled: &Arc<AtomicBool>,
-) -> Option<String> {
+) -> DebuggerVerdict {
     let tool_defs = readonly_tools(parent_tool_defs);
     let changed = changed_files(config);
+
+    // Mechanically find a single-file rewind candidate (opt-in, requires the
+    // judge). A free-form "notice AND name it" ask scored 0/24 in a tier-1
+    // probe; computing it in code and narrowing the ask to accept/reject
+    // raised that to 13/24 — see `tools::find_rewind_candidate`.
+    let candidate = if config.tools.debugger_judge && config.tools.debugger_judge_rewind {
+        fast_revisions
+            .as_deref()
+            .and_then(|revs| tools::find_rewind_candidate(&changed, revs))
+    } else {
+        None
+    };
+
     // Minimal, debugger-only context — NOT context::assemble (which would
     // inject the full plan-first/edit ceremony, see DEBUGGER_SYSTEM_PROMPT).
-    let system_prompt = if config.tools.debugger_judge {
+    let system_prompt = if candidate.is_some() {
+        DEBUGGER_JUDGE_REWIND_PROMPT
+    } else if config.tools.debugger_judge {
         DEBUGGER_JUDGE_PROMPT
     } else {
         DEBUGGER_SYSTEM_PROMPT
@@ -150,10 +219,16 @@ pub async fn run_debugger(
     } else {
         String::new()
     };
-    let mut messages = vec![
-        Message::system(system_prompt),
-        Message::user(&build_prompt(goal, failure_output, &changed, &diff)),
-    ];
+    let mut user_prompt = build_prompt(goal, failure_output, &changed, &diff);
+    if let Some(ref c) = candidate {
+        user_prompt.push_str(&format!(
+            "\n\nCANDIDATE REWIND POINT: {} rev_{} (ast=ok, file_errors={}) — the file's CURRENT \
+             state (file_errors={}) is a regression from this revision, reached via edits that \
+             were never reverted.",
+            c.path, c.rev, c.file_errors_then, c.file_errors_now
+        ));
+    }
+    let mut messages = vec![Message::system(system_prompt), Message::user(&user_prompt)];
     let mut report = String::new();
 
     for _round in 0..MAX_DEBUGGER_ROUNDS {
@@ -229,7 +304,35 @@ pub async fn run_debugger(
     }
 
     let report = report.trim().to_string();
-    (!report.is_empty()).then_some(report)
+    if report.is_empty() {
+        return DebuggerVerdict::Report("(the debugger produced no diagnosis)".to_string());
+    }
+    parse_verdict(&report, candidate)
+}
+
+/// Interpret the debugger's raw text into a structured verdict. Only the
+/// first few lines are inspected for the decision marker — the rest is the
+/// report body, injected verbatim by the caller when it's a `Report`.
+fn parse_verdict(report: &str, candidate: Option<tools::RewindCandidate>) -> DebuggerVerdict {
+    let head: String = report
+        .lines()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if let Some(cand) = candidate {
+        if head.contains("choice") && head.contains("(a)") {
+            return DebuggerVerdict::Scrap;
+        }
+        if head.contains("choice") && head.contains("(b)") {
+            return DebuggerVerdict::Rewind(cand);
+        }
+        return DebuggerVerdict::Report(report.to_string());
+    }
+    if head.contains("decision") && head.contains("scrap") {
+        return DebuggerVerdict::Scrap;
+    }
+    DebuggerVerdict::Report(report.to_string())
 }
 
 /// Drain one streamed LLM call to a single response. `None` on error/abort.
@@ -509,5 +612,59 @@ mod tests {
     fn build_prompt_handles_no_changed_files() {
         let p = build_prompt("goal", "boom", &[], "");
         assert!(p.contains("could not list changed files"));
+    }
+
+    fn candidate() -> tools::RewindCandidate {
+        tools::RewindCandidate {
+            path: "src/f.rs".to_string(),
+            rev: 4,
+            file_errors_now: 31,
+            file_errors_then: 1,
+        }
+    }
+
+    #[test]
+    fn parse_verdict_binary_scrap() {
+        let v = parse_verdict("DECISION: SCRAP\nREASON: off-path", None);
+        assert!(matches!(v, DebuggerVerdict::Scrap));
+    }
+
+    #[test]
+    fn parse_verdict_binary_continue_is_a_report() {
+        let v = parse_verdict("DECISION: CONTINUE\nROOT CAUSE: x", None);
+        assert!(matches!(v, DebuggerVerdict::Report(s) if s.contains("ROOT CAUSE")));
+    }
+
+    #[test]
+    fn parse_verdict_rewind_choice_a_is_scrap() {
+        let v = parse_verdict(
+            "CHOICE: (a)\nREASON: everywhere is broken",
+            Some(candidate()),
+        );
+        assert!(matches!(v, DebuggerVerdict::Scrap));
+    }
+
+    #[test]
+    fn parse_verdict_rewind_choice_b_is_rewind_with_the_candidate() {
+        let v = parse_verdict("CHOICE: (b)\nREASON: take it", Some(candidate()));
+        match v {
+            DebuggerVerdict::Rewind(c) => assert_eq!(c, candidate()),
+            other => panic!("expected Rewind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_verdict_rewind_choice_c_is_a_report() {
+        let v = parse_verdict("CHOICE: (c)\nROOT CAUSE: y", Some(candidate()));
+        assert!(matches!(v, DebuggerVerdict::Report(s) if s.contains("ROOT CAUSE")));
+    }
+
+    #[test]
+    fn rewind_prompt_offers_all_three_choices_and_forbids_edits() {
+        assert!(DEBUGGER_JUDGE_REWIND_PROMPT.contains("READ-ONLY"));
+        assert!(DEBUGGER_JUDGE_REWIND_PROMPT.contains("CANNOT edit"));
+        assert!(DEBUGGER_JUDGE_REWIND_PROMPT.contains("CHOICE: (a)"));
+        assert!(DEBUGGER_JUDGE_REWIND_PROMPT.contains("CHOICE: (b)"));
+        assert!(DEBUGGER_JUDGE_REWIND_PROMPT.contains("CHOICE: (c)"));
     }
 }

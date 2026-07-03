@@ -30,7 +30,7 @@ TASK="Add a CLI flag --system-prompt-override (short: -s) that takes a string an
 LLAMA_ENDPOINT="${LLAMA_ENDPOINT:-http://localhost:8464}"
 MODEL="gemma-4-26B-A4B-it"
 
-FIXTURE=""; RUNS=3; TIMEOUT=1800
+FIXTURE=""; RUNS=3; TIMEOUT=1800; FROM_SCRATCH=""
 ARMS=(control temp00 temp035 debugger revert_green)
 MAX_ROUNDS="${MAX_ROUNDS:-80}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
@@ -39,6 +39,7 @@ while [[ $# -gt 0 ]]; do
         --runs)    RUNS="$2";    shift 2 ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
         --arms)    IFS=' ' read -ra ARMS <<< "$2"; shift 2 ;;
+        --from-scratch) FROM_SCRATCH=1; shift ;;
         --max-rounds)  MAX_ROUNDS="$2";  shift 2 ;;
         --max-retries) MAX_RETRIES="$2"; shift 2 ;;
         -*) echo "Unknown: $1" >&2; exit 1 ;;
@@ -101,6 +102,8 @@ gen_config() {  # $1 = arm
         replan)       temp="0.2"; tools_extra="gate_replan = true" ;;
         restart)      temp="0.2"; tools_extra="gate_restart = true" ;;
         judge)        temp="0.2"; tools_extra="debugger_judge = true" ;;
+        judge_mf)     temp="0.2"; tools_extra=$'debugger_judge = true\ndebugger_multifire = true' ;;
+        judge_rewind) temp="0.2"; tools_extra=$'debugger_judge = true\ndebugger_judge_rewind = true' ;;
     esac
 cat <<TOML
 [model]
@@ -142,6 +145,7 @@ CONTAINER_SCRIPT=$(cat <<'SCRIPT'
 set -uo pipefail
 TIMEOUT="$1"
 TASK="$2"
+FROM_SCRATCH="$3"
 cd /work
 cp -a /fixture/tree/. /work/           # CLEAN baseline tree
 rm -rf target .miniswe
@@ -154,11 +158,17 @@ mkdir -p .miniswe/logs
 git config --global --add safe.directory /work
 git init -q && git add -A && git commit -q -m baseline 2>/dev/null
 
-echo "=== REPLAY (resume from captured context; corruption applied post-snapshot) ==="
-timeout "$TIMEOUT" miniswe --yes "$TASK" \
-    --replay-context /fixture/context.json \
-    --replay-apply /fixture/corruption.patch \
-    > /output/stdout.txt 2> /output/stderr.txt || true
+if [ "$FROM_SCRATCH" = "1" ]; then
+  echo "=== FROM-SCRATCH (clean baseline + task, no replay/corruption) ==="
+  timeout "$TIMEOUT" miniswe --yes "$TASK" \
+      > /output/stdout.txt 2> /output/stderr.txt || true
+else
+  echo "=== REPLAY (resume from captured context; corruption applied post-snapshot) ==="
+  timeout "$TIMEOUT" miniswe --yes "$TASK" \
+      --replay-context /fixture/context.json \
+      --replay-apply /fixture/corruption.patch \
+      > /output/stdout.txt 2> /output/stderr.txt || true
+fi
 
 git diff > /output/diff.patch 2>/dev/null || true
 git diff --name-only > /output/changed_files.txt 2>/dev/null || true
@@ -192,7 +202,7 @@ run_one() {  # $1=arm $2=run
         -v "$tmp:/run.sh:ro" \
         -e MINISWE_LLM_DUMP_DIR=/output/llm_dumps \
         --name "$cname" "$IMAGE_NAME" \
-        bash /run.sh "$TIMEOUT" "$TASK" > "$vdir/container.log" 2>&1 || true
+        bash /run.sh "$TIMEOUT" "$TASK" "$FROM_SCRATCH" > "$vdir/container.log" 2>&1 || true
     echo $(( $(date +%s) - t0 )) > "$vdir/wall_s.txt"
     rm -f "$tmp"; ACTIVE_CONTAINER=""
     local res; res=$(grep -oE "=== FINAL: [0-9]+/[0-9]+" "$vdir/container.log" 2>/dev/null | tail -1 | grep -oE "[0-9]+/[0-9]+" || echo "?/?")

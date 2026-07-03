@@ -56,20 +56,103 @@ fn changed_paths_in_patch(patch: &std::path::Path) -> Vec<String> {
 
 /// Stable signature of a gate failure, used by `debugger_multifire` to decide
 /// whether the failure CHANGED since the last diagnosis (so the debugger walks
-/// compile→smoke rather than re-diagnosing the same failure). The validation
-/// command leads each failure mode with a distinct line ("DOES NOT COMPILE:" vs
-/// "COMPILES but override NOT consumed…"), so the first non-empty line is a
-/// good discriminator; lowercased + truncated to absorb variable tails.
+/// compile→smoke rather than re-diagnosing the same failure). Using only the
+/// first line breaks this for commands that wrap every failure in a constant
+/// banner (e.g. `echo "DOES NOT COMPILE:"; echo "$out" | tail -20`) — every
+/// compile error then hashes to the identical string, so multifire silently
+/// refuses to refire when the underlying error actually changed. Join enough
+/// of the (non-empty) output to reach past such banners into the real detail.
 fn failure_key(output: &str) -> String {
-    output
+    let joined = output
         .lines()
         .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("")
-        .to_ascii_lowercase()
-        .chars()
-        .take(80)
-        .collect()
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    joined.to_ascii_lowercase().chars().take(400).collect()
+}
+
+#[cfg(test)]
+mod failure_key_tests {
+    use super::failure_key;
+
+    #[test]
+    fn distinguishes_different_errors_behind_the_same_banner() {
+        let a = "DOES NOT COMPILE:\nerror[E0599]: no method named `call_chat`\n --> src/cli/commands/run.rs:222:41";
+        let b = "DOES NOT COMPILE:\nerror[E0382]: borrow of partially moved value: `system_prompt_override`\n --> src/context/mod.rs:306:8";
+        assert_ne!(failure_key(a), failure_key(b));
+    }
+
+    #[test]
+    fn treats_the_same_error_as_the_same_key() {
+        let a = "DOES NOT COMPILE:\nerror[E0382]: borrow of partially moved value: `x`\n --> src/context/mod.rs:306:8";
+        let b = "DOES NOT COMPILE:\nerror[E0382]: borrow of partially moved value: `x`\n --> src/context/mod.rs:306:8";
+        assert_eq!(failure_key(a), failure_key(b));
+    }
+
+    #[test]
+    fn ignores_blank_lines_and_case() {
+        let a = "\n\nDOES NOT COMPILE:\n\nError[E0308]\n";
+        let b = "DOES NOT COMPILE:\nerror[e0308]";
+        assert_eq!(failure_key(a), failure_key(b));
+    }
+}
+
+/// Execute the debugger's proposed single-file rewind (`tools.
+/// debugger_judge_rewind`) and build the message to inject afterward.
+/// Best-effort, matching the codebase's other auto-recovery guards: on
+/// failure the tree is left as-is and the model just sees the original
+/// verification failure, no different from a plain Report verdict.
+#[allow(clippy::too_many_arguments)]
+async fn rewind_message(
+    candidate: &tools::RewindCandidate,
+    config: &Config,
+    perms: &Arc<PermissionManager>,
+    lsp_client: &Option<Arc<LspClient>>,
+    fast_revisions: &Option<Arc<tools::RevisionStore>>,
+    fast_baseline_errors: usize,
+    output: &str,
+) -> Message {
+    let Some(revisions) = fast_revisions.as_deref() else {
+        return Message::user(&format!(
+            "[Verification failed — do NOT finish yet. Check output:\n{output}]"
+        ));
+    };
+    let args = serde_json::json!({"path": candidate.path, "rev": candidate.rev});
+    let ok = tools::execute_fast_tool(
+        "revert",
+        &args,
+        config,
+        perms.as_ref(),
+        lsp_client.as_deref(),
+        revisions,
+        fast_baseline_errors,
+    )
+    .await
+    .is_ok_and(|r| r.success);
+
+    if ok {
+        tui::print_status(&format!(
+            "[debugger-judge] REWIND — reverted {} to rev_{} (file_errors {} → {})",
+            candidate.path, candidate.rev, candidate.file_errors_now, candidate.file_errors_then
+        ));
+        Message::user(&format!(
+            "[A read-only debugger with fresh eyes found that {} had regressed from a much \
+             cleaner earlier revision. The loop has ALREADY reverted it to rev_{} for you \
+             (file_errors {} → {}) — do NOT redo the discarded edits the same way. Re-read the \
+             file to see its current (reverted) content, then continue the plan, fixing the \
+             remaining problem differently. Everything outside this file is untouched.]",
+            candidate.path, candidate.rev, candidate.file_errors_now, candidate.file_errors_then
+        ))
+    } else {
+        tui::print_status(&format!(
+            "[debugger-judge] REWIND — revert of {} to rev_{} failed; continuing without it",
+            candidate.path, candidate.rev
+        ));
+        Message::user(&format!(
+            "[Verification failed — do NOT finish yet. Check output:\n{output}]"
+        ))
+    }
 }
 
 /// Run the agent for a single message.
@@ -410,7 +493,7 @@ pub async fn run(
     let mut last_green_round: usize = 0;
     let mut red_streak: usize = 0;
 
-    loop {
+    'round: loop {
         if had_error {
             break;
         }
@@ -843,7 +926,7 @@ pub async fn run(
                                 tui::print_status(
                                     "Still failing — spinning up a fresh-context debugger sub-agent…",
                                 );
-                                let report = debugger::run_debugger(
+                                let verdict = debugger::run_debugger(
                                     &output,
                                     message,
                                     &config,
@@ -858,64 +941,76 @@ pub async fn run(
                                     &cancelled,
                                 )
                                 .await;
-                                let body = report.unwrap_or_else(|| {
-                                    "(the debugger produced no diagnosis)".to_string()
-                                });
 
-                                // Debugger-as-judge: if it voted SCRAP, the LOOP
-                                // executes the restart (revert tree to clean
-                                // baseline + reset context) — the stuck agent never
-                                // decides. Fires once. Anything else = CONTINUE →
-                                // inject its diagnosis + plan for the main agent.
-                                let scrap = config.tools.debugger_judge
-                                    && !restart_fired
-                                    && body.lines().take(3).any(|l| {
-                                        let u = l.to_ascii_uppercase();
-                                        u.contains("DECISION") && u.contains("SCRAP")
-                                    });
-                                if scrap {
-                                    restart_fired = true;
-                                    if let Some(ref snap) = snapshots {
-                                        let guard = snap.lock();
-                                        match guard.revert_to_round(0) {
-                                            Ok(m) => tui::print_status(&format!(
-                                                "[debugger-judge] SCRAP — {m}"
-                                            )),
-                                            Err(e) => tui::print_status(&format!(
-                                                "[debugger-judge] SCRAP — tree revert failed: {e}"
-                                            )),
+                                // Debugger-as-judge: SCRAP → the LOOP executes the
+                                // whole-tree restart (the stuck agent never decides);
+                                // Rewind → the loop reverts JUST the one flagged file;
+                                // Report → inject the diagnosis for the main agent.
+                                let msg = match verdict {
+                                    debugger::DebuggerVerdict::Scrap if !restart_fired => {
+                                        restart_fired = true;
+                                        if let Some(ref snap) = snapshots {
+                                            let guard = snap.lock();
+                                            match guard.revert_to_round(0) {
+                                                Ok(m) => tui::print_status(&format!(
+                                                    "[debugger-judge] SCRAP — {m}"
+                                                )),
+                                                Err(e) => tui::print_status(&format!(
+                                                    "[debugger-judge] SCRAP — tree revert failed: {e}"
+                                                )),
+                                            }
                                         }
+                                        // Resync the symbol index / repo-map to the clean
+                                        // baseline after the whole-tree revert (the
+                                        // per-edit reindex path doesn't cover it).
+                                        tools::reindex_project_incremental(&config);
+                                        let _ =
+                                            std::fs::remove_file(config.miniswe_path("plan.md"));
+                                        let _ = std::fs::remove_file(
+                                            config.miniswe_path("scratchpad.md"),
+                                        );
+                                        let assembled = context::assemble(
+                                            &config,
+                                            message,
+                                            &[],
+                                            plan_only,
+                                            mcp_summary.as_deref(),
+                                        );
+                                        messages = assembled.messages;
+                                        conversation_history.clear();
+                                        validation_blocks = 0;
+                                        last_plan_set = false;
+                                        tui::print_status(
+                                            "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
+                                        );
+                                        continue;
                                     }
-                                    // Resync the symbol index / repo-map to the clean
-                                    // baseline after the whole-tree revert (the
-                                    // per-edit reindex path doesn't cover it).
-                                    tools::reindex_project_incremental(&config);
-                                    let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
-                                    let _ =
-                                        std::fs::remove_file(config.miniswe_path("scratchpad.md"));
-                                    let assembled = context::assemble(
-                                        &config,
-                                        message,
-                                        &[],
-                                        plan_only,
-                                        mcp_summary.as_deref(),
-                                    );
-                                    messages = assembled.messages;
-                                    conversation_history.clear();
-                                    validation_blocks = 0;
-                                    last_plan_set = false;
-                                    tui::print_status(
-                                        "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
-                                    );
-                                    continue;
-                                }
-
-                                let msg = Message::user(&format!(
-                                    "[A read-only debugger with fresh eyes investigated the failing \
-                                     check and produced this DIAGNOSIS. It did not edit anything — \
-                                     YOU must apply the fix and finish the plan it lays out:\n{body}\n\
-                                     Make the change(s), then finish; the verification will re-run.]"
-                                ));
+                                    debugger::DebuggerVerdict::Scrap => Message::user(
+                                        "[A fresh-context review voted to reset again, but the \
+                                         tree was already reset once this turn. Keep going: read \
+                                         the current failure carefully and fix it directly.]",
+                                    ),
+                                    debugger::DebuggerVerdict::Rewind(candidate) => {
+                                        rewind_message(
+                                            &candidate,
+                                            &config,
+                                            &perms,
+                                            &lsp_client,
+                                            &fast_revisions,
+                                            fast_baseline_errors,
+                                            &output,
+                                        )
+                                        .await
+                                    }
+                                    debugger::DebuggerVerdict::Report(body) => {
+                                        Message::user(&format!(
+                                            "[A read-only debugger with fresh eyes investigated the failing \
+                                         check and produced this DIAGNOSIS. It did not edit anything — \
+                                         YOU must apply the fix and finish the plan it lays out:\n{body}\n\
+                                         Make the change(s), then finish; the verification will re-run.]"
+                                        ))
+                                    }
+                                };
                                 messages.push(msg.clone());
                                 conversation_history.push(msg);
                                 continue;
@@ -1073,6 +1168,139 @@ pub async fn run(
                         tc.function.name, args_summary
                     ));
                     break;
+                }
+                // Second mutating loop after the recovery hint. With a
+                // behavioral done-gate configured this is NOT a dead end — it
+                // is the same "stuck but the task isn't done" state as a
+                // premature exit, so route it through the gate ladder (block →
+                // debugger/judge at 2 blocks) instead of dying with the whole
+                // recovery stack idle. (Real case: a run died at 70s looping
+                // on a malformed replace_range while gate + judge never ran.)
+                // Without a gate: original behavior — stop the turn.
+                if config.validation.command().is_some()
+                    && validation_blocks < config.validation.max_retries
+                {
+                    tui::print_error(&format!(
+                        "Loop detected again ({}({})) — routing through the done-gate instead of stopping",
+                        tc.function.name, args_summary
+                    ));
+                    if let validation::CheckOutcome::Fail(output) =
+                        validation::run_behavioral_check(&config).await
+                    {
+                        validation_blocks += 1;
+                        // Fresh recovery budget for the rounds the gate grants.
+                        loop_recoveries = 0;
+                        last_call_key = None;
+                        same_call_streak = 0;
+
+                        let fkey = failure_key(&output);
+                        let may_fire = if config.tools.debugger_multifire {
+                            debugger_fires < debugger::MAX_DEBUGGER_FIRES
+                                && last_debugged_failure.as_deref() != Some(fkey.as_str())
+                        } else {
+                            debugger_fires == 0
+                        };
+                        if (config.tools.reactive_debugger || config.tools.debugger_judge)
+                            && may_fire
+                            && validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
+                        {
+                            debugger_fires += 1;
+                            last_debugged_failure = Some(fkey);
+                            tui::print_status(
+                                "Looping + failing gate — spinning up a fresh-context debugger sub-agent…",
+                            );
+                            let verdict = debugger::run_debugger(
+                                &output,
+                                message,
+                                &config,
+                                &llm_worker,
+                                &tool_pool,
+                                &tool_defs,
+                                &perms,
+                                &mcp_registry,
+                                &lsp_client,
+                                &fast_revisions,
+                                fast_baseline_errors,
+                                &cancelled,
+                            )
+                            .await;
+
+                            let msg = match verdict {
+                                debugger::DebuggerVerdict::Scrap if !restart_fired => {
+                                    restart_fired = true;
+                                    if let Some(ref snap) = snapshots {
+                                        let guard = snap.lock();
+                                        match guard.revert_to_round(0) {
+                                            Ok(m) => tui::print_status(&format!(
+                                                "[debugger-judge] SCRAP — {m}"
+                                            )),
+                                            Err(e) => tui::print_status(&format!(
+                                                "[debugger-judge] SCRAP — tree revert failed: {e}"
+                                            )),
+                                        }
+                                    }
+                                    tools::reindex_project_incremental(&config);
+                                    let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+                                    let _ =
+                                        std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+                                    let assembled = context::assemble(
+                                        &config,
+                                        message,
+                                        &[],
+                                        plan_only,
+                                        mcp_summary.as_deref(),
+                                    );
+                                    messages = assembled.messages;
+                                    conversation_history.clear();
+                                    validation_blocks = 0;
+                                    last_plan_set = false;
+                                    tui::print_status(
+                                        "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
+                                    );
+                                    continue 'round;
+                                }
+                                debugger::DebuggerVerdict::Scrap => Message::user(
+                                    "[A fresh-context review voted to reset again, but the tree \
+                                     was already reset once this turn. Keep going: read the \
+                                     current failure carefully and fix it directly.]",
+                                ),
+                                debugger::DebuggerVerdict::Rewind(candidate) => {
+                                    rewind_message(
+                                        &candidate,
+                                        &config,
+                                        &perms,
+                                        &lsp_client,
+                                        &fast_revisions,
+                                        fast_baseline_errors,
+                                        &output,
+                                    )
+                                    .await
+                                }
+                                debugger::DebuggerVerdict::Report(body) => Message::user(&format!(
+                                    "[A read-only debugger with fresh eyes investigated the failing \
+                                     check and produced this DIAGNOSIS. It did not edit anything — \
+                                     YOU must apply the fix and finish the plan it lays out:\n{body}\n\
+                                     Make the change(s), then finish; the verification will re-run.]"
+                                )),
+                            };
+                            messages.push(msg.clone());
+                            conversation_history.push(msg);
+                            continue 'round;
+                        }
+
+                        let msg = Message::user(&format!(
+                            "[Your repeated failing tool call was aborted, and the task is NOT \
+                             done — the verification check failed:\n{output}\nRead the check \
+                             output and your tool errors carefully, fix the SPECIFIC problem, \
+                             and use a correctly-formed call (include every required parameter) \
+                             or a different tool.]"
+                        ));
+                        messages.push(msg.clone());
+                        conversation_history.push(msg);
+                        continue 'round;
+                    }
+                    // Gate passed (or skipped): the loop was on something the
+                    // check doesn't care about — fall through to the stop.
                 }
                 tui::print_error(&format!(
                     "Loop detected again ({}({})) after the recovery hint — stopping this turn",

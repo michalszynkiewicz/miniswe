@@ -432,8 +432,17 @@ pub async fn execute(
             out.push('\n');
         }
     }
+    // Probe-validated wording (moment-replay tier-1, 2026-07-02): the only
+    // variant that produced follow-up callsite edits (0%→14%) and cut the
+    // re-call-add_param loop (17%→11%). Every shorter rewording tested worse —
+    // the NOT-finished framing, explicit tool names, and the re-refactor
+    // prohibition are all load-bearing. Do not compress without re-probing.
     out.push_str(
-        "\nNext: run code(diagnostics) or your build to confirm the project still compiles.",
+        "\nNext: the placeholder callsites above are NOT finished. For each callsite that \
+         must pass a real value: read it, then edit it DIRECTLY with replace_range or \
+         insert_at, replacing the placeholder argument with the real value. Do NOT call \
+         refactor again for this — the parameter already exists and add_param will be \
+         rejected; direct edits are the correct tool for this step.",
     );
 
     // Note: we do NOT auto-revert on partial failure. The user (agent) gets
