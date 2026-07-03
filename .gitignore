@@ -5,4 +5,5 @@ models/
 .env
 **/benchmark_results
 tmp
+scripts/moments/.cache_*
 / /

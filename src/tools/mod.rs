@@ -40,6 +40,7 @@ pub use dispatch::execute_tool;
 pub use edit_orchestration::execute_edit_file_tool;
 pub(crate) use edit_orchestration::reindex_project_incremental;
 pub use fast::{RevisionStore, execute_fast_tool};
+pub(crate) use fast::{RewindCandidate, find_rewind_candidate};
 pub use permissions::PermissionManager;
 pub use refactor::execute_refactor_tool;
 

@@ -245,7 +245,7 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
              - Insert new lines/code -> insert_at\n\
              - Replace or delete existing lines -> replace_range\n\
              - Whole-file rewrite or new file -> write_file\n\
-             For a signature change or rename, {sig_route} updates the definition AND every callsite in ONE call — do NOT hand-edit callsites yourself.\n\
+             For a signature change or rename, {sig_route} updates the definition AND every callsite in ONE call — do NOT hand-edit callsites for the signature change itself.\n\
              Emit ONE tool call per response. Wait for its result before issuing the next one.\n\
              Tool contract: grouped tools require action plus action-specific params.\n\
              file read: {{\"action\":\"read\",\"path\":\"README.md\"}}\n\
@@ -264,7 +264,7 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
              - Insert new lines/code -> insert_at\n\
              - Replace or delete existing lines -> replace_range\n\
              - Whole-file rewrite or new file -> write_file\n\
-             For a signature change or rename, {sig_route} updates the definition AND every callsite in ONE call — do NOT hand-edit callsites yourself, that is exactly what it exists to avoid.\n\
+             For a signature change or rename, {sig_route} updates the definition AND every callsite in ONE call — do NOT hand-edit callsites for the signature change itself.\n\
              Mark a finished step with plan(action='check', step=N); use plan(action='refine') if the work split changed."
         )
     } else {

@@ -73,9 +73,27 @@ pub async fn execute(
     )
     .await;
 
+    // When the revisions being undone broke the parse, the very next edit is
+    // the highest-risk moment: the model tends to resubmit the same block
+    // that broke the file. Probe-validated wording (tier-1 brokenast probe,
+    // 2026-07-02: 12/12 read-loop → 12/12 parse-ok edit) — do not compress
+    // or reword without re-probing.
+    let rows = revisions.list(path);
+    let undid_broken = rows.iter().any(|r| r.number > rev && !r.ast_ok);
+    let target_parses = rows.iter().any(|r| r.number == rev && r.ast_ok);
+
     let header = format!("revert {path} → rev_{rev}: restored");
     let mut out = String::from(&header);
     out.push_str(&fb.text);
+    if undid_broken && target_parses {
+        out.push_str(
+            "\n[hint] Restored to a parsing state. Previous whole-block rewrites \
+             of this file kept breaking it — now make the SMALLEST possible edit: \
+             change only the 1-3 lines that must differ (replace_range on a narrow \
+             range, or insert_at), keeping braces balanced. Do NOT resubmit the \
+             whole block.",
+        );
+    }
     Ok(ToolResult::ok(out))
 }
 
@@ -241,6 +259,65 @@ mod tests {
             .unwrap();
         assert!(!r.success);
         assert!(r.content.contains("rev"));
+    }
+
+    #[tokio::test]
+    async fn revert_over_broken_revisions_appends_smallest_edit_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = scratch_config(tmp.path());
+        let p = tmp.path().join("f.rs");
+        std::fs::write(&p, "fn a() {}\n").unwrap();
+        let store = RevisionStore::with_cap(20);
+
+        store.ensure_pristine("f.rs", "fn a() {}\n").unwrap();
+        let mut broken = rec_args("replace_range", "replace_range L1-1");
+        broken.ast_ok = false;
+        broken.ast_error = Some("L1:1: syntax error".to_string());
+        store.record("f.rs", "fn a() {\n", broken).unwrap();
+        std::fs::write(&p, "fn a() {\n").unwrap();
+
+        let r = run(
+            serde_json::json!({ "path": "f.rs", "rev": 0 }),
+            &cfg,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert!(r.success, "{}", r.content);
+        assert!(
+            r.content.contains("SMALLEST possible edit"),
+            "hint should fire when undone revisions broke the parse: {}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn revert_over_clean_revisions_has_no_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = scratch_config(tmp.path());
+        let p = tmp.path().join("f.rs");
+        std::fs::write(&p, "a\n").unwrap();
+        let store = RevisionStore::with_cap(20);
+
+        store.ensure_pristine("f.rs", "a\n").unwrap();
+        store
+            .record("f.rs", "b\n", rec_args("replace_range", "r1"))
+            .unwrap();
+        std::fs::write(&p, "b\n").unwrap();
+
+        let r = run(
+            serde_json::json!({ "path": "f.rs", "rev": 0 }),
+            &cfg,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert!(r.success, "{}", r.content);
+        assert!(
+            !r.content.contains("SMALLEST possible edit"),
+            "hint must not fire when undone revisions parsed fine: {}",
+            r.content
+        );
     }
 
     #[tokio::test]

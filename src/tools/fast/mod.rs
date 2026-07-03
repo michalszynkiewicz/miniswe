@@ -32,6 +32,7 @@ mod dispatch;
 mod feedback;
 mod lines;
 mod revisions;
+mod rewind_candidate;
 
 mod check;
 mod insert_at;
@@ -42,3 +43,4 @@ mod show_rev;
 pub use dispatch::execute_fast_tool;
 pub use feedback::project_error_count;
 pub use revisions::{RecordArgs, RevisionStore};
+pub use rewind_candidate::{RewindCandidate, find_rewind_candidate};
