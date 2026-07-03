@@ -38,18 +38,14 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "refactor".into(),
                 description: "ATOMIC multi-file refactor — updates the definition AND every callsite \
-                    in one call. Use this WHENEVER the task is:\n\
-                    • adding a parameter (e.g. 'add a flag', 'add a context arg', 'extend signature with X')\n\
-                    • removing a parameter\n\
-                    • renaming a function, method, type, or variable across the codebase\n\
+                    in one call. Use it to add/remove a parameter (e.g. 'add a flag', 'extend signature \
+                    with X') or rename a function/method/type/variable across the codebase — do NOT \
+                    hand-edit callsites one by one with replace_range/insert_at for these tasks.\n\
                     \n\
-                    DO NOT enumerate or edit callsites yourself with replace_range/insert_at for these \
-                    tasks — that's manual, error-prone, and the exact thing this tool exists to avoid. \
-                    One refactor call is faster and atomic.\n\
+                    For add_param, `callsite_fill_in` is a placeholder — callsites that must pass a \
+                    real value need a follow-up edit after the call.\n\
                     \n\
-                    Target is resolved by `name` via LSP, so exact line/column isn't needed. \
-                    Actions: add_param, drop_param, rename. Use action='help' for parameter details \
-                    and worked examples.".into(),
+                    Actions: add_param, drop_param, rename; action='help' shows worked examples.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -62,7 +58,7 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
                         "line": { "type": "integer", "description": "1-based line hint. For add_param/drop_param: optional, disambiguates when multiple methods share `name`. For rename: required — line where `name` appears." },
                         "new_param": { "type": "string", "description": "For add_param: the new parameter declaration as it should appear in the signature, e.g. 'system_prompt_override: Option<&str>'" },
                         "position": { "type": "string", "description": "For add_param: where to insert. Either 'start' or 'after:<existing_param_name>'. Use after:<last_param> to append at the end." },
-                        "callsite_fill_in": { "type": "string", "description": "For add_param: the literal expression to insert at every existing callsite, e.g. 'None'" },
+                        "callsite_fill_in": { "type": "string", "description": "For add_param: the literal expression to insert at every existing callsite, e.g. 'None'. A placeholder only — callsites that should pass a real value still need a follow-up edit (plan those first)." },
                         "param": { "type": "string", "description": "For drop_param: the name of the parameter to remove" },
                         "new_name": { "type": "string", "description": "For rename: the new symbol name" }
                     },

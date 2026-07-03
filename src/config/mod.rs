@@ -529,6 +529,16 @@ pub struct ToolsConfig {
     /// stuck agent never has to decide). Fires once per turn; needs a
     /// `[validation]` command. `false` (default). A/B only.
     pub debugger_judge: bool,
+    /// EXPERIMENTAL. Requires `debugger_judge`. Adds a third option next to
+    /// SCRAP/CONTINUE: when a mechanical scan of the revision store finds one
+    /// changed file that regressed from a near-clean earlier revision (see
+    /// `tools::find_rewind_candidate`), the judge is offered REWIND — revert
+    /// JUST that file to the proposed revision, leaving the rest of the tree
+    /// untouched. A free-form version (ask the judge to notice AND name the
+    /// file+revision itself) scored 0/24 in a tier-1 replay probe; computing
+    /// the candidate mechanically and narrowing the ask to accept/reject it
+    /// raised that to 13/24. `false` (default). A/B only.
+    pub debugger_judge_rewind: bool,
 }
 
 /// Agent ceremony level — see `ToolsConfig::ceremony`.
@@ -590,6 +600,7 @@ impl Default for ToolsConfig {
             gate_replan: false,
             gate_restart: false,
             debugger_judge: false,
+            debugger_judge_rewind: false,
         }
     }
 }
