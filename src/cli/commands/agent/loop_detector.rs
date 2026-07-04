@@ -10,6 +10,41 @@ pub fn loop_call_key(tool_name: &str, args: &serde_json::Value) -> String {
     format!("{tool_name}:{}", canonical_json(args))
 }
 
+/// Repetitions of an alternating A/B pair that constitute a period-2 loop —
+/// the detection window is `2 * PERIOD2_REPS` calls (A,B,A,B,A,B).
+pub const PERIOD2_REPS: usize = 3;
+
+/// Detect a period-2 cycle at the END of the call-key history: the last
+/// `2 * PERIOD2_REPS` keys alternate A,B,A,B,A,B with A != B.
+///
+/// The consecutive-identical detector is structurally blind to this shape —
+/// an alternating pair resets its streak to 1 every round. Observed killing
+/// real bench runs: a byte-identical `replace_range` that breaks the AST,
+/// followed by `revert` to the same rev, re-issued 130+ times until the
+/// wall-clock died (observation-masking arm, 2026-07-03 matrix).
+pub fn is_period2_cycle(history: &[String]) -> bool {
+    let need = 2 * PERIOD2_REPS;
+    if history.len() < need {
+        return false;
+    }
+    let tail = &history[history.len() - need..];
+    let (a, b) = (&tail[0], &tail[1]);
+    if a == b {
+        return false; // period-1 streak — the consecutive detector owns that
+    }
+    tail.iter().step_by(2).all(|k| k == a) && tail.iter().skip(1).step_by(2).all(|k| k == b)
+}
+
+/// Whether a stored call key (from `loop_call_key`) refers to a mutating
+/// call. Used to judge a period-2 cycle by BOTH its members — an edit↔read
+/// alternation is still a harmful loop even when the current call is the
+/// read half.
+pub fn key_is_mutating(key: &str) -> bool {
+    let (name, json) = key.split_once(':').unwrap_or((key, "{}"));
+    let args: serde_json::Value = serde_json::from_str(json).unwrap_or(serde_json::json!({}));
+    is_mutating_call(name, &args)
+}
+
 /// True if the tool call mutates state (file contents, revision table,
 /// plan, scratchpad, etc.). Three identical mutating calls in a row are a
 /// real loop worth aborting. Three identical read-only calls are just
@@ -182,5 +217,56 @@ mod tests {
     #[test]
     fn unknown_tool_treated_as_mutating_for_safety() {
         assert!(is_mutating_call("brand_new_tool", &json!({})));
+    }
+
+    fn keys(seq: &[&str]) -> Vec<String> {
+        seq.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn period2_cycle_detected_on_alternating_pair() {
+        let h = keys(&["a", "b", "a", "b", "a", "b"]);
+        assert!(is_period2_cycle(&h));
+    }
+
+    #[test]
+    fn period2_detects_at_tail_of_longer_history() {
+        let h = keys(&["x", "y", "z", "a", "b", "a", "b", "a", "b"]);
+        assert!(is_period2_cycle(&h));
+    }
+
+    #[test]
+    fn period2_not_detected_below_three_repetitions() {
+        let h = keys(&["a", "b", "a", "b"]);
+        assert!(!is_period2_cycle(&h));
+    }
+
+    #[test]
+    fn period2_rejects_identical_pair_as_period1() {
+        // a,a,a,a,a,a is a streak, not a cycle — the consecutive detector owns it.
+        let h = keys(&["a", "a", "a", "a", "a", "a"]);
+        assert!(!is_period2_cycle(&h));
+    }
+
+    #[test]
+    fn period2_rejects_broken_alternation() {
+        let h = keys(&["a", "b", "a", "b", "b", "a"]);
+        assert!(!is_period2_cycle(&h));
+    }
+
+    #[test]
+    fn key_is_mutating_parses_stored_keys() {
+        assert!(key_is_mutating(&loop_call_key(
+            "replace_range",
+            &json!({"path": "x.rs", "start": 1, "end": 2, "content": "y"})
+        )));
+        assert!(key_is_mutating(&loop_call_key(
+            "revert",
+            &json!({"path": "x.rs", "rev": 3})
+        )));
+        assert!(!key_is_mutating(&loop_call_key(
+            "file",
+            &json!({"action": "read", "path": "x.rs"})
+        )));
     }
 }
