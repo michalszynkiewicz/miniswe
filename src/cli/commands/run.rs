@@ -20,11 +20,13 @@ use anyhow::Result;
 use crate::cli::commands::agent::debugger;
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
-    PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
+    PERIOD2_LOOP_HINT, PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
     PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE, is_file_write, is_prunable_refactor_failure,
     loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
 };
-use crate::cli::commands::agent::loop_detector::{is_mutating_call, loop_call_key};
+use crate::cli::commands::agent::loop_detector::{
+    is_mutating_call, is_period2_cycle, key_is_mutating, loop_call_key,
+};
 use crate::cli::commands::agent::spiral;
 use crate::cli::commands::agent::validation;
 use crate::config::{Config, EditMode, ModelRole};
@@ -325,6 +327,10 @@ pub async fn run(
     // Track consecutive identical tool calls for loop detection
     let mut last_call_key: Option<String> = None;
     let mut same_call_streak = 0u32;
+    // Short rolling history of call keys for period-2 cycle detection
+    // (edit↔revert oscillation — invisible to the consecutive detector,
+    // which resets its streak on every alternation).
+    let mut recent_call_keys: Vec<String> = Vec::new();
     // Number of distinct loops the model has been pulled out of in this
     // turn. We give one recovery; a second loop ends the turn for real.
     let mut loop_recoveries = 0u32;
@@ -1122,7 +1128,10 @@ pub async fn run(
 
             let args_summary = summarize_args(&tc.function.name, &args);
 
-            // Detect tool call loops: only identical calls repeated consecutively.
+            // Detect tool call loops: identical calls repeated consecutively
+            // (period-1), or the SAME two calls alternating (period-2 — the
+            // edit↔revert oscillation that the streak counter is blind to
+            // because every alternation resets it).
             let call_key = loop_call_key(&tc.function.name, &args);
             if last_call_key.as_ref() == Some(&call_key) {
                 same_call_streak += 1;
@@ -1130,8 +1139,24 @@ pub async fn run(
                 last_call_key = Some(call_key.clone());
                 same_call_streak = 1;
             }
-            if same_call_streak >= 3 {
-                let mutating = is_mutating_call(&tc.function.name, &args);
+            recent_call_keys.push(call_key.clone());
+            if recent_call_keys.len() > 12 {
+                recent_call_keys.remove(0);
+            }
+            let period2 = is_period2_cycle(&recent_call_keys);
+            if same_call_streak >= 3 || period2 {
+                // Period-2-only detection (not also a plain streak). Captured
+                // before any state resets below so messaging stays accurate.
+                let p2_only = period2 && same_call_streak < 3;
+                // A period-2 cycle is harmful if EITHER member mutates (the
+                // classic case is edit↔revert — both mutate; edit↔read still
+                // re-applies the same broken edit).
+                let mutating = if p2_only {
+                    let tail = &recent_call_keys[recent_call_keys.len().saturating_sub(2)..];
+                    tail.iter().any(|k| key_is_mutating(k))
+                } else {
+                    is_mutating_call(&tc.function.name, &args)
+                };
                 log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
 
                 // Read-only repetition: harmless, just wasted tokens.
@@ -1147,11 +1172,16 @@ pub async fn run(
                     ));
                     last_call_key = None;
                     same_call_streak = 0;
+                    recent_call_keys.clear();
                     continue;
                 }
 
-                let result_msg =
-                    Message::tool_result(&tc.id, loop_detected_hint(config.tools.edit_mode));
+                let hint = if p2_only {
+                    PERIOD2_LOOP_HINT
+                } else {
+                    loop_detected_hint(config.tools.edit_mode)
+                };
+                let result_msg = Message::tool_result(&tc.id, hint);
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
 
@@ -1163,9 +1193,16 @@ pub async fn run(
                     loop_recoveries += 1;
                     last_call_key = None;
                     same_call_streak = 0;
+                    recent_call_keys.clear();
                     tui::print_error(&format!(
-                        "Loop detected: {}({}) repeated 3 times — surfacing a hint, giving the model one more round",
-                        tc.function.name, args_summary
+                        "Loop detected: {}({}) {} — surfacing a hint, giving the model one more round",
+                        tc.function.name,
+                        args_summary,
+                        if p2_only {
+                            "alternating with the same partner call (period-2 cycle)"
+                        } else {
+                            "repeated 3 times"
+                        }
                     ));
                     break;
                 }
@@ -1192,6 +1229,7 @@ pub async fn run(
                         loop_recoveries = 0;
                         last_call_key = None;
                         same_call_streak = 0;
+                        recent_call_keys.clear();
 
                         let fkey = failure_key(&output);
                         let may_fire = if config.tools.debugger_multifire {

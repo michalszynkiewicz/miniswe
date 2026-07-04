@@ -100,6 +100,19 @@ pub fn loop_detected_hint(edit_mode: EditMode) -> &'static str {
     }
 }
 
+/// Injected when the period-2 cycle detector fires: the model alternates
+/// between the SAME two calls (typically an edit that breaks the file and a
+/// revert that undoes it). Distinct from `loop_detected_hint` because the
+/// calls are not consecutive-identical — telling the model "this exact call
+/// repeated 3 times" would be false and confusing here.
+pub const PERIOD2_LOOP_HINT: &str = "\
+ERROR: You are in an edit↔revert loop — you have alternated between the SAME two tool calls \
+several times in a row. The edit you keep re-submitting is what breaks the file; submitting it \
+again UNCHANGED will break it the same way, and reverting just resets for another failure. \
+Stop this cycle now: re-read the exact lines, check the project-wide errors for the REAL \
+blocker (it may be in a different file), and write a DIFFERENT, smaller edit — do not re-issue \
+either of the two calls you have been alternating between.";
+
 /// Injected after the server rejects the model's tool call with "Failed
 /// to parse tool call arguments as JSON" (see
 /// `crate::llm::TRUNCATED_TOOL_CALL_MARKER`). The previous assistant

@@ -465,10 +465,41 @@ const OBS_PLACEHOLDER: &str = "[earlier tool output elided to save context]";
 /// Number of most-recent observations always kept raw.
 const KEEP_RAW_OBS: usize = 3;
 
+/// Markers identifying corrective/guard tool results that must NEVER be
+/// masked. These carry loop-breaking guidance (auto-revert warnings,
+/// post-revert smallest-edit hints, loop-detector interventions) — masking
+/// them within a round or two of appearing was a direct contributor to fatal
+/// edit↔revert oscillations in the 2026-07-03 bench: the model lost both the
+/// medicine and the evidence it had already tried the same edit dozens of
+/// times. Keep the list narrow — these messages are short, so exempting them
+/// costs little budget.
+const GUARD_MARKERS: &[&str] = &[
+    "[auto-revert]",
+    "[hint]",
+    "You are in a loop",
+    "You are in an edit↔revert loop",
+    "same read/inspection call",
+];
+
+/// Guard exemption size cap. Guard texts ride on edit/revert results that
+/// also carry the revisions table + LSP feedback (~1.5-2.5k chars total); a
+/// much larger tool result containing a marker is almost certainly a file
+/// READ of source code that contains the marker string as a literal (this
+/// codebase does) — those must remain maskable or one read bloats the
+/// window forever.
+const GUARD_MAX_CHARS: usize = 4000;
+
+/// True if this tool-result content carries corrective/guard guidance that
+/// must survive observation masking.
+fn is_guard_observation(content: &str) -> bool {
+    content.len() <= GUARD_MAX_CHARS && GUARD_MARKERS.iter().any(|m| content.contains(m))
+}
+
 /// Mask old tool observations (oldest-first) down to [`OBS_PLACEHOLDER`] until
-/// within `raw_budget`, always keeping the last [`KEEP_RAW_OBS`] raw. Mutates in
-/// place; returns true if it masked anything. Shared by `observation_masking`
-/// and the tiered hybrid's cheap first tier.
+/// within `raw_budget`, always keeping the last [`KEEP_RAW_OBS`] raw and never
+/// masking guard observations (see [`GUARD_MARKERS`]). Mutates in place;
+/// returns true if it masked anything. Shared by `observation_masking` and the
+/// tiered hybrid's cheap first tier.
 fn mask_old_observations(messages: &mut [Message], raw_budget: usize) -> bool {
     let tool_idxs: Vec<usize> = messages
         .iter()
@@ -490,6 +521,9 @@ fn mask_old_observations(messages: &mut [Message], raw_budget: usize) -> bool {
         let content = messages[i].content.as_deref().unwrap_or("");
         if content == OBS_PLACEHOLDER {
             continue; // already masked on a prior pass
+        }
+        if is_guard_observation(content) {
+            continue; // corrective guidance — must stay visible
         }
         let saved = msg_token_cost(&messages[i]).saturating_sub(placeholder_tokens);
         messages[i].content = Some(OBS_PLACEHOLDER.to_string());
@@ -974,5 +1008,78 @@ mod compaction_tests {
             few.push(Message::tool_result(&format!("id{i}"), &blob()));
         }
         assert!(!mask_old_observations(&mut few, 1));
+    }
+
+    #[test]
+    fn guard_observations_survive_masking() {
+        let guard = format!(
+            "revert f.rs → rev_3: restored\n[hint] Restored to a parsing state. \
+             Make the SMALLEST possible edit.\n{}",
+            "x".repeat(200)
+        );
+        let mut msgs = vec![Message::system("sys")];
+        // Old guard result first, then plenty of plain old observations.
+        msgs.push(Message::tool_result("id-guard", &guard));
+        for i in 0..8 {
+            msgs.push(Message::assistant(&format!("call{i}")));
+            msgs.push(Message::tool_result(&format!("id{i}"), &blob()));
+        }
+        // Budget of 1 forces masking of every maskable message.
+        assert!(mask_old_observations(&mut msgs, 1));
+        let guard_msg = &msgs[1];
+        assert_eq!(
+            guard_msg.content.as_deref(),
+            Some(guard.as_str()),
+            "guard observation must never be masked"
+        );
+        // The plain old observations (all but the last KEEP_RAW_OBS) got masked.
+        let masked = msgs
+            .iter()
+            .filter(|m| m.content.as_deref() == Some(OBS_PLACEHOLDER))
+            .count();
+        assert_eq!(
+            masked,
+            8 - KEEP_RAW_OBS,
+            "non-guard old observations masked"
+        );
+    }
+
+    #[test]
+    fn oversized_marker_carrier_is_still_masked() {
+        // A file READ of source code containing a marker literal must remain
+        // maskable — only short, genuine guard messages are exempt.
+        let big_read = format!("[auto-revert] as a source literal\n{}", "x".repeat(5000));
+        let mut msgs = vec![Message::system("sys")];
+        msgs.push(Message::tool_result("id-big", &big_read));
+        for i in 0..8 {
+            msgs.push(Message::assistant(&format!("call{i}")));
+            msgs.push(Message::tool_result(&format!("id{i}"), &blob()));
+        }
+        assert!(mask_old_observations(&mut msgs, 1));
+        assert_eq!(
+            msgs[1].content.as_deref(),
+            Some(OBS_PLACEHOLDER),
+            "oversized marker-carrying read must be masked"
+        );
+    }
+
+    #[test]
+    fn is_guard_observation_matches_the_real_guard_texts() {
+        assert!(is_guard_observation(
+            "[auto-revert] Your last 3 edits to f.rs EACH left the syntax tree broken"
+        ));
+        assert!(is_guard_observation(
+            "revert f.rs → rev_0: restored\n[hint] Restored to a parsing state."
+        ));
+        assert!(is_guard_observation(
+            "ERROR: You are in a loop — this exact tool call has been repeated 3 times"
+        ));
+        assert!(is_guard_observation(
+            "ERROR: You are in an edit↔revert loop — you have alternated between the SAME two tool calls"
+        ));
+        assert!(is_guard_observation(
+            "You just made this same read/inspection call 3 times in a row."
+        ));
+        assert!(!is_guard_observation("[file] src/main.rs: 40 lines"));
     }
 }
