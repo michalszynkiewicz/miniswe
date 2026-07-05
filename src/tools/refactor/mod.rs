@@ -5,6 +5,7 @@
 //! and [`model_edit`] for the per-snippet model-call helper.
 
 mod add_param;
+mod ast_span;
 mod dispatch;
 mod drop_param;
 mod model_edit;
