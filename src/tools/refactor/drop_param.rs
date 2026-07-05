@@ -13,15 +13,14 @@ use crate::config::Config;
 use crate::llm::ModelRouter;
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
-use crate::tools::ToolResult;
 use crate::tools::args;
-
 use crate::tools::fast::RevisionStore;
+use crate::tools::{ToolDetail, ToolResult};
 
 use super::model_edit::{apply_rewrite, ask_rewrite_validated};
 use super::sites::{
-    StagedEdit, commit_staged, ensure_ready, extract_window, find_callsites,
-    resolve_function_location,
+    StagedEdit, callsite_old_block, commit_staged, ensure_ready, extract_window, find_callsites,
+    resolve_function_location, signature_old_block,
 };
 use super::validation::{ArgSchema, validate};
 
@@ -45,8 +44,16 @@ pub async fn execute(
     revisions: Option<&RevisionStore>,
     cancelled: Option<&AtomicBool>,
 ) -> Result<ToolResult> {
-    if let Err(e) = validate(args, &DROP_PARAM_SCHEMA) {
-        return Ok(ToolResult::err(e));
+    if let Err(verr) = validate(args, &DROP_PARAM_SCHEMA) {
+        return Ok(ToolResult::err_with_detail(
+            verr.message,
+            ToolDetail::InvalidArgs {
+                action: "drop_param",
+                missing: verr.missing,
+                bad_type: verr.bad_type,
+                unknown: verr.unknown,
+            },
+        ));
     }
     let path_str = args::require_str(args, "path").expect("validated");
     let function_name = args::require_str(args, "name").expect("validated");
@@ -98,12 +105,17 @@ pub async fn execute(
             ),
         );
     }
+    // Deterministic OLD: the model only needs to write NEW (see
+    // `ask_rewrite_validated`'s `known_old` doc — closes the "OLD line N
+    // doesn't match source" failure mode on multi-line signatures).
+    let known_old = signature_old_block(&original, line_0 as usize);
     let sig_rewrite = match ask_rewrite_validated(
         router,
         log,
         &format!("signature:{path_str}:{resolved_line_1}"),
         &sig_instruction,
         &sig_window.text,
+        known_old.as_deref(),
         cancelled,
         |r| apply_rewrite(&original, r, line_0).map(|_| ()),
     )
@@ -177,6 +189,8 @@ pub async fn execute(
                 }
             },
         };
+        // Deterministic OLD (same rationale as the signature rewrite above).
+        let known_old = callsite_old_block(&src, site.line, site.column);
         // Validator-aware retries: if the model produces an OLD/NEW that
         // can't be applied at the LSP-resolved anchor (e.g. paraphrased
         // input), retry with a fresh inference pass.
@@ -186,6 +200,7 @@ pub async fn execute(
             &format!("callsite:{rel}:{}", site.line + 1),
             &instruction,
             &site.window,
+            known_old.as_deref(),
             cancelled,
             |r| apply_rewrite(&src, r, site.line).map(|_| ()),
         )
@@ -273,7 +288,22 @@ pub async fn execute(
         if callsite_failures.is_empty() && side_effect_warnings.is_empty() {
             ToolResult::ok(out)
         } else {
-            ToolResult::err(out)
+            let mut unresolved = callsite_failures;
+            unresolved.extend(
+                side_effect_warnings
+                    .into_iter()
+                    .map(|w| format!("{w} (skipped: side-effecting expression)")),
+            );
+            ToolResult::err_with_detail(
+                out,
+                ToolDetail::PartialSignatureChange {
+                    action: "drop_param",
+                    total,
+                    succeeded,
+                    callsite_failures: unresolved,
+                    callsite_report: report,
+                },
+            )
         },
     )
 }

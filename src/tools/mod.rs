@@ -49,6 +49,41 @@ pub use refactor::execute_refactor_tool;
 pub struct ToolResult {
     pub content: String,
     pub success: bool,
+    /// Structured facts behind certain failures, alongside `content` (not
+    /// instead of it). `content` is always the complete, ready-to-use
+    /// message for miniswe's own agent loop — some of it is probe-validated
+    /// wording (see `refactor::add_param`) that must not be reworded.
+    /// `detail` lets a *different* consumer (e.g. an MCP server exposing a
+    /// different tool surface) render its own next-step guidance from the
+    /// same facts instead of reusing miniswe-specific tool-name references
+    /// (`file(...)`, `refactor(...)`) that don't apply to it.
+    pub detail: Option<ToolDetail>,
+}
+
+/// See [`ToolResult::detail`].
+#[derive(Debug, Clone)]
+pub enum ToolDetail {
+    /// An LSP-backed action was requested but no LSP client is available.
+    LspUnavailable,
+    /// A `refactor`-family action's arguments failed schema validation.
+    InvalidArgs {
+        action: &'static str,
+        missing: Vec<String>,
+        bad_type: Vec<String>,
+        unknown: Vec<String>,
+    },
+    /// add_param/drop_param rewrote the signature but not every callsite
+    /// could be updated.
+    PartialSignatureChange {
+        action: &'static str,
+        total: usize,
+        succeeded: usize,
+        /// Per-callsite failure descriptions (`path:line: reason`).
+        callsite_failures: Vec<String>,
+        /// Per-callsite success descriptions, already consumer-agnostic
+        /// (e.g. `"  • src/foo.rs:10 now passes \`None\`"`).
+        callsite_report: Vec<String>,
+    },
 }
 
 impl ToolResult {
@@ -56,6 +91,7 @@ impl ToolResult {
         Self {
             content,
             success: true,
+            detail: None,
         }
     }
 
@@ -63,6 +99,17 @@ impl ToolResult {
         Self {
             content,
             success: false,
+            detail: None,
+        }
+    }
+
+    /// Like [`Self::err`], plus structured facts for other consumers — see
+    /// [`ToolDetail`].
+    pub fn err_with_detail(content: String, detail: ToolDetail) -> Self {
+        Self {
+            content,
+            success: false,
+            detail: Some(detail),
         }
     }
 }

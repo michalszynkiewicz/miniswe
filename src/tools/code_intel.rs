@@ -90,6 +90,7 @@ pub(super) async fn lsp_project_diagnostics(
         Some(ToolResult {
             content: summary,
             success,
+            detail: None,
         })
     }
 }
@@ -105,8 +106,9 @@ pub(super) async fn lsp_goto_definition(
     let lsp = match lsp {
         Some(l) if l.is_ready() && !l.has_crashed() => l,
         _ => {
-            return Ok(ToolResult::err(
+            return Ok(ToolResult::err_with_detail(
                 "LSP not available. Use file(action='search') instead.".into(),
+                super::ToolDetail::LspUnavailable,
             ));
         }
     };
@@ -170,8 +172,9 @@ pub(super) async fn lsp_find_references(
     let lsp = match lsp {
         Some(l) if l.is_ready() && !l.has_crashed() => l,
         _ => {
-            return Ok(ToolResult::err(
+            return Ok(ToolResult::err_with_detail(
                 "LSP not available. Use file(action='search') instead.".into(),
+                super::ToolDetail::LspUnavailable,
             ));
         }
     };
