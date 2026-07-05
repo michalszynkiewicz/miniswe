@@ -100,6 +100,58 @@ mod failure_key_tests {
     }
 }
 
+/// Track consecutive `plan(action='check')` failures on the SAME step
+/// (`tools.plan_gate_debugger`'s trigger). A failure on a step other than the
+/// last-failed one (or the first ever) resets the streak to 1 — only
+/// *repeated* blocking on one step signals a stall worth escalating.
+fn track_plan_step_failure(last_failed_step: &mut Option<u64>, streak: &mut u32, step: u64) {
+    if *last_failed_step == Some(step) {
+        *streak += 1;
+    } else {
+        *last_failed_step = Some(step);
+        *streak = 1;
+    }
+}
+
+#[cfg(test)]
+mod track_plan_step_failure_tests {
+    use super::track_plan_step_failure;
+
+    #[test]
+    fn same_step_repeated_increments_streak() {
+        let mut last = None;
+        let mut streak = 0;
+        track_plan_step_failure(&mut last, &mut streak, 1);
+        assert_eq!(streak, 1);
+        track_plan_step_failure(&mut last, &mut streak, 1);
+        assert_eq!(streak, 2);
+        track_plan_step_failure(&mut last, &mut streak, 1);
+        assert_eq!(streak, 3);
+        assert_eq!(last, Some(1));
+    }
+
+    #[test]
+    fn different_step_resets_streak_to_one() {
+        let mut last = None;
+        let mut streak = 0;
+        track_plan_step_failure(&mut last, &mut streak, 1);
+        track_plan_step_failure(&mut last, &mut streak, 1);
+        assert_eq!(streak, 2);
+        track_plan_step_failure(&mut last, &mut streak, 2);
+        assert_eq!(streak, 1);
+        assert_eq!(last, Some(2));
+    }
+
+    #[test]
+    fn first_failure_ever_sets_streak_to_one() {
+        let mut last = None;
+        let mut streak = 0;
+        track_plan_step_failure(&mut last, &mut streak, 7);
+        assert_eq!(streak, 1);
+        assert_eq!(last, Some(7));
+    }
+}
+
 /// Execute the debugger's proposed single-file rewind (`tools.
 /// debugger_judge_rewind`) and build the message to inject afterward.
 /// Best-effort, matching the codebase's other auto-recovery guards: on
@@ -354,6 +406,11 @@ pub async fn run(
     // walks compile→smoke one diagnosis per distinct failure, never re-diagnosing
     // the same one (the blunt fire-≤N× variant regressed by doing exactly that).
     let mut last_debugged_failure: Option<String> = None;
+    // `tools.plan_gate_debugger`: consecutive plan(check) failures on the SAME
+    // step. Distinct from validation_blocks (the behavioral done-gate) — this
+    // is the plan tool's OWN compile gate repeatedly blocking one step.
+    let mut same_plan_step_failures: u32 = 0;
+    let mut last_failed_plan_step: Option<u64> = None;
     // Gate-triggered context resets fired this turn (bounded — don't loop).
     let mut gate_resets: usize = 0;
     // Spiral-reset: per-file revert counts this turn + how many resets fired,
@@ -865,6 +922,8 @@ pub async fn run(
                                 messages = assembled.messages;
                                 conversation_history.clear();
                                 validation_blocks = 0;
+                                same_plan_step_failures = 0;
+                                last_failed_plan_step = None;
                                 last_plan_set = false;
                                 tui::print_status(
                                     "[gate-restart] scrapped the stuck state — tree at clean baseline + fresh context; restarting from scratch.",
@@ -985,6 +1044,8 @@ pub async fn run(
                                         messages = assembled.messages;
                                         conversation_history.clear();
                                         validation_blocks = 0;
+                                        same_plan_step_failures = 0;
+                                        last_failed_plan_step = None;
                                         last_plan_set = false;
                                         tui::print_status(
                                             "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
@@ -1291,6 +1352,8 @@ pub async fn run(
                                     messages = assembled.messages;
                                     conversation_history.clear();
                                     validation_blocks = 0;
+                                    same_plan_step_failures = 0;
+                                    last_failed_plan_step = None;
                                     last_plan_set = false;
                                     tui::print_status(
                                         "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
@@ -1725,6 +1788,122 @@ pub async fn run(
             let result_msg = Message::tool_result(&tc.id, &result.content);
             messages.push(result_msg.clone());
             conversation_history.push(result_msg);
+
+            // `tools.plan_gate_debugger`: the plan tool's OWN compile gate
+            // repeatedly blocking the SAME step is a distinct stall signature
+            // from the behavioral done-gate (`validation_blocks` above) — the
+            // primary agent is re-litigating one step in its own accumulated
+            // context rather than making forward progress. See the field doc
+            // in config/mod.rs for the forensic evidence motivating this.
+            if tc.function.name == "plan"
+                && args.get("action").and_then(|a| a.as_str()) == Some("check")
+            {
+                if result.success {
+                    same_plan_step_failures = 0;
+                    last_failed_plan_step = None;
+                } else if let Some(step) = args.get("step").and_then(|s| s.as_u64()) {
+                    track_plan_step_failure(
+                        &mut last_failed_plan_step,
+                        &mut same_plan_step_failures,
+                        step,
+                    );
+
+                    let fkey = failure_key(&result.content);
+                    let may_fire = if config.tools.debugger_multifire {
+                        debugger_fires < debugger::MAX_DEBUGGER_FIRES
+                            && last_debugged_failure.as_deref() != Some(fkey.as_str())
+                    } else {
+                        debugger_fires == 0
+                    };
+                    if config.tools.plan_gate_debugger
+                        && may_fire
+                        && same_plan_step_failures as usize >= debugger::DEBUGGER_TRIGGER_BLOCKS
+                    {
+                        debugger_fires += 1;
+                        last_debugged_failure = Some(fkey);
+                        tui::print_status(
+                            "Plan-check gate failing repeatedly on the same step — spinning up a fresh-context debugger sub-agent…",
+                        );
+                        let verdict = debugger::run_debugger(
+                            &result.content,
+                            message,
+                            &config,
+                            &llm_worker,
+                            &tool_pool,
+                            &tool_defs,
+                            &perms,
+                            &mcp_registry,
+                            &lsp_client,
+                            &fast_revisions,
+                            fast_baseline_errors,
+                            &cancelled,
+                        )
+                        .await;
+
+                        let extra_msg = match verdict {
+                            debugger::DebuggerVerdict::Scrap if !restart_fired => {
+                                restart_fired = true;
+                                if let Some(ref snap) = snapshots {
+                                    let guard = snap.lock();
+                                    match guard.revert_to_round(0) {
+                                        Ok(m) => tui::print_status(&format!(
+                                            "[debugger-judge] SCRAP — {m}"
+                                        )),
+                                        Err(e) => tui::print_status(&format!(
+                                            "[debugger-judge] SCRAP — tree revert failed: {e}"
+                                        )),
+                                    }
+                                }
+                                tools::reindex_project_incremental(&config);
+                                let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+                                let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+                                let assembled = context::assemble(
+                                    &config,
+                                    message,
+                                    &[],
+                                    plan_only,
+                                    mcp_summary.as_deref(),
+                                );
+                                messages = assembled.messages;
+                                conversation_history.clear();
+                                validation_blocks = 0;
+                                same_plan_step_failures = 0;
+                                last_failed_plan_step = None;
+                                last_plan_set = false;
+                                tui::print_status(
+                                    "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
+                                );
+                                continue 'round;
+                            }
+                            debugger::DebuggerVerdict::Scrap => Message::user(
+                                "[A fresh-context review voted to reset again, but the tree \
+                                 was already reset once this turn. Keep going: read the \
+                                 current failure carefully and fix it directly.]",
+                            ),
+                            debugger::DebuggerVerdict::Rewind(candidate) => {
+                                rewind_message(
+                                    &candidate,
+                                    &config,
+                                    &perms,
+                                    &lsp_client,
+                                    &fast_revisions,
+                                    fast_baseline_errors,
+                                    &result.content,
+                                )
+                                .await
+                            }
+                            debugger::DebuggerVerdict::Report(body) => Message::user(&format!(
+                                "[A read-only debugger with fresh eyes investigated the failing \
+                                 plan-check step and produced this DIAGNOSIS. It did not edit \
+                                 anything — YOU must apply the fix and finish the step it lays \
+                                 out:\n{body}\nMake the change(s), then re-check the step.]"
+                            )),
+                        };
+                        messages.push(extra_msg.clone());
+                        conversation_history.push(extra_msg);
+                    }
+                }
+            }
 
             // Spiral-reset: a revert-loop (same file reverted repeatedly) means
             // the agent is cycling on the same failing edits. A bare revert

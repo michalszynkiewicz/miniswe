@@ -104,6 +104,7 @@ gen_config() {  # $1 = arm
         judge)        temp="0.2"; tools_extra="debugger_judge = true" ;;
         judge_mf)     temp="0.2"; tools_extra=$'debugger_judge = true\ndebugger_multifire = true' ;;
         judge_rewind) temp="0.2"; tools_extra=$'debugger_judge = true\ndebugger_judge_rewind = true' ;;
+        plan_gate)    temp="0.2"; tools_extra="plan_gate_debugger = true" ;;
     esac
 cat <<TOML
 [model]
