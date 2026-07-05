@@ -17,10 +17,11 @@ use crate::tools::args;
 use crate::tools::fast::RevisionStore;
 use crate::tools::{ToolDetail, ToolResult};
 
+use super::ast_span;
 use super::model_edit::{apply_rewrite, ask_rewrite_validated};
 use super::sites::{
-    StagedEdit, callsite_old_block, commit_staged, ensure_ready, extract_window, find_callsites,
-    resolve_function_location, signature_old_block,
+    StagedEdit, commit_staged, ensure_ready, extract_window, find_callsites,
+    resolve_function_location,
 };
 use super::validation::{ArgSchema, validate};
 
@@ -108,7 +109,7 @@ pub async fn execute(
     // Deterministic OLD: the model only needs to write NEW (see
     // `ask_rewrite_validated`'s `known_old` doc — closes the "OLD line N
     // doesn't match source" failure mode on multi-line signatures).
-    let known_old = signature_old_block(&original, line_0 as usize);
+    let known_old = ast_span::signature_span(&original, path_str, line_0 as usize);
     let sig_rewrite = match ask_rewrite_validated(
         router,
         log,
@@ -190,7 +191,7 @@ pub async fn execute(
             },
         };
         // Deterministic OLD (same rationale as the signature rewrite above).
-        let known_old = callsite_old_block(&src, site.line, site.column);
+        let known_old = ast_span::callsite_span(&src, &rel, site.line, site.column);
         // Validator-aware retries: if the model produces an OLD/NEW that
         // can't be applied at the LSP-resolved anchor (e.g. paraphrased
         // input), retry with a fresh inference pass.
