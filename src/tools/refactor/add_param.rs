@@ -26,10 +26,11 @@ use crate::tools::args;
 use crate::tools::fast::RevisionStore;
 use crate::tools::{ToolDetail, ToolResult};
 
+use super::ast_span;
 use super::model_edit::{apply_rewrite, ask_rewrite_validated};
 use super::sites::{
-    StagedEdit, balanced_parens, callsite_old_block, commit_staged, ensure_ready, extract_window,
-    find_callsites, resolve_function_location, signature_old_block,
+    StagedEdit, commit_staged, ensure_ready, extract_window, find_callsites,
+    resolve_function_location,
 };
 use super::validation::{ArgSchema, validate};
 
@@ -220,7 +221,12 @@ pub async fn execute(
         .trim_start_matches("mut ")
         .trim();
     if !new_param_name.is_empty()
-        && signature_has_param(&original_signature_source, line_0 as usize, new_param_name)
+        && ast_span::has_param(
+            &original_signature_source,
+            path_str,
+            line_0 as usize,
+            new_param_name,
+        )
     {
         return Ok(ToolResult::err(format!(
             "✗ add_param: `{function_name}` already has a parameter named `{new_param_name}` — \
@@ -258,7 +264,7 @@ pub async fn execute(
     // "OLD line N doesn't match source" failure mode on multi-line
     // signatures, which previously forced callers to abandon the atomic
     // refactor and fall back to a manual edit that skips every callsite).
-    let known_old = signature_old_block(&original_signature_source, line_0 as usize);
+    let known_old = ast_span::signature_span(&original_signature_source, path_str, line_0 as usize);
     let sig_rewrite = match ask_rewrite_validated(
         router,
         log,
@@ -358,7 +364,7 @@ pub async fn execute(
         // a live replay of a historical bench failure confirmed multi-line
         // callsites — one argument per line, the common rustfmt style —
         // hit the identical "OLD line N doesn't match source" failure.
-        let known_old = callsite_old_block(&src, site.line, site.column);
+        let known_old = ast_span::callsite_span(&src, &rel, site.line, site.column);
         // ask_rewrite_validated retries when the model produces a
         // syntactically-valid OLD/NEW that nonetheless can't be applied —
         // e.g. a paraphrased / lazy OLD that doesn't match at the LSP-
@@ -501,53 +507,9 @@ fn display_path(p: &std::path::Path, config: &Config) -> String {
         .to_string()
 }
 
-/// Best-effort check: does the function whose signature starts at `from_line`
-/// (0-based) already have a parameter named `param_name`? Used to make
-/// add_param idempotent. Scans the first balanced `(...)` after the definition
-/// line and compares the binding name (the text before `:`) of each parameter.
-///
-/// Conservative by design: splitting the parameter list on `,` can mis-split
-/// generic types like `HashMap<K, V>`, but since we only match a fragment whose
-/// pre-`:` text *equals* `param_name`, that can only cause a missed detection
-/// (no-op, same as today) — never a false positive that wrongly blocks a add.
-fn signature_has_param(source: &str, from_line: usize, param_name: &str) -> bool {
-    let tail: String = source
-        .lines()
-        .skip(from_line)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let Some((open, close)) = balanced_parens(&tail) else {
-        return false;
-    };
-    let params = &tail[open + 1..close];
-    params.split(',').any(|p| {
-        let p = p.trim().trim_start_matches("mut ").trim();
-        p.split(':').next().map(str::trim) == Some(param_name)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn signature_has_param_detects_existing_and_ignores_absent() {
-        // multi-line signature like assemble()/run() in the bench
-        let src = "fn assemble(\n    config: &Config,\n    user_message: &str,\n    system_prompt_override: Option<String>,\n) -> X {\n    body\n}";
-        assert!(signature_has_param(src, 0, "system_prompt_override"));
-        assert!(signature_has_param(src, 0, "config"));
-        assert!(!signature_has_param(src, 0, "headless")); // not present
-    }
-
-    #[test]
-    fn signature_has_param_not_fooled_by_generic_commas() {
-        // a generic type with an internal comma must not produce a false positive
-        let src = "fn f(map: HashMap<K, V>, name: String) {}";
-        assert!(signature_has_param(src, 0, "map"));
-        assert!(signature_has_param(src, 0, "name"));
-        assert!(!signature_has_param(src, 0, "V")); // generic param, not a binding
-        assert!(!signature_has_param(src, 0, "K"));
-    }
 
     #[test]
     fn position_parses_end_append() {
