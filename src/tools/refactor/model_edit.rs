@@ -63,9 +63,16 @@ pub async fn ask_rewrite(
     window: &str,
     cancelled: Option<&AtomicBool>,
 ) -> Result<Option<SnippetRewrite>> {
-    ask_rewrite_validated(router, log, tag, instruction, window, cancelled, |_| {
-        Ok::<(), anyhow::Error>(())
-    })
+    ask_rewrite_validated(
+        router,
+        log,
+        tag,
+        instruction,
+        window,
+        None,
+        cancelled,
+        |_| Ok::<(), anyhow::Error>(()),
+    )
     .await
 }
 
@@ -77,12 +84,29 @@ pub async fn ask_rewrite(
 /// but it doesn't actually fit the source" should also trigger a retry.
 /// Common case: strict-anchor `apply_rewrite_at` rejecting a paraphrased
 /// OLD — we want the model to try again, not just give up.
+///
+/// `known_old`: when the caller can determine OLD deterministically (e.g. a
+/// function signature's parameter list, found by balanced-paren scanning —
+/// see `add_param::signature_old_block`), pass it here instead of `None`.
+/// The ENTIRE OLD block is then prefilled (not just its first line), so the
+/// model only ever has to generate NEW — it never gets a chance to
+/// mis-transcribe OLD. Observed failure mode this closes: multi-line
+/// signatures reliably broke on OLD's line 2+ (the first line past the
+/// old first-line-only prefill) — a small model reconstructing source text
+/// from the prompt rather than copying it byte-for-byte, on Devstral AND
+/// Gemma 4, exhausting all 3 retries and forcing callers to give up on the
+/// atomic refactor entirely and fall back to a manual single-file edit that
+/// doesn't touch any callsites. When `known_old` is `None`, behavior is
+/// unchanged from before (first-line-only prefill, model produces the rest
+/// of OLD too).
+#[allow(clippy::too_many_arguments)]
 pub async fn ask_rewrite_validated<V, E>(
     router: &ModelRouter,
     log: Option<&SessionLog>,
     tag: &str,
     instruction: &str,
     window: &str,
+    known_old: Option<&str>,
     cancelled: Option<&AtomicBool>,
     validate: V,
 ) -> Result<Option<SnippetRewrite>>
@@ -94,17 +118,18 @@ where
         "Instruction:\n{instruction}\n\nSource snippet:\n```\n{window}\n```\n\n\
          Output the OLD/NEW block now."
     );
-    // Prefill the start of OLD with the window's first line. The model
-    // continues from there, so OLD's first line is *guaranteed* to equal
-    // source[anchor_line] — this lets the caller use direct line-range
-    // replacement instead of searching the file for OLD.
-    //
-    // The first line of `window` is the snippet's first line (we extract
-    // windows starting at the LSP-resolved target line). If the window
-    // is empty for some reason we skip prefill — the parser still works
-    // on a model-generated full OLD/NEW block.
-    let first_window_line = window.lines().next().unwrap_or("");
-    let prefill = format!("OLD:\n{first_window_line}\n");
+    // Prefill OLD so the model can't mis-transcribe it. With `known_old` we
+    // prefill the WHOLE block (model only writes NEW); otherwise we still
+    // prefill just the first line (guarantees OLD's first line equals
+    // source[anchor_line], the previous behavior) and the model produces
+    // the rest of OLD itself.
+    let prefill = match known_old {
+        Some(old) => format!("OLD:\n{old}\nEND_OLD\nNEW:\n"),
+        None => {
+            let first_window_line = window.lines().next().unwrap_or("");
+            format!("OLD:\n{first_window_line}\n")
+        }
+    };
     if let Some(log) = log {
         log.tool_debug(
             "change_signature",
@@ -296,8 +321,18 @@ pub fn parse_old_new(text: &str) -> Result<Option<SnippetRewrite>> {
     let old_raw = &stripped[after_old..after_old + end_old_rel];
 
     let after_end_old = after_old + end_old_rel + "END_OLD".len();
+    // LAST "NEW:", not first: when the OLD block is fully prefilled (the
+    // `known_old` path — see `ask_rewrite_validated`), the model sometimes
+    // doesn't treat the prefill as a continuation point and re-emits the
+    // whole `OLD:...END_OLD\nNEW:` pattern from scratch before its real
+    // answer. Anchoring on the first "NEW:" then captures that redundant
+    // restatement (including its own OLD:/END_OLD) as if it were the
+    // content — confirmed live: a real gemma response wrote the literal
+    // scaffolding text into the file this way (2026-07-05 replay). Only
+    // one "NEW:" is ever emitted in the normal (non-prefilled) path, so
+    // `rfind` is a no-op there — this is a pure robustness improvement.
     let after_new = stripped[after_end_old..]
-        .find("NEW:")
+        .rfind("NEW:")
         .ok_or_else(|| anyhow!("model output missing NEW: marker"))?
         + "NEW:".len()
         + after_end_old;
@@ -431,6 +466,54 @@ mod tests {
         let r = parse_old_new(text).unwrap().unwrap();
         assert_eq!(r.old, "  foo();");
         assert_eq!(r.new, "  foo(None);");
+    }
+
+    #[test]
+    fn known_old_prefill_parses_correctly_with_no_model_generated_old() {
+        // Simulates ask_rewrite_validated's known_old path: the ENTIRE OLD
+        // block is prefilled (never generated by the model), so a model
+        // continuation containing ONLY NEW content must still parse into a
+        // SnippetRewrite whose `old` exactly equals the multi-line known_old
+        // — proving the model never has an opportunity to mis-transcribe it.
+        let known_old = "pub fn assemble(\n    config: &Config,\n    mcp_summary: Option<&str>,\n) -> AssembledContext {";
+        let prefill = format!("OLD:\n{known_old}\nEND_OLD\nNEW:\n");
+        // What the model generates from here on — just NEW + END_NEW, no OLD.
+        let model_continuation = "pub fn assemble(\n    config: &Config,\n    mcp_summary: Option<&str>,\n    system_prompt_override: Option<&str>,\n) -> AssembledContext {\nEND_NEW";
+        let assembled = format!("{prefill}{model_continuation}");
+        let r = parse_old_new(&assembled).unwrap().unwrap();
+        assert_eq!(r.old, known_old);
+        assert!(r.new.contains("system_prompt_override: Option<&str>,"));
+    }
+
+    #[test]
+    fn known_old_prefill_survives_model_redundantly_restating_old_new() {
+        // Live-observed corruption (2026-07-05 replay against real gemma):
+        // given a fully-prefilled OLD block, the model sometimes doesn't
+        // treat the prefill as a continuation point and re-emits the whole
+        // `OLD:...END_OLD\nNEW:` pattern from scratch before its real
+        // answer. Before the `rfind` fix this wrote the literal scaffolding
+        // text into the file as "new" content — an unclosed-delimiter
+        // syntax error cascading to the end of the file.
+        let known_old = "pub fn assemble(\n    config: &Config,\n) -> AssembledContext {";
+        let prefill = format!("OLD:\n{known_old}\nEND_OLD\nNEW:\n");
+        let real_new =
+            "pub fn assemble(\n    config: &Config,\n    x: u32,\n) -> AssembledContext {";
+        // The model redundantly re-emits OLD:/END_OLD/NEW: before its real answer.
+        let model_continuation = format!("OLD:\n{known_old}\nEND_OLD\nNEW:\n{real_new}\nEND_NEW");
+        let assembled = format!("{prefill}{model_continuation}");
+        let r = parse_old_new(&assembled).unwrap().unwrap();
+        assert_eq!(r.old, known_old);
+        assert_eq!(r.new, real_new);
+        assert!(
+            !r.new.contains("OLD:"),
+            "scaffolding leaked into new: {}",
+            r.new
+        );
+        assert!(
+            !r.new.contains("END_OLD"),
+            "scaffolding leaked into new: {}",
+            r.new
+        );
     }
 
     #[test]

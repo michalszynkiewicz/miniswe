@@ -539,6 +539,28 @@ pub struct ToolsConfig {
     /// the candidate mechanically and narrowing the ask to accept/reject it
     /// raised that to 13/24. `false` (default). A/B only.
     pub debugger_judge_rewind: bool,
+    /// EXPERIMENTAL. Standalone — does NOT require `reactive_debugger` or
+    /// `debugger_judge` (it fires the same underlying sub-agent, which already
+    /// defaults to plain diagnostician mode when `debugger_judge` is off).
+    /// When `true`, fires the debugger on a trigger point distinct from
+    /// `reactive_debugger`'s (the behavioral done-gate): `DEBUGGER_TRIGGER_BLOCKS`
+    /// consecutive `plan(action='check')` failures on the SAME step.
+    /// Motivated by a 2026-07-04 forensic trace of two 4/6 compaction-bench
+    /// runs: the plan-check gate correctly reported a real `unused variable`
+    /// warning alongside 14 self-inflicted arity errors (a signature change
+    /// left 14 old callers unmigrated), but the primary agent — in its own
+    /// accumulated context — fixated on the numerous errors and never revisited
+    /// the warning, which was the actual bug. A tier-1 replay probe found no
+    /// safe text-formatting fix (declutter/reposition/dedup all failed, or only
+    /// "worked" via unsafe silent deletion of real error information); a
+    /// fresh-context debugger sub-agent handed the SAME unmodified error text
+    /// plus the goal and last action (no accumulated momentum) correctly
+    /// targeted the real bug 12/12. Deliberately independent of
+    /// `reactive_debugger` (initial A/B ran them coupled — sharing one fire
+    /// budget meant the OTHER trigger's condition was hit first in 3 of 4
+    /// runs, so the coupled config never actually tested this trigger cleanly)
+    /// so it can be A/B'd in isolation. `false` (default).
+    pub plan_gate_debugger: bool,
 }
 
 /// Agent ceremony level — see `ToolsConfig::ceremony`.
@@ -601,6 +623,7 @@ impl Default for ToolsConfig {
             gate_restart: false,
             debugger_judge: false,
             debugger_judge_rewind: false,
+            plan_gate_debugger: false,
         }
     }
 }

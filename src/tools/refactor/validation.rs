@@ -18,7 +18,20 @@ pub struct ArgSchema<'a> {
     pub example: &'a str,
 }
 
-pub fn validate(args: &Value, schema: &ArgSchema) -> Result<(), String> {
+/// A validation failure: `message` is the complete, byte-identical text
+/// miniswe's own agent loop has always seen for this failure (including the
+/// grouped `refactor(action=...)` example syntax); `missing`/`bad_type`/
+/// `unknown` are the same facts as plain data, for a consumer with a
+/// different tool surface (e.g. an MCP server exposing flat tools) to build
+/// its own example/guidance from instead of reusing `message` verbatim.
+pub struct ValidationError {
+    pub message: String,
+    pub missing: Vec<String>,
+    pub bad_type: Vec<String>,
+    pub unknown: Vec<String>,
+}
+
+pub fn validate(args: &Value, schema: &ArgSchema) -> Result<(), ValidationError> {
     let mut missing: Vec<&str> = Vec::new();
     let mut bad_type: Vec<String> = Vec::new();
     let mut unknown: Vec<String> = Vec::new();
@@ -93,7 +106,7 @@ pub fn validate(args: &Value, schema: &ArgSchema) -> Result<(), String> {
         .chain(schema.optional_ints.iter())
         .copied()
         .collect();
-    Err(format!(
+    let message = format!(
         "✗ change_signature({action}): {problems}\nRequired: {required}\nOptional: {optional}\nExample: {example}",
         action = schema.action,
         problems = parts.join("\n"),
@@ -104,7 +117,14 @@ pub fn validate(args: &Value, schema: &ArgSchema) -> Result<(), String> {
             optional.join(", ")
         },
         example = schema.example,
-    ))
+    );
+
+    Err(ValidationError {
+        message,
+        missing: missing.into_iter().map(str::to_string).collect(),
+        bad_type,
+        unknown,
+    })
 }
 
 fn kind_of(v: &Value) -> &'static str {
@@ -187,7 +207,7 @@ mod tests {
     #[test]
     fn lists_all_missing_in_one_error() {
         let v = json!({"action": "add_param", "path": "p"});
-        let err = validate(&v, &schema()).unwrap_err();
+        let err = validate(&v, &schema()).unwrap_err().message;
         assert!(err.contains("name"));
         assert!(err.contains("new_param"));
         assert!(err.contains("position"));
@@ -202,7 +222,7 @@ mod tests {
             "path": "p", "name": "n", "new_param": "x: u32",
             "position": "start", "fill_in": "0"
         });
-        let err = validate(&v, &schema()).unwrap_err();
+        let err = validate(&v, &schema()).unwrap_err().message;
         assert!(err.contains("fill_in"));
         assert!(err.contains("did you mean"));
         // `callsite_fill_in` contains `fill_in` → wins by substring match.
@@ -216,7 +236,7 @@ mod tests {
             "path": 123, "name": "n", "new_param": "x: u32",
             "position": "start", "callsite_fill_in": "0"
         });
-        let err = validate(&v, &schema()).unwrap_err();
+        let err = validate(&v, &schema()).unwrap_err().message;
         assert!(err.contains("'path' must be string"));
     }
 }
