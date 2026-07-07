@@ -142,6 +142,35 @@ fn scratchpad_included_in_context() {
     );
 }
 
+#[test]
+fn plan_injected_exactly_once() {
+    // Regression test: assemble() used to append a second `[PLAN]` block via
+    // a manual `load_plan()` call, on top of the one PlanProvider already
+    // contributes — duplicating tokens and risking two conflicting plan
+    // views if only one path was ever updated.
+    let (_tmp, config) = helpers::create_test_project();
+
+    fs::write(
+        config.miniswe_path("plan.md"),
+        "1. Add the flag\n2. Wire it through\n",
+    )
+    .unwrap();
+
+    let assembled = context::assemble(&config, "continue", &[], false, None);
+    let system = assembled.messages[0].content.as_deref().unwrap();
+
+    assert_eq!(
+        system.matches("[PLAN]").count(),
+        1,
+        "plan should be injected exactly once, got: {system}"
+    );
+    assert_eq!(
+        system.matches("Add the flag").count(),
+        1,
+        "plan content should appear exactly once, got: {system}"
+    );
+}
+
 // ── Plan mode ───────────────────────────────────────────────────────
 
 #[test]

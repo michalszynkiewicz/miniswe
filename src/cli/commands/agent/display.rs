@@ -20,8 +20,8 @@ pub fn summarize_args(tool_name: &str, args: &serde_json::Value) -> String {
         "file" => match action {
             "read" => {
                 let path = get_str_or(args, "path", "?");
-                let start = opt_u64(args, "start_line").unwrap_or(None);
-                let end = opt_u64(args, "end_line").unwrap_or(None);
+                let start = opt_u64(args, "start").unwrap_or(None);
+                let end = opt_u64(args, "end").unwrap_or(None);
                 match (start, end) {
                     (Some(s), Some(e)) => format!("read {path}:{s}-{e}"),
                     (Some(s), None) => format!("read {path}:{s}-"),
@@ -172,8 +172,8 @@ mod tests {
         let args = json!({
             "action": "read",
             "path": "src/main.rs",
-            "start_line": 10,
-            "end_line": 20,
+            "start": 10,
+            "end": 20,
         });
         assert_eq!(summarize_args("file", &args), "read src/main.rs:10-20");
     }

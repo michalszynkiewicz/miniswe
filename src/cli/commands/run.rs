@@ -152,6 +152,94 @@ mod track_plan_step_failure_tests {
     }
 }
 
+/// Concatenated plan + scratchpad content, used to detect whether the
+/// persisted current-state files changed since the last system-prompt
+/// assembly. `tools::plan::plan_exists()` alone only catches existence
+/// flipping (set/clear), not content mutations from `check`/`refine`/
+/// `scratchpad` actions, which leave the file non-empty but change what's
+/// in it. A NUL separator avoids two different (plan, scratchpad) pairs
+/// concatenating to the same string.
+fn current_state_snapshot(config: &crate::config::Config) -> String {
+    let plan = crate::tools::plan::load_plan(config).unwrap_or_default();
+    let scratchpad =
+        std::fs::read_to_string(config.miniswe_path("scratchpad.md")).unwrap_or_default();
+    format!("{plan}\u{0}{scratchpad}")
+}
+
+#[cfg(test)]
+mod current_state_snapshot_tests {
+    use super::current_state_snapshot;
+    use crate::config::Config;
+
+    fn config_in(dir: &std::path::Path) -> Config {
+        std::fs::create_dir_all(dir.join(".miniswe")).unwrap();
+        let mut config = Config::default();
+        config.project_root = dir.to_path_buf();
+        config
+    }
+
+    #[test]
+    fn changes_when_plan_content_changes_even_if_both_versions_are_non_empty() {
+        // The bug this guards against: plan(action='check'/'refine') edits
+        // plan.md's content without ever making it empty, so a plain
+        // exists()-flip check misses the change entirely.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+
+        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+        let before = current_state_snapshot(&config);
+
+        std::fs::write(config.miniswe_path("plan.md"), "1. [x] step one\n").unwrap();
+        let after = current_state_snapshot(&config);
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn changes_when_scratchpad_content_changes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+
+        std::fs::write(config.miniswe_path("scratchpad.md"), "## Current Task\nA\n").unwrap();
+        let before = current_state_snapshot(&config);
+
+        std::fs::write(config.miniswe_path("scratchpad.md"), "## Current Task\nB\n").unwrap();
+        let after = current_state_snapshot(&config);
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn stable_when_neither_file_changes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+        std::fs::write(config.miniswe_path("scratchpad.md"), "## Current Task\nA\n").unwrap();
+
+        let a = current_state_snapshot(&config);
+        let b = current_state_snapshot(&config);
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn distinguishes_content_shifted_across_the_plan_scratchpad_boundary() {
+        // Regression guard for the NUL-separator choice: without a
+        // separator, plan="ab", scratchpad="" and plan="a", scratchpad="b"
+        // would concatenate to the same string.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        std::fs::write(config.miniswe_path("plan.md"), "ab").unwrap();
+        let a = current_state_snapshot(&config);
+
+        std::fs::write(config.miniswe_path("plan.md"), "a").unwrap();
+        std::fs::write(config.miniswe_path("scratchpad.md"), "b").unwrap();
+        let b = current_state_snapshot(&config);
+
+        assert_ne!(a, b);
+    }
+}
+
 /// Execute the debugger's proposed single-file rewind (`tools.
 /// debugger_judge_rewind`) and build the message to inject afterward.
 /// Best-effort, matching the codebase's other auto-recovery guards: on
@@ -525,14 +613,17 @@ pub async fn run(
         }
     }
     // The system prompt is phase-aware (pre-plan "explore→plan" vs
-    // post-plan "you are EDITING" + routing). `assemble()` runs once
-    // before the loop, so messages[0] is frozen at the attempt's
-    // starting plan-state. Track it; when plan-state flips mid-loop
-    // (the model calls plan(action='set')) we rebuild messages[0] so
-    // the prompt actually switches — mirroring how visible_tool_defs is
-    // re-evaluated per turn at the same boundary. Without this the
-    // post-plan prompt never activates within an attempt.
-    let mut last_plan_set = tools::plan::plan_exists(&config);
+    // post-plan "you are EDITING" + routing) AND carries the current plan
+    // and scratchpad content. `assemble()` runs once before the loop, so
+    // messages[0] is frozen at the attempt's starting state. Track a
+    // snapshot of it; whenever the persisted plan/scratchpad content
+    // changes mid-loop (plan(action='set'/'check'/'refine'/'scratchpad'))
+    // we rebuild messages[0] so the prompt reflects the current state —
+    // mirroring how visible_tool_defs is re-evaluated per turn at the same
+    // boundary. Comparing content (not just plan_exists()) matters because
+    // check/refine/scratchpad mutate plan.md/scratchpad.md without ever
+    // making them empty/non-empty, so a plain existence flip misses them.
+    let mut last_state_snapshot = current_state_snapshot(&config);
 
     // Nudge the model to plan before editing (strict/legacy only). Skipped in
     // replay mode — the captured context already reflects whatever planning the
@@ -673,10 +764,11 @@ pub async fn run(
         // Hide edit tools from the model until a plan exists. See
         // visible_tool_defs for rationale.
         let plan_set = tools::plan::plan_exists(&config);
-        // Plan-state flipped (model just set/cleared a plan): rebuild the
-        // system prompt so its pre-plan vs post-plan phase matches. Happens
-        // at most once per attempt, so the extra assemble() is negligible.
-        if strict && plan_set != last_plan_set {
+        // Plan/scratchpad content changed (set/check/refine/scratchpad):
+        // rebuild the system prompt so it reflects the current state, not
+        // whatever was current at the attempt's start or last refresh.
+        let state_snapshot = current_state_snapshot(&config);
+        if strict && state_snapshot != last_state_snapshot {
             let re = context::assemble(
                 &config,
                 message,
@@ -689,7 +781,7 @@ pub async fn run(
             {
                 messages[0] = sys;
             }
-            last_plan_set = plan_set;
+            last_state_snapshot = state_snapshot;
         }
         // Off: never hide edit tools (pass plan_exists=true). Strict:
         // legacy hide-until-plan behavior.
@@ -924,7 +1016,7 @@ pub async fn run(
                                 validation_blocks = 0;
                                 same_plan_step_failures = 0;
                                 last_failed_plan_step = None;
-                                last_plan_set = false;
+                                last_state_snapshot = String::new();
                                 tui::print_status(
                                     "[gate-restart] scrapped the stuck state — tree at clean baseline + fresh context; restarting from scratch.",
                                 );
@@ -1046,7 +1138,7 @@ pub async fn run(
                                         validation_blocks = 0;
                                         same_plan_step_failures = 0;
                                         last_failed_plan_step = None;
-                                        last_plan_set = false;
+                                        last_state_snapshot = String::new();
                                         tui::print_status(
                                             "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                         );
@@ -1354,7 +1446,7 @@ pub async fn run(
                                     validation_blocks = 0;
                                     same_plan_step_failures = 0;
                                     last_failed_plan_step = None;
-                                    last_plan_set = false;
+                                    last_state_snapshot = String::new();
                                     tui::print_status(
                                         "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                     );
@@ -1869,7 +1961,7 @@ pub async fn run(
                                 validation_blocks = 0;
                                 same_plan_step_failures = 0;
                                 last_failed_plan_step = None;
-                                last_plan_set = false;
+                                last_state_snapshot = String::new();
                                 tui::print_status(
                                     "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                 );

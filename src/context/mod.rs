@@ -544,13 +544,6 @@ pub fn assemble(
         }
     }
 
-    // Inject structured plan if it exists
-    if let Some(plan_content) = crate::tools::plan::load_plan(config) {
-        system_context.push_str("\n[PLAN]\n");
-        system_context.push_str(&plan_content);
-        system_context.push('\n');
-    }
-
     // TieredSmart compaction: nudge the model to externalize non-re-derivable
     // findings to the (compaction-surviving) scratchpad before old tool outputs
     // are elided. Only meaningful for this strategy; no-op otherwise.
