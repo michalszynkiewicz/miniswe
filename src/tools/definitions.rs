@@ -80,8 +80,8 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
                             "description": "One of: read, delete, search, shell, revert, help"
                         },
                         "path": { "type": "string", "description": "File path (required for read/delete/revert)" },
-                        "start_line": { "type": "integer", "description": "Start line for action='read'" },
-                        "end_line": { "type": "integer", "description": "End line for action='read'" },
+                        "start": { "type": "integer", "description": "Start line for action='read'" },
+                        "end": { "type": "integer", "description": "End line for action='read'" },
                         "query": { "type": "string", "description": "Search text (for search)" },
                         "pattern": { "type": "string", "description": "Regex pattern (for search)" },
                         "scope": { "type": "string", "description": "Search scope (for search)" },
@@ -524,7 +524,7 @@ pub fn file_help(edit_mode: EditMode) -> &'static str {
             "\
 Available actions for `file`:
 
-- read: Read a file. Params: path (required), start_line, end_line
+- read: Read a file. Params: path (required), start, end
 - delete: Delete an existing file. Params: path (required)
   Example: {\"action\":\"delete\",\"path\":\"src/bin/old.rs\"}
 - search: Search codebase. Params: query (literal text, no regex) OR pattern (regex); exactly one required. Also: scope, max_results
@@ -539,7 +539,7 @@ use write_file. There is no longer a deterministic search-and-replace action."
             "\
 Available actions for `file`:
 
-- read: Read a file. Params: path (required), start_line, end_line
+- read: Read a file. Params: path (required), start, end
 - delete: Delete an existing file. Params: path (required)
   Example: {\"action\":\"delete\",\"path\":\"src/bin/old.rs\"}
 - search: Search codebase. Params: query (literal text, no regex) OR pattern (regex); exactly one required. Also: scope, max_results

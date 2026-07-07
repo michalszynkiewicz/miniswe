@@ -105,47 +105,31 @@ fi
 echo ""
 
 # ── Arm → config recipe ──────────────────────────────────────────────────
-# An "arm" maps to (compaction, gate_context_reset, auto_revert_ast_cascade,
-# plan_gate_debugger). Plain compaction names use the production defaults
-# (gate off, auto_revert on, plan_gate_debugger off). Special arms hold
-# compaction fixed and vary one knob, for isolated A/Bs.
-arm_settings() {  # echoes: "<compaction> <gate> <auto_revert> <plan_gate_debugger>"
+# An "arm" maps to (compaction, gate_context_reset, auto_revert_ast_cascade).
+# The debugger stack (reactive_debugger/plan_gate_debugger/debugger_judge/
+# debugger_judge_rewind/debugger_multifire) is NOT part of this tuple — it's
+# unconditionally on for every arm (see generate_config below). The 6-arm
+# debugger-enabled matrix (2026-07-06) showed it consistently helps or is a
+# no-op, never hurts; there is no more "isolated, debugger-off" baseline to
+# preserve. Only compaction and gate_context_reset stay as intentional A/B
+# knobs — everything else is just the default, not something to toggle per
+# arm.
+arm_settings() {  # echoes: "<compaction> <gate> <auto_revert>"
     case "$1" in
-        gate_on)  echo "unified true  true  false" ;;  # gate A/B: gate ON,  auto_revert ON
-        gate_off) echo "unified false true  false" ;;  # gate A/B: gate OFF, auto_revert ON
-        # Validation run (2026-07-05) for the refactor-tool fix +
-        # plan_gate_debugger: production defaults plus the new debugger
-        # trigger, on the now-fixed add_param/drop_param binary.
-        unified_plangate) echo "unified false true true" ;;
-        # Same, but with the full debugger stack (see the debugger_judge/
-        # debugger_judge_rewind/debugger_multifire block below) — the
-        # first unified_plangate run showed the loop detector + behavioral
-        # gate correctly catching a stuck edit/revert thrash, but nothing
-        # escalated further once max_retries ran out, because this arm
-        # alone had no reactive_debugger/debugger_judge to hand off to.
-        unified_full) echo "unified false true true" ;;
-        # Plain compaction arm → production defaults: gate OFF (A/B-decided),
-        # auto_revert ON. Matches src/config ToolsConfig::default after 2026-06-29.
-        *)        echo "$1 false true false" ;;
+        gate_on)  echo "unified true  true" ;;  # gate A/B: gate ON,  auto_revert ON
+        gate_off) echo "unified false true" ;;  # gate A/B: gate OFF, auto_revert ON
+        *)        echo "$1 false true" ;;       # plain compaction arm: gate OFF, auto_revert ON
     esac
 }
 
 # ── Config generator ────────────────────────────────────────────────────
 # All providers on (the 6/6 baseline); knobs come from arm_settings so a single
-# driver run can do either a compaction A/B or a single-knob A/B (e.g. the gate).
+# driver run can do either a compaction A/B or the gate A/B. Debugger stack is
+# unconditionally on for every arm — see arm_settings' comment.
 generate_config() {
     local arm="$1"
-    local _compaction _gate _autorev _plangate
-    read -r _compaction _gate _autorev _plangate <<< "$(arm_settings "$arm")"
-    # Full debugger stack: judge (SCRAP/CONTINUE on repeated gate blocks) +
-    # rewind (single-file revert option) + multifire (walk a chain of
-    # distinct failures instead of firing once). Only for unified_full —
-    # requires(OR's with) reactive_debugger/debugger_judge internally, so
-    # plan_gate_debugger alone (unified_plangate) stays isolated/unaffected.
-    local _judge=false _judge_rewind=false _multifire=false
-    case "$arm" in
-        unified_full) _judge=true; _judge_rewind=true; _multifire=true ;;
-    esac
+    local _compaction _gate _autorev
+    read -r _compaction _gate _autorev <<< "$(arm_settings "$arm")"
     cat <<TOML
 [model]
 provider = "llama-cpp"
@@ -194,17 +178,18 @@ diagnostic_timeout_ms = 2000
 web_tools = true
 plan = true
 scratchpad = true
-# Knobs from arm_settings. auto_revert + gate default ON (production defaults
-# as of this session); a gate A/B varies gate_context_reset while holding the
-# rest constant. reactive_debugger/spiral_reset stay OFF (not default-good).
+# auto_revert + gate come from arm_settings (gate A/B varies gate_context_reset
+# while holding the rest constant). The full debugger stack is unconditionally
+# on for every arm — see arm_settings' comment for why this stopped being a
+# per-arm toggle.
 auto_revert_ast_cascade = ${_autorev}
-reactive_debugger = false
+reactive_debugger = true
 spiral_reset = false
 gate_context_reset = ${_gate}
-plan_gate_debugger = ${_plangate}
-debugger_judge = ${_judge}
-debugger_judge_rewind = ${_judge_rewind}
-debugger_multifire = ${_multifire}
+plan_gate_debugger = true
+debugger_judge = true
+debugger_judge_rewind = true
+debugger_multifire = true
 
 [logging]
 level = "trace"

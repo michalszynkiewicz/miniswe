@@ -56,20 +56,20 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 
     let total_lines = content.lines().count();
 
-    let start_line = args["start_line"]
+    let start = args["start"]
         .as_u64()
         .map(|n| n as usize)
         .unwrap_or(1)
         .max(1);
-    let end_line = args["end_line"]
+    let end = args["end"]
         .as_u64()
         .map(|n| n as usize)
         .unwrap_or(total_lines)
         .min(total_lines);
 
-    if start_line > total_lines {
+    if start > total_lines {
         return Ok(ToolResult::err(format!(
-            "start_line {start_line} exceeds file length ({total_lines} lines)"
+            "start {start} exceeds file length ({total_lines} lines)"
         )));
     }
 
@@ -84,21 +84,21 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         let compressed = compress::compress_for_reading(&content, ext);
 
         // Count how many lines were stripped. Clamp to the compressed vec's
-        // length: `end_line` is bounded by `content.lines().count()`, but the
+        // length: `end` is bounded by `content.lines().count()`, but the
         // compressor can return a different number of entries, so slicing with
-        // the raw `end_line` would panic out of bounds (it did, on a debugger
+        // the raw `end` would panic out of bounds (it did, on a debugger
         // read). The display loop below already uses `.get()`, so it's safe.
-        let slice_end = end_line.min(compressed.len());
-        let slice_start = start_line.saturating_sub(1).min(slice_end);
+        let slice_end = end.min(compressed.len());
+        let slice_start = start.saturating_sub(1).min(slice_end);
         let stripped_count = compressed[slice_start..slice_end]
             .iter()
             .filter(|l| l.is_none())
             .count();
-        let _visible_count = (end_line - start_line + 1) - stripped_count;
+        let _visible_count = (end - start + 1) - stripped_count;
 
         output.push_str(&format!("[{path_str}: {total_lines} lines"));
-        if start_line != 1 || end_line != total_lines {
-            output.push_str(&format!(", showing L{start_line}-{end_line}"));
+        if start != 1 || end != total_lines {
+            output.push_str(&format!(", showing L{start}-{end}"));
         }
         if stripped_count > 0 {
             output.push_str(&format!(", {stripped_count} comment/import lines stripped"));
@@ -106,11 +106,11 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         output.push_str("]\n");
 
         let mut lines_shown = 0;
-        for i in (start_line - 1)..end_line {
+        for i in (start - 1)..end {
             if lines_shown >= max_lines {
-                let remaining = end_line - i;
+                let remaining = end - i;
                 output.push_str(&format!(
-                    "\n... truncated ({remaining} more lines). Use start_line/end_line to read specific ranges."
+                    "\n... truncated ({remaining} more lines). Use start/end to read specific ranges."
                 ));
                 break;
             }
@@ -124,7 +124,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
     } else {
         // Non-code files: output raw with line numbers
         let lines: Vec<&str> = content.lines().collect();
-        let selected = &lines[start_line.saturating_sub(1)..end_line];
+        let selected = &lines[start.saturating_sub(1)..end];
         let truncated = selected.len() > max_lines;
         let display_lines = if truncated {
             &selected[..max_lines]
@@ -133,19 +133,19 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         };
 
         output.push_str(&format!("[{path_str}: {total_lines} lines"));
-        if start_line != 1 || end_line != total_lines {
-            output.push_str(&format!(", showing L{start_line}-{end_line}"));
+        if start != 1 || end != total_lines {
+            output.push_str(&format!(", showing L{start}-{end}"));
         }
         output.push_str("]\n");
 
         for (i, line) in display_lines.iter().enumerate() {
-            let line_num = start_line + i;
+            let line_num = start + i;
             output.push_str(&format!("{line_num:>4}│{line}\n"));
         }
 
         if truncated {
             output.push_str(&format!(
-                "\n... truncated ({} more lines). Use start_line/end_line to read specific ranges.",
+                "\n... truncated ({} more lines). Use start/end to read specific ranges.",
                 selected.len() - max_lines
             ));
         }
