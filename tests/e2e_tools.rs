@@ -57,7 +57,7 @@ async fn read_file_with_line_range() {
         .join("\n");
     fs::write(helpers::project_path(&config, "range.txt"), &content).unwrap();
 
-    let args = json!({"action": "read", "path": "range.txt", "start_line": 3, "end_line": 5});
+    let args = json!({"action": "read", "path": "range.txt", "start": 3, "end": 5});
     let result = tools::execute_tool("file", &args, &config, &perms(&config), None)
         .await
         .unwrap();

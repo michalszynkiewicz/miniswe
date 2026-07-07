@@ -108,8 +108,7 @@ impl ContextProvider for PlanProvider {
     }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
-        let path = input.config.miniswe_path("plan.md");
-        let content = fs::read_to_string(path).ok()?;
+        let content = crate::tools::plan::load_plan(input.config)?;
         Some(ContextBlock {
             header: "[PLAN]",
             content,
