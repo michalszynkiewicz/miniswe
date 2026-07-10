@@ -64,7 +64,7 @@ fn changed_paths_in_patch(patch: &std::path::Path) -> Vec<String> {
 /// compile error then hashes to the identical string, so multifire silently
 /// refuses to refire when the underlying error actually changed. Join enough
 /// of the (non-empty) output to reach past such banners into the real detail.
-fn failure_key(output: &str) -> String {
+pub(crate) fn failure_key(output: &str) -> String {
     let joined = output
         .lines()
         .map(str::trim)
@@ -104,7 +104,11 @@ mod failure_key_tests {
 /// (`tools.plan_gate_debugger`'s trigger). A failure on a step other than the
 /// last-failed one (or the first ever) resets the streak to 1 — only
 /// *repeated* blocking on one step signals a stall worth escalating.
-fn track_plan_step_failure(last_failed_step: &mut Option<u64>, streak: &mut u32, step: u64) {
+pub(crate) fn track_plan_step_failure(
+    last_failed_step: &mut Option<u64>,
+    streak: &mut u32,
+    step: u64,
+) {
     if *last_failed_step == Some(step) {
         *streak += 1;
     } else {
@@ -152,95 +156,22 @@ mod track_plan_step_failure_tests {
     }
 }
 
-/// Concatenated plan + scratchpad content, used to detect whether the
-/// persisted current-state files changed since the last system-prompt
-/// assembly. `tools::plan::plan_exists()` alone only catches existence
-/// flipping (set/clear), not content mutations from `check`/`refine`/
-/// `scratchpad` actions, which leave the file non-empty but change what's
-/// in it. A NUL separator avoids two different (plan, scratchpad) pairs
-/// concatenating to the same string.
-fn current_state_snapshot(config: &crate::config::Config) -> String {
-    let plan = crate::tools::plan::load_plan(config).unwrap_or_default();
-    let scratchpad =
-        std::fs::read_to_string(config.miniswe_path("scratchpad.md")).unwrap_or_default();
-    format!("{plan}\u{0}{scratchpad}")
-}
-
-#[cfg(test)]
-mod current_state_snapshot_tests {
-    use super::current_state_snapshot;
-    use crate::config::Config;
-
-    fn config_in(dir: &std::path::Path) -> Config {
-        std::fs::create_dir_all(dir.join(".miniswe")).unwrap();
-        let mut config = Config::default();
-        config.project_root = dir.to_path_buf();
-        config
-    }
-
-    #[test]
-    fn changes_when_plan_content_changes_even_if_both_versions_are_non_empty() {
-        // The bug this guards against: plan(action='check'/'refine') edits
-        // plan.md's content without ever making it empty, so a plain
-        // exists()-flip check misses the change entirely.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = config_in(tmp.path());
-
-        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
-        let before = current_state_snapshot(&config);
-
-        std::fs::write(config.miniswe_path("plan.md"), "1. [x] step one\n").unwrap();
-        let after = current_state_snapshot(&config);
-
-        assert_ne!(before, after);
-    }
-
-    #[test]
-    fn changes_when_scratchpad_content_changes() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = config_in(tmp.path());
-
-        std::fs::write(config.miniswe_path("scratchpad.md"), "## Current Task\nA\n").unwrap();
-        let before = current_state_snapshot(&config);
-
-        std::fs::write(config.miniswe_path("scratchpad.md"), "## Current Task\nB\n").unwrap();
-        let after = current_state_snapshot(&config);
-
-        assert_ne!(before, after);
-    }
-
-    #[test]
-    fn stable_when_neither_file_changes() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = config_in(tmp.path());
-        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
-        std::fs::write(config.miniswe_path("scratchpad.md"), "## Current Task\nA\n").unwrap();
-
-        let a = current_state_snapshot(&config);
-        let b = current_state_snapshot(&config);
-
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn distinguishes_content_shifted_across_the_plan_scratchpad_boundary() {
-        // Regression guard for the NUL-separator choice: without a
-        // separator, plan="ab", scratchpad="" and plan="a", scratchpad="b"
-        // would concatenate to the same string.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = config_in(tmp.path());
-        std::fs::write(config.miniswe_path("plan.md"), "ab").unwrap();
-        let a = current_state_snapshot(&config);
-
-        std::fs::write(config.miniswe_path("plan.md"), "a").unwrap();
-        std::fs::write(config.miniswe_path("scratchpad.md"), "b").unwrap();
-        let b = current_state_snapshot(&config);
-
-        assert_ne!(a, b);
-    }
-}
-
 /// Execute the debugger's proposed single-file rewind (`tools.
+/// Persist the behavioral gate's raw failure output (stdout+stderr from the
+/// configured validation command) to a file the model can `read` directly.
+/// The reactive debugger's Report/Rewind verdicts summarize this output in
+/// their own words before handing it to the primary agent — a paraphrase
+/// that can lose precision the raw text had (e.g. the exact "GOT: <value>"
+/// line pointing at which callsite is actually broken). Writing the raw
+/// text alongside the summary, rather than instead of it, lets the model
+/// fall back to ground truth when the summary steers it wrong. Best-effort:
+/// a write failure just means no pointer gets appended, never a hard error.
+pub(crate) fn write_gate_failure_output(config: &Config, output: &str) -> Option<String> {
+    let rel = "last_gate_failure.txt";
+    std::fs::write(config.miniswe_path(rel), output).ok()?;
+    Some(format!(".miniswe/{rel}"))
+}
+
 /// debugger_judge_rewind`) and build the message to inject afterward.
 /// Best-effort, matching the codebase's other auto-recovery guards: on
 /// failure the tree is left as-is and the model just sees the original
@@ -278,12 +209,20 @@ async fn rewind_message(
             "[debugger-judge] REWIND — reverted {} to rev_{} (file_errors {} → {})",
             candidate.path, candidate.rev, candidate.file_errors_now, candidate.file_errors_then
         ));
+        // REWIND fixes the ONE regressed file the debugger flagged — it doesn't
+        // mean the gate's original failure is fully resolved (the behavioral
+        // check may still be failing for an unrelated reason elsewhere). Point
+        // at the raw check output so the model isn't left guessing what
+        // "the remaining problem" actually is from the rewind summary alone.
+        let output_note = write_gate_failure_output(config, output)
+            .map(|path| format!(" Full check output that triggered this: read(\"{path}\")."))
+            .unwrap_or_default();
         Message::user(&format!(
             "[A read-only debugger with fresh eyes found that {} had regressed from a much \
              cleaner earlier revision. The loop has ALREADY reverted it to rev_{} for you \
              (file_errors {} → {}) — do NOT redo the discarded edits the same way. Re-read the \
              file to see its current (reverted) content, then continue the plan, fixing the \
-             remaining problem differently. Everything outside this file is untouched.]",
+             remaining problem differently. Everything outside this file is untouched.{output_note}]",
             candidate.path, candidate.rev, candidate.file_errors_now, candidate.file_errors_then
         ))
     } else {
@@ -613,17 +552,10 @@ pub async fn run(
         }
     }
     // The system prompt is phase-aware (pre-plan "explore→plan" vs
-    // post-plan "you are EDITING" + routing) AND carries the current plan
-    // and scratchpad content. `assemble()` runs once before the loop, so
-    // messages[0] is frozen at the attempt's starting state. Track a
-    // snapshot of it; whenever the persisted plan/scratchpad content
-    // changes mid-loop (plan(action='set'/'check'/'refine'/'scratchpad'))
-    // we rebuild messages[0] so the prompt reflects the current state —
-    // mirroring how visible_tool_defs is re-evaluated per turn at the same
-    // boundary. Comparing content (not just plan_exists()) matters because
-    // check/refine/scratchpad mutate plan.md/scratchpad.md without ever
-    // making them empty/non-empty, so a plain existence flip misses them.
-    let mut last_state_snapshot = current_state_snapshot(&config);
+    // post-plan "you are EDITING" + routing), but no longer carries plan or
+    // scratchpad content — that's now attached to the tail of the message
+    // list every round, inside `context::compressor::maybe_compress`'s
+    // `refresh_current_state` (see its doc comment for why it lives there).
 
     // Nudge the model to plan before editing (strict/legacy only). Skipped in
     // replay mode — the captured context already reflects whatever planning the
@@ -764,25 +696,6 @@ pub async fn run(
         // Hide edit tools from the model until a plan exists. See
         // visible_tool_defs for rationale.
         let plan_set = tools::plan::plan_exists(&config);
-        // Plan/scratchpad content changed (set/check/refine/scratchpad):
-        // rebuild the system prompt so it reflects the current state, not
-        // whatever was current at the attempt's start or last refresh.
-        let state_snapshot = current_state_snapshot(&config);
-        if strict && state_snapshot != last_state_snapshot {
-            let re = context::assemble(
-                &config,
-                message,
-                &conversation_history,
-                plan_only,
-                mcp_summary.as_deref(),
-            );
-            if let Some(sys) = re.messages.into_iter().next()
-                && !messages.is_empty()
-            {
-                messages[0] = sys;
-            }
-            last_state_snapshot = state_snapshot;
-        }
         // Off: never hide edit tools (pass plan_exists=true). Strict:
         // legacy hide-until-plan behavior.
         let visible = visible_tool_defs(&tool_defs, plan_set || !strict);
@@ -1016,7 +929,6 @@ pub async fn run(
                                 validation_blocks = 0;
                                 same_plan_step_failures = 0;
                                 last_failed_plan_step = None;
-                                last_state_snapshot = String::new();
                                 tui::print_status(
                                     "[gate-restart] scrapped the stuck state — tree at clean baseline + fresh context; restarting from scratch.",
                                 );
@@ -1138,7 +1050,6 @@ pub async fn run(
                                         validation_blocks = 0;
                                         same_plan_step_failures = 0;
                                         last_failed_plan_step = None;
-                                        last_state_snapshot = String::new();
                                         tui::print_status(
                                             "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                         );
@@ -1162,11 +1073,26 @@ pub async fn run(
                                         .await
                                     }
                                     debugger::DebuggerVerdict::Report(body) => {
+                                        // The debugger's diagnosis is a paraphrase of the raw
+                                        // check output — a paraphrase can lose precision the
+                                        // raw text had (e.g. the exact "GOT: <value>" line
+                                        // pointing at which callsite is actually broken).
+                                        // Point at the raw output alongside the diagnosis so
+                                        // the model can fall back to ground truth if the
+                                        // summary steers it wrong.
+                                        let output_note =
+                                            write_gate_failure_output(&config, &output)
+                                                .map(|path| {
+                                                    format!(
+                                                        "\nFull raw check output: read(\"{path}\")."
+                                                    )
+                                                })
+                                                .unwrap_or_default();
                                         Message::user(&format!(
                                             "[A read-only debugger with fresh eyes investigated the failing \
                                          check and produced this DIAGNOSIS. It did not edit anything — \
                                          YOU must apply the fix and finish the plan it lays out:\n{body}\n\
-                                         Make the change(s), then finish; the verification will re-run.]"
+                                         Make the change(s), then finish; the verification will re-run.{output_note}]"
                                         ))
                                     }
                                 };
@@ -1446,7 +1372,6 @@ pub async fn run(
                                     validation_blocks = 0;
                                     same_plan_step_failures = 0;
                                     last_failed_plan_step = None;
-                                    last_state_snapshot = String::new();
                                     tui::print_status(
                                         "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                     );
@@ -1469,12 +1394,19 @@ pub async fn run(
                                     )
                                     .await
                                 }
-                                debugger::DebuggerVerdict::Report(body) => Message::user(&format!(
-                                    "[A read-only debugger with fresh eyes investigated the failing \
+                                debugger::DebuggerVerdict::Report(body) => {
+                                    let output_note = write_gate_failure_output(&config, &output)
+                                        .map(|path| {
+                                            format!("\nFull raw check output: read(\"{path}\").")
+                                        })
+                                        .unwrap_or_default();
+                                    Message::user(&format!(
+                                        "[A read-only debugger with fresh eyes investigated the failing \
                                      check and produced this DIAGNOSIS. It did not edit anything — \
                                      YOU must apply the fix and finish the plan it lays out:\n{body}\n\
-                                     Make the change(s), then finish; the verification will re-run.]"
-                                )),
+                                     Make the change(s), then finish; the verification will re-run.{output_note}]"
+                                    ))
+                                }
                             };
                             messages.push(msg.clone());
                             conversation_history.push(msg);
@@ -1961,7 +1893,6 @@ pub async fn run(
                                 validation_blocks = 0;
                                 same_plan_step_failures = 0;
                                 last_failed_plan_step = None;
-                                last_state_snapshot = String::new();
                                 tui::print_status(
                                     "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                 );
@@ -1984,12 +1915,20 @@ pub async fn run(
                                 )
                                 .await
                             }
-                            debugger::DebuggerVerdict::Report(body) => Message::user(&format!(
-                                "[A read-only debugger with fresh eyes investigated the failing \
+                            debugger::DebuggerVerdict::Report(body) => {
+                                let output_note =
+                                    write_gate_failure_output(&config, &result.content)
+                                        .map(|path| {
+                                            format!("\nFull raw check output: read(\"{path}\").")
+                                        })
+                                        .unwrap_or_default();
+                                Message::user(&format!(
+                                    "[A read-only debugger with fresh eyes investigated the failing \
                                  plan-check step and produced this DIAGNOSIS. It did not edit \
                                  anything — YOU must apply the fix and finish the step it lays \
-                                 out:\n{body}\nMake the change(s), then re-check the step.]"
-                            )),
+                                 out:\n{body}\nMake the change(s), then re-check the step.{output_note}]"
+                                ))
+                            }
                         };
                         messages.push(extra_msg.clone());
                         conversation_history.push(extra_msg);

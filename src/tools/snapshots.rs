@@ -40,7 +40,7 @@ impl SnapshotManager {
         }
 
         let manager = Self {
-            git_dir,
+            git_dir: git_dir.clone(),
             work_tree: project_root.to_path_buf(),
             current_round: 0,
         };
@@ -48,6 +48,21 @@ impl SnapshotManager {
         // Set identity so commits work in any environment
         manager.git_config("user.email", "miniswe@local")?;
         manager.git_config("user.name", "miniswe")?;
+
+        // The shadow git dir lives INSIDE its own work tree (project_root),
+        // unlike a normal repo's `.git`, which git auto-excludes from `git
+        // add` by name. A bare `--git-dir` pointing at an arbitrary nested
+        // path gets no such special-casing, so `git add -A` would otherwise
+        // track the shadow repo's own object files as blobs within itself —
+        // self-referential tracking that `git reset --hard` (unlike the
+        // gentler `checkout <commit> -- <pathspec>`) refuses to reconcile.
+        // `info/exclude` is git's repo-local, untracked equivalent of
+        // .gitignore — exclude the shadow-git dir from ever being added.
+        std::fs::write(
+            git_dir.join("info").join("exclude"),
+            "/.miniswe/shadow-git/\n",
+        )
+        .context("failed to write shadow-git exclude file")?;
 
         // Initial snapshot
         manager.snapshot("session start")?;
@@ -97,10 +112,16 @@ impl SnapshotManager {
             .context(format!("no snapshot found for round {target_round}"))?
             .to_string();
 
-        // Checkout that commit's tree into the work tree
-        let status = self.git(&["checkout", &commit, "--", "."])?;
+        // `reset --hard`, not `checkout <commit> -- .`: checkout with a
+        // pathspec only restores content for files present in the target
+        // commit — it leaves anything created in a LATER round untouched on
+        // disk, so a file added after the target round survives a "revert"
+        // to before it existed. `reset --hard` moves the branch, resets the
+        // index, and syncs the working tree to match exactly, deleting
+        // anything tracked in the current HEAD but absent from the target.
+        let status = self.git(&["reset", "--hard", &commit])?;
         if !status.success() {
-            anyhow::bail!("git checkout failed for round {target_round}");
+            anyhow::bail!("git reset --hard failed for round {target_round}");
         }
 
         Ok(format!(
@@ -125,9 +146,26 @@ impl SnapshotManager {
             .context(format!("no snapshot found for round {target_round}"))?
             .to_string();
 
-        let status = self.git(&["checkout", &commit, "--", path])?;
-        if !status.success() {
-            anyhow::bail!("git checkout failed for {path} at round {target_round}");
+        // A file that didn't exist yet at the target round has no content to
+        // check out — `checkout <commit> -- path` fails with a pathspec
+        // error for a path absent from the target tree and leaves the file
+        // untouched, instead of correctly deleting it. "Reverted to a round
+        // before this file existed" means the file shouldn't exist, so
+        // remove it instead.
+        let existed = self
+            .git(&["cat-file", "-e", &format!("{commit}:{path}")])?
+            .success();
+
+        if existed {
+            let status = self.git(&["checkout", &commit, "--", path])?;
+            if !status.success() {
+                anyhow::bail!("git checkout failed for {path} at round {target_round}");
+            }
+        } else {
+            let status = self.git(&["rm", "-f", "--ignore-unmatch", "--", path])?;
+            if !status.success() {
+                anyhow::bail!("git rm failed for {path} at round {target_round}");
+            }
         }
 
         Ok(format!("Reverted {path} to round {target_round}"))
