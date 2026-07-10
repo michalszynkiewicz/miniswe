@@ -117,10 +117,15 @@ fn assembly_skips_template_guide() {
     );
 }
 
-// ── Scratchpad ──────────────────────────────────────────────────────
+// ── Scratchpad / plan (NOT in the system prompt) ─────────────────────
 
 #[test]
-fn scratchpad_included_in_context() {
+fn scratchpad_not_in_system_prompt() {
+    // Scratchpad used to be a system-prompt provider; it's now attached at
+    // the point it changes instead (cli::commands::run::refresh_current_state)
+    // — see that function's doc comment for why (it's agent-mutable
+    // mid-run, which made the system prompt go stale between refreshes).
+    // assemble() should never mention it.
     let (_tmp, config) = helpers::create_test_project();
 
     fs::write(
@@ -133,21 +138,17 @@ fn scratchpad_included_in_context() {
     let system = assembled.messages[0].content.as_deref().unwrap();
 
     assert!(
-        system.contains("[SCRATCHPAD]"),
-        "should have scratchpad section"
-    );
-    assert!(
-        system.contains("Implement auth"),
-        "scratchpad content should be present"
+        !system.contains("[SCRATCHPAD]"),
+        "scratchpad moved out of the system prompt, got: {system}"
     );
 }
 
 #[test]
-fn plan_injected_exactly_once() {
-    // Regression test: assemble() used to append a second `[PLAN]` block via
-    // a manual `load_plan()` call, on top of the one PlanProvider already
-    // contributes — duplicating tokens and risking two conflicting plan
-    // views if only one path was ever updated.
+fn plan_not_in_system_prompt() {
+    // Same as scratchpad — plan used to be injected here (and briefly,
+    // injected TWICE — see run.rs's refresh_current_state_tests for the
+    // regression coverage that replaced this). Now it's attached at the
+    // point it changes instead.
     let (_tmp, config) = helpers::create_test_project();
 
     fs::write(
@@ -159,15 +160,9 @@ fn plan_injected_exactly_once() {
     let assembled = context::assemble(&config, "continue", &[], false, None);
     let system = assembled.messages[0].content.as_deref().unwrap();
 
-    assert_eq!(
-        system.matches("[PLAN]").count(),
-        1,
-        "plan should be injected exactly once, got: {system}"
-    );
-    assert_eq!(
-        system.matches("Add the flag").count(),
-        1,
-        "plan content should appear exactly once, got: {system}"
+    assert!(
+        !system.contains("[PLAN]"),
+        "plan moved out of the system prompt, got: {system}"
     );
 }
 

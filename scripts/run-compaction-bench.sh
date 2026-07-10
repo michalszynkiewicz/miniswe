@@ -153,13 +153,14 @@ compaction = "${_compaction}"
 profile = true
 guide = true
 project_notes = true
-plan = true
 lessons = true
 repo_map = false  # off by default — available on demand via code(action='repo_map')
 mcp = true
-scratchpad = true
 usage_guide = true
 plan_mode = true
+# plan/scratchpad are NOT providers anymore — they're attached to the tail
+# of the message list every round via refresh_current_state, not injected
+# into the system prompt. See config::ProvidersConfig's doc comment.
 
 [hardware]
 vram_gb = 24.0

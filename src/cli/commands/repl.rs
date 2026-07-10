@@ -15,17 +15,21 @@ use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
+use crate::cli::commands::agent::debugger;
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
-    PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
+    PERIOD2_LOOP_HINT, PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
     PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE, is_file_write, is_prunable_refactor_failure,
     loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
 };
-use crate::cli::commands::agent::loop_detector::{is_mutating_call, loop_call_key};
+use crate::cli::commands::agent::loop_detector::{
+    is_mutating_call, is_period2_cycle, key_is_mutating, loop_call_key,
+};
 use crate::cli::commands::agent::permissions::permission_action;
-use crate::config::{Config, EditMode, ModelRole};
+use crate::cli::commands::agent::spiral;
+use crate::cli::commands::agent::validation;
+use crate::config::{CeremonyMode, Config, EditMode, ModelRole};
 use crate::context;
-use crate::context::compress;
 use crate::llm::{ChatRequest, Message, ModelRouter, is_truncated_tool_call_error};
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
@@ -321,6 +325,18 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
     } else {
         0
     };
+
+    // Snapshot manager for whole-tree revert support (SCRAP restart,
+    // revert-to-green). Unlike run.rs (where one session IS one task, so a
+    // single session-scoped instance is correct), REPL is a persistent
+    // multi-turn surface — (re-)initialized fresh at the start of every turn
+    // below, right before run_agent_loop, so SCRAP's revert-to-round-0 only
+    // ever reverts the CURRENT turn's changes, never prior turns' work.
+    // `SnapshotManager::init` wipes and recreates the shadow-git repo each
+    // call, so this is just a relocation, not new plumbing. No instance
+    // exists yet before the first turn runs — always overwritten before use.
+    #[allow(unused_assignments)]
+    let mut snapshots: Option<Arc<Mutex<tools::snapshots::SnapshotManager>>> = None;
 
     // Clear stale scratchpad/plan — unless `--continue` is set, in which
     // case carry the previous session's state forward.
@@ -700,7 +716,20 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
 
                                 log.user_message(&input);
 
-                                // Run agent loop inline (not spawned — needs mutable refs)
+                                // Fresh snapshot baseline for THIS turn: SCRAP's
+                                // revert-to-round-0 must only undo this turn's
+                                // changes, never prior turns' work (see the
+                                // `snapshots` declaration above for why this
+                                // can't be session-scoped the way run.rs's is).
+                                snapshots =
+                                    tools::snapshots::SnapshotManager::init(&config.project_root)
+                                        .ok()
+                                        .map(|s| Arc::new(Mutex::new(s)));
+
+                                // Run agent loop inline (not spawned — needs mutable refs).
+                                // Context compaction now happens EVERY round inside
+                                // run_agent_loop (matching run.rs) rather than once
+                                // per turn out here.
                                 run_agent_loop(
                                     &mut app,
                                     &mut rx,
@@ -721,46 +750,22 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                     &lsp_client,
                                     &fast_revisions,
                                     fast_baseline_errors,
+                                    &snapshots,
+                                    tool_def_tokens,
+                                    mcp_summary.as_deref(),
+                                    &user_message,
                                 )
                                 .await;
 
                                 // The agent loop may exit via early-break
                                 // paths (empty choices, errors) that skip
                                 // flush_tokens. Flush here so stray tokens
-                                // don't sit in the buffer through compression.
+                                // don't sit in the buffer.
                                 app.flush_tokens();
 
-                                app.set_active_job("compressing context");
-                                let _ = terminal.draw(|frame| ui::draw(frame, &app));
-                                let mut plan_update_requested = true;
-                                {
-                                    let compress_fut = context::compressor::maybe_compress(
-                                        &mut conversation_history,
-                                        &config,
-                                        &router,
-                                        &llm_worker,
-                                        tool_def_tokens,
-                                        &mut plan_update_requested,
-                                    );
-                                    let mut compress_fut = std::pin::pin!(compress_fut);
-                                    let mut done = false;
-                                    while !done {
-                                        tokio::select! {
-                                            biased;
-                                            () = &mut compress_fut, if !done => { done = true; }
-                                            evt = rx.recv() => {
-                                                if matches!(evt, Some(AppEvent::Tick)) {
-                                                    let _ = terminal.draw(|frame| ui::draw(frame, &app));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                app.clear_active_job();
-
-                                // Now the turn and any post-turn work are
-                                // fully done — flush tokens, draw the
-                                // separator, flip `is_thinking=false`, redraw.
+                                // The turn and any post-turn work are fully
+                                // done — flush tokens, draw the separator, flip
+                                // `is_thinking=false`, redraw.
                                 finish_completed_turn(&mut app, &mut terminal, None, None)?;
 
                                 // Turns that never produced a plan (the model
@@ -891,6 +896,7 @@ fn refresh_plan_panel(app: &mut App, config: &Config, round: usize) {
 }
 
 /// This runs inline in the main loop, processing events between rounds.
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_loop(
     app: &mut App,
     rx: &mut mpsc::UnboundedReceiver<AppEvent>,
@@ -912,19 +918,67 @@ async fn run_agent_loop(
     lsp: &Option<Arc<LspClient>>,
     fast_revisions: &Option<Arc<tools::RevisionStore>>,
     fast_baseline_errors: usize,
+    snapshots: &Option<Arc<Mutex<tools::snapshots::SnapshotManager>>>,
+    tool_def_tokens: usize,
+    mcp_summary: Option<&str>,
+    // The original user message for this turn — the recovery goal used by the
+    // done-gate re-anchor, the debugger sub-agent, and whole-tree SCRAP/reset
+    // re-assembly.
+    goal: &str,
 ) {
+    // Ceremony=Strict re-enables the legacy plan-first machinery (plan gate,
+    // plan/no-plan nudges, hide-edit-tools-until-plan). Derived from the
+    // per-turn config, which already has ceremony forced Off for explore turns.
+    let strict = config.tools.ceremony == CeremonyMode::Strict;
+    let pause_at = config.context.pause_after_rounds;
+
     let mut round = 0;
-    let mut tool_result_log: Vec<(String, serde_json::Value, String)> = Vec::new();
+    let mut had_error = false;
+    let mut user_continued = false;
     // Track consecutive identical tool calls to detect loops
     let mut last_call_key: Option<String> = None;
     let mut same_call_streak = 0u32;
+    // Short rolling history of call keys for period-2 cycle detection
+    // (edit↔revert oscillation — invisible to the consecutive detector).
+    let mut recent_call_keys: Vec<String> = Vec::new();
     // Number of distinct loops the model has been pulled out of in this
     // turn. We give one recovery; a second loop ends the turn for real.
     let mut loop_recoveries = 0u32;
+    let mut calls_since_last_edit = 0u32;
     let mut successful_edits_since_plan_update = 0u32;
+    let mut plan_update_requested = false;
     let mut nudged_premature_exit = false;
+    let mut nudged_no_plan = false;
+    // How many times the behavioral done-gate has blocked completion this turn.
+    let mut validation_blocks: usize = 0;
+    // The model's stated rationale each time the gate blocked it (bounded, auditable).
+    let mut validation_disputes: Vec<String> = Vec::new();
+    // Reactive-debugger / restart / replan bookkeeping (each fires at most once
+    // per turn; debugger_multifire walks the failure chain up to MAX fires).
+    let mut replan_fired = false;
+    let mut restart_fired = false;
+    let mut debugger_fires = 0usize;
+    let mut last_debugged_failure: Option<String> = None;
+    // `plan_gate_debugger`: consecutive plan(check) failures on the SAME step.
+    let mut same_plan_step_failures: u32 = 0;
+    let mut last_failed_plan_step: Option<u64> = None;
+    // Gate-triggered context resets fired this turn (bounded — don't loop).
+    let mut gate_resets: usize = 0;
+    // Spiral-reset: per-file revert counts + how many resets fired this turn.
+    let mut revert_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut spiral_resets: usize = 0;
+    // revert-to-green state (opt-in `tools.revert_to_green`): the last round
+    // whose start-of-round snapshot was green (project errors ≤ baseline) and
+    // how many consecutive rounds the project has stayed broken.
+    const REVERT_TO_GREEN_BLOCKS: usize = 6;
+    let mut last_green_round: usize = 0;
+    let mut red_streak: usize = 0;
 
-    loop {
+    'round: loop {
+        if had_error {
+            break;
+        }
         // Check cancellation at the top of every round
         if consume_interrupt(cancelled) {
             app.push_output("(interrupted)", LineStyle::Status);
@@ -933,29 +987,129 @@ async fn run_agent_loop(
 
         round += 1;
         log.round_start(round);
+
+        // Snapshot at the start of each round for revert support (SCRAP /
+        // revert-to-green rely on these per-round commits in the shadow repo).
+        if let Some(snap) = snapshots {
+            let mut guard = snap.lock();
+            let _ = guard.begin_round(round);
+        }
+
+        // revert-to-green: if the project has been broken above baseline for
+        // REVERT_TO_GREEN_BLOCKS rounds, the agent is digging deeper, not
+        // recovering — reset the whole tree to the last green snapshot.
+        if config.tools.revert_to_green
+            && config.tools.edit_mode == EditMode::Fast
+            && let Some(snap) = snapshots
+        {
+            let errs = tools::fast::project_error_count(lsp.as_deref()).await;
+            if errs <= fast_baseline_errors {
+                last_green_round = round;
+                red_streak = 0;
+            } else {
+                red_streak += 1;
+                if red_streak >= REVERT_TO_GREEN_BLOCKS {
+                    let result = {
+                        let guard = snap.lock();
+                        guard.revert_to_round(last_green_round)
+                    };
+                    match result {
+                        Ok(m) => {
+                            app.push_output(
+                                &format!("[revert-to-green] stuck {red_streak} rounds; {m}"),
+                                LineStyle::Status,
+                            );
+                            messages.push(Message::user(&format!(
+                                "[auto-revert-to-green] The project has had compile errors for \
+                                 {red_streak} rounds straight and you are not converging — you are \
+                                 digging deeper, not recovering. I reverted the ENTIRE working tree \
+                                 to round {last_green_round}, the last state that compiled cleanly. \
+                                 Your edits since then are GONE; do not replay them. Start over from \
+                                 this clean base: re-read the relevant code, make ONE small complete \
+                                 change, and run a check before continuing."
+                            )));
+                            red_streak = 0;
+                        }
+                        Err(e) => {
+                            app.push_output(
+                                &format!("[revert-to-green] revert failed: {e}"),
+                                LineStyle::Error,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         if round > max_rounds {
             app.push_output("Maximum tool rounds reached.", LineStyle::Error);
             break;
         }
 
+        // Ask the user whether to continue after pause_after_rounds rounds.
+        if round == pause_at && !user_continued {
+            app.pending_permission = Some(format!(
+                "{pause_at} tool rounds used. Continue? [y]es / [n]o:"
+            ));
+            app.input.clear();
+            app.cursor = 0;
+            let response = wait_for_modal_input(app, rx, terminal, &['y', 'n']).await;
+            app.pending_permission = None;
+            match response.as_str() {
+                "y" | "yes" | "" => user_continued = true,
+                _ => messages.push(Message::user("[Stop now. Summarize what you've done.]")),
+            }
+        }
+
+        // Warn the LLM when approaching the hard limit.
+        if round == max_rounds.saturating_sub(5) {
+            messages.push(Message::user(
+                "[Approaching tool limit. Wrap up and summarize.]",
+            ));
+        }
+
         // Refresh the live plan panel from plan.md (single source of truth).
         refresh_plan_panel(app, config, round);
 
-        // Observation masking — budget = half the context window
-        let tool_result_budget = config.model.context_window / 2;
-        mask_old_tool_results(
-            messages,
-            &tool_result_log,
-            tool_result_budget,
-            &config.project_root,
-        );
+        // Unified context compression — handles both tool results and
+        // conversation, every round (matching run.rs). Driven through a
+        // select! so a long LLM-based summarization keeps the TUI responsive.
+        {
+            let pre = messages.len();
+            {
+                let compress_fut = context::compressor::maybe_compress(
+                    messages,
+                    config,
+                    router,
+                    llm_worker,
+                    tool_def_tokens,
+                    &mut plan_update_requested,
+                );
+                let mut compress_fut = std::pin::pin!(compress_fut);
+                let mut done = false;
+                while !done {
+                    tokio::select! {
+                        biased;
+                        () = &mut compress_fut, if !done => { done = true; }
+                        evt = rx.recv() => {
+                            if matches!(evt, Some(AppEvent::Tick)) {
+                                let _ = terminal.draw(|frame| ui::draw(frame, app));
+                            }
+                        }
+                    }
+                }
+            }
+            log.masking_applied(pre.saturating_sub(messages.len()), pre);
+        }
 
         // Sanitize messages
         context::sanitize_messages(messages);
 
         // Hide edit tools until a plan exists; see visible_tool_defs.
         let plan_set = tools::plan::plan_exists(config);
-        let visible = visible_tool_defs(tool_defs, plan_set);
+        // Off: never hide edit tools (pass plan_exists=true). Strict: legacy
+        // hide-until-plan behavior.
+        let visible = visible_tool_defs(tool_defs, plan_set || !strict);
         // Build request. See run.rs for the per-model reasoning_effort logic.
         let chat_template_kwargs = if config.model.is_mistral_small_4_family() {
             let effort = if plan_set { "none" } else { "high" };
@@ -1135,7 +1289,8 @@ async fn run_agent_loop(
                 // See run.rs for rationale — nudge on both "mid-plan exit"
                 // and "no-plan exit" (the latter caught Mistral Small 4
                 // bailing during exploration before any meaningful work).
-                if !nudged_premature_exit && config.tools.plan {
+                // Strict/legacy only.
+                if strict && !nudged_premature_exit && config.tools.plan {
                     let has_unchecked = tools::plan::has_unchecked_steps(config);
                     let plan_exists = tools::plan::plan_exists(config);
                     if has_unchecked || !plan_exists {
@@ -1154,6 +1309,235 @@ async fn run_agent_loop(
                         conversation_history.push(nudge);
                         continue;
                     }
+                }
+
+                // Behavioral done-gate: before accepting completion, verify the
+                // change actually works at runtime. Default config has no
+                // command → no-op. See docs/success-validation-design.md.
+                // Skipped for read-only (explore) turns — a Q&A turn makes no
+                // edits, so there is nothing to behaviorally verify and blocking
+                // the answer would be nonsensical.
+                if !read_only
+                    && validation_blocks < config.validation.max_retries
+                    && config.validation.command().is_some()
+                {
+                    match validation::run_behavioral_check(config).await {
+                        validation::CheckOutcome::Fail(output) => {
+                            validation_blocks += 1;
+                            // Record the model's completion rationale (its
+                            // no-tool-call exit content) — a bounded, auditable
+                            // voice, not a silent free pass.
+                            if let Some(rationale) = assistant_msg
+                                .content
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|c| !c.is_empty())
+                            {
+                                tracing::warn!(
+                                    "[validation] blocked completion (attempt {validation_blocks}); model rationale: {}",
+                                    crate::truncate_chars(rationale, 300)
+                                );
+                                validation_disputes.push(rationale.to_string());
+                            }
+                            app.push_output(
+                                "Behavioral check failed — not done yet.",
+                                LineStyle::Status,
+                            );
+
+                            // Full restart (opt-in `gate_restart`): on the FIRST
+                            // gate block, abandon the possibly-poisoned attempt —
+                            // revert the WHOLE tree to the clean baseline AND
+                            // reset the context. Fires once per turn.
+                            if config.tools.gate_restart && !restart_fired {
+                                restart_fired = true;
+                                *messages =
+                                    scrap_restart(app, config, goal, mcp_summary, snapshots, false);
+                                conversation_history.clear();
+                                validation_blocks = 0;
+                                same_plan_step_failures = 0;
+                                last_failed_plan_step = None;
+                                continue;
+                            }
+
+                            // Goal re-anchor (opt-in `gate_replan`): re-anchor on
+                            // the ORIGINAL goal and force a fresh plan — but skip
+                            // when the block is a COMPILE failure (re-anchoring on
+                            // a broken tree just digs deeper).
+                            let is_compile_fail = output.contains("DOES NOT COMPILE")
+                                || output.contains("could not compile")
+                                || output.contains("error[E");
+                            if config.tools.gate_replan && !replan_fired && !is_compile_fail {
+                                replan_fired = true;
+                                app.push_output(
+                                    "Re-anchoring on the original goal — re-plan from the task…",
+                                    LineStyle::Status,
+                                );
+                                let msg = Message::user(&format!(
+                                    "[A check that exercises the change end-to-end FAILED — it \
+                                     COMPILES but does not yet BEHAVE as required. After fixing \
+                                     errors it is easy to lose the original goal and stop at \"it \
+                                     compiles\". Re-anchor on the task: \"{goal}\". Use \
+                                     plan(action='set') to re-derive the FULL plan from that goal — \
+                                     list every step the feature needs end-to-end, INCLUDING the \
+                                     code that actually USES the new input to change behavior (not \
+                                     just declaring or plumbing it). For each step, confirm it is \
+                                     DONE in the code, not merely compiling — then implement \
+                                     whatever is missing before finishing.\nCheck output:\n{output}]"
+                                ));
+                                messages.push(msg.clone());
+                                conversation_history.push(msg);
+                                continue;
+                            }
+
+                            // Reactive debugger (opt-in): hand the SPECIFIC
+                            // failure to a fresh-context sub-agent once the
+                            // primary agent has failed the gate a couple times.
+                            let fkey = crate::cli::commands::run::failure_key(&output);
+                            let may_fire = if config.tools.debugger_multifire {
+                                debugger_fires < debugger::MAX_DEBUGGER_FIRES
+                                    && last_debugged_failure.as_deref() != Some(fkey.as_str())
+                            } else {
+                                debugger_fires == 0
+                            };
+                            if (config.tools.reactive_debugger || config.tools.debugger_judge)
+                                && may_fire
+                                && validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
+                            {
+                                debugger_fires += 1;
+                                last_debugged_failure = Some(fkey);
+                                app.push_output(
+                                    "Still failing — spinning up a fresh-context debugger sub-agent…",
+                                    LineStyle::Status,
+                                );
+                                let verdict = debugger::run_debugger(
+                                    &output,
+                                    goal,
+                                    config,
+                                    llm_worker,
+                                    tool_pool,
+                                    tool_defs,
+                                    perms,
+                                    mcp_registry,
+                                    lsp,
+                                    fast_revisions,
+                                    fast_baseline_errors,
+                                    cancelled,
+                                )
+                                .await;
+
+                                let msg = match verdict {
+                                    debugger::DebuggerVerdict::Scrap if !restart_fired => {
+                                        restart_fired = true;
+                                        *messages = scrap_restart(
+                                            app,
+                                            config,
+                                            goal,
+                                            mcp_summary,
+                                            snapshots,
+                                            true,
+                                        );
+                                        conversation_history.clear();
+                                        validation_blocks = 0;
+                                        same_plan_step_failures = 0;
+                                        last_failed_plan_step = None;
+                                        continue;
+                                    }
+                                    debugger::DebuggerVerdict::Scrap => Message::user(
+                                        "[A fresh-context review voted to reset again, but the \
+                                         tree was already reset once this turn. Keep going: read \
+                                         the current failure carefully and fix it directly.]",
+                                    ),
+                                    debugger::DebuggerVerdict::Rewind(candidate) => {
+                                        rewind_message_repl(
+                                            app,
+                                            &candidate,
+                                            config,
+                                            perms,
+                                            lsp,
+                                            fast_revisions,
+                                            fast_baseline_errors,
+                                            &output,
+                                        )
+                                        .await
+                                    }
+                                    debugger::DebuggerVerdict::Report(body) => {
+                                        let output_note =
+                                            crate::cli::commands::run::write_gate_failure_output(
+                                                config, &output,
+                                            )
+                                            .map(|path| {
+                                                format!(
+                                                    "\nFull raw check output: read(\"{path}\")."
+                                                )
+                                            })
+                                            .unwrap_or_default();
+                                        Message::user(&format!(
+                                            "[A read-only debugger with fresh eyes investigated the failing \
+                                         check and produced this DIAGNOSIS. It did not edit anything — \
+                                         YOU must apply the fix and finish the plan it lays out:\n{body}\n\
+                                         Make the change(s), then finish; the verification will re-run.{output_note}]"
+                                        ))
+                                    }
+                                };
+                                messages.push(msg.clone());
+                                conversation_history.push(msg);
+                                continue;
+                            }
+
+                            // Gate context-reset (opt-in): drop the polluted
+                            // history and re-assemble a clean context (files
+                            // persist on disk). Bounded per turn.
+                            if config.tools.gate_context_reset
+                                && gate_resets < spiral::MAX_GATE_RESETS
+                                && validation_blocks >= spiral::GATE_RESET_AFTER_BLOCKS
+                            {
+                                gate_resets += 1;
+                                validation_blocks = 0;
+                                let fresh = spiral::build_gate_reset_prompt(goal, &output);
+                                let assembled =
+                                    context::assemble(config, &fresh, &[], false, mcp_summary);
+                                *messages = assembled.messages;
+                                app.push_output(
+                                    "Gate context-reset — fresh start (history cleared, files kept).",
+                                    LineStyle::Status,
+                                );
+                                log.tool_debug(
+                                    "agent",
+                                    "gate context-reset: re-assembled clean context after repeated gate blocks",
+                                );
+                                continue;
+                            }
+
+                            let msg = Message::user(&format!(
+                                "[Verification failed — do NOT finish yet. A check that exercises \
+                                 the change end-to-end exited non-zero; the output below shows what \
+                                 is actually wrong. Read it carefully and fix the SPECIFIC problem \
+                                 it reports (it may be a compile error, not a logic error), then \
+                                 continue. (If you are certain the check itself is wrong, finish \
+                                 anyway and state the specific reason — it will be recorded.)\n\
+                                 Check output:\n{output}]"
+                            ));
+                            messages.push(msg.clone());
+                            conversation_history.push(msg);
+                            continue;
+                        }
+                        validation::CheckOutcome::Pass | validation::CheckOutcome::Skipped => {}
+                    }
+                }
+                // Exiting now. Surface any recorded gate rationale(s) for audit.
+                if !validation_disputes.is_empty() {
+                    app.push_output(
+                        &format!(
+                            "Completed after {} blocked verification(s); model's reasons recorded in the log.",
+                            validation_disputes.len()
+                        ),
+                        LineStyle::Status,
+                    );
+                    tracing::warn!(
+                        "[validation] turn completed over {} blocked check(s); model rationale(s): {}",
+                        validation_disputes.len(),
+                        validation_disputes.join(" | ")
+                    );
                 }
                 break;
             }
@@ -1183,7 +1567,7 @@ async fn run_agent_loop(
             // Check cancellation between tool calls
             if consume_interrupt(cancelled) {
                 app.push_output("(interrupted)", LineStyle::Status);
-                return;
+                break 'round;
             }
             let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
                 Ok(v) => v,
@@ -1204,7 +1588,9 @@ async fn run_agent_loop(
 
             let args_summary = summarize_args(&tc.function.name, &args);
 
-            // Detect tool call loops: only identical calls repeated consecutively.
+            // Detect tool call loops: identical calls repeated consecutively
+            // (period-1), or the SAME two calls alternating (period-2 — the
+            // edit↔revert oscillation the streak counter is blind to).
             let call_key = loop_call_key(&tc.function.name, &args);
             if last_call_key.as_ref() == Some(&call_key) {
                 same_call_streak += 1;
@@ -1212,8 +1598,21 @@ async fn run_agent_loop(
                 last_call_key = Some(call_key.clone());
                 same_call_streak = 1;
             }
-            if same_call_streak >= 3 {
-                let mutating = is_mutating_call(&tc.function.name, &args);
+            recent_call_keys.push(call_key.clone());
+            if recent_call_keys.len() > 12 {
+                recent_call_keys.remove(0);
+            }
+            let period2 = is_period2_cycle(&recent_call_keys);
+            if same_call_streak >= 3 || period2 {
+                // Period-2-only detection (not also a plain streak).
+                let p2_only = period2 && same_call_streak < 3;
+                // A period-2 cycle is harmful if EITHER member mutates.
+                let mutating = if p2_only {
+                    let tail = &recent_call_keys[recent_call_keys.len().saturating_sub(2)..];
+                    tail.iter().any(|k| key_is_mutating(k))
+                } else {
+                    is_mutating_call(&tc.function.name, &args)
+                };
                 log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
 
                 // Read-only repetition: harmless, just wasted tokens.
@@ -1231,30 +1630,171 @@ async fn run_agent_loop(
                     );
                     last_call_key = None;
                     same_call_streak = 0;
+                    recent_call_keys.clear();
                     continue;
                 }
 
-                let result_msg =
-                    Message::tool_result(&tc.id, loop_detected_hint(config.tools.edit_mode));
+                let hint = if p2_only {
+                    PERIOD2_LOOP_HINT
+                } else {
+                    loop_detected_hint(config.tools.edit_mode)
+                };
+                let result_msg = Message::tool_result(&tc.id, hint);
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
 
                 // First mutating loop in this turn: surface the hint, reset
                 // the streak, and let the model try a different approach.
-                // A second loop after the recovery means the model is
-                // genuinely stuck — bail then.
                 if loop_recoveries == 0 {
                     loop_recoveries += 1;
                     last_call_key = None;
                     same_call_streak = 0;
+                    recent_call_keys.clear();
                     app.push_output(
                         &format!(
-                            "  ⚠ Loop detected: {}({}) repeated 3 times — surfacing a hint, giving the model one more round",
-                            tc.function.name, args_summary
+                            "  ⚠ Loop detected: {}({}) {} — surfacing a hint, giving the model one more round",
+                            tc.function.name,
+                            args_summary,
+                            if p2_only {
+                                "alternating with the same partner call (period-2 cycle)"
+                            } else {
+                                "repeated 3 times"
+                            }
                         ),
                         LineStyle::Status,
                     );
                     break;
+                }
+
+                // Second mutating loop after the recovery hint. With a
+                // behavioral done-gate configured this is NOT a dead end — it
+                // is the same "stuck but the task isn't done" state as a
+                // premature exit, so route it through the gate ladder instead
+                // of dying with the whole recovery stack idle.
+                if !read_only
+                    && config.validation.command().is_some()
+                    && validation_blocks < config.validation.max_retries
+                {
+                    app.push_output(
+                        &format!(
+                            "  Loop detected again ({}({})) — routing through the done-gate instead of stopping",
+                            tc.function.name, args_summary
+                        ),
+                        LineStyle::Status,
+                    );
+                    if let validation::CheckOutcome::Fail(output) =
+                        validation::run_behavioral_check(config).await
+                    {
+                        validation_blocks += 1;
+                        // Fresh recovery budget for the rounds the gate grants.
+                        loop_recoveries = 0;
+                        last_call_key = None;
+                        same_call_streak = 0;
+                        recent_call_keys.clear();
+
+                        let fkey = crate::cli::commands::run::failure_key(&output);
+                        let may_fire = if config.tools.debugger_multifire {
+                            debugger_fires < debugger::MAX_DEBUGGER_FIRES
+                                && last_debugged_failure.as_deref() != Some(fkey.as_str())
+                        } else {
+                            debugger_fires == 0
+                        };
+                        if (config.tools.reactive_debugger || config.tools.debugger_judge)
+                            && may_fire
+                            && validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
+                        {
+                            debugger_fires += 1;
+                            last_debugged_failure = Some(fkey);
+                            app.push_output(
+                                "Looping + failing gate — spinning up a fresh-context debugger sub-agent…",
+                                LineStyle::Status,
+                            );
+                            let verdict = debugger::run_debugger(
+                                &output,
+                                goal,
+                                config,
+                                llm_worker,
+                                tool_pool,
+                                tool_defs,
+                                perms,
+                                mcp_registry,
+                                lsp,
+                                fast_revisions,
+                                fast_baseline_errors,
+                                cancelled,
+                            )
+                            .await;
+
+                            let msg = match verdict {
+                                debugger::DebuggerVerdict::Scrap if !restart_fired => {
+                                    restart_fired = true;
+                                    *messages = scrap_restart(
+                                        app,
+                                        config,
+                                        goal,
+                                        mcp_summary,
+                                        snapshots,
+                                        true,
+                                    );
+                                    conversation_history.clear();
+                                    validation_blocks = 0;
+                                    same_plan_step_failures = 0;
+                                    last_failed_plan_step = None;
+                                    continue 'round;
+                                }
+                                debugger::DebuggerVerdict::Scrap => Message::user(
+                                    "[A fresh-context review voted to reset again, but the tree \
+                                     was already reset once this turn. Keep going: read the \
+                                     current failure carefully and fix it directly.]",
+                                ),
+                                debugger::DebuggerVerdict::Rewind(candidate) => {
+                                    rewind_message_repl(
+                                        app,
+                                        &candidate,
+                                        config,
+                                        perms,
+                                        lsp,
+                                        fast_revisions,
+                                        fast_baseline_errors,
+                                        &output,
+                                    )
+                                    .await
+                                }
+                                debugger::DebuggerVerdict::Report(body) => {
+                                    let output_note =
+                                        crate::cli::commands::run::write_gate_failure_output(
+                                            config, &output,
+                                        )
+                                        .map(|path| {
+                                            format!("\nFull raw check output: read(\"{path}\").")
+                                        })
+                                        .unwrap_or_default();
+                                    Message::user(&format!(
+                                        "[A read-only debugger with fresh eyes investigated the failing \
+                                     check and produced this DIAGNOSIS. It did not edit anything — \
+                                     YOU must apply the fix and finish the plan it lays out:\n{body}\n\
+                                     Make the change(s), then finish; the verification will re-run.{output_note}]"
+                                    ))
+                                }
+                            };
+                            messages.push(msg.clone());
+                            conversation_history.push(msg);
+                            continue 'round;
+                        }
+
+                        let msg = Message::user(&format!(
+                            "[Your repeated failing tool call was aborted, and the task is NOT \
+                             done — the verification check failed:\n{output}\nRead the check \
+                             output and your tool errors carefully, fix the SPECIFIC problem, \
+                             and use a correctly-formed call (include every required parameter) \
+                             or a different tool.]"
+                        ));
+                        messages.push(msg.clone());
+                        conversation_history.push(msg);
+                        continue 'round;
+                    }
+                    // Gate passed (or skipped): the loop was on something the
+                    // check doesn't care about — fall through to the stop.
                 }
                 app.push_output(
                     &format!(
@@ -1263,7 +1803,8 @@ async fn run_agent_loop(
                     ),
                     LineStyle::Error,
                 );
-                return;
+                had_error = true;
+                break;
             }
 
             log.tool_call_detail(&tc.function.name, &args);
@@ -1371,6 +1912,22 @@ async fn run_agent_loop(
             }
 
             let file_action = args["action"].as_str().unwrap_or("");
+
+            // Write gating: require a plan before write tools (strict only).
+            let is_write_action = is_file_write(tc.function.name.as_str());
+            if strict && config.tools.plan && !tools::plan::plan_exists(config) && is_write_action {
+                let result_msg = Message::tool_result(
+                    &tc.id,
+                    "Create a plan first: use plan(action='set') with your step-by-step approach before making changes.",
+                );
+                messages.push(result_msg.clone());
+                conversation_history.push(result_msg);
+                app.push_output(
+                    &format!("  ✗ {}: blocked — no plan", tc.function.name),
+                    LineStyle::ToolErr,
+                );
+                continue;
+            }
             // (Plan-checkpoint used to hard-block writes after N edits without
             //  a plan action; that interacted poorly with the compile-gate on
             //  `plan(check)` — if the project didn't compile, the model
@@ -1628,6 +2185,11 @@ async fn run_agent_loop(
                 result.content.push_str(&hint);
             }
 
+            // Append round number to every tool result.
+            result
+                .content
+                .push_str(&format!("\n[round {round}/{max_rounds}]"));
+
             let first_line = result.content.lines().next().unwrap_or("(empty)");
             log.tool_call(&tc.function.name, &args_summary, result.success, first_line);
             log.tool_result_detail(&tc.function.name, result.success, &result.content);
@@ -1647,11 +2209,12 @@ async fn run_agent_loop(
                 successful_edits_since_plan_update = 0;
             }
 
-            // Successful file write = code changed, reset loop detector
+            // Successful file write = code changed, reset loop/stall trackers.
             if result.success && is_file_write(tc.function.name.as_str()) {
                 last_call_key = None;
                 same_call_streak = 0;
-                if config.tools.plan {
+                calls_since_last_edit = 0;
+                if strict && config.tools.plan {
                     if tools::plan::plan_exists(config) {
                         result.content.push('\n');
                         result.content.push_str(PLAN_PROGRESS_NUDGE);
@@ -1662,13 +2225,9 @@ async fn run_agent_loop(
                         result.content.push_str(PLAN_CHECKPOINT_WARNING);
                     }
                 }
+            } else {
+                calls_since_last_edit += 1;
             }
-
-            tool_result_log.push((
-                tc.function.name.clone(),
-                args.clone(),
-                result.content.clone(),
-            ));
 
             if !is_prunable_refactor_failure(&result.content, result.success) {
                 all_prunable_failures = false;
@@ -1679,6 +2238,143 @@ async fn run_agent_loop(
             let result_msg = Message::tool_result(&tc.id, &result.content);
             messages.push(result_msg.clone());
             conversation_history.push(result_msg);
+
+            // `plan_gate_debugger`: the plan tool's OWN compile gate repeatedly
+            // blocking the SAME step is a distinct stall signature from the
+            // behavioral done-gate (`validation_blocks`) — the primary agent is
+            // re-litigating one step rather than making forward progress.
+            if tc.function.name == "plan"
+                && args.get("action").and_then(|a| a.as_str()) == Some("check")
+            {
+                if result.success {
+                    same_plan_step_failures = 0;
+                    last_failed_plan_step = None;
+                } else if let Some(step) = args.get("step").and_then(|s| s.as_u64()) {
+                    crate::cli::commands::run::track_plan_step_failure(
+                        &mut last_failed_plan_step,
+                        &mut same_plan_step_failures,
+                        step,
+                    );
+
+                    let fkey = crate::cli::commands::run::failure_key(&result.content);
+                    let may_fire = if config.tools.debugger_multifire {
+                        debugger_fires < debugger::MAX_DEBUGGER_FIRES
+                            && last_debugged_failure.as_deref() != Some(fkey.as_str())
+                    } else {
+                        debugger_fires == 0
+                    };
+                    if config.tools.plan_gate_debugger
+                        && may_fire
+                        && same_plan_step_failures as usize >= debugger::DEBUGGER_TRIGGER_BLOCKS
+                    {
+                        debugger_fires += 1;
+                        last_debugged_failure = Some(fkey);
+                        app.push_output(
+                            "Plan-check gate failing repeatedly on the same step — spinning up a fresh-context debugger sub-agent…",
+                            LineStyle::Status,
+                        );
+                        let verdict = debugger::run_debugger(
+                            &result.content,
+                            goal,
+                            config,
+                            llm_worker,
+                            tool_pool,
+                            tool_defs,
+                            perms,
+                            mcp_registry,
+                            lsp,
+                            fast_revisions,
+                            fast_baseline_errors,
+                            cancelled,
+                        )
+                        .await;
+
+                        let extra_msg = match verdict {
+                            debugger::DebuggerVerdict::Scrap if !restart_fired => {
+                                restart_fired = true;
+                                *messages =
+                                    scrap_restart(app, config, goal, mcp_summary, snapshots, true);
+                                conversation_history.clear();
+                                validation_blocks = 0;
+                                same_plan_step_failures = 0;
+                                last_failed_plan_step = None;
+                                continue 'round;
+                            }
+                            debugger::DebuggerVerdict::Scrap => Message::user(
+                                "[A fresh-context review voted to reset again, but the tree \
+                                 was already reset once this turn. Keep going: read the \
+                                 current failure carefully and fix it directly.]",
+                            ),
+                            debugger::DebuggerVerdict::Rewind(candidate) => {
+                                rewind_message_repl(
+                                    app,
+                                    &candidate,
+                                    config,
+                                    perms,
+                                    lsp,
+                                    fast_revisions,
+                                    fast_baseline_errors,
+                                    &result.content,
+                                )
+                                .await
+                            }
+                            debugger::DebuggerVerdict::Report(body) => {
+                                let output_note =
+                                    crate::cli::commands::run::write_gate_failure_output(
+                                        config,
+                                        &result.content,
+                                    )
+                                    .map(|path| {
+                                        format!("\nFull raw check output: read(\"{path}\").")
+                                    })
+                                    .unwrap_or_default();
+                                Message::user(&format!(
+                                    "[A read-only debugger with fresh eyes investigated the failing \
+                                 plan-check step and produced this DIAGNOSIS. It did not edit \
+                                 anything — YOU must apply the fix and finish the step it lays \
+                                 out:\n{body}\nMake the change(s), then re-check the step.{output_note}]"
+                                ))
+                            }
+                        };
+                        messages.push(extra_msg.clone());
+                        conversation_history.push(extra_msg);
+                    }
+                }
+            }
+
+            // Spiral-reset: a revert-loop (same file reverted repeatedly) means
+            // the agent is cycling on the same failing edits. Inject a cognitive
+            // reset (names what failed + forces a replan + concrete redirection).
+            if config.tools.spiral_reset
+                && result.success
+                && tc.function.name == "revert"
+                && config.tools.edit_mode == EditMode::Fast
+                && spiral_resets < spiral::MAX_RESETS_PER_TURN
+                && let Some(path) = args.get("path").and_then(|p| p.as_str())
+            {
+                let count = revert_counts.entry(path.to_string()).or_insert(0);
+                *count += 1;
+                if *count >= spiral::SPIRAL_REVERT_THRESHOLD {
+                    let n = *count;
+                    *count = 0;
+                    spiral_resets += 1;
+                    let tried = fast_revisions
+                        .as_deref()
+                        .map(|r| spiral::tried_edit_labels(r, path, 4))
+                        .unwrap_or_default();
+                    let reset = Message::user(&spiral::build_reset_message(path, n, &tried));
+                    messages.push(reset.clone());
+                    conversation_history.push(reset);
+                    app.push_output(
+                        "Spiral detected (revert-loop) — reset + replan injected.",
+                        LineStyle::Status,
+                    );
+                    log.tool_debug(
+                        "agent",
+                        &format!("spiral-reset fired for {path} after {n} reverts"),
+                    );
+                }
+            }
 
             // Re-render after tool result
             let _ = terminal.draw(|frame| ui::draw(frame, app));
@@ -1704,105 +2400,163 @@ async fn run_agent_loop(
                 ),
             );
         }
+
+        // Early no-plan nudge (strict only): edit tools are hidden until
+        // plan(action='set'). Nudge around round 12 so a model that ignores the
+        // system prompt gets a course correction before it's deeply stuck.
+        if strict && round >= 12 && !nudged_no_plan && !tools::plan::plan_exists(config) {
+            let unlock_tools = "refactor, replace_range, insert_at, write_file";
+            messages.push(Message::user(&format!(
+                "[Reminder: you've explored for several rounds without a plan. \
+                 Call plan(action='set') with your step-by-step approach now — \
+                 the edit tools ({unlock_tools}) are hidden until you do, and \
+                 you'll need them to make changes.]"
+            )));
+            nudged_no_plan = true;
+        }
+
+        // Stall detection: too many tool calls without any edits. Content is
+        // plan-state aware — without a plan the edit tools are hidden, so
+        // re-fire the plan nudge instead of pointing at hidden tools.
+        if calls_since_last_edit >= 20 && calls_since_last_edit.is_multiple_of(20) {
+            let body = if strict && !tools::plan::plan_exists(config) {
+                "Still no plan set after 20+ exploration calls. \
+                 Edit tools cannot appear in your tool list until plan(action='set') is called. \
+                 Stop exploring and set a plan now — even an imperfect plan can be refined later. \
+                 If something is blocking you from planning, say so."
+                    .to_string()
+            } else {
+                let edit_hint = match config.tools.edit_mode {
+                    EditMode::Smart => "Use edit_file for semantic file edits.",
+                    EditMode::Fast => "Use replace_range or insert_at to land targeted edits.",
+                };
+                format!(
+                    "You have used 20+ tool calls without making any edits. \
+                     You likely have enough information. Start making changes now. \
+                     {edit_hint} \
+                     If you're stuck, explain what's blocking you."
+                )
+            };
+            messages.push(Message::user(&format!("[WARNING: {body}]")));
+        }
+    }
+
+    log.session_end(round, had_error);
+}
+
+/// Execute the debugger's proposed single-file rewind (`debugger_judge_rewind`)
+/// and build the message to inject afterward. Best-effort: on failure the tree
+/// is left as-is and the model just sees the original verification failure.
+#[allow(clippy::too_many_arguments)]
+async fn rewind_message_repl(
+    app: &mut App,
+    candidate: &tools::RewindCandidate,
+    config: &Config,
+    perms: &Arc<PermissionManager>,
+    lsp: &Option<Arc<LspClient>>,
+    fast_revisions: &Option<Arc<tools::RevisionStore>>,
+    fast_baseline_errors: usize,
+    output: &str,
+) -> Message {
+    let Some(revisions) = fast_revisions.as_deref() else {
+        return Message::user(&format!(
+            "[Verification failed — do NOT finish yet. Check output:\n{output}]"
+        ));
+    };
+    let args = serde_json::json!({"path": candidate.path, "rev": candidate.rev});
+    let ok = tools::execute_fast_tool(
+        "revert",
+        &args,
+        config,
+        perms.as_ref(),
+        lsp.as_deref(),
+        revisions,
+        fast_baseline_errors,
+    )
+    .await
+    .is_ok_and(|r| r.success);
+
+    if ok {
+        app.push_output(
+            &format!(
+                "[debugger-judge] REWIND — reverted {} to rev_{} (file_errors {} → {})",
+                candidate.path,
+                candidate.rev,
+                candidate.file_errors_now,
+                candidate.file_errors_then
+            ),
+            LineStyle::Status,
+        );
+        // REWIND fixes the ONE regressed file the debugger flagged — it doesn't
+        // mean the gate's original failure is fully resolved. Point at the raw
+        // check output so the model isn't left guessing what "the remaining
+        // problem" actually is from the rewind summary alone.
+        let output_note = crate::cli::commands::run::write_gate_failure_output(config, output)
+            .map(|path| format!(" Full check output that triggered this: read(\"{path}\")."))
+            .unwrap_or_default();
+        Message::user(&format!(
+            "[A read-only debugger with fresh eyes found that {} had regressed from a much \
+             cleaner earlier revision. The loop has ALREADY reverted it to rev_{} for you \
+             (file_errors {} → {}) — do NOT redo the discarded edits the same way. Re-read the \
+             file to see its current (reverted) content, then continue the plan, fixing the \
+             remaining problem differently. Everything outside this file is untouched.{output_note}]",
+            candidate.path, candidate.rev, candidate.file_errors_now, candidate.file_errors_then
+        ))
+    } else {
+        app.push_output(
+            &format!(
+                "[debugger-judge] REWIND — revert of {} to rev_{} failed; continuing without it",
+                candidate.path, candidate.rev
+            ),
+            LineStyle::Status,
+        );
+        Message::user(&format!(
+            "[Verification failed — do NOT finish yet. Check output:\n{output}]"
+        ))
     }
 }
 
-/// Token-budget-aware observation masking (same logic as run.rs).
-fn mask_old_tool_results(
-    messages: &mut Vec<Message>,
-    tool_result_log: &[(String, serde_json::Value, String)],
-    tool_result_token_budget: usize,
-    project_root: &std::path::Path,
-) {
-    // Delegate to the shared implementation pattern
-    if tool_result_log.is_empty() {
-        return;
-    }
-
-    let mut used_tokens = 0;
-    let mut should_mask: Vec<bool> = vec![false; tool_result_log.len()];
-
-    for i in (0..tool_result_log.len()).rev() {
-        let tokens = context::estimate_tokens(&tool_result_log[i].2);
-        used_tokens += tokens;
-        if used_tokens > tool_result_token_budget {
-            should_mask[i] = true;
+/// Whole-tree SCRAP restart: revert the working tree to the clean round-0
+/// baseline, resync the symbol index, clear plan/scratchpad, and return a
+/// freshly-assembled context. `judge` selects the debugger-judge vs
+/// gate-restart status wording. The caller resets the loop counters and
+/// `continue`s. Mirrors run.rs's SCRAP/gate-restart blocks.
+fn scrap_restart(
+    app: &mut App,
+    config: &Config,
+    goal: &str,
+    mcp_summary: Option<&str>,
+    snapshots: &Option<Arc<Mutex<tools::snapshots::SnapshotManager>>>,
+    judge: bool,
+) -> Vec<Message> {
+    let (ok_prefix, err_prefix, done) = if judge {
+        (
+            "[debugger-judge] SCRAP — ",
+            "[debugger-judge] SCRAP — tree revert failed: ",
+            "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
+        )
+    } else {
+        (
+            "[gate-restart] ",
+            "[gate-restart] tree revert failed: ",
+            "[gate-restart] scrapped the stuck state — tree at clean baseline + fresh context; restarting from scratch.",
+        )
+    };
+    if let Some(snap) = snapshots {
+        let guard = snap.lock();
+        match guard.revert_to_round(0) {
+            Ok(m) => app.push_output(&format!("{ok_prefix}{m}"), LineStyle::Status),
+            Err(e) => app.push_output(&format!("{err_prefix}{e}"), LineStyle::Status),
         }
     }
-
-    if !should_mask.iter().any(|m| *m) {
-        return;
-    }
-
-    let summaries: Vec<Option<String>> = tool_result_log
-        .iter()
-        .enumerate()
-        .map(|(i, (name, args, content))| {
-            if should_mask[i] {
-                Some(compress::summarize_tool_result(name, args, content))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let summary_count = summaries.iter().filter(|s| s.is_some()).count();
-    let keep_count = 20;
-
-    if summary_count > keep_count {
-        let archive_path = project_root.join(".miniswe").join("tool_history.md");
-        let mut archive = match std::fs::read_to_string(&archive_path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => {
-                tracing::warn!(
-                    "Tool history read failed for {}; starting fresh and the next archive \
-                     will overwrite the existing file: {e}",
-                    archive_path.display()
-                );
-                String::new()
-            }
-        };
-        let excess = summary_count - keep_count;
-        let mut archived = 0;
-        for s in &summaries {
-            if let Some(s) = s
-                && archived < excess
-            {
-                archive.push_str(s);
-                archive.push('\n');
-                archived += 1;
-            }
-        }
-        if let Err(e) = crate::atomic_write(&archive_path, archive.as_bytes()) {
-            tracing::warn!(
-                "Tool history write failed for {}: {e}",
-                archive_path.display()
-            );
-        }
-    }
-
-    let total_summaries = summaries.iter().filter(|s| s.is_some()).count();
-    let mut tool_msg_idx = 0;
-    for msg in messages.iter_mut() {
-        if msg.role == "tool" {
-            if let Some(Some(summary)) = summaries.get(tool_msg_idx) {
-                let pos = summaries[..=tool_msg_idx]
-                    .iter()
-                    .filter(|s| s.is_some())
-                    .count();
-                let from_end = total_summaries - pos;
-                if from_end < keep_count {
-                    msg.content = Some(summary.clone());
-                } else {
-                    msg.content = Some(
-                        "[archived — use file(action='read', path='.miniswe/tool_history.md') to recall]".into(),
-                    );
-                }
-            }
-            tool_msg_idx += 1;
-        }
-    }
+    // Whole-tree revert touched many files outside the per-edit reindex path —
+    // resync the symbol index / repo-map to the clean baseline.
+    tools::reindex_project_incremental(config);
+    let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+    let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+    let assembled = context::assemble(config, goal, &[], false, mcp_summary);
+    app.push_output(done, LineStyle::Status);
+    assembled.messages
 }
 
 fn handle_background_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {

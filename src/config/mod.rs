@@ -256,17 +256,21 @@ pub enum CompactionStrategy {
 /// lessons = false
 /// repo_map = false
 /// ```
+///
+/// Plan and scratchpad are NOT here — they used to be system-prompt
+/// providers, but they're the only two pieces of injected state the agent
+/// itself mutates mid-run (via `plan(action=...)`), which made the system
+/// prompt go stale between refreshes. They're now attached at the point
+/// they change instead — see `cli::commands::run::refresh_current_state`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProvidersConfig {
     pub profile: bool,
     pub guide: bool,
     pub project_notes: bool,
-    pub plan: bool,
     pub lessons: bool,
     pub repo_map: bool,
     pub mcp: bool,
-    pub scratchpad: bool,
     pub usage_guide: bool,
     pub plan_mode: bool,
 }
@@ -282,11 +286,9 @@ impl Default for ProvidersConfig {
             profile: true,
             guide: true,
             project_notes: true,
-            plan: true,
             lessons: true,
             repo_map: false, // still on-demand via code(action='repo_map')
             mcp: true,
-            scratchpad: true,
             usage_guide: true,
             plan_mode: true,
         }
@@ -300,11 +302,9 @@ impl ProvidersConfig {
             "profile" => self.profile,
             "guide" => self.guide,
             "project_notes" => self.project_notes,
-            "plan" => self.plan,
             "lessons" => self.lessons,
             "repo_map" => self.repo_map,
             "mcp" => self.mcp,
-            "scratchpad" => self.scratchpad,
             "usage_guide" => self.usage_guide,
             "plan_mode" => self.plan_mode,
             _ => true, // unknown providers default to enabled

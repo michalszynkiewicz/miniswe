@@ -227,7 +227,7 @@ pub fn commit_staged(
     revisions: Option<&RevisionStore>,
     tool_name: &str,
 ) -> Result<()> {
-    use crate::tools::fast::RecordArgs;
+    use crate::tools::fast::{RecordArgs, parse_check};
 
     for (path, edit) in staged {
         std::fs::write(path, &edit.updated)
@@ -253,6 +253,23 @@ pub fn commit_staged(
                 .lines()
                 .count()
                 .saturating_sub(edit.updated.lines().count());
+            // Every fast-mode edit tool (replace_range, insert_at, ...)
+            // computes real ast_ok/ast_error via a live parse_check on the
+            // content it just wrote — refactor's commit path used to
+            // hardcode ast_ok=true/ast_error=None instead, unconditionally
+            // claiming a clean parse regardless of what was actually
+            // written. That false "ast=ok" is what lured the model into
+            // reverting its own valid progress toward a revision that was
+            // actually broken (see docs/gpt55-gaps.md investigation):
+            // shown a choice between its current (correctly diagnosed as
+            // still-broken) state and a labeled-clean rev_1, it rationally
+            // chose the one the tool told it was safe. parse_check is the
+            // same tree-sitter-based, multi-language, LSP-independent
+            // check `build_feedback` already uses — cheap enough to run
+            // unconditionally here too.
+            let ast_result = parse_check(&rel, &edit.updated);
+            let ast_ok = ast_result.is_ok();
+            let ast_error = ast_result.err();
             store
                 .record(
                     &rel,
@@ -264,8 +281,8 @@ pub fn commit_staged(
                         payload: None,
                         added,
                         removed,
-                        ast_ok: true,
-                        ast_error: None,
+                        ast_ok,
+                        ast_error,
                         file_errors: 0,
                         project_errors: 0,
                     },
@@ -394,4 +411,90 @@ pub fn extract_window(source: &str, line: u32, lines_after: u32) -> Window {
     let end = (line + lines_after).min(total.saturating_sub(1));
     let text = lines[start as usize..=end as usize].join("\n");
     Window { start, end, text }
+}
+
+#[cfg(test)]
+mod commit_staged_tests {
+    use super::*;
+    use crate::tools::fast::RevisionStore;
+    use std::collections::BTreeMap;
+
+    fn config_in(dir: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.project_root = dir.to_path_buf();
+        config
+    }
+
+    /// Reproduces the bug found via bench investigation: `commit_staged`
+    /// used to hardcode `ast_ok: true, ast_error: None` for every commit,
+    /// regardless of what was actually written — so a refactor edit that
+    /// broke a file's syntax was recorded as a clean revision. A model
+    /// choosing between its own (correctly diagnosed) broken state and a
+    /// revision falsely labeled "ast=ok" would rationally, but wrongly,
+    /// revert toward the mislabeled one.
+    #[test]
+    fn records_real_ast_ok_for_syntactically_broken_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        let revisions = RevisionStore::new(tmp.path()).unwrap();
+
+        let path = config.project_root.join("broken.rs");
+        let mut staged = BTreeMap::new();
+        staged.insert(
+            path.clone(),
+            StagedEdit {
+                original: "fn f(a: u32) {}\n".to_string(),
+                // Missing closing paren/brace — syntactically broken.
+                updated: "fn f(a: u32, b: u32 {\n".to_string(),
+            },
+        );
+
+        commit_staged(
+            &staged,
+            &config,
+            Some(&revisions),
+            "change_signature.add_param",
+        )
+        .unwrap();
+
+        let revs = revisions.list("broken.rs");
+        let last = revs.last().expect("one revision recorded");
+        assert!(
+            !last.ast_ok,
+            "commit_staged must not claim ast_ok=true for content that doesn't parse"
+        );
+        assert!(last.ast_error.is_some());
+    }
+
+    /// Sanity check the other direction: valid content is still recorded
+    /// as clean, so the fix doesn't just flip the flag unconditionally.
+    #[test]
+    fn records_ast_ok_true_for_valid_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        let revisions = RevisionStore::new(tmp.path()).unwrap();
+
+        let path = config.project_root.join("fine.rs");
+        let mut staged = BTreeMap::new();
+        staged.insert(
+            path.clone(),
+            StagedEdit {
+                original: "fn f(a: u32) {}\n".to_string(),
+                updated: "fn f(a: u32, b: u32) {}\n".to_string(),
+            },
+        );
+
+        commit_staged(
+            &staged,
+            &config,
+            Some(&revisions),
+            "change_signature.add_param",
+        )
+        .unwrap();
+
+        let revs = revisions.list("fine.rs");
+        let last = revs.last().expect("one revision recorded");
+        assert!(last.ast_ok);
+        assert!(last.ast_error.is_none());
+    }
 }
