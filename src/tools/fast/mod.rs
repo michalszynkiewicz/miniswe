@@ -40,6 +40,7 @@ mod replace_range;
 mod revert;
 mod show_rev;
 
+pub use ast::parse_check;
 pub use dispatch::execute_fast_tool;
 pub use feedback::project_error_count;
 pub use revisions::{RecordArgs, RevisionStore};

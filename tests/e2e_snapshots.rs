@@ -132,6 +132,46 @@ fn revert_new_file_roundtrip() {
 }
 
 #[test]
+fn revert_to_round_deletes_file_created_after_target_round() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let mut snap = SnapshotManager::init(&config.project_root).unwrap();
+
+    // Round 1: create a brand-new file (didn't exist at round 0).
+    fs::write(helpers::project_path(&config, "new_file.txt"), "content").unwrap();
+    snap.begin_round(1).unwrap();
+    assert!(helpers::project_path(&config, "new_file.txt").exists());
+
+    // Revert all the way back to round 0 — the file must be gone, not just
+    // left in place. `checkout <commit> -- .` used to leave it untouched
+    // since round 0's tree never contained it.
+    snap.revert_to_round(0).unwrap();
+    assert!(
+        !helpers::project_path(&config, "new_file.txt").exists(),
+        "file created after the target round should be deleted on revert"
+    );
+}
+
+#[test]
+fn revert_file_deletes_file_that_did_not_exist_at_target_round() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let mut snap = SnapshotManager::init(&config.project_root).unwrap();
+
+    // Round 1: create a brand-new file (didn't exist at round 0).
+    fs::write(helpers::project_path(&config, "new_file.txt"), "content").unwrap();
+    snap.begin_round(1).unwrap();
+
+    // Revert just this file to round 0 — it should be deleted, not left
+    // untouched by a failing `checkout` pathspec error.
+    snap.revert_file("new_file.txt", 0).unwrap();
+    assert!(
+        !helpers::project_path(&config, "new_file.txt").exists(),
+        "file absent at the target round should be deleted, not left in place"
+    );
+}
+
+#[test]
 fn revert_nonexistent_round_fails() {
     let (_tmp, config) = helpers::create_test_project();
 

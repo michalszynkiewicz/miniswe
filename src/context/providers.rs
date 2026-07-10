@@ -99,23 +99,6 @@ impl ContextProvider for ProjectNotesProvider {
     }
 }
 
-/// Active plan from `.miniswe/plan.md`.
-pub struct PlanProvider;
-
-impl ContextProvider for PlanProvider {
-    fn name(&self) -> &'static str {
-        "plan"
-    }
-
-    fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
-        let content = crate::tools::plan::load_plan(input.config)?;
-        Some(ContextBlock {
-            header: "[PLAN]",
-            content,
-        })
-    }
-}
-
 /// Keyword-matched lessons from `.miniswe/lessons.md`.
 pub struct LessonsProvider;
 
@@ -213,24 +196,6 @@ impl ContextProvider for McpProvider {
     }
 }
 
-/// Task scratchpad from `.miniswe/scratchpad.md`.
-pub struct ScratchpadProvider;
-
-impl ContextProvider for ScratchpadProvider {
-    fn name(&self) -> &'static str {
-        "scratchpad"
-    }
-
-    fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
-        let path = input.config.miniswe_path("scratchpad.md");
-        let content = fs::read_to_string(path).ok()?;
-        Some(ContextBlock {
-            header: "[SCRATCHPAD]",
-            content,
-        })
-    }
-}
-
 /// Embedded usage guide — injected when the user asks meta-questions.
 pub struct UsageGuideProvider;
 
@@ -275,11 +240,9 @@ pub fn default_providers() -> Vec<Box<dyn ContextProvider>> {
         Box::new(ProfileProvider),
         Box::new(GuideProvider),
         Box::new(ProjectNotesProvider),
-        Box::new(PlanProvider),
         Box::new(LessonsProvider),
         Box::new(RepoMapProvider),
         Box::new(McpProvider),
-        Box::new(ScratchpadProvider),
         Box::new(UsageGuideProvider),
         Box::new(PlanModeProvider),
     ]

@@ -148,6 +148,21 @@ pub async fn maybe_compress(
     tool_def_tokens: usize,
     plan_update_requested: &mut bool,
 ) {
+    // Plan and scratchpad are no longer injected into the system prompt —
+    // they're the only two pieces of context the agent itself mutates
+    // mid-run, which made the system prompt go stale between refreshes
+    // (see `config::ProvidersConfig`'s doc comment). Instead, the current
+    // state is kept on the tail of the message list, refreshed here,
+    // unconditionally, every time compression runs (i.e. every round).
+    // This has to live in front of every compaction strategy's dispatch,
+    // not be gated on "did plan/scratchpad change" or "is this strategy
+    // about to actually do work": the risk isn't the content changing, it's
+    // an unchanged block quietly aging until some strategy's cutoff reaches
+    // past it and drops or summarizes it away. Refreshing every round keeps
+    // it permanently at 0 rounds old, which every strategy here treats as
+    // "too recent to touch" by construction.
+    refresh_current_state(messages, config);
+
     match config.context.compaction {
         CompactionStrategy::Unified => {
             compact_unified(
@@ -220,6 +235,181 @@ pub async fn maybe_compress(
             )
             .await
         }
+    }
+}
+
+/// Marker prefixing the current-state block appended to the tail of the
+/// message list every round. Lets `refresh_current_state` find-and-strip
+/// whatever it previously appended before appending a fresh copy, so at
+/// most one live copy exists at a time, always on the last message.
+const CURRENT_STATE_MARKER: &str = "\n\n[CURRENT STATE]\n";
+
+/// Build the current-state block (plan + scratchpad), or `None` if both are
+/// empty.
+fn format_current_state_block(config: &Config) -> Option<String> {
+    let plan = crate::tools::plan::load_plan(config);
+    let scratchpad = std::fs::read_to_string(config.miniswe_path("scratchpad.md"))
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    if plan.is_none() && scratchpad.is_none() {
+        return None;
+    }
+    let mut block = String::from(CURRENT_STATE_MARKER);
+    if let Some(p) = plan {
+        block.push_str("[PLAN]\n");
+        block.push_str(p.trim_end());
+        block.push('\n');
+    }
+    if let Some(s) = scratchpad {
+        block.push_str("[SCRATCHPAD]\n");
+        block.push_str(s.trim_end());
+        block.push('\n');
+    }
+    Some(block)
+}
+
+/// Strip any previously-appended current-state block from `messages`
+/// (wherever it landed), then append a fresh one to the last message.
+/// Unconditional and called every round (see `maybe_compress`'s call site)
+/// so the block is never more than 0 rounds old — every compaction
+/// strategy here treats the most recent message as too new to touch, so a
+/// block re-attached every round can never be dropped or summarized away.
+///
+/// Appending to an EXISTING message's content (rather than inserting a new
+/// message) is role-order-safe by construction: it never introduces a new
+/// role transition, so it can't break strict chat templates.
+fn refresh_current_state(messages: &mut [Message], config: &Config) {
+    for m in messages.iter_mut() {
+        if let Some(content) = &m.content
+            && let Some(pos) = content.find(CURRENT_STATE_MARKER)
+        {
+            m.content = Some(content[..pos].to_string());
+        }
+    }
+    let Some(block) = format_current_state_block(config) else {
+        return;
+    };
+    if let Some(last) = messages.last_mut() {
+        let content = last.content.get_or_insert_with(String::new);
+        content.push_str(&block);
+    }
+}
+
+#[cfg(test)]
+mod current_state_tests {
+    use super::{CURRENT_STATE_MARKER, format_current_state_block, refresh_current_state};
+    use crate::config::Config;
+    use crate::llm::Message;
+
+    fn config_in(dir: &std::path::Path) -> Config {
+        std::fs::create_dir_all(dir.join(".miniswe")).unwrap();
+        let mut config = Config::default();
+        config.project_root = dir.to_path_buf();
+        config
+    }
+
+    #[test]
+    fn no_block_when_both_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        assert!(format_current_state_block(&config).is_none());
+    }
+
+    #[test]
+    fn appends_to_last_message_when_state_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+
+        let mut msgs = vec![Message::user("do the task"), Message::assistant("ok")];
+        refresh_current_state(&mut msgs, &config);
+
+        let content = msgs.last().unwrap().content.as_deref().unwrap();
+        assert!(content.contains("[CURRENT STATE]"));
+        assert!(content.contains("[PLAN]"));
+        assert!(content.contains("step one"));
+        assert!(
+            content.starts_with("ok"),
+            "original content preserved: {content}"
+        );
+    }
+
+    #[test]
+    fn replaces_old_block_instead_of_accumulating() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+
+        let mut msgs = vec![Message::tool_result("call1", "first result")];
+        refresh_current_state(&mut msgs, &config);
+        assert_eq!(
+            msgs[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .matches("[PLAN]")
+                .count(),
+            1
+        );
+
+        // A later round: a fresh tool result gets pushed, plan changes.
+        std::fs::write(config.miniswe_path("plan.md"), "1. [x] step one\n").unwrap();
+        msgs.push(Message::tool_result("call2", "second result"));
+        refresh_current_state(&mut msgs, &config);
+
+        // Old block gone from msgs[0], new one only on the last message.
+        assert!(
+            !msgs[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains(CURRENT_STATE_MARKER)
+        );
+        assert_eq!(msgs[0].content.as_deref().unwrap(), "first result");
+        let last_content = msgs.last().unwrap().content.as_deref().unwrap();
+        assert!(last_content.contains("[x] step one"));
+        assert_eq!(last_content.matches("[PLAN]").count(), 1);
+    }
+
+    #[test]
+    fn refreshes_every_round_even_when_state_is_unchanged() {
+        // The bug this guards against: a block parked on an old message and
+        // never moved would eventually be compacted away. Simulate several
+        // "rounds" with unchanged plan content and confirm the block always
+        // ends up on the newest message, never left behind on an old one.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+
+        let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
+        refresh_current_state(&mut msgs, &config);
+
+        for i in 2..=5 {
+            msgs.push(Message::tool_result(
+                &format!("call{i}"),
+                &format!("round {i} result"),
+            ));
+            refresh_current_state(&mut msgs, &config); // unchanged plan content
+        }
+
+        for m in &msgs[..msgs.len() - 1] {
+            assert!(
+                !m.content.as_deref().unwrap().contains(CURRENT_STATE_MARKER),
+                "block should not linger on an old message: {:?}",
+                m.content
+            );
+        }
+        let last_content = msgs.last().unwrap().content.as_deref().unwrap();
+        assert!(last_content.contains("[PLAN]"));
+    }
+
+    #[test]
+    fn no_op_when_no_state_and_nothing_to_strip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        let mut msgs = vec![Message::tool_result("call1", "a result")];
+        refresh_current_state(&mut msgs, &config);
+        assert_eq!(msgs[0].content.as_deref().unwrap(), "a result");
     }
 }
 
