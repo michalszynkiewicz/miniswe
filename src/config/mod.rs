@@ -100,7 +100,20 @@ pub struct ModelConfig {
     pub temperature: f64,
     /// Maximum output tokens per response
     pub max_output_tokens: usize,
-    /// Timeout in seconds for non-streaming chat requests.
+    /// Ceiling on the connect phase of an LLM request — from send to
+    /// receiving response headers (the start of the SSE stream), not the
+    /// full generation (see `stream_idle_timeout_secs`/`request_deadline_secs`
+    /// for that). A server-side connect wedge is retried as a transient
+    /// failure on timeout. Empirically (27K+ requests analyzed across many
+    /// benchmark runs on this project's local llama-server setup) the
+    /// largest clean connect+prefill observed was ~24s even at the biggest
+    /// real context sizes (24K+ tokens); genuine wedges cluster tightly at
+    /// the old 120s default with a near-empty gap in between (42-100s),
+    /// confirming wedges are a distinct failure mode, not slow-but-healthy
+    /// prefill. 30s gives ~25% margin over the largest clean case observed
+    /// while cutting wasted wedge-recovery time 4x (120s → 30s); the rare
+    /// case of a legitimate prefill exceeding this just costs one extra
+    /// retry cycle, safely bounded by `request_deadline_secs`.
     pub request_timeout_secs: u64,
     /// Idle timeout (seconds) for streamed LLM responses. If no token
     /// activity is observed for this many seconds the request is killed
@@ -677,7 +690,7 @@ impl Default for ModelConfig {
             context_window: 50000,
             temperature: 0.15,
             max_output_tokens: 16384,
-            request_timeout_secs: 120,
+            request_timeout_secs: 30,
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             request_deadline_secs: default_request_deadline_secs(),
             max_retries: 6,

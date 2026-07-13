@@ -114,11 +114,17 @@ echo ""
 # preserve. Only compaction and gate_context_reset stay as intentional A/B
 # knobs — everything else is just the default, not something to toggle per
 # arm.
-arm_settings() {  # echoes: "<compaction> <gate> <auto_revert>"
+arm_settings() {  # echoes: "<compaction> <gate> <auto_revert> <ceremony>"
     case "$1" in
-        gate_on)  echo "unified true  true" ;;  # gate A/B: gate ON,  auto_revert ON
-        gate_off) echo "unified false true" ;;  # gate A/B: gate OFF, auto_revert ON
-        *)        echo "$1 false true" ;;       # plain compaction arm: gate OFF, auto_revert ON
+        gate_on)      echo "unified true  true strict" ;;  # gate A/B: gate ON,  auto_revert ON
+        gate_off)     echo "unified false true strict" ;;  # gate A/B: gate OFF, auto_revert ON
+        ceremony_off) echo "unified false true off" ;;     # ceremony A/B: no plan gate/nudges/tool-hiding.
+                                                             # The behavioral gate and debugger stack are
+                                                             # NOT touched by ceremony (see arm_settings'
+                                                             # comment in generate_config) — this isolates
+                                                             # "does forced planning help" from "does the
+                                                             # gate/debugger help."
+        *)            echo "$1 false true strict" ;;       # plain compaction arm: gate OFF, auto_revert ON
     esac
 }
 
@@ -128,8 +134,8 @@ arm_settings() {  # echoes: "<compaction> <gate> <auto_revert>"
 # unconditionally on for every arm — see arm_settings' comment.
 generate_config() {
     local arm="$1"
-    local _compaction _gate _autorev
-    read -r _compaction _gate _autorev <<< "$(arm_settings "$arm")"
+    local _compaction _gate _autorev _ceremony
+    read -r _compaction _gate _autorev _ceremony <<< "$(arm_settings "$arm")"
     cat <<TOML
 [model]
 provider = "llama-cpp"
@@ -179,6 +185,10 @@ diagnostic_timeout_ms = 2000
 web_tools = true
 plan = true
 scratchpad = true
+# ceremony comes from arm_settings (ceremony A/B: "off" drops the plan-first
+# gate/nudges/tool-hiding only — it does NOT touch the behavioral gate or the
+# debugger stack below, both driven by their own independent config flags).
+ceremony = "${_ceremony}"
 # auto_revert + gate come from arm_settings (gate A/B varies gate_context_reset
 # while holding the rest constant). The full debugger stack is unconditionally
 # on for every arm — see arm_settings' comment for why this stopped being a
