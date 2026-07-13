@@ -257,6 +257,18 @@ pub enum CompactionStrategy {
     /// its scratchpad before they're elided. Same compaction behavior as
     /// `Tiered`; differs only in the prompt.
     TieredSmart,
+    /// Reactive ("lazy") compaction, OpenCode-style: never compact
+    /// proactively — let history grow until the SERVER signals context
+    /// exhaustion (a rejected over-size request, or a generation truncated
+    /// by the context ceiling), then compact once via the `Unified`
+    /// summary+archive action and retry. Rationale: proactive strategies
+    /// here trigger at ~26% of the window and re-fire every 1-2 rounds in
+    /// steady state (compaction lands a mean of only ~145 tokens below its
+    /// own trigger); a reactive policy uses ~the whole window and fires
+    /// rarely. Trade-off: bigger per-round prompts (weaker KV-cache
+    /// locality), and each compaction event is a large, expensive summary
+    /// instead of many small ones.
+    Lazy,
 }
 
 /// Which context providers are enabled.
@@ -875,6 +887,8 @@ mod compaction_strategy_tests {
         assert_eq!(c.compaction, CompactionStrategy::TieredSmart);
         let c: ContextConfig = toml::from_str("compaction = \"tiered_rolling\"").unwrap();
         assert_eq!(c.compaction, CompactionStrategy::TieredRolling);
+        let c: ContextConfig = toml::from_str("compaction = \"lazy\"").unwrap();
+        assert_eq!(c.compaction, CompactionStrategy::Lazy);
     }
 
     #[test]
