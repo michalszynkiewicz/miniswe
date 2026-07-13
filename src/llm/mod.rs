@@ -229,6 +229,14 @@ impl LlmClient {
                 Err(err) if attempt < max_retries && is_retryable_llm_error(&err) => {
                     let delay = retry_delays[attempt];
                     attempt += 1;
+                    // This branch used to be silent — a connect-phase wedge
+                    // (see request_timeout_secs' doc comment) was only
+                    // detectable after the fact by diffing llm_dumps
+                    // timestamps. Surface it live instead.
+                    tracing::warn!(
+                        "LLM request failed (retryable), attempt {attempt}/{max_retries}, \
+                         retrying in {delay}s: {err}"
+                    );
                     match cancelled {
                         Some(flag) => {
                             tokio::select! {
