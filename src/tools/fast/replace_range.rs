@@ -5,6 +5,16 @@
 //!
 //! No OLD-block confirmation: wrong-line edits surface as broken AST or
 //! new LSP errors in the next feedback block, and the model reverts.
+//!
+//! Every applied edit echoes its real line diff back to the model, with a
+//! revert hint, so a silently dropped line is visible immediately —
+//! AST/LSP feedback can't catch drops that still compile (the recurring
+//! dropped-provider-header bench bug: wide rewrites retyped from memory
+//! lose lines without any error). A hard range cap was tried against the
+//! same failure mode (2026-07-13) and REVERTED: it blocked a fully correct
+//! 46-line rewrite 14 times in a row until the attempt died — the model
+//! can't reliably do the "split your own payload" surgery the rejection
+//! asks for.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -19,6 +29,44 @@ use super::lines::{
     join_with_trailing_nl, split_preserving_trailing_nl, split_replacement, validate_range,
 };
 use super::revisions::{RecordArgs, RevisionStore};
+
+/// Line-level LCS diff of the replaced range, rendered as `-`/`+` lines
+/// with unchanged lines omitted. Ranges are typically tens of lines, so
+/// the quadratic table is negligible.
+fn render_applied_diff(old: &[String], new: &[String]) -> String {
+    let n = old.len();
+    let m = new.len();
+    // lcs[i][j] = LCS length of old[i..] vs new[j..]
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if old[i] == new[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut out = String::new();
+    while i < n || j < m {
+        if i < n && j < m && old[i] == new[j] {
+            i += 1;
+            j += 1;
+        } else if j < m && (i == n || lcs[i][j + 1] >= lcs[i + 1][j]) {
+            out.push('+');
+            out.push_str(&new[j]);
+            out.push('\n');
+            j += 1;
+        } else {
+            out.push('-');
+            out.push_str(&old[i]);
+            out.push('\n');
+            i += 1;
+        }
+    }
+    out
+}
 
 pub async fn execute(
     args: &Value,
@@ -78,8 +126,21 @@ pub async fn execute(
 
     // Splice [start..=end] (1-based) with replacement.
     let head: Vec<String> = lines_owned.drain(..start - 1).collect();
-    let _removed_lines: Vec<String> = lines_owned.drain(..removed).collect();
+    let removed_lines: Vec<String> = lines_owned.drain(..removed).collect();
     let tail = std::mem::take(&mut lines_owned);
+
+    // Diff before the splice consumes `replacement_lines`. Pure deletion
+    // (empty content) diffs against nothing — split_replacement's [""]
+    // placeholder would otherwise render as a spurious `+` blank.
+    let empty: Vec<String> = Vec::new();
+    let applied_diff = render_applied_diff(
+        &removed_lines,
+        if content.is_empty() {
+            &empty
+        } else {
+            &replacement_lines
+        },
+    );
 
     let mut new_lines: Vec<String> = head;
     new_lines.extend(replacement_lines);
@@ -180,6 +241,14 @@ pub async fn execute(
     let header =
         format!("replace_range {path} L{start}-{end}: rev_{rev} applied (+{added} -{removed})");
     let mut out = String::from(&header);
+    // Echo the real applied diff: a dropped line that still compiles is
+    // invisible to AST/LSP feedback, so show the model exactly what it
+    // removed and give it an immediate way out.
+    if !applied_diff.is_empty() {
+        out.push_str("\nApplied diff (every '-' line is now GONE from the file):\n");
+        out.push_str(&applied_diff);
+        out.push_str("If this is not exactly the edit you intended, call revert.");
+    }
     out.push_str(&fb.text);
     Ok(ToolResult::ok(out))
 }
@@ -313,6 +382,73 @@ mod tests {
             None,
             "no rev should be recorded on failure"
         );
+    }
+
+    #[tokio::test]
+    async fn wide_range_is_allowed_and_diffed() {
+        // The 30-line cap was tried and reverted (see module doc) — wide
+        // ranges must apply, with the diff echo as the safety net.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = scratch_config(tmp.path());
+        let original: String = (1..=40).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(tmp.path().join("f.rs"), &original).unwrap();
+        let store = RevisionStore::with_cap(20);
+
+        let r = run(
+            serde_json::json!({ "path": "f.rs", "start": 1, "end": 35, "content": "X" }),
+            &cfg,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert!(r.success, "35-line range must apply: {}", r.content);
+        assert!(r.content.contains("Applied diff"), "{}", r.content);
+        assert!(r.content.contains("-line35"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn result_echoes_applied_diff_with_revert_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = scratch_config(tmp.path());
+        std::fs::write(tmp.path().join("f.rs"), "keep1\nold\nkeep2\n").unwrap();
+        let store = RevisionStore::with_cap(20);
+
+        let r = run(
+            serde_json::json!({ "path": "f.rs", "start": 1, "end": 3, "content": "keep1\nnew\nkeep2" }),
+            &cfg,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert!(r.success, "{}", r.content);
+        assert!(r.content.contains("Applied diff"), "{}", r.content);
+        assert!(r.content.contains("-old"), "{}", r.content);
+        assert!(r.content.contains("+new"), "{}", r.content);
+        // unchanged lines inside the range are NOT echoed
+        assert!(!r.content.contains("-keep1"), "{}", r.content);
+        assert!(!r.content.contains("+keep2"), "{}", r.content);
+        assert!(r.content.contains("call revert"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn deletion_diff_shows_all_removed_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = scratch_config(tmp.path());
+        std::fs::write(tmp.path().join("f.rs"), "a\nb\nc\n").unwrap();
+        let store = RevisionStore::with_cap(20);
+
+        let r = run(
+            serde_json::json!({ "path": "f.rs", "start": 2, "end": 3, "content": "" }),
+            &cfg,
+            &store,
+        )
+        .await
+        .unwrap();
+        assert!(r.success, "{}", r.content);
+        assert!(r.content.contains("-b"), "{}", r.content);
+        assert!(r.content.contains("-c"), "{}", r.content);
+        // no spurious "+" blank from the deletion placeholder
+        assert!(!r.content.contains("\n+\n"), "{}", r.content);
     }
 
     #[tokio::test]

@@ -249,17 +249,21 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
 /// `docs/fast-mode-design.md`.
 pub fn fast_mode_tool_definitions() -> Vec<ToolDefinition> {
     vec![
-        // The "smallest range" line is the model-facing fix for a Mistral 4
-        // failure mode: when given a wide range it tries to reproduce the
-        // surrounding unchanged lines from memory in `content`, drops bits,
-        // and silently deletes parts of the file. Keeping the range tight
-        // sidesteps that — content only needs to cover what's actually
-        // changing.
+        // Wide ranges make the model reproduce surrounding unchanged lines
+        // from memory in `content`, dropping bits and silently deleting
+        // parts of the file (measured: every dropped-provider-header bench
+        // incident used a 42-115 line range). Wording alone proved
+        // ineffective (7-arm moment-replay, 2026-07-13: 13/13 direct-edit
+        // samples reproduced the bug regardless of description text), and a
+        // hard 30-line cap was tried and REVERTED the same day (it blocked
+        // a fully correct wide rewrite until the attempt died). The
+        // mechanical safety net is the applied-diff echo in the tool result
+        // — see fast/replace_range.rs.
         ToolDefinition {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "replace_range".into(),
-                description: "Replace lines [start..=end] (1-based, inclusive) with `content`. Empty content deletes. Keep the range TIGHT — anything in the range that isn't in `content` is gone. To ADD new lines, use insert_at. For signature changes / renames, use refactor. Per-edit AST+LSP feedback comes back in the response; if you see a regression, call `revert`.".into(),
+                description: "Replace lines [start..=end] (1-based, inclusive) with `content`. Empty content deletes. Replace ONLY the lines that need to change. To ADD new lines, use insert_at. For signature changes / renames, use refactor. The applied diff plus AST+LSP feedback come back in the response — review the diff; if it isn't what you intended, call `revert`.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
