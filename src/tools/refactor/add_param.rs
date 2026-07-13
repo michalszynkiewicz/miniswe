@@ -479,6 +479,19 @@ pub async fn execute(
          refactor again for this — the parameter already exists and add_param will be \
          rejected; direct edits are the correct tool for this step.",
     );
+    // New addition (not part of the probe-validated paragraph above — kept
+    // as a separate sentence so it doesn't disturb that wording, and not
+    // itself re-probed): the failure this targets is different from the
+    // "forgot to wire the value" case the paragraph above already covers —
+    // it's the model rewriting unrelated code nearby (e.g. the function
+    // body while wiring the new param in) and silently dropping something
+    // that was already there. A signature update alone can't cause that;
+    // only a follow-up hand-edit can, which is exactly the step this
+    // message sends the model to next.
+    out.push_str(
+        " Once every callsite has a real value, run the FULL test suite — not just a compile \
+         check — to confirm nothing else nearby broke while you were wiring this in.",
+    );
 
     // Note: we do NOT auto-revert on partial failure. The user (agent) gets
     // the per-callsite report and can decide whether to keep, fix, or
