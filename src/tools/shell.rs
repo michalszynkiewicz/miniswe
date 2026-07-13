@@ -78,13 +78,28 @@ pub fn start(args: &Value, config: &Config) -> Result<RunningShellCommand> {
         .arg("-c")
         .arg(command)
         .current_dir(&config.project_root)
+        .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
 
+    // Commands must not be able to prompt the user: stdin is closed (EOF)
+    // above, and setsid() detaches the controlling terminal so programs
+    // that prompt on /dev/tty directly (sudo, ssh, gpg) fail fast instead
+    // of painting a password prompt over the TUI and swallowing keystrokes.
+    // setsid also makes the child a process-group leader (pgid == pid),
+    // which is what terminate_process_tree's kill(-pid) relies on — the
+    // same guarantee process_group(0) gave before.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command_builder.process_group(0);
+        unsafe {
+            command_builder.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     let child = command_builder
@@ -230,8 +245,27 @@ fn render_finished_result(mut running: RunningShellCommand, config: &Config) -> 
     if exit_code == 0 {
         ToolResult::ok(result)
     } else {
+        if needs_interactive_input(&stderr) {
+            result.push_str(
+                "\n[This command needs interactive input (a password/tty prompt), which \
+                 miniswe does not support. Do NOT retry it — ask the user to run it \
+                 themselves in a separate terminal and tell you when it's done.]",
+            );
+        }
         ToolResult::err(result)
     }
+}
+
+/// Signatures of commands that died trying to prompt on a terminal —
+/// possible again since stdin is null and setsid() removed the
+/// controlling tty. Matched on stderr of failed commands only.
+fn needs_interactive_input(stderr: &str) -> bool {
+    stderr.contains("a terminal is required")
+        || stderr.contains("no tty present")
+        || stderr.contains("Interactive authentication required")
+        || stderr.contains("could not read Username")
+        || stderr.contains("could not read Password")
+        || (stderr.contains("sudo:") && stderr.contains("password"))
 }
 
 fn cleanup_temp_file(path: &PathBuf) -> std::io::Result<()> {
@@ -304,6 +338,71 @@ mod tests {
             let alive = unsafe { libc::kill(pid as i32, 0) };
             assert_eq!(alive, -1, "process should be dead after drop");
         }
+    }
+
+    #[tokio::test]
+    async fn stdin_is_closed_so_readers_get_eof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = tmp.path().to_path_buf();
+
+        // `read` blocks forever on an open stdin; with stdin null it hits
+        // EOF immediately and exits non-zero instead of hanging (or eating
+        // the TUI's keystrokes).
+        let args = serde_json::json!({ "command": "read x", "timeout": 5 });
+        let r = execute(&args, &config).await.unwrap();
+        assert!(!r.success);
+        assert!(
+            !r.content.contains("timed out"),
+            "read must EOF instantly, not hang: {}",
+            r.content
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_controlling_tty_for_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = tmp.path().to_path_buf();
+
+        // setsid() detaches the controlling terminal, so /dev/tty must not
+        // be openable — this is what stops sudo/ssh password prompts from
+        // painting over the TUI.
+        let args = serde_json::json!({ "command": "echo hi > /dev/tty", "timeout": 5 });
+        let r = execute(&args, &config).await.unwrap();
+        assert!(!r.success, "opening /dev/tty must fail: {}", r.content);
+    }
+
+    #[tokio::test]
+    async fn interactive_prompt_failure_gets_run_separately_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = tmp.path().to_path_buf();
+
+        let args = serde_json::json!({
+            "command": "echo 'sudo: a terminal is required to read the password' >&2; exit 1",
+            "timeout": 5
+        });
+        let r = execute(&args, &config).await.unwrap();
+        assert!(!r.success);
+        assert!(
+            r.content.contains("ask the user to run it"),
+            "expected the run-separately hint: {}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_failure_gets_no_interactive_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = tmp.path().to_path_buf();
+
+        let args = serde_json::json!({ "command": "echo boom >&2; exit 1", "timeout": 5 });
+        let r = execute(&args, &config).await.unwrap();
+        assert!(!r.success);
+        assert!(!r.content.contains("ask the user to run it"));
     }
 
     #[cfg(unix)]
