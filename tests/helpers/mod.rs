@@ -152,6 +152,32 @@ pub fn mock_sse_tool_call(tool_name: &str, tool_args: &str) -> ResponseTemplate 
     ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
 }
 
+/// Build a mock SSE streaming response whose generation was clipped by the
+/// context ceiling: `finish_reason: "length"` on the content chunk, plus a
+/// final usage-bearing chunk (no `choices` at all — the shape some servers
+/// send with `include_usage`) showing the completion stopped well short of
+/// any realistic requested cap.
+pub fn mock_sse_context_clipped(content: &str, prompt_tokens: usize) -> ResponseTemplate {
+    let completion_tokens = content.len() / 4;
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({
+            "choices": [{
+                "delta": {"content": content},
+                "finish_reason": "length"
+            }]
+        }),
+        serde_json::json!({
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            }
+        }),
+    );
+    ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+}
+
 /// Build a mock SSE streaming response that returns stop with no content.
 pub fn mock_sse_stop() -> ResponseTemplate {
     let body = format!(

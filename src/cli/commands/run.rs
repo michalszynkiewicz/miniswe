@@ -31,7 +31,10 @@ use crate::cli::commands::agent::spiral;
 use crate::cli::commands::agent::validation;
 use crate::config::{Config, EditMode, ModelRole};
 use crate::context;
-use crate::llm::{ChatRequest, Message, ModelRouter, is_truncated_tool_call_error};
+use crate::llm::{
+    ChatRequest, Message, ModelRouter, is_context_exceeded_error, is_context_truncated_response,
+    is_truncated_tool_call_error,
+};
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
 use crate::mcp::{McpConfig, McpRegistry};
@@ -418,6 +421,11 @@ pub async fn run(
     let mut plan_update_requested = false;
     let mut nudged_premature_exit = false;
     let mut nudged_no_plan = false;
+    // Consecutive reactive-compaction retries (context exhaustion signaled
+    // by the server — see compressor::force_compress). Reset whenever a
+    // response is successfully consumed, so this bounds futile retries of
+    // one failing request, not total compactions over a long run.
+    let mut context_compact_retries: usize = 0;
     // How many times the behavioral done-gate has blocked completion this turn.
     let mut validation_blocks: usize = 0;
     // The model's stated rationale each time the gate blocked it — so a model
@@ -771,11 +779,63 @@ pub async fn run(
                     tui::print_status("Generation interrupted.");
                     break;
                 }
+                // The server rejected the request outright: prompt alone
+                // exceeds the context window. Compact and resend — this is
+                // the primary recovery path for compaction="lazy" (which
+                // never compacts proactively), and a safety net for every
+                // other strategy.
+                if is_context_exceeded_error(&err_str)
+                    && context_compact_retries < context::compressor::FORCE_COMPRESS_MAX_RETRIES
+                {
+                    context_compact_retries += 1;
+                    if context::compressor::force_compress(
+                        &mut messages,
+                        &config,
+                        &router,
+                        &llm_worker,
+                        tool_def_tokens,
+                    )
+                    .await
+                    {
+                        log.llm_error("context window exceeded — compacted history, retrying");
+                        tui::print_status("Context window exceeded — compacting and retrying.");
+                        continue;
+                    }
+                    // Nothing could be freed — fall through to the normal
+                    // error handling; retrying would fail identically.
+                }
                 if is_truncated_tool_call_error(&err_str) {
                     // Model hit max_tokens mid tool-call — the server
                     // dropped the assistant turn, no tool_call_id was
-                    // issued. Push a user-role hint and let the agent
-                    // retry with a smaller operation.
+                    // issued. When the prompt is sitting near the context
+                    // window, the truncation is really context exhaustion
+                    // (the server clamps generation to the remaining room):
+                    // a hint can't fix that, compaction can.
+                    if context::compressor::estimated_context_tokens(&messages, tool_def_tokens)
+                        > config.model.context_window * 3 / 4
+                        && context_compact_retries < context::compressor::FORCE_COMPRESS_MAX_RETRIES
+                    {
+                        context_compact_retries += 1;
+                        if context::compressor::force_compress(
+                            &mut messages,
+                            &config,
+                            &router,
+                            &llm_worker,
+                            tool_def_tokens,
+                        )
+                        .await
+                        {
+                            log.llm_error(
+                                "tool call truncated near context ceiling — compacted history, retrying",
+                            );
+                            tui::print_status(
+                                "Tool call truncated near context ceiling — compacting and retrying.",
+                            );
+                            continue;
+                        }
+                    }
+                    // Push a user-role hint and let the agent retry with a
+                    // smaller operation.
                     log.llm_error(
                         "tool call JSON truncated (max_tokens) — injecting hint and continuing",
                     );
@@ -806,6 +866,41 @@ pub async fn run(
             }
         };
 
+        // A 200 response can still be a context-exhaustion casualty: llama.cpp
+        // silently stops generation the instant prompt+completion reaches
+        // n_ctx (finish_reason="length", completion well under the requested
+        // cap — see is_context_truncated_response). The partial output is
+        // unusable (often a half-finished thought or clipped tool call), so
+        // discard it, compact, and regenerate. Gated on the prompt actually
+        // sitting near the window, which the "legitimately hit max_tokens"
+        // case can never satisfy.
+        let effective_max_tokens =
+            max_tokens_override.unwrap_or(config.model.max_output_tokens as u64) as usize;
+        if is_context_truncated_response(&response, effective_max_tokens)
+            && context::compressor::estimated_context_tokens(&messages, tool_def_tokens)
+                > config.model.context_window * 3 / 4
+            && context_compact_retries < context::compressor::FORCE_COMPRESS_MAX_RETRIES
+        {
+            context_compact_retries += 1;
+            if context::compressor::force_compress(
+                &mut messages,
+                &config,
+                &router,
+                &llm_worker,
+                tool_def_tokens,
+            )
+            .await
+            {
+                log.llm_error(
+                    "generation truncated by context ceiling — compacted history, regenerating",
+                );
+                tui::print_status(
+                    "Generation truncated by context ceiling — compacting and regenerating.",
+                );
+                continue;
+            }
+        }
+
         // Get the assistant's response
         let choice = match response.choices.first() {
             Some(c) => c,
@@ -814,6 +909,9 @@ pub async fn run(
                 break;
             }
         };
+        // A response made it through whole — any prior reactive-compaction
+        // retries resolved this request; reset the budget for the next one.
+        context_compact_retries = 0;
 
         let assistant_msg = &choice.message;
 

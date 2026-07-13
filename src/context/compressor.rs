@@ -235,7 +235,101 @@ pub async fn maybe_compress(
             )
             .await
         }
+        // Reactive: never compact proactively. Compaction happens only via
+        // `force_compress`, driven from the round loop when the server
+        // itself signals context exhaustion. (refresh_current_state above
+        // still ran — the current-state block stays on the tail regardless
+        // of strategy.)
+        CompactionStrategy::Lazy => {}
     }
+}
+
+/// Cap on consecutive `force_compress`-and-retry cycles for one failing
+/// request. Two is enough for the realistic worst case (first pass frees
+/// too little because one giant recent message survives the split; second
+/// pass after the summary landed); beyond that, retrying is futile and the
+/// original error should surface.
+pub const FORCE_COMPRESS_MAX_RETRIES: usize = 2;
+
+/// Estimated total prompt cost of a request as the round loop is about to
+/// send it: every message (system included) plus the serialized tool
+/// definitions. Used by the reactive-compaction gate to distinguish "the
+/// model legitimately hit its output cap" from "the context window is
+/// exhausted" — `finish_reason == "length"` alone can't tell these apart,
+/// but a prompt sitting near the window can only mean the latter.
+pub fn estimated_context_tokens(messages: &[Message], tool_def_tokens: usize) -> usize {
+    messages.iter().map(msg_token_cost).sum::<usize>() + tool_def_tokens
+}
+
+/// Reactive compaction: the server itself signaled context exhaustion (a
+/// rejected over-size request, or a generation truncated by the context
+/// ceiling), so compact NOW and let the caller retry the round. Unlike
+/// `maybe_compress` this bypasses `compact_unified`'s plan-update detour —
+/// there is no "nudge first, compress next round" luxury when the request
+/// can't even be sent — and `Lazy` (a no-op in `maybe_compress`) maps to
+/// the `Unified` summary+archive action here.
+///
+/// Returns `true` if the message list actually shrank; callers must treat
+/// `false` as "nothing could be freed" and fall through to their normal
+/// error handling instead of retrying a request that will fail identically.
+pub async fn force_compress(
+    messages: &mut Vec<Message>,
+    config: &Config,
+    router: &ModelRouter,
+    llm_worker: &LlmWorkerHandle,
+    tool_def_tokens: usize,
+) -> bool {
+    let before = history_token_total(messages);
+    // Bypass the plan-update nudge branch in the unified/tiered paths:
+    // pretend the nudge already happened this cycle.
+    let mut plan_nudge_done = true;
+    match config.context.compaction {
+        CompactionStrategy::Lazy | CompactionStrategy::Unified => {
+            compact_unified(
+                messages,
+                config,
+                router,
+                llm_worker,
+                tool_def_tokens,
+                &mut plan_nudge_done,
+                "lazy",
+            )
+            .await
+        }
+        CompactionStrategy::RollingSummary => {
+            compact_rolling_summary(
+                messages,
+                config,
+                router,
+                llm_worker,
+                tool_def_tokens,
+                "lazy_rolling",
+            )
+            .await
+        }
+        CompactionStrategy::SlidingWindow => {
+            compact_sliding_window(messages, config, tool_def_tokens)
+        }
+        CompactionStrategy::ObservationMasking => {
+            compact_observation_masking(messages, config, tool_def_tokens)
+        }
+        CompactionStrategy::Tiered
+        | CompactionStrategy::TieredRolling
+        | CompactionStrategy::TieredSmart => {
+            compact_tiered(
+                messages,
+                config,
+                router,
+                llm_worker,
+                tool_def_tokens,
+                &mut plan_nudge_done,
+                "lazy_tiered",
+                matches!(config.context.compaction, CompactionStrategy::TieredRolling),
+            )
+            .await
+        }
+    }
+    history_token_total(messages) < before
 }
 
 /// Marker prefixing the current-state block appended to the tail of the
@@ -1271,5 +1365,148 @@ mod compaction_tests {
             "You just made this same read/inspection call 3 times in a row."
         ));
         assert!(!is_guard_observation("[file] src/main.rs: 40 lines"));
+    }
+}
+
+#[cfg(test)]
+mod force_compress_tests {
+    use super::{FORCE_COMPRESS_MAX_RETRIES, estimated_context_tokens, force_compress};
+    use crate::config::{CompactionStrategy, Config};
+    use crate::llm::{Message, ModelRouter};
+    use crate::runtime::LlmWorkerHandle;
+    use std::sync::Arc;
+
+    /// Test config rooted in a temp dir. The endpoint points at a port
+    /// nothing listens on and retries are disabled, so any LLM-based
+    /// summarization fails instantly (connection refused) and falls back to
+    /// the heuristic summary — tests never touch a live server.
+    fn config_in(dir: &std::path::Path, strategy: CompactionStrategy) -> Config {
+        std::fs::create_dir_all(dir.join(".miniswe")).unwrap();
+        let mut config = Config::default();
+        config.project_root = dir.to_path_buf();
+        config.model.endpoint = "http://127.0.0.1:9".into();
+        config.model.max_retries = 0;
+        config.model.context_window = 60_000;
+        config.context.compaction = strategy;
+        config
+    }
+
+    /// A message list far over `raw_budget` (~16.7K tokens at a 60K window
+    /// with tool_def_tokens=0): 20 tool results of 5K chars ≈ 25K tokens.
+    fn over_budget_messages() -> Vec<Message> {
+        let mut msgs = vec![
+            Message::system("You are miniswe."),
+            Message::user("do the task"),
+        ];
+        for i in 0..20 {
+            msgs.push(Message::assistant(&format!("reading file {i}")));
+            msgs.push(Message::tool_result(
+                &format!("call{i}"),
+                &"line of tool output\n".repeat(250),
+            ));
+        }
+        msgs
+    }
+
+    #[tokio::test]
+    async fn lazy_is_a_no_op_in_maybe_compress() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path(), CompactionStrategy::Lazy);
+        let router = Arc::new(ModelRouter::new(&config));
+        let worker = LlmWorkerHandle::new(router.clone(), 1);
+
+        let mut messages = over_budget_messages();
+        let before_tokens = estimated_context_tokens(&messages, 0);
+        let before_len = messages.len();
+
+        let mut plan_flag = false;
+        super::maybe_compress(&mut messages, &config, &router, &worker, 0, &mut plan_flag).await;
+
+        // Far over budget, yet nothing was compacted — Lazy never fires
+        // proactively. (No plan/scratchpad exists in the temp project, so
+        // the current-state refresh is also a no-op here.)
+        assert_eq!(messages.len(), before_len);
+        assert_eq!(estimated_context_tokens(&messages, 0), before_tokens);
+    }
+
+    #[tokio::test]
+    async fn force_compress_lazy_shrinks_via_unified_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path(), CompactionStrategy::Lazy);
+        let router = Arc::new(ModelRouter::new(&config));
+        let worker = LlmWorkerHandle::new(router.clone(), 1);
+
+        let mut messages = over_budget_messages();
+        let before_tokens = estimated_context_tokens(&messages, 0);
+
+        let freed = force_compress(&mut messages, &config, &router, &worker, 0).await;
+
+        // The LLM summarizer can't be reached (dead endpoint, 0 retries) —
+        // the heuristic fallback must still compact.
+        assert!(freed, "force_compress should report freed tokens");
+        assert!(
+            estimated_context_tokens(&messages, 0) < before_tokens,
+            "history should shrink"
+        );
+        // The unified path archives what it elided.
+        assert!(config.miniswe_path("session_archive.md").exists());
+    }
+
+    #[tokio::test]
+    async fn force_compress_sliding_window_shrinks_without_llm() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path(), CompactionStrategy::SlidingWindow);
+        let router = Arc::new(ModelRouter::new(&config));
+        let worker = LlmWorkerHandle::new(router.clone(), 1);
+
+        let mut messages = over_budget_messages();
+        let before_tokens = estimated_context_tokens(&messages, 0);
+
+        let freed = force_compress(&mut messages, &config, &router, &worker, 0).await;
+
+        assert!(freed);
+        assert!(estimated_context_tokens(&messages, 0) < before_tokens);
+    }
+
+    #[tokio::test]
+    async fn force_compress_reports_false_when_nothing_to_free() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path(), CompactionStrategy::Lazy);
+        let router = Arc::new(ModelRouter::new(&config));
+        let worker = LlmWorkerHandle::new(router.clone(), 1);
+
+        // Tiny history — nothing old enough to compact. Callers rely on
+        // `false` here to avoid resending a request that will fail
+        // identically.
+        let mut messages = vec![
+            Message::system("You are miniswe."),
+            Message::user("hi"),
+            Message::assistant("hello"),
+        ];
+        let freed = force_compress(&mut messages, &config, &router, &worker, 0).await;
+        assert!(!freed);
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn retry_cap_is_small_and_nonzero() {
+        // The cap bounds consecutive futile retries of ONE failing request;
+        // it must allow at least one retry and stay small enough that a
+        // truly unfixable request fails fast.
+        assert!((1..=3).contains(&FORCE_COMPRESS_MAX_RETRIES));
+    }
+
+    #[test]
+    fn estimated_context_tokens_counts_system_and_tools() {
+        let messages = vec![
+            Message::system(&"s".repeat(400)), // ~100 tokens
+            Message::user(&"u".repeat(400)),   // ~100 tokens
+        ];
+        let with_tools = estimated_context_tokens(&messages, 500);
+        let without_tools = estimated_context_tokens(&messages, 0);
+        assert_eq!(with_tools - without_tools, 500);
+        // System message IS counted — unlike needs_compression's history
+        // total, this estimates the full prompt as the server sees it.
+        assert!(without_tools >= 200);
     }
 }

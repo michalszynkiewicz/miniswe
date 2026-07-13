@@ -333,6 +333,13 @@ impl LlmClient {
         // Warn at most once per stream if the server omits tool_call index;
         // a broken server would otherwise spam a line per delta.
         let mut warned_missing_index = false;
+        // Real finish_reason/usage from the stream (the final chunks carry
+        // them). finish_reason matters downstream: "length" is the only
+        // signal that a generation was cut off by the context ceiling
+        // rather than finishing on its own — see
+        // `is_context_truncated_response`.
+        let mut finish_reason: Option<String> = None;
+        let mut usage: Option<Usage> = None;
 
         loop {
             // Wrap each chunk read in an idle-timeout. If the model has
@@ -385,7 +392,13 @@ impl LlmClient {
                     let Ok(parsed) = serde_json::from_str::<StreamChunk>(data) else {
                         continue;
                     };
+                    if let Some(u) = parsed.usage {
+                        usage = Some(u);
+                    }
                     if let Some(choice) = parsed.choices.first() {
+                        if let Some(fr) = &choice.finish_reason {
+                            finish_reason = Some(fr.clone());
+                        }
                         if let Some(content) = &choice.delta.content {
                             on_token(content);
                             full_content.push_str(content);
@@ -468,9 +481,12 @@ impl LlmClient {
                     tool_call_id: None,
                     name: None,
                 },
-                finish_reason: Some("stop".into()),
+                // Real finish_reason from the stream when the server sent
+                // one; "stop" preserves the old behavior for servers/mocks
+                // that never emit it.
+                finish_reason: Some(finish_reason.unwrap_or_else(|| "stop".into())),
             }],
-            usage: None,
+            usage,
         };
         normalize_xml_tool_calls(&mut resp, self.config.tool_call_format);
         Ok(resp)
@@ -648,6 +664,58 @@ pub const TRUNCATED_TOOL_CALL_MARKER: &str = "Failed to parse tool call argument
 /// the caller should surface a hint to the agent instead.
 pub fn is_truncated_tool_call_error(err_msg: &str) -> bool {
     err_msg.contains(TRUNCATED_TOOL_CALL_MARKER)
+}
+
+/// True if the server rejected the request outright because the PROMPT
+/// alone exceeds the context window. llama.cpp returns a 400 whose body
+/// carries `"type":"exceed_context_size_error"` (verified empirically:
+/// `{"error":{"code":400,"message":"request (70017 tokens) exceeds the
+/// available context size (60160 tokens)...","type":
+/// "exceed_context_size_error",...}}`), which `stream_once_assembled`
+/// folds into the error message verbatim. Not retryable as-is — the same
+/// request fails identically — but recoverable by compacting the message
+/// list and resending (see `compressor::force_compress`).
+pub fn is_context_exceeded_error(err_msg: &str) -> bool {
+    err_msg.contains("exceed_context_size_error")
+        || err_msg.contains("exceeds the available context size")
+}
+
+/// True if a *successful* response was silently cut off by the context
+/// ceiling rather than finishing on its own or legitimately hitting the
+/// requested output cap. llama.cpp does NOT error in this case (verified
+/// empirically): it returns 200 with `finish_reason: "length"` and stops
+/// generation the instant `prompt_tokens + completion_tokens` reaches
+/// `n_ctx`, regardless of the requested `max_tokens`. Since
+/// `finish_reason: "length"` is the same value used for a legitimate
+/// max-tokens stop, the tell is the completion landing well SHORT of the
+/// requested cap: a legitimate cap-stop generates ~exactly `max_tokens`.
+/// Uses real `usage` numbers when the server sent them, otherwise a
+/// chars/4 estimate of the generated output; the 3/4 margin absorbs
+/// estimation error. Callers should additionally gate on the prompt
+/// actually being near the window (`compressor::estimated_context_tokens`)
+/// before treating this as context exhaustion.
+pub fn is_context_truncated_response(resp: &ChatResponse, requested_max_tokens: usize) -> bool {
+    let Some(choice) = resp.choices.first() else {
+        return false;
+    };
+    if choice.finish_reason.as_deref() != Some("length") {
+        return false;
+    }
+    let completion_tokens = match &resp.usage {
+        Some(u) => u.completion_tokens,
+        None => {
+            let msg = &choice.message;
+            let content_chars = msg.content.as_deref().map_or(0, str::len);
+            let args_chars: usize = msg
+                .tool_calls
+                .iter()
+                .flatten()
+                .map(|tc| tc.function.arguments.len())
+                .sum();
+            (content_chars + args_chars) / 4
+        }
+    };
+    completion_tokens < requested_max_tokens * 3 / 4
 }
 
 /// True if any tool-call argument string contains a chat-template token
@@ -870,6 +938,107 @@ mod tests {
 
         let err = anyhow::anyhow!("Failed to connect to LLM at http://localhost:8080");
         assert!(is_retryable_llm_error(&err));
+    }
+
+    #[test]
+    fn context_exceeded_error_detected() {
+        // Verbatim llama.cpp 400 body, captured empirically against the
+        // real server (a ~70K-token request into a 60K window).
+        let msg = r#"LLM API error (400 Bad Request): {"error":{"code":400,"message":"request (70017 tokens) exceeds the available context size (60160 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":70017,"n_ctx":60160}}"#;
+        assert!(is_context_exceeded_error(msg));
+        // Not blindly retryable — same request fails identically; recovery
+        // is compact-and-resend, driven by the round loop.
+        assert!(!is_retryable_llm_error(&anyhow::anyhow!("{msg}")));
+    }
+
+    #[test]
+    fn unrelated_errors_are_not_context_exceeded() {
+        assert!(!is_context_exceeded_error(
+            "LLM API error (400 Bad Request): invalid model"
+        ));
+        assert!(!is_context_exceeded_error(
+            "LLM request timed out after 30s"
+        ));
+        assert!(!is_context_exceeded_error(
+            "LLM API error (500 Internal Server Error): Failed to parse tool call arguments as JSON"
+        ));
+    }
+
+    fn resp_with_finish(
+        finish_reason: &str,
+        content: Option<&str>,
+        usage: Option<Usage>,
+    ) -> ChatResponse {
+        ChatResponse {
+            choices: vec![Choice {
+                message: Message {
+                    role: "assistant".into(),
+                    content: content.map(str::to_string),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                finish_reason: Some(finish_reason.into()),
+            }],
+            usage,
+        }
+    }
+
+    #[test]
+    fn context_truncated_response_detected_via_usage() {
+        // The empirically observed shape: finish_reason="length" with the
+        // completion stopping at n_ctx (210 tokens) despite max_tokens=2000.
+        let resp = resp_with_finish(
+            "length",
+            Some("partial output"),
+            Some(Usage {
+                prompt_tokens: 59_950,
+                completion_tokens: 210,
+                total_tokens: 60_160,
+            }),
+        );
+        assert!(is_context_truncated_response(&resp, 2000));
+    }
+
+    #[test]
+    fn legitimate_max_tokens_stop_is_not_context_truncation() {
+        // finish_reason="length" with the completion AT the requested cap
+        // is the model legitimately running to max_tokens.
+        let resp = resp_with_finish(
+            "length",
+            Some("long output"),
+            Some(Usage {
+                prompt_tokens: 5_000,
+                completion_tokens: 7_950,
+                total_tokens: 12_950,
+            }),
+        );
+        assert!(!is_context_truncated_response(&resp, 8000));
+    }
+
+    #[test]
+    fn normal_stop_is_not_context_truncation() {
+        let resp = resp_with_finish("stop", Some("done"), None);
+        assert!(!is_context_truncated_response(&resp, 8000));
+    }
+
+    #[test]
+    fn context_truncation_estimates_when_usage_absent() {
+        // Streaming servers may omit usage — a ~1000-char (~250-token)
+        // completion against an 8000-token cap still classifies via the
+        // chars/4 estimate.
+        let content = "x".repeat(1000);
+        let resp = resp_with_finish("length", Some(&content), None);
+        assert!(is_context_truncated_response(&resp, 8000));
+    }
+
+    #[test]
+    fn empty_choices_is_not_context_truncation() {
+        let resp = ChatResponse {
+            choices: vec![],
+            usage: None,
+        };
+        assert!(!is_context_truncated_response(&resp, 8000));
     }
 
     fn resp_with_args(args: &str) -> ChatResponse {
