@@ -158,7 +158,15 @@ pub struct Usage {
 /// A streaming chunk from SSE.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChunk {
+    /// Defaulted: the final usage-bearing chunk from some servers carries
+    /// no `choices` field at all, and must still parse.
+    #[serde(default)]
     pub choices: Vec<StreamChoice>,
+    /// llama.cpp (and OpenAI with `include_usage`) attach token usage to
+    /// the final chunk. Captured when present so the assembled response
+    /// carries real numbers; absent chunks leave it `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 /// A streaming choice.

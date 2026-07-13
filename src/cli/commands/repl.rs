@@ -30,7 +30,10 @@ use crate::cli::commands::agent::spiral;
 use crate::cli::commands::agent::validation;
 use crate::config::{CeremonyMode, Config, EditMode, ModelRole};
 use crate::context;
-use crate::llm::{ChatRequest, Message, ModelRouter, is_truncated_tool_call_error};
+use crate::llm::{
+    ChatRequest, Message, ModelRouter, is_context_exceeded_error, is_context_truncated_response,
+    is_truncated_tool_call_error,
+};
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
 use crate::mcp::{McpConfig, McpRegistry};
@@ -895,6 +898,37 @@ fn refresh_plan_panel(app: &mut App, config: &Config, round: usize) {
     app.round = round;
 }
 
+/// `compressor::force_compress` driven through the same select!-with-redraw
+/// pattern the round loop uses for `maybe_compress`, so a long LLM-based
+/// summarization during reactive context-exhaustion recovery keeps the TUI
+/// responsive. Returns force_compress's "did anything shrink" result.
+#[allow(clippy::too_many_arguments)]
+async fn force_compress_responsive(
+    app: &mut App,
+    rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    messages: &mut Vec<Message>,
+    config: &Config,
+    router: &ModelRouter,
+    llm_worker: &LlmWorkerHandle,
+    tool_def_tokens: usize,
+) -> bool {
+    let fut =
+        context::compressor::force_compress(messages, config, router, llm_worker, tool_def_tokens);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        tokio::select! {
+            biased;
+            freed = &mut fut => break freed,
+            evt = rx.recv() => {
+                if matches!(evt, Some(AppEvent::Tick)) {
+                    let _ = terminal.draw(|frame| ui::draw(frame, app));
+                }
+            }
+        }
+    }
+}
+
 /// This runs inline in the main loop, processing events between rounds.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_loop(
@@ -949,6 +983,11 @@ async fn run_agent_loop(
     let mut plan_update_requested = false;
     let mut nudged_premature_exit = false;
     let mut nudged_no_plan = false;
+    // Consecutive reactive-compaction retries (context exhaustion signaled
+    // by the server — see compressor::force_compress). Reset whenever a
+    // response is successfully consumed; bounds futile retries of one
+    // failing request, not total compactions over a long turn.
+    let mut context_compact_retries: usize = 0;
     // How many times the behavioral done-gate has blocked completion this turn.
     let mut validation_blocks: usize = 0;
     // The model's stated rationale each time the gate blocked it (bounded, auditable).
@@ -1148,6 +1187,11 @@ async fn run_agent_loop(
         // hint and continue the outer loop so the agent can recover
         // with a smaller operation, instead of aborting the session.
         let mut truncated_tool_call_hint_pushed = false;
+        // Set when the failure is really CONTEXT EXHAUSTION (the server
+        // rejected an over-size request, or clipped a tool call because the
+        // prompt sits near the window). Handled after the select loop —
+        // force_compress is a long await that must not run inside it.
+        let mut context_ceiling_hit = false;
         let response = {
             let mut token_count = 0u32;
             let mut llm_events =
@@ -1169,27 +1213,53 @@ async fn run_agent_loop(
                                 if err_str.contains("Interrupted") {
                                     cancelled.store(false, Ordering::Relaxed);
                                     app.push_output("Generation interrupted.", LineStyle::Status);
+                                } else if is_context_exceeded_error(&err_str)
+                                    && context_compact_retries
+                                        < context::compressor::FORCE_COMPRESS_MAX_RETRIES
+                                {
+                                    // Prompt alone exceeds the context window
+                                    // — recoverable by compacting + resending
+                                    // (primary path for compaction="lazy",
+                                    // safety net for every other strategy).
+                                    context_ceiling_hit = true;
                                 } else if is_truncated_tool_call_error(&err_str) {
                                     // Model hit max_tokens mid tool-call — the
                                     // JSON couldn't be parsed server-side, so
-                                    // no tool_call_id was issued. Clear the
-                                    // partial UI text (don't persist the
-                                    // half-streamed output) and push a
-                                    // user-role hint so the agent retries
-                                    // with a smaller operation.
-                                    log.llm_error(
-                                        "tool call JSON truncated (max_tokens) — \
-                                         injecting hint and continuing",
-                                    );
-                                    app.push_output(
-                                        "Previous tool call truncated — retrying with guidance.",
-                                        LineStyle::Status,
-                                    );
-                                    let hint =
-                                        Message::user(truncated_tool_call_hint(config.tools.edit_mode));
-                                    messages.push(hint.clone());
-                                    conversation_history.push(hint);
-                                    truncated_tool_call_hint_pushed = true;
+                                    // no tool_call_id was issued. When the
+                                    // prompt sits near the context window the
+                                    // truncation is really context exhaustion
+                                    // (the server clamps generation to the
+                                    // remaining room): a hint can't fix that,
+                                    // compaction can.
+                                    if context::compressor::estimated_context_tokens(
+                                        messages,
+                                        tool_def_tokens,
+                                    ) > config.model.context_window * 3 / 4
+                                        && context_compact_retries
+                                            < context::compressor::FORCE_COMPRESS_MAX_RETRIES
+                                    {
+                                        context_ceiling_hit = true;
+                                    } else {
+                                        // Clear the partial UI text (don't
+                                        // persist the half-streamed output)
+                                        // and push a user-role hint so the
+                                        // agent retries with a smaller
+                                        // operation.
+                                        log.llm_error(
+                                            "tool call JSON truncated (max_tokens) — \
+                                             injecting hint and continuing",
+                                        );
+                                        app.push_output(
+                                            "Previous tool call truncated — retrying with guidance.",
+                                            LineStyle::Status,
+                                        );
+                                        let hint = Message::user(truncated_tool_call_hint(
+                                            config.tools.edit_mode,
+                                        ));
+                                        messages.push(hint.clone());
+                                        conversation_history.push(hint);
+                                        truncated_tool_call_hint_pushed = true;
+                                    }
                                 } else {
                                     let clean = if err_str.contains('<') {
                                         err_str
@@ -1251,6 +1321,34 @@ async fn run_agent_loop(
         let _ = terminal.draw(|frame| ui::draw(frame, app));
 
         let Some(response) = response else {
+            if context_ceiling_hit {
+                context_compact_retries += 1;
+                app.push_output(
+                    "Context window exceeded — compacting and retrying.",
+                    LineStyle::Status,
+                );
+                if force_compress_responsive(
+                    app,
+                    rx,
+                    terminal,
+                    messages,
+                    config,
+                    router,
+                    llm_worker,
+                    tool_def_tokens,
+                )
+                .await
+                {
+                    log.llm_error("context window exceeded — compacted history, retrying");
+                    continue;
+                }
+                // Nothing could be freed — retrying would fail identically.
+                app.push_output(
+                    "Compaction could not free any context — stopping this turn.",
+                    LineStyle::Error,
+                );
+                break;
+            }
             if truncated_tool_call_hint_pushed {
                 // Hint was injected into `messages`; loop back and let
                 // the agent try again with smaller operations.
@@ -1259,10 +1357,49 @@ async fn run_agent_loop(
             break;
         };
 
+        // A 200 response can still be a context-exhaustion casualty:
+        // finish_reason="length" with the completion well under the
+        // requested cap means the server clipped generation at n_ctx (see
+        // run.rs / is_context_truncated_response). Discard the partial
+        // output, compact, regenerate.
+        let effective_max_tokens =
+            max_tokens_override.unwrap_or(config.model.max_output_tokens as u64) as usize;
+        if is_context_truncated_response(&response, effective_max_tokens)
+            && context::compressor::estimated_context_tokens(messages, tool_def_tokens)
+                > config.model.context_window * 3 / 4
+            && context_compact_retries < context::compressor::FORCE_COMPRESS_MAX_RETRIES
+        {
+            context_compact_retries += 1;
+            app.push_output(
+                "Generation truncated by context ceiling — compacting and regenerating.",
+                LineStyle::Status,
+            );
+            if force_compress_responsive(
+                app,
+                rx,
+                terminal,
+                messages,
+                config,
+                router,
+                llm_worker,
+                tool_def_tokens,
+            )
+            .await
+            {
+                log.llm_error(
+                    "generation truncated by context ceiling — compacted history, regenerating",
+                );
+                continue;
+            }
+        }
+
         let choice = match response.choices.first() {
             Some(c) => c,
             None => break,
         };
+        // A response made it through whole — any prior reactive-compaction
+        // retries resolved this request; reset the budget for the next one.
+        context_compact_retries = 0;
 
         let assistant_msg = &choice.message;
 

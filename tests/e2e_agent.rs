@@ -14,7 +14,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use miniswe::config::Config;
 use miniswe::llm::{
-    ChatRequest, LlmClient, Message, TRUNCATED_TOOL_CALL_MARKER, is_truncated_tool_call_error,
+    ChatRequest, LlmClient, Message, TRUNCATED_TOOL_CALL_MARKER, is_context_truncated_response,
+    is_truncated_tool_call_error,
 };
 use miniswe::tools::{self, PermissionManager};
 
@@ -127,6 +128,50 @@ async fn llm_client_stream_plain_text() {
         "Streamed hello!"
     );
     assert!(!tokens.is_empty(), "should have received streaming tokens");
+    // Servers that never send finish_reason keep the legacy "stop" default.
+    assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
+}
+
+#[tokio::test]
+async fn llm_client_stream_captures_length_finish_and_usage() {
+    // A generation clipped by the context ceiling arrives as a NORMAL 200
+    // stream — finish_reason "length" on the content chunk, real usage in a
+    // trailing choices-less chunk. The assembled response must carry both
+    // (they used to be discarded: finish_reason hardcoded to "stop", usage
+    // to None), and the classifier must recognize the shape.
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(helpers::mock_sse_context_clipped(
+            "partial output cut mid-thought",
+            59_950,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+
+    let client = LlmClient::new(config.model.clone());
+    let request = ChatRequest {
+        messages: vec![Message::user("hi")],
+        tools: None,
+        tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
+    };
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let response = client
+        .chat_stream(&request, |_| {}, &cancelled)
+        .await
+        .unwrap();
+
+    assert_eq!(response.choices[0].finish_reason.as_deref(), Some("length"));
+    let usage = response.usage.as_ref().expect("usage captured from stream");
+    assert_eq!(usage.prompt_tokens, 59_950);
+    assert!(is_context_truncated_response(&response, 8000));
 }
 
 #[tokio::test]
