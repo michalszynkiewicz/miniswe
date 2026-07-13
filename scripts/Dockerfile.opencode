@@ -1,0 +1,38 @@
+# Dockerfile.opencode — Isolated environment for running one opencode variant.
+#
+# Mirrors Dockerfile.aider but installs opencode (npm) instead of aider-chat
+# (pip). Keeps the Rust toolchain so the same 6-check validation can run
+# in-container.
+#
+# Build:
+#   docker build -f scripts/Dockerfile.opencode -t miniswe-opencode-bench .
+
+FROM rust:1.89-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js (LTS) via nodesource — Debian bookworm's apt Node is too old for
+# opencode-ai's npm package requirements.
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g opencode-ai@latest
+
+WORKDIR /build
+
+# Bring the repo in so we have a .git for `git archive ${BASELINE_SHA}`.
+# Unlike the miniswe image we do NOT build a binary here — opencode runs
+# against the freshly-archived /work tree at execution time.
+COPY . .
+RUN cd /build && cargo fetch
+
+# Keep the repo for git archive — same convention as the miniswe/aider images.
+RUN mkdir /repo && cp -r /build/.git /repo/.git
+
+# Clean source tree — each variant starts from a fresh git-archive.
+RUN rm -rf /build/target /build/src /build/tests /build/Cargo.lock 2>/dev/null || true
+
+WORKDIR /work
