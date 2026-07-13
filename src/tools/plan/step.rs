@@ -48,10 +48,9 @@ impl Step {
                 } else {
                     (true, None, after_check.to_string())
                 }
-            } else if let Some(after_check) = trimmed.strip_prefix("- [ ]") {
-                (false, None, after_check.trim_start().to_string())
             } else {
-                return None;
+                let after_check = trimmed.strip_prefix("- [ ]")?;
+                (false, None, after_check.trim_start().to_string())
             };
 
         // Parse compile tag from end
