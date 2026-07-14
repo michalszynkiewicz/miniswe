@@ -71,13 +71,13 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
             r#type: "function".into(),
             function: FunctionDefinition {
                 name: "file".into(),
-                description: format!("File operations: read, search, shell, delete, revert. Use action='help' for details. {file_edit_hint}"),
+                description: format!("File operations: read, search, delete, revert. Use action='help' for details. {file_edit_hint}"),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "description": "One of: read, delete, search, shell, revert, help"
+                            "description": "One of: read, delete, search, revert, help"
                         },
                         "path": { "type": "string", "description": "File path (required for read/delete/revert)" },
                         "start": { "type": "integer", "description": "Start line for action='read'" },
@@ -86,9 +86,6 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
                         "pattern": { "type": "string", "description": "Regex pattern (for search)" },
                         "scope": { "type": "string", "description": "Search scope (for search)" },
                         "max_results": { "type": "integer", "description": "Max results (for search)" },
-                        "command": { "type": "string", "description": "Shell command (for shell)" },
-                        "timeout": { "type": "integer", "description": "Timeout in seconds (for shell)" },
-                        "background": { "type": "boolean", "description": "shell: start as a background job (for long-running commands — deploys, builds, servers); manage with the jobs tool" },
                         "to_round": { "type": "integer", "description": "Round to revert to (for revert)" }
                     },
                     "required": ["action"]
@@ -244,22 +241,27 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
     ]
 }
 
-/// The `jobs` tool. Jobs come from file(shell background=true) — the
-/// explicit path for known-long commands — or, in headless runs, from
-/// auto-promotion of foreground commands that outlive the check-in
-/// threshold (see tools::jobs). The `check` parameter is the skill-guided
-/// progress hook: wait-then-probe in one paced round.
-pub fn jobs_tool_definition() -> ToolDefinition {
+/// The top-level `shell` tool: command execution plus the background-job
+/// lifecycle in one surface (probe 2026-07-14: consolidation adopted
+/// cleanly once the prompt contract example migrated with it). Jobs come
+/// from action='run' with background=true, or auto-promotion of foreground
+/// commands that outlive the check-in threshold (headless). The `check`
+/// parameter is the skill-guided progress hook: wait-then-probe in one
+/// paced round.
+pub fn shell_tool_definition() -> ToolDefinition {
     ToolDefinition {
         r#type: "function".into(),
         function: FunctionDefinition {
-            name: "jobs".into(),
-            description: "Manage background jobs (started with file shell background=true, or auto-promoted long commands). Actions: 'wait' (block up to `secs`, return new output; pass `check` = a quick status command to probe progress after the wait, e.g. kubectl get pods), 'status' (new output + state, id optional), 'kill'. A finished job reports its full result once.".into(),
+            name: "shell".into(),
+            description: "Run shell commands and manage long-running ones. Actions: 'run' (execute `command`; pass background=true for long-running commands — deploys, builds, servers), 'wait' (block up to `secs` for background job `id`, return new output; pass `check` = a quick status command probed after the wait, e.g. kubectl get pods), 'status' (new output + state, id optional), 'kill'. Long foreground commands are auto-promoted to background jobs; a finished job reports its full result once.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["status", "wait", "kill"], "description": "What to do" },
-                    "id": { "type": "integer", "description": "Job id (from the promotion message; optional when only one job is live)" },
+                    "action": { "type": "string", "enum": ["run", "wait", "status", "kill"], "description": "What to do" },
+                    "command": { "type": "string", "description": "run: the shell command" },
+                    "timeout": { "type": "integer", "description": "run: timeout in seconds" },
+                    "background": { "type": "boolean", "description": "run: start as a background job" },
+                    "id": { "type": "integer", "description": "Job id (optional when only one job is live)" },
                     "secs": { "type": "integer", "description": "wait: max seconds to block (default 60, cap 300)" },
                     "check": { "type": "string", "description": "wait: shell command run after the wait to probe progress; its output is returned" }
                 },

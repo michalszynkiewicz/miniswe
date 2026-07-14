@@ -317,7 +317,7 @@ pub async fn run(
         // Background-jobs surface: explicit background=true works in every
         // mode; auto-promotion of long foreground commands stays headless-
         // only (interactive keeps the human continue/kill prompt).
-        tool_defs.push(tools::definitions::jobs_tool_definition());
+        tool_defs.push(tools::definitions::shell_tool_definition());
     }
 
     // Registry for background jobs (explicit background=true + promoted).
@@ -988,8 +988,8 @@ pub async fn run(
                     nudged_live_jobs = true;
                     let nudge = Message::user(
                         "[Background job(s) still running — the task is not done. \
-                         Wait for them with jobs(action='wait', secs=60, check='<status command>') \
-                         and verify the result, or jobs(action='kill') them deliberately. \
+                         Wait for them with shell(action='wait', secs=60, check='<status command>') \
+                         and verify the result, or shell(action='kill') them deliberately. \
                          Finishing now would abandon and kill them.]",
                     );
                     messages.push(nudge.clone());
@@ -1381,8 +1381,8 @@ pub async fn run(
                 // the turn-stopping path (2026-07-14, stuck scenario died 11s
                 // into a monitoring task). Capped so a genuine runaway still
                 // escalates normally.
-                if tc.function.name == "file"
-                    && args["action"].as_str() == Some("shell")
+                if ((tc.function.name == "shell" && args["action"].as_str() == Some("run"))
+                    || (tc.function.name == "file" && args["action"].as_str() == Some("shell")))
                     && !job_registry.is_empty()
                     && jobs_poll_redirects < 2
                 {
@@ -1392,7 +1392,7 @@ pub async fn run(
                         &tc.id,
                         &format!(
                             "You are polling `{polled}` in a loop while a background job runs. \
-                             Use jobs(action='wait', secs=60, check='{polled}') instead — it \
+                             Use shell(action='wait', secs=60, check='{polled}') instead — it \
                              waits, THEN runs the probe, one paced cycle per call."
                         ),
                     );
@@ -1782,7 +1782,9 @@ pub async fn run(
                         crate::tools::ToolResult::err("Tool worker dropped refactor job".into())
                     }
                 }
-            } else if tc.function.name == "file" && file_action == "shell" {
+            } else if (tc.function.name == "shell" && args["action"].as_str() == Some("run"))
+                || (tc.function.name == "file" && file_action == "shell")
+            {
                 if args["background"].as_bool() == Some(true) {
                     // Explicit background start: the sanctioned form of the
                     // model's "cmd & echo $! > .pid" instinct — registered,
@@ -1796,7 +1798,7 @@ pub async fn run(
                     )
                     .await
                 }
-            } else if tc.function.name == "jobs" {
+            } else if tc.function.name == "shell" {
                 tools::jobs::execute(
                     &args,
                     &config,

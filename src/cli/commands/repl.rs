@@ -228,6 +228,15 @@ fn explore_block_reason(name: &str, file_action: &str, args: &serde_json::Value)
     if is_file_write(name) || matches!(name, "revert" | "delete_file" | "spawn_agents") {
         return Some(format!("`{name}` can modify files"));
     }
+    if name == "shell" {
+        let cmd = args["command"].as_str().unwrap_or("");
+        if args["action"].as_str() == Some("run") && !shell_is_read_only(cmd) {
+            return Some(format!(
+                "shell command is not read-only: `{}`",
+                crate::truncate_chars(cmd, 80)
+            ));
+        }
+    }
     if name == "file" {
         match file_action {
             "shell" => {
@@ -305,7 +314,7 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
         // Background jobs: explicit file(shell background=true) start +
         // jobs(wait/status/kill) management. Session-scoped registry so a
         // server started in one turn is manageable in later turns.
-        tool_defs.push(tools::definitions::jobs_tool_definition());
+        tool_defs.push(tools::definitions::shell_tool_definition());
     }
     let job_registry = Arc::new(tools::jobs::JobRegistry::default());
 
@@ -2279,7 +2288,9 @@ async fn run_agent_loop(
                         .map_err(|e| format!("refactor error: {e}"))
                 });
                 await_tool_job_ui(rx, terminal, app, "refactor", &mut result_rx, cancelled).await
-            } else if tc.function.name == "file" && file_action == "shell" {
+            } else if (tc.function.name == "shell" && args["action"].as_str() == Some("run"))
+                || (tc.function.name == "file" && file_action == "shell")
+            {
                 if args["background"].as_bool() == Some(true) {
                     // Explicit background start (cheap, non-blocking) —
                     // registered in the session job registry, managed via
@@ -2295,7 +2306,7 @@ async fn run_agent_loop(
                     )
                     .await
                 }
-            } else if tc.function.name == "jobs" {
+            } else if tc.function.name == "shell" {
                 // Runs on the pool (own runtime) so jobs(wait) keeps the TUI
                 // responsive via await_tool_job_ui, like other pooled tools.
                 let args_for_job = args.clone();
