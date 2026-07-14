@@ -511,9 +511,15 @@ pub fn assemble(
         config.tools.flat,
     );
 
-    // 1b. Project root (always present)
+    // 1b. Project root (always present). The "IS the project" line counters
+    // the base-model prior of scaffolding a named subdirectory (mkdir app &&
+    // cd app / npx create-x app) — coding-agent convention is that the
+    // workspace root is the project itself.
     system_context.push_str(&format!(
-        "[PROJECT ROOT]{}\nAll file paths are relative to this directory. Use relative paths only.\n",
+        "[PROJECT ROOT]{}\nAll file paths are relative to this directory. Use relative paths only.\n\
+         This directory IS the project — create files at its top level; do not create a new \
+         project subdirectory unless the user names one. Scaffolding tools: use in-place forms \
+         (`cargo init .`, `npm init`, `npx create-x .`).\n",
         config.project_root.display()
     ));
 
