@@ -252,7 +252,7 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
              {edit_contract}\n\
              If a tool says a parameter is missing, retry with the exact required parameter names.\n\
              Before finishing, verify your change actually works — run the FULL test suite, not just a compile check. A test failure in code you didn't mean to touch means your edit broke something; don't finish until it's fixed.\n\
-             Background servers: spawn with `& echo $! > .pid` and kill via that pid before respawning — don't pkill/grep ps.\n\
+             Long-running commands (deploys, builds, servers): run with file(action='shell', background=true) and manage with jobs(action='wait'|'status'|'kill'); wait takes check='<status cmd>' to probe progress. NEVER self-background with '&' or nohup — output is lost and nothing tracks the process.\n\
              Bound port with no matching process under you: switch ports, don't escalate kills.\n"
         );
     }
@@ -286,7 +286,7 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
          {edit_contract}\n\
          If a tool says a parameter is missing, retry with the exact required parameter names.\n\
          Before finishing, verify your change actually works — run the FULL test suite, not just a compile check. A test failure in code you didn't mean to touch means your edit broke something; don't finish until it's fixed.\n\
-         Background servers: spawn with `& echo $! > .pid` and kill via that pid before respawning — don't pkill/grep ps.\n\
+         Long-running commands (deploys, builds, servers): run with file(action='shell', background=true) and manage with jobs(action='wait'|'status'|'kill'); wait takes check='<status cmd>' to probe progress. NEVER self-background with '&' or nohup — output is lost and nothing tracks the process.\n\
          Bound port with no matching process under you: switch ports, don't escalate kills.\n"
     )
 }
@@ -749,7 +749,8 @@ mod prompt_phase_tests {
         for p in [pre(), post()] {
             assert!(p.contains("Emit ONE tool call per response."));
             assert!(p.contains("Tool contract: grouped tools require action"));
-            assert!(p.contains("Background servers: spawn with"));
+            assert!(p.contains("background=true"));
+            assert!(p.contains("NEVER self-background"));
         }
     }
 }

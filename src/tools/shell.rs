@@ -17,10 +17,11 @@ use crate::config::Config;
 /// Maximum characters per output line before truncation (display).
 const MAX_LINE_CHARS: usize = 1000;
 
+#[derive(Debug)]
 pub struct RunningShellCommand {
-    child: Child,
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
+    pub(crate) child: Child,
+    pub(crate) stdout_path: PathBuf,
+    pub(crate) stderr_path: PathBuf,
 }
 
 impl Drop for RunningShellCommand {
@@ -167,7 +168,10 @@ pub fn interrupt(mut running: RunningShellCommand) -> ToolResult {
     ToolResult::err("Command interrupted by user.".into())
 }
 
-fn render_finished_result(mut running: RunningShellCommand, config: &Config) -> ToolResult {
+pub(crate) fn render_finished_result(
+    mut running: RunningShellCommand,
+    config: &Config,
+) -> ToolResult {
     let exit_code = running
         .child
         .wait()

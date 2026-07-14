@@ -302,7 +302,12 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
         if config.runtime.llm_concurrency > 1 {
             tool_defs.push(tools::definitions::spawn_agents_tool_definition());
         }
+        // Background jobs: explicit file(shell background=true) start +
+        // jobs(wait/status/kill) management. Session-scoped registry so a
+        // server started in one turn is manageable in later turns.
+        tool_defs.push(tools::definitions::jobs_tool_definition());
     }
+    let job_registry = Arc::new(tools::jobs::JobRegistry::default());
 
     // Spawn LSP client (non-blocking)
     let lsp_client: Option<Arc<LspClient>> = if config.lsp.enabled {
@@ -757,6 +762,7 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                     tool_def_tokens,
                                     mcp_summary.as_deref(),
                                     &user_message,
+                                    &job_registry,
                                 )
                                 .await;
 
@@ -959,6 +965,8 @@ async fn run_agent_loop(
     // done-gate re-anchor, the debugger sub-agent, and whole-tree SCRAP/reset
     // re-assembly.
     goal: &str,
+    // Session-scoped background-job registry (file shell background=true).
+    job_registry: &Arc<tools::jobs::JobRegistry>,
 ) {
     // Ceremony=Strict re-enables the legacy plan-first machinery (plan gate,
     // plan/no-plan nudges, hide-edit-tools-until-plan). Derived from the
@@ -2272,14 +2280,46 @@ async fn run_agent_loop(
                 });
                 await_tool_job_ui(rx, terminal, app, "refactor", &mut result_rx, cancelled).await
             } else if tc.function.name == "file" && file_action == "shell" {
-                await_shell_job_repl(
-                    tool_pool.submit_shell(args.clone(), config.clone(), cancelled.clone()),
-                    app,
-                    rx,
-                    terminal,
-                    cancelled,
-                )
-                .await
+                if args["background"].as_bool() == Some(true) {
+                    // Explicit background start (cheap, non-blocking) —
+                    // registered in the session job registry, managed via
+                    // the jobs tool in this or any later turn.
+                    tools::jobs::start_background(&args, config, job_registry.as_ref())
+                } else {
+                    await_shell_job_repl(
+                        tool_pool.submit_shell(args.clone(), config.clone(), cancelled.clone()),
+                        app,
+                        rx,
+                        terminal,
+                        cancelled,
+                    )
+                    .await
+                }
+            } else if tc.function.name == "jobs" {
+                // Runs on the pool (own runtime) so jobs(wait) keeps the TUI
+                // responsive via await_tool_job_ui, like other pooled tools.
+                let args_for_job = args.clone();
+                let config_for_job = config.clone();
+                let perms_for_job = perms.clone();
+                let registry_for_job = job_registry.clone();
+                let cancelled_for_job = cancelled.clone();
+                let mut result_rx = tool_pool.submit(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    Ok(runtime.block_on(async {
+                        tools::jobs::execute(
+                            &args_for_job,
+                            &config_for_job,
+                            perms_for_job.as_ref(),
+                            registry_for_job.as_ref(),
+                            Some(cancelled_for_job.as_ref()),
+                        )
+                        .await
+                    }))
+                });
+                await_tool_job_ui(rx, terminal, app, "jobs", &mut result_rx, cancelled).await
             } else {
                 let tool_name = tc.function.name.clone();
                 let args = args.clone();
@@ -3277,6 +3317,16 @@ async fn await_shell_job_repl(
                             return crate::tools::ToolResult::err("Shell worker dropped control channel".into());
                         }
                         let _ = terminal.draw(|frame| ui::draw(frame, app));
+                    }
+                    Some(ShellWorkerEvent::Detached { running, command }) => {
+                        // The REPL never sends ShellControl::Detach (jobs are
+                        // a headless-only surface) — if this arrives anyway,
+                        // fail safe: kill the command rather than leak it.
+                        app.clear_active_job();
+                        let _ = crate::tools::shell::kill(running, 0);
+                        return crate::tools::ToolResult::err(format!(
+                            "Shell command detached unexpectedly and was killed: {command}"
+                        ));
                     }
                     Some(ShellWorkerEvent::Completed(result)) => {
                         app.clear_active_job();
