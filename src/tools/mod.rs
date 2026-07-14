@@ -22,6 +22,7 @@ mod dispatch;
 pub mod edit_file;
 mod edit_orchestration;
 pub mod fast;
+pub mod jobs;
 pub mod plan;
 mod read_file;
 mod refactor;

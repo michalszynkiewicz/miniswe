@@ -314,7 +314,14 @@ pub async fn run(
         if config.runtime.llm_concurrency > 1 {
             tool_defs.push(tools::definitions::spawn_agents_tool_definition());
         }
+        // Background-jobs surface: explicit background=true works in every
+        // mode; auto-promotion of long foreground commands stays headless-
+        // only (interactive keeps the human continue/kill prompt).
+        tool_defs.push(tools::definitions::jobs_tool_definition());
     }
+
+    // Registry for background jobs (explicit background=true + promoted).
+    let job_registry = Arc::new(tools::jobs::JobRegistry::default());
 
     // Clear stale scratchpad/plan from previous sessions — unless this
     // is a `--continue` invocation, in which case the model is meant to
@@ -420,6 +427,8 @@ pub async fn run(
     let mut successful_edits_since_plan_update = 0u32;
     let mut plan_update_requested = false;
     let mut nudged_premature_exit = false;
+    let mut nudged_live_jobs = false;
+    let mut jobs_poll_redirects = 0u32;
     let mut nudged_no_plan = false;
     // Consecutive reactive-compaction retries (context exhaustion signaled
     // by the server — see compressor::force_compress). Reset whenever a
@@ -970,6 +979,23 @@ pub async fn run(
                         continue;
                     }
                 }
+                // Live-jobs finish-gate: finishing while background jobs run
+                // abandons them (session end kills them — a deploy started
+                // with background=true dies half-way). One nudge to wait or
+                // kill deliberately; jobs e2e (2026-07-14) showed the model
+                // fire-and-forgetting a background deploy otherwise.
+                if !job_registry.is_empty() && !nudged_live_jobs {
+                    nudged_live_jobs = true;
+                    let nudge = Message::user(
+                        "[Background job(s) still running — the task is not done. \
+                         Wait for them with jobs(action='wait', secs=60, check='<status command>') \
+                         and verify the result, or jobs(action='kill') them deliberately. \
+                         Finishing now would abandon and kill them.]",
+                    );
+                    messages.push(nudge.clone());
+                    conversation_history.push(nudge);
+                    continue;
+                }
                 // Behavioral done-gate: before accepting completion, verify the
                 // change actually works at runtime. A configured check that
                 // exits non-zero blocks the exit and feeds its output back so
@@ -1347,6 +1373,41 @@ pub async fn run(
                 };
                 log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
 
+                // Polling a status command while a background job runs is
+                // the unpaced form of monitoring — redirect to the paced one,
+                // naming the polled command as the check probe. Fires BEFORE
+                // the mutating classification: shell commands classify as
+                // mutating, which routed the jobs e2e's status-poll loop into
+                // the turn-stopping path (2026-07-14, stuck scenario died 11s
+                // into a monitoring task). Capped so a genuine runaway still
+                // escalates normally.
+                if tc.function.name == "file"
+                    && args["action"].as_str() == Some("shell")
+                    && !job_registry.is_empty()
+                    && jobs_poll_redirects < 2
+                {
+                    jobs_poll_redirects += 1;
+                    let polled = args["command"].as_str().unwrap_or("<status command>");
+                    let result_msg = Message::tool_result(
+                        &tc.id,
+                        &format!(
+                            "You are polling `{polled}` in a loop while a background job runs. \
+                             Use jobs(action='wait', secs=60, check='{polled}') instead — it \
+                             waits, THEN runs the probe, one paced cycle per call."
+                        ),
+                    );
+                    messages.push(result_msg.clone());
+                    conversation_history.push(result_msg);
+                    tui::print_status(&format!(
+                        "Job-poll loop: {}({}) — redirected to jobs(wait), continuing",
+                        tc.function.name, args_summary
+                    ));
+                    last_call_key = None;
+                    same_call_streak = 0;
+                    recent_call_keys.clear();
+                    continue;
+                }
+
                 // Read-only repetition: harmless, just wasted tokens.
                 // Surface a polite nudge inline and let the for-loop
                 // continue so the model can react in subsequent rounds.
@@ -1722,9 +1783,26 @@ pub async fn run(
                     }
                 }
             } else if tc.function.name == "file" && file_action == "shell" {
-                await_shell_job_run(
-                    tool_pool.submit_shell(args.clone(), config.clone(), cancelled.clone()),
-                    cancelled.as_ref(),
+                if args["background"].as_bool() == Some(true) {
+                    // Explicit background start: the sanctioned form of the
+                    // model's "cmd & echo $! > .pid" instinct — registered,
+                    // output-captured, managed via the jobs tool.
+                    tools::jobs::start_background(&args, &config, job_registry.as_ref())
+                } else {
+                    await_shell_job_run(
+                        tool_pool.submit_shell(args.clone(), config.clone(), cancelled.clone()),
+                        cancelled.as_ref(),
+                        headless.then_some(job_registry.as_ref()),
+                    )
+                    .await
+                }
+            } else if tc.function.name == "jobs" {
+                tools::jobs::execute(
+                    &args,
+                    &config,
+                    perms.as_ref(),
+                    job_registry.as_ref(),
+                    Some(cancelled.as_ref()),
                 )
                 .await
             } else if matches!(
@@ -2174,6 +2252,11 @@ pub async fn run(
 async fn await_shell_job_run(
     mut shell_job: crate::runtime::ShellJobHandle,
     cancelled: &AtomicBool,
+    // Some(registry) = headless: long-running commands auto-promote to
+    // background jobs (nobody can answer the continue/kill prompt — real
+    // e2e runs hung at it for their full timeout, pkg-mcp 2026-07-13).
+    // None = interactive: the human prompt stays.
+    promote_to: Option<&tools::jobs::JobRegistry>,
 ) -> crate::tools::ToolResult {
     while let Some(event) = shell_job.events_rx.recv().await {
         match event {
@@ -2181,24 +2264,72 @@ async fn await_shell_job_run(
                 command,
                 timeout_secs,
             } => {
-                let prompt = format!(
-                    "Shell command still running after {timeout_secs}s.\n  $ {command}\n[c]ontinue waiting / [k]ill: "
-                );
-                let response = crate::tui::read_input(&prompt)
-                    .unwrap_or_else(|| "k".into())
-                    .trim()
-                    .to_lowercase();
-                let control = if response == "c" || response == "continue" {
-                    crate::tui::print_status("continuing to wait for shell command...");
-                    ShellControl::Continue
+                let control = if promote_to.is_some() {
+                    crate::tui::print_status(&format!(
+                        "shell still running after {timeout_secs}s — promoting to background job: $ {command}"
+                    ));
+                    ShellControl::Detach
                 } else {
-                    ShellControl::Kill
+                    let prompt = format!(
+                        "Shell command still running after {timeout_secs}s.\n  $ {command}\n[c]ontinue waiting / [k]ill: "
+                    );
+                    let response = crate::tui::read_input(&prompt)
+                        .unwrap_or_else(|| "k".into())
+                        .trim()
+                        .to_lowercase();
+                    if response == "c" || response == "continue" {
+                        crate::tui::print_status("continuing to wait for shell command...");
+                        ShellControl::Continue
+                    } else {
+                        ShellControl::Kill
+                    }
                 };
+                let is_detach = matches!(control, ShellControl::Detach);
                 if shell_job.send_control(control).is_err() {
                     return crate::tools::ToolResult::err(
                         "Shell worker dropped control channel".into(),
                     );
                 }
+                if is_detach {
+                    // Worker responds with Detached carrying the live command.
+                    match shell_job.events_rx.recv().await {
+                        Some(ShellWorkerEvent::Detached { running, command }) => {
+                            let registry = promote_to.expect("Detach only sent when Some");
+                            let (id, so_far) = registry.register(&command, running);
+                            return crate::tools::ToolResult::ok(tools::jobs::promotion_message(
+                                id,
+                                &command,
+                                timeout_secs,
+                                &so_far,
+                            ));
+                        }
+                        Some(ShellWorkerEvent::Completed(result)) => {
+                            // Raced completion between TimedOut and Detach —
+                            // the finished result wins.
+                            return match result {
+                                Ok(r) => r,
+                                Err(e) => crate::tools::ToolResult::err(e),
+                            };
+                        }
+                        _ => {
+                            return crate::tools::ToolResult::err(
+                                "Shell worker dropped during job promotion".into(),
+                            );
+                        }
+                    }
+                }
+            }
+            ShellWorkerEvent::Detached { running, command } => {
+                // Defensive: only expected right after a Detach request.
+                if let Some(registry) = promote_to {
+                    let (id, so_far) = registry.register(&command, running);
+                    return crate::tools::ToolResult::ok(tools::jobs::promotion_message(
+                        id, &command, 0, &so_far,
+                    ));
+                }
+                return crate::tools::ToolResult::err(
+                    "Shell worker detached without a registry".into(),
+                );
             }
             ShellWorkerEvent::Completed(result) => {
                 if cancelled.load(Ordering::Relaxed) {

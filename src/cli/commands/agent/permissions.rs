@@ -17,6 +17,13 @@ pub fn permission_action(tool_name: &str, args: &serde_json::Value) -> Option<Ac
         "file" if get_str_or(args, "action", "") == "shell" => {
             Some(Action::Shell(get_str_or(args, "command", "").into()))
         }
+        // jobs(wait) may carry a `check` probe command — same permission
+        // surface as running that command via shell directly. Pre-prompting
+        // here lets the inner perms.check in jobs::wait pass silently in
+        // interactive mode (no raw-stdin prompt under the TUI).
+        "jobs" if !get_str_or(args, "check", "").is_empty() => {
+            Some(Action::Shell(get_str_or(args, "check", "").into()))
+        }
         "web_search" => Some(Action::WebSearch(get_str_or(args, "query", "").into())),
         "web_fetch" => Some(Action::WebFetch(get_str_or(args, "url", "").into())),
         "mcp_use" => Some(Action::McpUse(

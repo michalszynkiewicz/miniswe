@@ -88,6 +88,7 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
                         "max_results": { "type": "integer", "description": "Max results (for search)" },
                         "command": { "type": "string", "description": "Shell command (for shell)" },
                         "timeout": { "type": "integer", "description": "Timeout in seconds (for shell)" },
+                        "background": { "type": "boolean", "description": "shell: start as a background job (for long-running commands — deploys, builds, servers); manage with the jobs tool" },
                         "to_round": { "type": "integer", "description": "Round to revert to (for revert)" }
                     },
                     "required": ["action"]
@@ -241,6 +242,31 @@ pub fn tool_definitions(edit_mode: EditMode) -> Vec<ToolDefinition> {
             },
         },
     ]
+}
+
+/// The `jobs` tool. Jobs come from file(shell background=true) — the
+/// explicit path for known-long commands — or, in headless runs, from
+/// auto-promotion of foreground commands that outlive the check-in
+/// threshold (see tools::jobs). The `check` parameter is the skill-guided
+/// progress hook: wait-then-probe in one paced round.
+pub fn jobs_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".into(),
+        function: FunctionDefinition {
+            name: "jobs".into(),
+            description: "Manage background jobs (started with file shell background=true, or auto-promoted long commands). Actions: 'wait' (block up to `secs`, return new output; pass `check` = a quick status command to probe progress after the wait, e.g. kubectl get pods), 'status' (new output + state, id optional), 'kill'. A finished job reports its full result once.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["status", "wait", "kill"], "description": "What to do" },
+                    "id": { "type": "integer", "description": "Job id (from the promotion message; optional when only one job is live)" },
+                    "secs": { "type": "integer", "description": "wait: max seconds to block (default 60, cap 300)" },
+                    "check": { "type": "string", "description": "wait: shell command run after the wait to probe progress; its output is returned" }
+                },
+                "required": ["action"]
+            }),
+        },
+    }
 }
 
 /// Return the fast-mode tool definitions (`replace_range`, `insert_at`,
