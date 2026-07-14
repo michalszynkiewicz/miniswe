@@ -125,11 +125,24 @@ struct ToolTask {
 pub enum ShellControl {
     Continue,
     Kill,
+    /// Hand the still-running command back to the caller instead of
+    /// waiting or killing — used to promote a long-running foreground
+    /// command to a background job (headless runs have no human to answer
+    /// the continue/kill prompt).
+    Detach,
 }
 
 #[derive(Debug)]
 pub enum ShellWorkerEvent {
-    TimedOut { command: String, timeout_secs: u64 },
+    TimedOut {
+        command: String,
+        timeout_secs: u64,
+    },
+    /// Response to `ShellControl::Detach`: the live command, still running.
+    Detached {
+        running: shell::RunningShellCommand,
+        command: String,
+    },
     Completed(Result<ToolResult, String>),
 }
 
@@ -222,6 +235,13 @@ impl ToolWorkerPool {
                                 Ok(ShellControl::Kill) => {
                                     let result = shell::kill(running, timeout_secs);
                                     let _ = events_tx.send(ShellWorkerEvent::Completed(Ok(result)));
+                                    return Ok(ToolResult::ok(String::new()));
+                                }
+                                Ok(ShellControl::Detach) => {
+                                    let _ = events_tx.send(ShellWorkerEvent::Detached {
+                                        running,
+                                        command: command.clone(),
+                                    });
                                     return Ok(ToolResult::ok(String::new()));
                                 }
                                 Err(_) => {
