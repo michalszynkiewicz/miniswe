@@ -298,6 +298,8 @@ pub struct ProvidersConfig {
     pub mcp: bool,
     pub usage_guide: bool,
     pub plan_mode: bool,
+    /// Installed-skills listing (names + descriptions, bodies on demand).
+    pub skills: bool,
 }
 
 impl Default for ProvidersConfig {
@@ -316,6 +318,7 @@ impl Default for ProvidersConfig {
             mcp: true,
             usage_guide: true,
             plan_mode: true,
+            skills: true,
         }
     }
 }
@@ -332,6 +335,7 @@ impl ProvidersConfig {
             "mcp" => self.mcp,
             "usage_guide" => self.usage_guide,
             "plan_mode" => self.plan_mode,
+            "skills" => self.skills,
             _ => true, // unknown providers default to enabled
         }
     }

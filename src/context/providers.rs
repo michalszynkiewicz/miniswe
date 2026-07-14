@@ -234,6 +234,56 @@ impl ContextProvider for PlanModeProvider {
     }
 }
 
+/// Installed-skills listing (`.ai/skills/`, project shadows global). Names,
+/// descriptions, and paths only — progressive disclosure: the model reads a
+/// skill's SKILL.md on demand instead of paying for every body every turn
+/// (measured on a real 8-skill library: listing ~650 tokens vs ~21.6k for
+/// all bodies).
+pub struct SkillsProvider;
+
+/// Per-skill description cap in the listing. Generous on purpose: sane
+/// hand-written descriptions run 200-300 chars, so this only defends
+/// against degenerate frontmatter, never trims a reasonable skill.
+const SKILL_DESC_CAP: usize = 800;
+
+impl ContextProvider for SkillsProvider {
+    fn name(&self) -> &'static str {
+        "skills"
+    }
+
+    fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
+        let entries = crate::skills::discover(&input.config.project_root);
+        if entries.is_empty() {
+            return None;
+        }
+        let mut content = String::new();
+        for entry in entries {
+            let Ok(skill) = crate::skills::load(&entry.path) else {
+                continue;
+            };
+            // Collapse whitespace so multi-line descriptions stay one line.
+            let desc: String = skill
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let desc = crate::truncate_chars(&desc, SKILL_DESC_CAP);
+            let path = skill.display_path(&input.config.project_root);
+            content.push_str(&format!("{} — {desc}  ({path})\n", skill.name));
+        }
+        if content.is_empty() {
+            return None;
+        }
+        content.push_str(
+            "If the task matches a skill, read its SKILL.md with file(action='read') and follow it.\n",
+        );
+        Some(ContextBlock {
+            header: "[SKILLS]",
+            content,
+        })
+    }
+}
+
 /// Build the default ordered list of providers.
 pub fn default_providers() -> Vec<Box<dyn ContextProvider>> {
     vec![
@@ -243,6 +293,7 @@ pub fn default_providers() -> Vec<Box<dyn ContextProvider>> {
         Box::new(LessonsProvider),
         Box::new(RepoMapProvider),
         Box::new(McpProvider),
+        Box::new(SkillsProvider),
         Box::new(UsageGuideProvider),
         Box::new(PlanModeProvider),
     ]

@@ -97,11 +97,34 @@ fn split_frontmatter(content: &str) -> (String, &str) {
 
 fn extract_scalar(fm: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}:");
-    for line in fm.lines() {
+    let mut lines = fm.lines();
+    while let Some(line) = lines.next() {
         if let Some(rest) = line.strip_prefix(&prefix) {
             let val = rest.trim();
             if val.is_empty() {
                 continue;
+            }
+            // YAML block scalar (`>` folded / `|` literal, with optional
+            // +/- chomping): the value is the following indented lines
+            // until the first non-indented line. Folded joins with spaces,
+            // literal preserves newlines. Real skill libraries use this
+            // (e.g. `description: >`) — previously we returned ">" itself.
+            if matches!(val, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
+                let folded = val.starts_with('>');
+                let mut parts: Vec<String> = Vec::new();
+                for cont in lines.by_ref() {
+                    if cont.trim().is_empty() {
+                        continue;
+                    }
+                    if !cont.starts_with(' ') && !cont.starts_with('\t') {
+                        break; // dedent = end of block scalar
+                    }
+                    parts.push(cont.trim().to_string());
+                }
+                if parts.is_empty() {
+                    return None;
+                }
+                return Some(parts.join(if folded { " " } else { "\n" }));
             }
             if val.len() >= 2
                 && ((val.starts_with('"') && val.ends_with('"'))
@@ -165,6 +188,26 @@ mod tests {
         assert_eq!(skill.name, "my-skill");
         assert_eq!(skill.description, "Does things");
         assert_eq!(skill.body, "Body text here.\n");
+    }
+
+    #[test]
+    fn parse_folded_block_scalar_description() {
+        // Real skill libraries write `description: >` with indented
+        // continuation lines — previously this parsed as literally ">".
+        let content = "---\nname: s\ndescription: >\n  Use when building a package\n  from a Helm chart.\nargument-hint: <x>\n---\nbody\n";
+        let skill = parse(&fake_path(), content).unwrap();
+        assert_eq!(
+            skill.description,
+            "Use when building a package from a Helm chart."
+        );
+        assert_eq!(skill.argument_hint.as_deref(), Some("<x>"));
+    }
+
+    #[test]
+    fn parse_literal_block_scalar_preserves_newlines() {
+        let content = "---\nname: s\ndescription: |\n  line one\n  line two\n---\nbody\n";
+        let skill = parse(&fake_path(), content).unwrap();
+        assert_eq!(skill.description, "line one\nline two");
     }
 
     #[test]
