@@ -650,17 +650,28 @@ pub async fn run(
             break;
         }
 
-        // Ask user if they want to continue after pause_after_rounds
+        // Ask user if they want to continue after pause_after_rounds.
+        // Headless runs have nobody to answer — blocking on stdin hung real
+        // e2e harness runs for their full timeout (pkg-mcp 2026-07-13: two
+        // of three attempts died waiting at exactly this prompt). Continue
+        // with a logged notice instead; max_rounds stays the hard stop.
         if round == pause_at && !user_continued {
-            tui::print_status(&format!("{pause_at} tool rounds used."));
-            let response = tui::read_input("Continue? [y]es / [n]o:");
-            match response.as_deref() {
-                Some("y") | Some("yes") | Some("") => {
-                    user_continued = true;
-                }
-                _ => {
-                    // Tell the LLM to wrap up
-                    messages.push(Message::user("[Stop now. Summarize what you've done.]"));
+            if headless {
+                tui::print_status(&format!(
+                    "{pause_at} tool rounds used — headless, continuing without prompt."
+                ));
+                user_continued = true;
+            } else {
+                tui::print_status(&format!("{pause_at} tool rounds used."));
+                let response = tui::read_input("Continue? [y]es / [n]o:");
+                match response.as_deref() {
+                    Some("y") | Some("yes") | Some("") => {
+                        user_continued = true;
+                    }
+                    _ => {
+                        // Tell the LLM to wrap up
+                        messages.push(Message::user("[Stop now. Summarize what you've done.]"));
+                    }
                 }
             }
         }
