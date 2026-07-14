@@ -40,6 +40,8 @@ To continue work from a previous session, you can:
 - `/clear` — clear conversation history
 - `/new` — clear history + scratchpad + plan (fresh start)
 - `/help` — show available commands
+- `/skills list` — list installed skills; `/skills <name> help` — show a skill's details
+- `/<skill-name> [args]` — run a skill (`.ai/skills/<name>/SKILL.md`; project shadows global `~/.ai/skills/`). Installed skills are also advertised to the model as a [SKILLS] listing so it can apply them on its own.
 - `quit` or `exit` or Ctrl+D — exit
 
 ## Keyboard Shortcuts (REPL)
@@ -60,8 +62,10 @@ Current tool surface:
 - `file(action='delete', path=...)` — delete an existing file
 - `file(action='replace', path=..., old=..., new=..., all?)` — exact replacement in a file
 - `file(action='search', query|pattern, scope?, max_results?)` — local ripgrep-based code search
-- `file(action='shell', command=..., timeout?)` — execute a shell command
 - `file(action='revert', ...)` — revert to a previous round via snapshots
+- `shell(action='run', command=..., timeout?, background?)` — execute a shell command; `background=true` starts it as a tracked background job (for deploys, builds, servers)
+- `shell(action='wait', id?, secs?, check?)` — wait for a background job; `check` runs a quick status command after the wait to probe progress
+- `shell(action='status' | 'kill', id?)` — inspect or stop a background job (long foreground commands are promoted to jobs automatically in headless runs)
 - `code(action='diagnostics' | 'goto_definition' | 'find_references' | 'repo_map' | 'project_info' | 'architecture_notes')`
 - `web(action='search', query=..., max_results?)` — general web search when Serper is configured; otherwise GitHub repository search only
 - `web(action='fetch', url=...)` — fetch a URL as markdown
