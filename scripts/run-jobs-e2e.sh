@@ -212,8 +212,8 @@ and report the root cause. Do not modify any files; just deploy, monitor, and re
     check "run finished within timeout (no hang)" "$([ "$exit_code" -ne 124 ]; echo $?)"
     grep -qE "started as background job|promoted to background job" "$clean"
     check "deploy ran as a background job (explicit or promoted)" $?
-    grep -qE "→ jobs\(" "$clean"
-    check "model called the jobs tool" $?
+    grep -qE "→ (jobs|shell)\(.*(wait|status|kill)" "$clean"
+    check "model used job management (wait/status/kill)" $?
     model_saw "READY [0-9]/5|ImagePullBackOff"
     check "monitoring probe output reached the model" $?
     local runs
@@ -229,7 +229,7 @@ and report the root cause. Do not modify any files; just deploy, monitor, and re
         grep -qiE "success|complete|deployed" "$out/stdout.txt"
         check "final answer reports success" $?
     else
-        grep -qE "→ jobs\(.*kill|job [0-9]+ killed" "$clean" || model_saw "job [0-9]+ killed"
+        grep -qE "→ (jobs|shell)\(.*kill|job [0-9]+ killed" "$clean" || model_saw "job [0-9]+ killed"
         check "model KILLED the stuck job via jobs(kill)" $?
         sleep 1
         ! pgrep -f "$deploy_script" >/dev/null

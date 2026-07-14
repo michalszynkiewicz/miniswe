@@ -142,7 +142,7 @@ pub async fn execute(
         "wait" => wait(args, config, perms, registry, cancelled).await,
         "kill" => kill(args, config, registry),
         other => ToolResult::err(format!(
-            "jobs: unknown action '{other}'. Use 'status', 'wait' (id, secs, optional check) or 'kill' (id)."
+            "shell: unknown action '{other}'. Use 'run' (command), 'wait' (id, secs, optional check), 'status' or 'kill'."
         )),
     }
 }
@@ -157,7 +157,7 @@ fn require_id(args: &Value, registry: &JobRegistry) -> Result<u64, ToolResult> {
                 1 => Ok(*jobs.keys().next().expect("len checked")),
                 0 => Err(ToolResult::err(
                     "jobs: no background jobs exist. Start one with \
-                     file(action='shell', command=..., background=true); long-running \
+                     shell(action='run', command=..., background=true); long-running \
                      foreground commands are also promoted to jobs automatically."
                         .into(),
                 )),
@@ -215,9 +215,9 @@ pub fn start_background(args: &Value, config: &Config, registry: &JobRegistry) -
     }
     msg.push_str(&format!(
         "It runs in the background. Wait and monitor with \
-         jobs(action='wait', id={id}, secs=60, check='<status command>') — use the \
+         shell(action='wait', id={id}, secs=60, check='<status command>') — use the \
          progress-check command your task guidance recommends. \
-         jobs(action='kill', id={id}) stops it."
+         shell(action='kill', id={id}) stops it."
     ));
     ToolResult::ok(msg)
 }
@@ -411,9 +411,9 @@ pub fn promotion_message(id: u64, command: &str, timeout_secs: u64, output_so_fa
     }
     msg.push_str(&format!(
         "The command keeps running. Do NOT re-run it. \
-         Wait and monitor with jobs(action='wait', id={id}, secs=60, check='<status command>') — \
+         Wait and monitor with shell(action='wait', id={id}, secs=60, check='<status command>') — \
          use the progress-check command your task guidance recommends (e.g. kubectl get pods). \
-         jobs(action='kill', id={id}) stops it."
+         shell(action='kill', id={id}) stops it."
     ));
     msg
 }
@@ -599,7 +599,7 @@ mod tests {
             r.content
         );
         assert!(
-            r.content.contains("jobs(action='wait', id=1"),
+            r.content.contains("shell(action='wait', id=1"),
             "{}",
             r.content
         );
@@ -684,7 +684,7 @@ mod tests {
         let msg = promotion_message(3, "zarf package deploy x", 60, "some output");
         assert!(msg.contains("job 3"));
         assert!(msg.contains("Do NOT re-run"));
-        assert!(msg.contains("jobs(action='wait', id=3"));
+        assert!(msg.contains("shell(action='wait', id=3"));
         assert!(msg.contains("check="));
     }
 }

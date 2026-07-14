@@ -43,8 +43,8 @@ async fn shell_promotion_and_jobs_wait_end_to_end() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(helpers::mock_sse_tool_call(
-            "file",
-            r#"{"action":"shell","command":"echo started; sleep 3; echo done-marker-xyz"}"#,
+            "shell",
+            r#"{"action":"run","command":"echo started; sleep 3; echo done-marker-xyz"}"#,
         ))
         .up_to_n_times(1)
         .mount(&mock_server)
@@ -53,7 +53,7 @@ async fn shell_promotion_and_jobs_wait_end_to_end() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(helpers::mock_sse_tool_call(
-            "jobs",
+            "shell",
             r#"{"action":"wait","id":1,"secs":30,"check":"echo probe-ok-xyz"}"#,
         ))
         .up_to_n_times(1)

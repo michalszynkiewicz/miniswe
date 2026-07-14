@@ -13,16 +13,19 @@ use crate::tools::permissions::Action;
 
 pub fn permission_action(tool_name: &str, args: &serde_json::Value) -> Option<Action> {
     match tool_name {
-        "shell" => Some(Action::Shell(get_str_or(args, "command", "").into())),
+        "shell" => {
+            let check = get_str_or(args, "check", "");
+            if !check.is_empty() {
+                // wait's probe command — same permission surface as running it
+                Some(Action::Shell(check.into()))
+            } else if get_str_or(args, "action", "") == "run" || args.get("action").is_none() {
+                Some(Action::Shell(get_str_or(args, "command", "").into()))
+            } else {
+                None // wait/status/kill without check: no new execution
+            }
+        }
         "file" if get_str_or(args, "action", "") == "shell" => {
             Some(Action::Shell(get_str_or(args, "command", "").into()))
-        }
-        // jobs(wait) may carry a `check` probe command — same permission
-        // surface as running that command via shell directly. Pre-prompting
-        // here lets the inner perms.check in jobs::wait pass silently in
-        // interactive mode (no raw-stdin prompt under the TUI).
-        "jobs" if !get_str_or(args, "check", "").is_empty() => {
-            Some(Action::Shell(get_str_or(args, "check", "").into()))
         }
         "web_search" => Some(Action::WebSearch(get_str_or(args, "query", "").into())),
         "web_fetch" => Some(Action::WebFetch(get_str_or(args, "url", "").into())),
