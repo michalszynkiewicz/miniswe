@@ -168,7 +168,7 @@ For signature changes (adding/dropping a parameter) or renames, edit the functio
 {edit_file_smart_line}\
 write_file with content replaces the whole file: {{\"path\":\"notes/todo.txt\",\"content\":\"first line\\nsecond line\\n\"}}\n\
 write_file without content creates a new empty file: {{\"path\":\"tmp/placeholder.txt\"}}\n\
-file shell: {{\"action\":\"shell\",\"command\":\"ls\",\"timeout\":60}}\n\
+shell run: {{\"action\":\"run\",\"command\":\"ls\",\"timeout\":60}}\n\
 {smart_tail_line}"
             )
         }
@@ -180,7 +180,7 @@ replace_range replaces lines [start..=end] (1-based, inclusive) with content: {{
 insert_at inserts content after a line (0=top, last line = append): {{\"path\":\"src/lib.rs\",\"after_line\":0,\"content\":\"use std::fs;\\n\"}}\n\
 write_file with content replaces the whole file: {{\"path\":\"notes/todo.txt\",\"content\":\"first line\\nsecond line\\n\"}}\n\
 write_file without content creates a new empty file: {{\"path\":\"tmp/placeholder.txt\"}}\n\
-file shell: {{\"action\":\"shell\",\"command\":\"ls\",\"timeout\":60}}\n\
+shell run: {{\"action\":\"run\",\"command\":\"ls\",\"timeout\":60}}\n\
 Every edit returns a revision table; if an edit regresses, call revert {{\"path\":...,\"rev\":N}} to roll back — do not layer more edits on top."
             )
         }
@@ -252,7 +252,7 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
              {edit_contract}\n\
              If a tool says a parameter is missing, retry with the exact required parameter names.\n\
              Before finishing, verify your change actually works — run the FULL test suite, not just a compile check. A test failure in code you didn't mean to touch means your edit broke something; don't finish until it's fixed.\n\
-             Long-running commands (deploys, builds, servers): run with file(action='shell', background=true) and manage with jobs(action='wait'|'status'|'kill'); wait takes check='<status cmd>' to probe progress. NEVER self-background with '&' or nohup — output is lost and nothing tracks the process.\n\
+             Long-running commands (deploys, builds, servers): run with shell(action='run', background=true), monitor with shell(action='wait', id=N, secs=60, check='<status cmd>'), stop with shell(action='kill'). NEVER self-background with '&' or nohup — output is lost and nothing tracks the process.\n\
              Bound port with no matching process under you: switch ports, don't escalate kills.\n"
         );
     }
@@ -286,7 +286,7 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
          {edit_contract}\n\
          If a tool says a parameter is missing, retry with the exact required parameter names.\n\
          Before finishing, verify your change actually works — run the FULL test suite, not just a compile check. A test failure in code you didn't mean to touch means your edit broke something; don't finish until it's fixed.\n\
-         Long-running commands (deploys, builds, servers): run with file(action='shell', background=true) and manage with jobs(action='wait'|'status'|'kill'); wait takes check='<status cmd>' to probe progress. NEVER self-background with '&' or nohup — output is lost and nothing tracks the process.\n\
+         Long-running commands (deploys, builds, servers): run with shell(action='run', background=true), monitor with shell(action='wait', id=N, secs=60, check='<status cmd>'), stop with shell(action='kill'). NEVER self-background with '&' or nohup — output is lost and nothing tracks the process.\n\
          Bound port with no matching process under you: switch ports, don't escalate kills.\n"
     )
 }
