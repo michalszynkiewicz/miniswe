@@ -242,6 +242,66 @@ fn relevant_lessons_included() {
     assert!(system.contains("cargo test"));
 }
 
+// ── Skills listing ──────────────────────────────────────────────────
+
+#[test]
+fn skills_listing_included_in_context() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let skill_dir = config.project_root.join(".ai/skills/deploy-app");
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: deploy-app\ndescription: >\n  Use when deploying the app\n  to the staging cluster.\n---\nStep 1: build.\n",
+    )
+    .unwrap();
+
+    let assembled = context::assemble(&config, "deploy the app", &[], false, None);
+    let system = assembled.messages[0].content.as_deref().unwrap();
+
+    assert!(system.contains("[SKILLS]"), "missing skills block");
+    assert!(system.contains("deploy-app — Use when deploying the app to the staging cluster."));
+    assert!(system.contains(".ai/skills/deploy-app/SKILL.md"));
+    assert!(system.contains("read its SKILL.md"));
+    // progressive disclosure: the body must NOT be in the listing
+    assert!(!system.contains("Step 1: build."));
+}
+
+#[test]
+fn skills_listing_caps_degenerate_descriptions() {
+    let (_tmp, config) = helpers::create_test_project();
+
+    let skill_dir = config.project_root.join(".ai/skills/wordy");
+    fs::create_dir_all(&skill_dir).unwrap();
+    let long_desc = format!("{} ZZEND", "blah ".repeat(400)); // ~2000 chars
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("---\nname: wordy\ndescription: {long_desc}\n---\nbody\n"),
+    )
+    .unwrap();
+
+    let assembled = context::assemble(&config, "hello", &[], false, None);
+    let system = assembled.messages[0].content.as_deref().unwrap();
+
+    assert!(system.contains("wordy — blah"));
+    assert!(
+        !system.contains("ZZEND"),
+        "description over the cap must be truncated"
+    );
+}
+
+#[test]
+fn no_skills_block_without_skills_dir() {
+    let (_tmp, config) = helpers::create_test_project();
+    let assembled = context::assemble(&config, "hello", &[], false, None);
+    let system = assembled.messages[0].content.as_deref().unwrap();
+    // Only guaranteed when the test host has no global ~/.ai/skills — the
+    // helpers project itself has none.
+    if dirs::home_dir().is_none_or(|h| !h.join(".ai/skills").exists()) {
+        assert!(!system.contains("[SKILLS]"));
+    }
+}
+
 // ── History compression ─────────────────────────────────────────────
 
 #[test]
