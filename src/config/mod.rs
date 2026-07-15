@@ -231,7 +231,6 @@ pub enum CompactionStrategy {
     /// miniswe production: rolling LLM summary anchored on the plan, keeping
     /// recent turns raw, with the full pre-compression text archived to
     /// `.miniswe/session_archive.md` (and a pointer to it in the summary).
-    #[default]
     Unified,
     /// Pure truncation: drop the oldest turns, keep the most-recent turns
     /// within budget. No summary, no LLM call, no archive.
@@ -268,6 +267,11 @@ pub enum CompactionStrategy {
     /// rarely. Trade-off: bigger per-round prompts (weaker KV-cache
     /// locality), and each compaction event is a large, expensive summary
     /// instead of many small ones.
+    ///
+    /// The DEFAULT since 2026-07-15: deepest-validated strategy of the
+    /// matrix (9x 6/6 across three bench batches + the jobs e2e), fires
+    /// rarely, and recovers cleanly at the ceiling.
+    #[default]
     Lazy,
 }
 
@@ -485,14 +489,17 @@ pub struct ToolsConfig {
     /// specific failing check output + the changed files and told to fix only
     /// that. The bet (see GitHub #40) is *attention reset / fresh eyes* on a
     /// "knows-it's-wrong-but-can't-recover" stall — not extra capability
-    /// (same weights). `false` (default) keeps the gate's plain retry-nudge
+    /// (same weights). `true` since 2026-07-15 (bench-unconditional since
+    /// 07-06: helps or no-ops, never hurt). `false` keeps the gate's plain retry-nudge
     /// loop. Requires a `[validation]` command to do anything. A/B only.
     pub reactive_debugger: bool,
     /// EXPERIMENTAL. Requires `reactive_debugger`. When `true`, the debugger may
     /// re-fire WITHIN a turn — but only when the gate's failure SIGNATURE changes
     /// (e.g. compile error fixed, now a runtime/smoke failure), so it walks the
     /// failure chain one fresh diagnosis per distinct failure instead of
-    /// re-diagnosing the same thing. `false` (default) keeps single-fire. The
+    /// re-diagnosing the same thing. `false` keeps single-fire; `true` since
+    /// 2026-07-15 (bench ran it unconditionally since 07-06: helps or no-ops,
+    /// never hurt). The
     /// blunt "fire ≤N×/turn" variant regressed before (scattered diagnoses the
     /// small model couldn't integrate); the distinct-signature gate is the
     /// difference. A/B only.
@@ -556,7 +563,7 @@ pub struct ToolsConfig {
     /// for the main agent to apply. Unifies the restart trigger, the debugger,
     /// and goal re-anchoring into ONE fresh-eyes decision the loop executes (the
     /// stuck agent never has to decide). Fires once per turn; needs a
-    /// `[validation]` command. `false` (default). A/B only.
+    /// `[validation]` command. `true` since 2026-07-15 (bench-unconditional).
     pub debugger_judge: bool,
     /// EXPERIMENTAL. Requires `debugger_judge`. Adds a third option next to
     /// SCRAP/CONTINUE: when a mechanical scan of the revision store finds one
@@ -566,7 +573,7 @@ pub struct ToolsConfig {
     /// untouched. A free-form version (ask the judge to notice AND name the
     /// file+revision itself) scored 0/24 in a tier-1 replay probe; computing
     /// the candidate mechanically and narrowing the ask to accept/reject it
-    /// raised that to 13/24. `false` (default). A/B only.
+    /// raised that to 13/24. `true` since 2026-07-15 (bench-unconditional).
     pub debugger_judge_rewind: bool,
     /// EXPERIMENTAL. Standalone — does NOT require `reactive_debugger` or
     /// `debugger_judge` (it fires the same underlying sub-agent, which already
@@ -588,7 +595,7 @@ pub struct ToolsConfig {
     /// `reactive_debugger` (initial A/B ran them coupled — sharing one fire
     /// budget meant the OTHER trigger's condition was hit first in 3 of 4
     /// runs, so the coupled config never actually tested this trigger cleanly)
-    /// so it can be A/B'd in isolation. `false` (default).
+    /// so it can be A/B'd in isolation. `true` since 2026-07-15 (bench-unconditional).
     pub plan_gate_debugger: bool,
 }
 
@@ -640,8 +647,8 @@ impl Default for ToolsConfig {
             flat: false,
             edit_mode: EditMode::Fast,
             auto_revert_ast_cascade: true,
-            reactive_debugger: false,
-            debugger_multifire: false,
+            reactive_debugger: true,
+            debugger_multifire: true,
             spiral_reset: false,
             // Off: the controlled gemma A/B (2026-06-29) showed OFF is strictly
             // better (6.0 vs 5.67, ~1.6× faster) — the reset causes re-work churn
@@ -650,9 +657,9 @@ impl Default for ToolsConfig {
             revert_to_green: false,
             gate_replan: false,
             gate_restart: false,
-            debugger_judge: false,
-            debugger_judge_rewind: false,
-            plan_gate_debugger: false,
+            debugger_judge: true,
+            debugger_judge_rewind: true,
+            plan_gate_debugger: true,
         }
     }
 }
@@ -870,10 +877,11 @@ mod compaction_strategy_tests {
     use super::*;
 
     #[test]
-    fn defaults_to_unified() {
+    fn defaults_to_lazy() {
+        // Bench-validated default (3 batches of 6/6): reactive compaction.
         assert_eq!(
             ContextConfig::default().compaction,
-            CompactionStrategy::Unified
+            CompactionStrategy::Lazy
         );
     }
 
@@ -899,7 +907,7 @@ mod compaction_strategy_tests {
     fn missing_field_keeps_default() {
         // Old configs with no `compaction` key still parse (struct-level serde default).
         let c: ContextConfig = toml::from_str("repo_map_budget = 1234").unwrap();
-        assert_eq!(c.compaction, CompactionStrategy::Unified);
+        assert_eq!(c.compaction, CompactionStrategy::Lazy);
         assert_eq!(c.repo_map_budget, 1234);
     }
 }
