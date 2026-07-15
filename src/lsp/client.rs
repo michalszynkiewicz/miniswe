@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -18,14 +18,35 @@ use tokio::task::JoinHandle;
 
 use crate::lsp::transport::LspTransport;
 
+/// How a request failure implicates the server itself.
+#[derive(Clone, Copy)]
+enum InfraFailure {
+    /// Transport/process provably dead (channel closed, broken pipe).
+    Hard,
+    /// Request deadline elapsed — could be a wedge OR a busy indexer.
+    Soft,
+}
+
 /// LSP client wrapping a rust-analyzer process.
 pub struct LspClient {
-    transport: Arc<LspTransport>,
+    transport: parking_lot::RwLock<Arc<LspTransport>>,
     child: parking_lot::Mutex<Child>,
     ready: AtomicBool,
     opened_files: parking_lot::Mutex<HashSet<String>>,
     project_root: PathBuf,
-    _reader_handle: JoinHandle<()>,
+    server: crate::lsp::servers::LspServer,
+    binary_path: PathBuf,
+    /// Wedged-server restarts performed this session (capped — each costs
+    /// a full re-index).
+    restarts: AtomicU32,
+    /// Single-flight guard: concurrent failing requests must not each kill
+    /// and respawn the server (the second kill would murder the first's
+    /// fresh spawn and burn the whole restart budget on one incident).
+    restart_lock: tokio::sync::Mutex<()>,
+    /// Bumped on every successful restart; waiters that queued behind a
+    /// restart use it to detect the work is already done.
+    generation: AtomicU32,
+    reader_handle: parking_lot::Mutex<JoinHandle<()>>,
 }
 
 impl LspClient {
@@ -81,11 +102,13 @@ impl LspClient {
         unreachable!()
     }
 
-    async fn try_spawn(
+    /// Spawn the server process and wire up transport + reader. Shared by
+    /// initial spawn and wedged-server restart.
+    fn spawn_process(
         server: &crate::lsp::servers::LspServer,
         binary_path: &Path,
         project_root: &Path,
-    ) -> Result<Self> {
+    ) -> Result<(Child, Arc<LspTransport>, JoinHandle<()>)> {
         let mut cmd = server.build_command(binary_path, project_root);
         let mut child = cmd
             .stdin(Stdio::piped())
@@ -126,13 +149,29 @@ impl LspClient {
             LspTransport::reader_loop(transport_clone, stdout);
         });
 
+        Ok((child, transport, reader_handle))
+    }
+
+    async fn try_spawn(
+        server: &crate::lsp::servers::LspServer,
+        binary_path: &Path,
+        project_root: &Path,
+    ) -> Result<Self> {
+        let (child, transport, reader_handle) =
+            Self::spawn_process(server, binary_path, project_root)?;
+
         let client = Self {
-            transport: Arc::clone(&transport),
+            transport: parking_lot::RwLock::new(Arc::clone(&transport)),
             child: parking_lot::Mutex::new(child),
             ready: AtomicBool::new(false),
             opened_files: parking_lot::Mutex::new(HashSet::new()),
             project_root: project_root.to_path_buf(),
-            _reader_handle: reader_handle,
+            server: *server,
+            binary_path: binary_path.to_path_buf(),
+            restarts: AtomicU32::new(0),
+            restart_lock: tokio::sync::Mutex::new(()),
+            generation: AtomicU32::new(0),
+            reader_handle: parking_lot::Mutex::new(reader_handle),
         };
 
         match initialize(&transport, project_root).await {
@@ -151,8 +190,113 @@ impl LspClient {
         self.ready.load(Ordering::Acquire)
     }
 
+    fn tx(&self) -> Arc<LspTransport> {
+        self.transport.read().clone()
+    }
+
+    /// Wedged-server restarts performed so far this session.
+    pub fn restart_count(&self) -> u32 {
+        self.restarts.load(Ordering::Relaxed)
+    }
+
+    /// Kill the underlying server process without the client's knowledge —
+    /// test/diagnostic hook simulating a wedged or crashed server.
+    pub fn kill_server_for_test(&self) {
+        let mut child = self.child.lock();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Restart a wedged server: kill + respawn + re-initialize + replay the
+    /// opened files, so the caller can re-issue the failed request against
+    /// an indexed workspace. Capped per session (each restart costs a full
+    /// re-index). Returns true when the new server is ready.
+    async fn try_restart_once(&self, failure: InfraFailure) -> bool {
+        const MAX_RESTARTS: u32 = 2;
+        // Single-flight: whoever loses the race waits, then discovers the
+        // restart already happened (generation bump) and just retries.
+        let seen_gen = self.generation.load(Ordering::Acquire);
+        let _guard = self.restart_lock.lock().await;
+        if self.generation.load(Ordering::Acquire) != seen_gen {
+            return self.is_ready();
+        }
+        // Busy vs wedged: a SOFT failure (request deadline) on a live,
+        // uncrashed server that is actively reporting progress means it's
+        // indexing a big workspace, not dead — restarting would trade a
+        // nearly-warm index for a cold start and likely time out again.
+        // Only hard evidence (process exit, transport crash, dead channel)
+        // or timeout-while-idle (a contradiction: nothing in flight yet
+        // unresponsive = dead worker) justifies the restart.
+        let process_exited = {
+            let mut child = self.child.lock();
+            matches!(child.try_wait(), Ok(Some(_)))
+        };
+        if matches!(failure, InfraFailure::Soft)
+            && !process_exited
+            && !self.tx().crashed.load(Ordering::Relaxed)
+            && !self.wait_for_idle(Duration::from_secs(20)).await
+        {
+            eprintln!(
+                "[lsp] request timed out but {} is busy (indexing?) — not restarting",
+                self.server.name()
+            );
+            return false;
+        }
+        let n = self.restarts.fetch_add(1, Ordering::SeqCst);
+        if n >= MAX_RESTARTS {
+            return false;
+        }
+        eprintln!(
+            "[lsp] request failed on a wedged {} — restarting it ({}/{MAX_RESTARTS})",
+            self.server.name(),
+            n + 1
+        );
+        {
+            let mut child = self.child.lock();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let (child, transport, reader_handle) =
+            match Self::spawn_process(&self.server, &self.binary_path, &self.project_root) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[lsp] restart spawn failed: {e:#}");
+                    self.ready.store(false, Ordering::Release);
+                    return false;
+                }
+            };
+        if let Err(e) = initialize(&transport, &self.project_root).await {
+            eprintln!("[lsp] restart initialization failed: {e:#}");
+            self.ready.store(false, Ordering::Release);
+            return false;
+        }
+        *self.child.lock() = child;
+        *self.transport.write() = transport;
+        {
+            let mut handle = self.reader_handle.lock();
+            let old = std::mem::replace(&mut *handle, reader_handle);
+            old.abort();
+        }
+        self.ready.store(true, Ordering::Release);
+        // Replay opened files so queries hit an indexed workspace again.
+        let uris: Vec<String> = {
+            let mut opened = self.opened_files.lock();
+            opened.drain().collect()
+        };
+        for uri in uris {
+            if let Ok(parsed) = uri.parse::<lsp_types::Uri>()
+                && let Some(path) = uri_to_path(&parsed)
+            {
+                let _ = self.notify_file_changed(&path);
+            }
+        }
+        let _ = self.wait_for_idle(Duration::from_secs(60)).await;
+        self.generation.fetch_add(1, Ordering::Release);
+        true
+    }
+
     pub fn has_crashed(&self) -> bool {
-        self.transport.crashed.load(Ordering::Relaxed)
+        self.tx().crashed.load(Ordering::Relaxed)
     }
 
     /// Wait until the LSP server has no in-flight `$/progress` work
@@ -167,7 +311,7 @@ impl LspClient {
     pub async fn wait_for_idle(&self, timeout: Duration) -> bool {
         let start = std::time::Instant::now();
         loop {
-            if self.transport.is_idle() {
+            if self.tx().is_idle() {
                 return true;
             }
             if start.elapsed() >= timeout {
@@ -189,7 +333,7 @@ impl LspClient {
         let mut opened = self.opened_files.lock();
         if opened.contains(&uri) {
             // didChange — full sync
-            self.transport.send_notification(
+            self.tx().send_notification(
                 "textDocument/didChange",
                 serde_json::json!({
                     "textDocument": { "uri": uri, "version": 1 },
@@ -199,7 +343,7 @@ impl LspClient {
         } else {
             // didOpen
             let lang_id = language_id(path);
-            self.transport.send_notification(
+            self.tx().send_notification(
                 "textDocument/didOpen",
                 serde_json::json!({
                     "textDocument": {
@@ -214,7 +358,7 @@ impl LspClient {
         }
 
         // Also send didSave to trigger full analysis
-        self.transport.send_notification(
+        self.tx().send_notification(
             "textDocument/didSave",
             serde_json::json!({
                 "textDocument": { "uri": uri }
@@ -251,12 +395,10 @@ impl LspClient {
         let uri = path_to_uri(path);
 
         // Mark that we're waiting for fresh diagnostics
-        self.transport.diagnostics.remove(&uri);
+        self.tx().diagnostics.remove(&uri);
         // Also remove by any URI that ends with our path
         let path_str = path.to_string_lossy().to_string();
-        self.transport
-            .diagnostics
-            .retain(|k, _| !k.ends_with(&path_str));
+        self.tx().diagnostics.retain(|k, _| !k.ends_with(&path_str));
 
         let overall_start = std::time::Instant::now();
 
@@ -273,7 +415,7 @@ impl LspClient {
         let idle = self.wait_for_idle(idle_budget).await;
 
         // 2) A publishDiagnostics for this file is authoritative — confirmed.
-        for entry in self.transport.diagnostics.iter() {
+        for entry in self.tx().diagnostics.iter() {
             let key = entry.key();
             if key == &uri || key.ends_with(&path_str) {
                 return (entry.value().clone(), true);
@@ -286,7 +428,7 @@ impl LspClient {
         //    return immediately on the first iteration.
         let mut saw_empty = false;
         while overall_start.elapsed() < timeout {
-            for entry in self.transport.diagnostics.iter() {
+            for entry in self.tx().diagnostics.iter() {
                 let key = entry.key();
                 if key == &uri || key.ends_with(&path_str) {
                     let diags = entry.value().clone();
@@ -311,14 +453,14 @@ impl LspClient {
     }
 
     /// Go to definition of symbol at position.
-    pub async fn goto_definition(
+    async fn goto_definition_raw(
         &self,
         path: &Path,
         line: u32,
         character: u32,
     ) -> Result<Vec<Location>> {
         let uri = path_to_uri(path);
-        let rx = self.transport.send_request(
+        let rx = self.tx().send_request(
             "textDocument/definition",
             serde_json::json!({
                 "textDocument": { "uri": uri },
@@ -335,14 +477,14 @@ impl LspClient {
     }
 
     /// Find all references to symbol at position.
-    pub async fn find_references(
+    async fn find_references_raw(
         &self,
         path: &Path,
         line: u32,
         character: u32,
     ) -> Result<Vec<Location>> {
         let uri = path_to_uri(path);
-        let rx = self.transport.send_request(
+        let rx = self.tx().send_request(
             "textDocument/references",
             serde_json::json!({
                 "textDocument": { "uri": uri },
@@ -366,9 +508,9 @@ impl LspClient {
     /// servers return `DocumentSymbol[]` (hierarchical) and older ones return
     /// `SymbolInformation[]` (flat). For nested symbols (methods inside impls)
     /// the children are flattened in too.
-    pub async fn document_symbol(&self, path: &Path) -> Result<Vec<DocumentSymbolEntry>> {
+    async fn document_symbol_raw(&self, path: &Path) -> Result<Vec<DocumentSymbolEntry>> {
         let uri = path_to_uri(path);
-        let rx = self.transport.send_request(
+        let rx = self.tx().send_request(
             "textDocument/documentSymbol",
             serde_json::json!({
                 "textDocument": { "uri": uri }
@@ -409,9 +551,9 @@ impl LspClient {
 
     /// Search the entire workspace for symbols matching `query`.
     /// Used as a "did you mean" fallback when a per-file lookup misses.
-    pub async fn workspace_symbol(&self, query: &str) -> Result<Vec<WorkspaceSymbolEntry>> {
+    async fn workspace_symbol_raw(&self, query: &str) -> Result<Vec<WorkspaceSymbolEntry>> {
         let rx = self
-            .transport
+            .tx()
             .send_request("workspace/symbol", serde_json::json!({ "query": query }))?;
         let response = tokio::time::timeout(Duration::from_secs(15), rx)
             .await
@@ -447,7 +589,7 @@ impl LspClient {
     /// by every server miniswe ships against (rust-analyzer, gopls,
     /// ts-language-server, pyright, clangd, jdtls). When it isn't supported
     /// the server returns null, which surfaces here as `Ok(None)`.
-    pub async fn rename(
+    async fn rename_raw(
         &self,
         path: &Path,
         line: u32,
@@ -455,7 +597,7 @@ impl LspClient {
         new_name: &str,
     ) -> Result<Option<WorkspaceEdit>> {
         let uri = path_to_uri(path);
-        let rx = self.transport.send_request(
+        let rx = self.tx().send_request(
             "textDocument/rename",
             serde_json::json!({
                 "textDocument": { "uri": uri },
@@ -478,9 +620,91 @@ impl LspClient {
         Ok(Some(edit))
     }
 
+    /// Classify failures caused by a dead/wedged server (vs. bad requests).
+    /// Hard = the transport/process is provably gone; Soft = a request
+    /// deadline elapsed, which a busy-but-healthy server can also cause.
+    fn infra_class(e: &anyhow::Error) -> Option<InfraFailure> {
+        let s = format!("{e:#}").to_lowercase();
+        if s.contains("channel closed")
+            || s.contains("broken pipe")
+            || s.contains("failed to write")
+        {
+            return Some(InfraFailure::Hard);
+        }
+        if s.contains("timed out") {
+            return Some(InfraFailure::Soft);
+        }
+        None
+    }
+
+    /// Restart gate used by the request wrappers.
+    async fn restart_for(&self, e: &anyhow::Error) -> bool {
+        match Self::infra_class(e) {
+            Some(class) => self.try_restart_once(class).await,
+            None => false,
+        }
+    }
+
+    pub async fn goto_definition(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<Location>> {
+        match self.goto_definition_raw(path, line, character).await {
+            Err(e) if self.restart_for(&e).await => {
+                self.goto_definition_raw(path, line, character).await
+            }
+            r => r,
+        }
+    }
+
+    pub async fn find_references(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<Location>> {
+        match self.find_references_raw(path, line, character).await {
+            Err(e) if self.restart_for(&e).await => {
+                self.find_references_raw(path, line, character).await
+            }
+            r => r,
+        }
+    }
+
+    pub async fn document_symbol(&self, path: &Path) -> Result<Vec<DocumentSymbolEntry>> {
+        match self.document_symbol_raw(path).await {
+            Err(e) if self.restart_for(&e).await => self.document_symbol_raw(path).await,
+            r => r,
+        }
+    }
+
+    pub async fn workspace_symbol(&self, query: &str) -> Result<Vec<WorkspaceSymbolEntry>> {
+        match self.workspace_symbol_raw(query).await {
+            Err(e) if self.restart_for(&e).await => self.workspace_symbol_raw(query).await,
+            r => r,
+        }
+    }
+
+    pub async fn rename(
+        &self,
+        path: &Path,
+        line: u32,
+        character: u32,
+        new_name: &str,
+    ) -> Result<Option<WorkspaceEdit>> {
+        match self.rename_raw(path, line, character, new_name).await {
+            Err(e) if self.restart_for(&e).await => {
+                self.rename_raw(path, line, character, new_name).await
+            }
+            r => r,
+        }
+    }
+
     /// Get a snapshot of all current diagnostics across all files.
     pub fn diagnostics_snapshot(&self) -> Vec<(String, Vec<Diagnostic>)> {
-        self.transport
+        self.tx()
             .diagnostics
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
@@ -490,12 +714,12 @@ impl LspClient {
     /// Shut down the LSP server gracefully.
     pub async fn shutdown(self) {
         // Send shutdown request
-        if let Ok(rx) = self.transport.send_request("shutdown", Value::Null) {
+        if let Ok(rx) = self.tx().send_request("shutdown", Value::Null) {
             let _ = tokio::time::timeout(Duration::from_secs(5), rx).await;
         }
 
         // Send exit notification
-        let _ = self.transport.send_notification("exit", Value::Null);
+        let _ = self.tx().send_notification("exit", Value::Null);
 
         // Wait briefly for process to exit
         tokio::time::sleep(Duration::from_millis(500)).await;
