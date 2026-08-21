@@ -25,7 +25,7 @@ use crate::cli::commands::agent::hints::{
     is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{
-    is_mutating_call, is_period2_cycle, key_is_mutating, loop_call_key,
+    is_mutating_call, is_period2_cycle, key_is_mutating, loop_call_key_tagged,
 };
 use crate::cli::commands::agent::spiral;
 use crate::cli::commands::agent::validation;
@@ -1916,14 +1916,8 @@ pub async fn run(
             // (period-1), or the SAME two calls alternating (period-2 — the
             // edit↔revert oscillation that the streak counter is blind to
             // because every alternation resets it).
-            let call_key = {
-                let mut k = loop_call_key(&tc.function.name, &args);
-                if let Some(tag) = &active_step_tag {
-                    k.push('@');
-                    k.push_str(tag);
-                }
-                k
-            };
+            let call_key =
+                loop_call_key_tagged(&tc.function.name, &args, active_step_tag.as_deref());
             if last_call_key.as_ref() == Some(&call_key) {
                 same_call_streak += 1;
             } else {
@@ -2092,9 +2086,10 @@ pub async fn run(
                 //    command's own failure never surfaced. A fresh-context
                 //    debugger fixes exactly this (probe: 10/10 on the flavor bug);
                 //  - else a check that FAILS → its output;
-                //  - else no check but a skill step IS active (Fix 2) →
-                //    synthesize the stuck state so a non-checkable investigative
-                //    loop still reaches the debugger.
+                //  - else a skill step IS active (Fix 2) → synthesize the
+                //    stuck state so a non-checkable (or check-passing but
+                //    still looping) step reaches the debugger instead of the
+                //    hard stop below, which assumes no cursor.
                 let recover_output: Option<String> = if let Some((k, out)) = &last_tool_failure
                     && *k == call_key
                 {
@@ -2118,23 +2113,32 @@ pub async fn run(
                          give the single concrete fix (exact command or edit) that makes it \
                          succeed."
                     ))
-                } else if let Some(cmd) = effective_check.as_deref() {
-                    match validation::run_check_command(&config, cmd).await {
-                        validation::CheckOutcome::Fail(o) => Some(o),
-                        _ => None,
-                    }
                 } else {
-                    let cursor = skill_cursor::load(&config);
-                    cursor.current().map(|(_, s)| {
-                        let def = cursor.cached().unwrap_or("");
-                        format!(
-                            "The agent is stuck in a repeating loop while executing the '{}' step \
-                             of a skill and is making no progress. Repeated tool call: {}({}). \
-                             The current step:\n{def}\n\nDiagnose why it is stuck and the single \
-                             concrete action that would unblock it — or, if the current state is \
-                             a dead end, whether to scrap and restart from a clean base.",
-                            s.name, tc.function.name, args_summary
-                        )
+                    let check_fail = if let Some(cmd) = effective_check.as_deref() {
+                        match validation::run_check_command(&config, cmd).await {
+                            validation::CheckOutcome::Fail(o) => Some(o),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    check_fail.or_else(|| {
+                        // A passing (often read-only proxy) check does NOT
+                        // mean the step is unstuck — the model is still
+                        // looping. Fall through to the synthesized stuck
+                        // state rather than the cursor-less hard stop.
+                        let cursor = skill_cursor::load(&config);
+                        cursor.current().map(|(_, s)| {
+                            let def = cursor.cached().unwrap_or("");
+                            format!(
+                                "The agent is stuck in a repeating loop while executing the '{}' step \
+                                 of a skill and is making no progress. Repeated tool call: {}({}). \
+                                 The current step:\n{def}\n\nDiagnose why it is stuck and the single \
+                                 concrete action that would unblock it — or, if the current state is \
+                                 a dead end, whether to scrap and restart from a clean base.",
+                                s.name, tc.function.name, args_summary
+                            )
+                        })
                     })
                 };
                 if let Some(output) = recover_output
@@ -2712,9 +2716,11 @@ pub async fn run(
             // loop on a *failing* command can hand the real error to the
             // debugger (see the loop-recovery ladder). Shell exit≠0 sets
             // success=false, so this catches the `zarf package create` case.
+            // Keyed by the SAME tagged `call_key` the ladder compares against
+            // — an untagged key here never matches during skill runs.
             if !result.success {
                 last_tool_failure = Some((
-                    loop_call_key(&tc.function.name, &args),
+                    call_key.clone(),
                     crate::truncate_chars(result.content.trim(), 2000),
                 ));
                 // A FAILED background job (deploy) surfaces here (status/wait

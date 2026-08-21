@@ -10,6 +10,23 @@ pub fn loop_call_key(tool_name: &str, args: &serde_json::Value) -> String {
     format!("{tool_name}:{}", canonical_json(args))
 }
 
+/// `loop_call_key` extended with the active skill-step tag, so a step change
+/// resets streak/period detection. Every site that stores a key later
+/// compared against a streak key must build it through this helper — a
+/// tagged compare against an untagged record silently never matches.
+pub fn loop_call_key_tagged(
+    tool_name: &str,
+    args: &serde_json::Value,
+    step_tag: Option<&str>,
+) -> String {
+    let mut key = loop_call_key(tool_name, args);
+    if let Some(tag) = step_tag {
+        key.push('@');
+        key.push_str(tag);
+    }
+    key
+}
+
 /// Repetitions of an alternating A/B pair that constitute a period-2 loop —
 /// the detection window is `2 * PERIOD2_REPS` calls (A,B,A,B,A,B).
 pub const PERIOD2_REPS: usize = 3;
@@ -252,6 +269,31 @@ mod tests {
     fn period2_rejects_broken_alternation() {
         let h = keys(&["a", "b", "a", "b", "b", "a"]);
         assert!(!is_period2_cycle(&h));
+    }
+
+    #[test]
+    fn tagged_key_is_stable_and_differs_from_untagged() {
+        // The recovery ladder compares a stored failure key against the
+        // current streak key; both must come from the same constructor.
+        let args = json!({"action": "shell", "command": "zarf package create ."});
+        let tag = Some("uds-package/create");
+        assert_eq!(
+            loop_call_key_tagged("file", &args, tag),
+            loop_call_key_tagged("file", &args, tag)
+        );
+        assert_ne!(
+            loop_call_key_tagged("file", &args, tag),
+            loop_call_key("file", &args)
+        );
+    }
+
+    #[test]
+    fn tagged_key_without_tag_equals_plain_key() {
+        let args = json!({"path": "x.rs"});
+        assert_eq!(
+            loop_call_key_tagged("write_file", &args, None),
+            loop_call_key("write_file", &args)
+        );
     }
 
     #[test]
