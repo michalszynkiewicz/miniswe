@@ -177,12 +177,14 @@ impl SkillCursor {
     }
 
     /// The installed skill named in `hay` (not already on the stack), longest
-    /// match first so `x-build` beats its own substring `x`.
+    /// match first so `x-build` beats its own substring `x`. Matches only at
+    /// token boundaries: a mention inside a longer identifier or a file path
+    /// (`chart/templates/uds-package.yaml`) is not a handoff.
     fn match_installed(&self, hay: &str, installed: &[String]) -> Option<String> {
         let hay = hay.to_lowercase();
         let mut cands: Vec<&String> = installed
             .iter()
-            .filter(|n| !self.on_stack(n) && hay.contains(&n.to_lowercase()))
+            .filter(|n| !self.on_stack(n) && contains_token(&hay, &n.to_lowercase()))
             .collect();
         cands.sort_by_key(|n| std::cmp::Reverse(n.len()));
         cands.first().map(|s| (*s).clone())
@@ -261,6 +263,33 @@ impl SkillCursor {
     pub fn current_material(&self) -> Option<String> {
         gather_material(self.current_dir()?)
     }
+}
+
+/// Whether `needle` occurs in `hay` as a whole token: not butted against a
+/// name character (alnum/`-`/`_`) on either side, and not followed by a file
+/// extension (`.yaml` in `uds-package.yaml`) — a sentence-ending period is
+/// fine because no alphanumeric follows it.
+fn contains_token(hay: &str, needle: &str) -> bool {
+    let is_name_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    let mut search_from = 0;
+    while let Some(rel) = hay[search_from..].find(needle) {
+        let start = search_from + rel;
+        let end = start + needle.len();
+        let before_ok = !hay[..start].chars().next_back().is_some_and(is_name_char);
+        let mut after = hay[end..].chars();
+        let after_ok = match after.next() {
+            Some(c) if is_name_char(c) => false,
+            Some('.') => !after.next().is_some_and(|c| c.is_alphanumeric()),
+            _ => true,
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        // Step one char, not the whole needle: the next viable occurrence
+        // may overlap a rejected one.
+        search_from = start + hay[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 /// SKILL.md + sibling `.md` files in the same directory, concatenated and
@@ -403,6 +432,44 @@ mod tests {
         assert_eq!(c.current().unwrap(), ("root", &steps(&["C"])[0]));
         // still no re-descend at C
         assert_eq!(c.handoff_target(&["child".into()]), None);
+    }
+
+    #[test]
+    fn handoff_requires_token_boundaries_not_raw_containment() {
+        // A skill name inside a file path or longer identifier is a passing
+        // mention, not a handoff — `chart/templates/uds-package.yaml` must
+        // not descend into uds-package.
+        let installed = vec!["uds-package".to_string(), "uds".to_string()];
+        let c = cur(&["Create chart/templates/uds-package.yaml from the template"]);
+        assert_eq!(c.handoff_target(&installed), None);
+
+        let c = cur(&["Invoke uds-package skill"]);
+        assert_eq!(c.handoff_target(&installed).as_deref(), Some("uds-package"));
+        // longest name still wins over its own substring
+        let c = cur(&["Invoke the uds-package skill, part of uds"]);
+        assert_eq!(c.handoff_target(&installed).as_deref(), Some("uds-package"));
+        // sentence-ending period is a boundary, an extension is not
+        let c = cur(&["Finish with uds-package."]);
+        assert_eq!(c.handoff_target(&installed).as_deref(), Some("uds-package"));
+        let c = cur(&["Edit my-uds-package now"]);
+        assert_eq!(c.handoff_target(&installed), None);
+    }
+
+    #[test]
+    fn contains_token_boundary_cases() {
+        assert!(contains_token("invoke uds-package skill", "uds-package"));
+        assert!(contains_token("uds-package", "uds-package"));
+        assert!(contains_token("(uds-package)", "uds-package"));
+        assert!(contains_token("run uds-package.", "uds-package"));
+        assert!(!contains_token("chart/uds-package.yaml", "uds-package"));
+        assert!(!contains_token("my-uds-package", "uds-package"));
+        assert!(!contains_token("uds-packages", "uds-package"));
+        assert!(!contains_token("uds-package_v2", "uds-package"));
+        // rejected first occurrence must not mask a valid later one
+        assert!(contains_token(
+            "uds-package.yaml uses uds-package",
+            "uds-package"
+        ));
     }
 
     #[test]
