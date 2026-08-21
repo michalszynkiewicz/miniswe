@@ -379,7 +379,15 @@ fn format_current_state_block(config: &Config) -> Option<String> {
     let scratchpad = std::fs::read_to_string(config.miniswe_path("scratchpad.md"))
         .ok()
         .filter(|s| !s.trim().is_empty());
-    if plan.is_none() && scratchpad.is_none() {
+    // Just-in-time skill-step re-inject: when a skill cursor is active,
+    // append the CURRENT step's distilled instructions so the model executes
+    // from the manual, not from priors (uds-mcp e2e: it drifted after one
+    // read otherwise). One step at a time — nothing to rubber-stamp.
+    // Computed BEFORE the empty-state check: an active cursor alone must
+    // produce a block — the routed task points the model at [SKILL STEP]
+    // from round 1, before any plan or scratchpad exists.
+    let step_block = crate::cli::commands::agent::skill_cursor::active_step_block(config);
+    if plan.is_none() && scratchpad.is_none() && step_block.is_none() {
         return None;
     }
     let mut block = String::from(CURRENT_STATE_MARKER);
@@ -393,11 +401,7 @@ fn format_current_state_block(config: &Config) -> Option<String> {
         block.push_str(s.trim_end());
         block.push('\n');
     }
-    // Just-in-time skill-step re-inject: when a skill cursor is active,
-    // append the CURRENT step's distilled instructions so the model executes
-    // from the manual, not from priors (uds-mcp e2e: it drifted after one
-    // read otherwise). One step at a time — nothing to rubber-stamp.
-    if let Some(step_block) = crate::cli::commands::agent::skill_cursor::active_step_block(config) {
+    if let Some(step_block) = step_block {
         block.push_str(&step_block);
     }
     Some(block)
@@ -448,6 +452,33 @@ mod current_state_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = config_in(tmp.path());
         assert!(format_current_state_block(&config).is_none());
+    }
+
+    #[test]
+    fn active_skill_cursor_alone_produces_a_block() {
+        // Regression: the empty-state early return must not swallow the
+        // [SKILL STEP] injection — before the model writes a plan or
+        // scratchpad, the cursor is the only guidance the routed task
+        // points at.
+        use crate::cli::commands::agent::skill_cursor::{self, SkillCursor};
+        use crate::cli::commands::agent::skill_router::SkillStep;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        let mut cursor = SkillCursor::default();
+        cursor.push_skill(
+            "uds-package",
+            tmp.path(),
+            vec![SkillStep {
+                name: "Create the package".into(),
+                anchor: "## Create".into(),
+            }],
+        );
+        skill_cursor::save(&config, &cursor);
+
+        let block = format_current_state_block(&config).expect("cursor alone must produce a block");
+        assert!(block.contains("[SKILL STEP]"), "{block}");
+        assert!(block.contains("uds-package"), "{block}");
+        assert!(!block.contains("[PLAN]"), "{block}");
     }
 
     #[test]
