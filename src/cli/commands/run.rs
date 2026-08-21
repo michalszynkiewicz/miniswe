@@ -122,7 +122,7 @@ pub(crate) fn track_plan_step_failure(
 
 #[cfg(test)]
 mod job_failure_tests {
-    use super::{failing_job_output, normalize_command, parse_finished_job_command};
+    use super::{failing_job_output, job_banner_command, normalize_command, note_job_banners};
 
     #[test]
     fn normalize_strips_cd_prefix_and_whitespace() {
@@ -134,14 +134,38 @@ mod job_failure_tests {
     }
 
     #[test]
-    fn parse_finished_job_command_extracts_command() {
-        let content =
-            "[job 1 FINISHED]  $ cd pkg && uds run dev\n[shell: exit 1]\nunable to pull chart";
+    fn job_banner_command_extracts_normalized_command() {
         assert_eq!(
-            parse_finished_job_command(content).as_deref(),
+            job_banner_command("[job 1 FAILED]  $ cd pkg && uds run dev").as_deref(),
             Some("uds run dev")
         );
-        assert_eq!(parse_finished_job_command("just some output"), None);
+        assert_eq!(job_banner_command("just some output"), None);
+    }
+
+    #[test]
+    fn failed_banner_records_and_clean_finish_clears() {
+        let mut failed = std::collections::HashMap::new();
+        note_job_banners(
+            "[job 1 FAILED]  $ cd pkg && uds run dev\n[shell: exit 1]\nunable to pull chart",
+            &mut failed,
+        );
+        assert!(failed["uds run dev"].contains("unable to pull chart"));
+        // Same command later finishes cleanly → stale failure cleared.
+        note_job_banners("[job 2 FINISHED]  $ uds run dev\nok", &mut failed);
+        assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn aggregate_result_with_mixed_banners_attributes_per_job() {
+        // One result carrying two banners (aggregate status): only the FAILED
+        // job's command must be recorded, regardless of result-level success.
+        let mut failed = std::collections::HashMap::new();
+        note_job_banners(
+            "[job 1 FINISHED]  $ ls\nok\n[job 2 FAILED]  $ uds run dev\n[shell: exit 128]",
+            &mut failed,
+        );
+        assert!(!failed.contains_key("ls"));
+        assert!(failed.contains_key("uds run dev"));
     }
 
     #[test]
@@ -259,17 +283,36 @@ fn normalize_command(cmd: &str) -> String {
     tail.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// If a tool result reports a FAILED background job (`[job N FINISHED]  $ <cmd>`
-/// — e.g. a detached `uds run dev` deploy that exited non-zero), return the
-/// normalized command. Background jobs fail LATER, in a status/wait result,
-/// not on the launch call, so keying their failure by command is the only way
-/// a re-launched-and-re-failing deploy reaches the debugger.
-fn parse_finished_job_command(content: &str) -> Option<String> {
-    let line = content
-        .lines()
-        .find(|l| l.contains("FINISHED]") && l.contains("$ "))?;
+/// The normalized command out of a single job banner line
+/// (`[job N FINISHED|FAILED]  $ <cmd>`).
+fn job_banner_command(line: &str) -> Option<String> {
     let cmd = line.split("$ ").nth(1)?.trim();
     (!cmd.is_empty()).then(|| normalize_command(cmd))
+}
+
+/// Apply every job banner in a tool result to the failed-command map: a
+/// FAILED banner records its (normalized) command with the result text, a
+/// clean FINISHED banner clears any stale failure for it. Background jobs
+/// fail LATER, in a status/wait result, not on the launch call, so keying
+/// their failure by command is the only way a re-launched-and-re-failing
+/// deploy reaches the debugger. Parsed per banner line — an aggregate
+/// status result can carry several banners with different verdicts, so the
+/// wrapper's overall ok/err cannot attribute them.
+fn note_job_banners(
+    content: &str,
+    failed_job_commands: &mut std::collections::HashMap<String, String>,
+) {
+    for line in content.lines() {
+        if line.contains(" FAILED]  $ ") {
+            if let Some(cmd) = job_banner_command(line) {
+                failed_job_commands.insert(cmd, crate::truncate_chars(content.trim(), 2000));
+            }
+        } else if line.contains(" FINISHED]  $ ")
+            && let Some(cmd) = job_banner_command(line)
+        {
+            failed_job_commands.remove(&cmd);
+        }
+    }
 }
 
 /// The recorded failure output for a shell tool call whose (normalized)
@@ -2723,17 +2766,12 @@ pub async fn run(
                     call_key.clone(),
                     crate::truncate_chars(result.content.trim(), 2000),
                 ));
-                // A FAILED background job (deploy) surfaces here (status/wait
-                // returns err) — record it by command so a re-launched failing
-                // deploy reaches the debugger even across job ids.
-                if let Some(cmd) = parse_finished_job_command(&result.content) {
-                    failed_job_commands
-                        .insert(cmd, crate::truncate_chars(result.content.trim(), 2000));
-                }
-            } else if let Some(cmd) = parse_finished_job_command(&result.content) {
-                // The same job command later SUCCEEDED — clear its stale failure.
-                failed_job_commands.remove(&cmd);
             }
+            // Background-job bookkeeping is per BANNER, not per result: a
+            // FAILED deploy surfaces later in a wait/status result (possibly
+            // aggregated with other jobs' banners), so the wrapper's ok/err
+            // can't attribute verdicts to commands.
+            note_job_banners(&result.content, &mut failed_job_commands);
 
             if result.success && tc.function.name == "plan" {
                 successful_edits_since_plan_update = 0;

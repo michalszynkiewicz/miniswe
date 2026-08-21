@@ -223,8 +223,12 @@ pub fn start_background(args: &Value, config: &Config, registry: &JobRegistry) -
 }
 
 fn finish_line(id: u64, command: &str, result: &ToolResult) -> String {
+    // Distinct FAILED banner: a finished job is removed from the registry on
+    // first observation, so this one line is the only place its exit status
+    // ever surfaces — and the agent loop's failed-job bookkeeping keys off it.
+    let verdict = if result.success { "FINISHED" } else { "FAILED" };
     format!(
-        "[job {id} FINISHED]  $ {command}\n{}",
+        "[job {id} {verdict}]  $ {command}\n{}",
         result.content.as_str()
     )
 }
@@ -242,14 +246,22 @@ fn status(args: &Value, config: &Config, registry: &JobRegistry) -> ToolResult {
         jobs.keys().copied().collect()
     };
     let mut out = String::new();
+    let mut any_failed = false;
     for id in ids {
         let r = status_one(id, config, registry);
+        any_failed |= !r.success;
         if !out.is_empty() {
             out.push('\n');
         }
         out.push_str(&r.content);
     }
-    ToolResult::ok(out)
+    // A FAILED child must not be laundered into an ok aggregate — the agent
+    // loop keys failure recording off the result's success flag.
+    if any_failed {
+        ToolResult::err(out)
+    } else {
+        ToolResult::ok(out)
+    }
 }
 
 fn status_one(id: u64, config: &Config, registry: &JobRegistry) -> ToolResult {
@@ -328,12 +340,14 @@ async fn wait(
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
 
+    let mut job_failed = false;
     let mut content = if finished {
         let job = {
             let mut jobs = registry.jobs.lock();
             jobs.remove(&id).expect("present in loop above")
         };
         let result = shell::render_finished_result(job.running, config);
+        job_failed = !result.success;
         finish_line(id, &job.command, &result)
     } else {
         let mut jobs = registry.jobs.lock();
@@ -372,7 +386,13 @@ async fn wait(
         }
     }
 
-    ToolResult::ok(content)
+    // Mirror status_one: a job that exited non-zero is an err result, even
+    // when observed through wait — the flow the start banner recommends.
+    if job_failed {
+        ToolResult::err(content)
+    } else {
+        ToolResult::ok(content)
+    }
 }
 
 fn kill(args: &Value, _config: &Config, registry: &JobRegistry) -> ToolResult {
@@ -447,6 +467,54 @@ mod tests {
         assert!(r.content.contains("FINISHED"), "{}", r.content);
         assert!(r.content.contains("done-marker"), "{}", r.content);
         assert!(registry.is_empty(), "finished job must be removed");
+    }
+
+    #[tokio::test]
+    async fn wait_on_failed_job_returns_err_with_failed_banner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = scratch_config(tmp.path());
+        let registry = JobRegistry::default();
+        let running = start_job(&cfg, "echo boom; exit 3");
+        let (id, _) = registry.register("echo boom; exit 3", running);
+
+        let perms = PermissionManager::headless(&cfg);
+        let args = serde_json::json!({ "action": "wait", "id": id, "secs": 5 });
+        let r = execute(&args, &cfg, &perms, &registry, None).await;
+        assert!(
+            !r.success,
+            "failed job observed via wait must be an err result: {}",
+            r.content
+        );
+        assert!(r.content.contains("FAILED]"), "{}", r.content);
+        assert!(r.content.contains("boom"), "{}", r.content);
+        assert!(registry.is_empty(), "finished job must be removed");
+    }
+
+    #[tokio::test]
+    async fn aggregate_status_errs_when_a_job_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = scratch_config(tmp.path());
+        let registry = JobRegistry::default();
+        let running = start_job(&cfg, "exit 7");
+        registry.register("exit 7", running);
+
+        let perms = PermissionManager::headless(&cfg);
+        let args = serde_json::json!({ "action": "status" });
+        let mut observed = None;
+        for _ in 0..50 {
+            let r = execute(&args, &cfg, &perms, &registry, None).await;
+            if r.content.contains("FAILED]") {
+                observed = Some(r);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let r = observed.expect("job never reported FAILED via aggregate status");
+        assert!(
+            !r.success,
+            "aggregate status with a failed child must be an err result: {}",
+            r.content
+        );
     }
 
     #[tokio::test]
