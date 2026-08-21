@@ -285,12 +285,26 @@ pub async fn judge_step_done(
 /// the judge's diagnosis was previously thrown away, and it's often the exact
 /// steer the model needs (e2e 2026-07-16: the judge correctly flagged the
 /// tmp_repo build, silently).
+/// Byte offset of the first ASCII-case-insensitive occurrence of `needle`
+/// in `hay`, safe for slicing `hay` directly: ASCII bytes never occur
+/// inside a multi-byte UTF-8 sequence, so a match of an ASCII needle always
+/// sits on char boundaries. (Replaces find-on-`to_uppercase()`: case
+/// mapping can CHANGE byte length — ﬁ→FI, ŉ→ʼN — so an index from the
+/// folded copy can land past the end or mid-char in the original and
+/// panic on raw model output.)
+fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
+    debug_assert!(needle.is_ascii() && !needle.is_empty());
+    let n = needle.as_bytes();
+    hay.as_bytes()
+        .windows(n.len())
+        .position(|w| w.eq_ignore_ascii_case(n))
+}
+
 fn extract_verdict_reason(raw: &str) -> String {
     let t = raw.trim();
-    let up = t.to_uppercase();
-    let rest = if let Some(i) = up.find("NOT DONE") {
+    let rest = if let Some(i) = find_ascii_ci(t, "NOT DONE") {
         &t[i + "NOT DONE".len()..]
-    } else if let Some(i) = up.find("DONE") {
+    } else if let Some(i) = find_ascii_ci(t, "DONE") {
         &t[i + "DONE".len()..]
     } else {
         t
@@ -315,8 +329,7 @@ fn parse_done_verdict(raw: &str) -> bool {
 
 /// Extract the `DONE WHEN:` criterion from distilled step instructions.
 pub fn extract_done_when(distilled: &str) -> Option<String> {
-    let lower = distilled.to_lowercase();
-    let pos = lower.find("done when")?;
+    let pos = find_ascii_ci(distilled, "done when")?;
     let after = &distilled[pos + "done when".len()..];
     let after = after.trim_start_matches([':', ' ', '\t']);
     let crit = after.trim();
@@ -621,6 +634,25 @@ mod tests {
             Some("zarf.yaml exists and is valid.")
         );
         assert_eq!(extract_done_when("INSTRUCTIONS: no criterion here"), None);
+    }
+
+    #[test]
+    fn extraction_survives_multibyte_case_folding() {
+        // Both inputs are raw model output. Under the old fold-then-slice
+        // code, chars whose UTF-8 length changes under case mapping shifted
+        // the found index off the original string: 'ŉ' (2 bytes → "ʼN",
+        // 3 bytes) pushed the slice past the end (panic), 'ﬁ' (3 bytes →
+        // "FI", 2 bytes) pulled it mid-char.
+        assert_eq!(extract_verdict_reason("ŉ DONE"), "");
+        assert_eq!(
+            extract_verdict_reason("ﬁx applied — NOT DONE: finish the chart"),
+            "finish the chart"
+        );
+        assert_eq!(
+            extract_done_when("ﬁnal step notes\ndone when: zarf.yaml exists").as_deref(),
+            Some("zarf.yaml exists")
+        );
+        assert_eq!(extract_done_when("ŉ done when: x").as_deref(), Some("x"));
     }
 
     #[test]
