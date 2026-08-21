@@ -55,6 +55,12 @@ pub struct SkillCursor {
     /// on every step change.
     #[serde(default)]
     done_attempts: usize,
+    /// Consecutive failed handoff descends on the current invoke step.
+    /// Step extraction runs an LLM, which can fail transiently — the caller
+    /// retries next round and only consumes the invoke step (skipping the
+    /// whole sub-skill) once this passes a threshold. Reset on step change.
+    #[serde(default)]
+    handoff_failures: usize,
 }
 
 fn path(config: &Config) -> PathBuf {
@@ -97,6 +103,7 @@ impl SkillCursor {
         }
         self.on_current = 0;
         self.done_attempts = 0;
+        self.handoff_failures = 0;
         self.stack.push(Frame {
             skill: skill.to_string(),
             dir: dir.to_path_buf(),
@@ -119,6 +126,7 @@ impl SkillCursor {
         }
         self.on_current = 0;
         self.done_attempts = 0;
+        self.handoff_failures = 0;
         self.stack.push(Frame {
             skill: skill.to_string(),
             dir: dir.to_path_buf(),
@@ -157,6 +165,7 @@ impl SkillCursor {
         }
         self.on_current = 0;
         self.done_attempts = 0;
+        self.handoff_failures = 0;
     }
 
     /// Register a skill(done) call on the current step and return the running
@@ -174,6 +183,16 @@ impl SkillCursor {
     pub fn note_round(&mut self) -> usize {
         self.on_current += 1;
         self.on_current
+    }
+
+    /// Register a failed handoff descend on the current invoke step and
+    /// return the running count (1 on the first failure). The caller retries
+    /// on later rounds and only consumes the invoke step once the count
+    /// passes its threshold — a single transient LLM extraction failure must
+    /// not silently skip an entire sub-skill.
+    pub fn note_handoff_failure(&mut self) -> usize {
+        self.handoff_failures += 1;
+        self.handoff_failures
     }
 
     /// The installed skill named in `hay` (not already on the stack), longest
@@ -491,6 +510,44 @@ mod tests {
         assert_eq!(c.note_round(), 2);
         c.mark_done(); // step change resets the counter
         assert_eq!(c.note_round(), 1);
+    }
+
+    #[test]
+    fn handoff_failure_counter_counts_and_resets_on_step_change() {
+        // Retry-before-consume: the caller only mark_done()s the invoke step
+        // once this counter passes its threshold, so a transient extraction
+        // failure can't silently skip a whole sub-skill.
+        let mut c = cur(&["Invoke child skill", "B"]);
+        assert_eq!(c.note_handoff_failure(), 1);
+        assert_eq!(c.note_handoff_failure(), 2);
+        c.mark_done(); // step change resets the counter
+        assert_eq!(c.note_handoff_failure(), 1);
+    }
+
+    #[test]
+    fn handoff_failure_counter_resets_on_successful_descend() {
+        // A failure followed by a successful descend starts the sub-skill
+        // with a clean slate — its own eventual handoffs get full retries.
+        let mut c = cur(&["Invoke child skill", "B"]);
+        assert_eq!(c.note_handoff_failure(), 1);
+        c.descend("child", Path::new("/skills/child"), steps(&["X"]));
+        assert_eq!(c.note_handoff_failure(), 1);
+    }
+
+    #[test]
+    fn handoff_failure_counter_survives_save_load_roundtrip() {
+        // The cursor is reloaded from disk every round, so the counter must
+        // persist — otherwise every round sees "first failure" and the
+        // threshold never trips.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = tmp.path().to_path_buf();
+        let mut c = cur(&["Invoke child skill"]);
+        c.note_handoff_failure();
+        c.note_handoff_failure();
+        save(&config, &c);
+        let mut reloaded = load(&config);
+        assert_eq!(reloaded.note_handoff_failure(), 3);
     }
 
     #[test]

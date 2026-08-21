@@ -937,12 +937,22 @@ pub async fn run(
                         .await
                 {
                     // Name-based handoff (umbrella "Invoke X skill" step) but
-                    // extraction failed — consume the invoke step so we don't
-                    // spin on it every round.
-                    cursor.mark_done();
-                    tui::print_status(&format!(
-                        "[skills] handoff '{next}' yielded no steps; skipping"
-                    ));
+                    // extraction failed. Step extraction is an LLM call, so a
+                    // failure can be transient — retry on later rounds and only
+                    // consume the invoke step (skipping the whole sub-skill)
+                    // after several consecutive failures.
+                    const MAX_HANDOFF_FAILURES: usize = 3;
+                    let n = cursor.note_handoff_failure();
+                    if n >= MAX_HANDOFF_FAILURES {
+                        cursor.mark_done();
+                        tui::print_status(&format!(
+                            "[skills] handoff '{next}' yielded no steps {n}x; skipping"
+                        ));
+                    } else {
+                        tui::print_status(&format!(
+                            "[skills] handoff '{next}' yielded no steps (attempt {n}); will retry"
+                        ));
+                    }
                 }
                 if cursor.is_active() {
                     let n = cursor.note_round();
