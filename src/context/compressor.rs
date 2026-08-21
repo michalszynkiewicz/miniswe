@@ -386,7 +386,14 @@ fn format_current_state_block(config: &Config) -> Option<String> {
     // Computed BEFORE the empty-state check: an active cursor alone must
     // produce a block — the routed task points the model at [SKILL STEP]
     // from round 1, before any plan or scratchpad exists.
-    let step_block = crate::cli::commands::agent::skill_cursor::active_step_block(config);
+    // Gated on skill_step_injection: only the surface that registers the
+    // `skill` tool (headless run) may inject a block that demands calling it;
+    // a stale on-disk cursor must not leak the block into the repl.
+    let step_block = if config.skill_step_injection {
+        crate::cli::commands::agent::skill_cursor::active_step_block(config)
+    } else {
+        None
+    };
     if plan.is_none() && scratchpad.is_none() && step_block.is_none() {
         return None;
     }
@@ -463,7 +470,8 @@ mod current_state_tests {
         use crate::cli::commands::agent::skill_cursor::{self, SkillCursor};
         use crate::cli::commands::agent::skill_router::SkillStep;
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = config_in(tmp.path());
+        let mut config = config_in(tmp.path());
+        config.skill_step_injection = true;
         let mut cursor = SkillCursor::default();
         cursor.push_skill(
             "uds-package",
@@ -479,6 +487,40 @@ mod current_state_tests {
         assert!(block.contains("[SKILL STEP]"), "{block}");
         assert!(block.contains("uds-package"), "{block}");
         assert!(!block.contains("[PLAN]"), "{block}");
+    }
+
+    #[test]
+    fn skill_step_injection_off_ignores_stale_cursor() {
+        // The repl never sets skill_step_injection, so a cursor left behind
+        // by a killed run must not inject a [SKILL STEP] block there — the
+        // repl has no `skill` tool, so the block would demand an impossible
+        // call with no way to advance or clear the cursor.
+        use crate::cli::commands::agent::skill_cursor::{self, SkillCursor};
+        use crate::cli::commands::agent::skill_router::SkillStep;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        let mut cursor = SkillCursor::default();
+        cursor.push_skill(
+            "uds-package",
+            tmp.path(),
+            vec![SkillStep {
+                name: "Create the package".into(),
+                anchor: "## Create".into(),
+            }],
+        );
+        skill_cursor::save(&config, &cursor);
+
+        assert!(
+            format_current_state_block(&config).is_none(),
+            "cursor must be inert when injection is off"
+        );
+
+        // A plan alongside the stale cursor still yields a block — just
+        // without the [SKILL STEP] section.
+        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+        let block = format_current_state_block(&config).unwrap();
+        assert!(block.contains("[PLAN]"), "{block}");
+        assert!(!block.contains("[SKILL STEP]"), "{block}");
     }
 
     #[test]

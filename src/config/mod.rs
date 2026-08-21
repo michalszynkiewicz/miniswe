@@ -36,6 +36,14 @@ pub struct Config {
     /// Resolved project root directory (not serialized).
     #[serde(skip)]
     pub project_root: PathBuf,
+    /// Whether current-state refresh injects the active skill-step block
+    /// (`[SKILL STEP]`). Runtime-only: set by the headless `run` surface,
+    /// which registers the `skill` tool the block tells the model to call.
+    /// The repl shares the same on-disk cursor (a killed run leaves one
+    /// behind) but has no `skill` tool, so injecting there would demand a
+    /// call the model cannot make — with no way to advance or clear it.
+    #[serde(skip)]
+    pub skill_step_injection: bool,
 }
 
 /// Which named model slot to use for each role.
@@ -691,6 +699,7 @@ impl Default for Config {
             tools: ToolsConfig::default(),
             validation: ValidationConfig::default(),
             project_root: PathBuf::from("."),
+            skill_step_injection: false,
         }
     }
 }

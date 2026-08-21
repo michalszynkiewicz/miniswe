@@ -430,6 +430,9 @@ pub async fn run(
     replay_context: Option<PathBuf>,
     replay_apply: Option<PathBuf>,
 ) -> Result<()> {
+    // This surface registers the `skill` tool, so the [SKILL STEP] block's
+    // instruction to call it is actionable here (unlike the repl).
+    config.skill_step_injection = true;
     let log = Arc::new(SessionLog::new(&config));
     log.user_message(message);
 
