@@ -19,8 +19,8 @@ use crate::cli::commands::agent::debugger;
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
     PERIOD2_LOOP_HINT, PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
-    PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE, is_file_write, is_prunable_refactor_failure,
-    loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
+    PREMATURE_EXIT_NUDGE, REPEATED_READ_ESCALATION, REPEATED_READ_NUDGE, is_file_write,
+    is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{
     is_mutating_call, is_period2_cycle, key_is_mutating, loop_call_key,
@@ -82,6 +82,7 @@ async fn classify_is_explore(
         tool_choice: None,
         max_tokens_override: Some(8),
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+        cache_prompt: None,
     };
     let mut events = llm_worker.submit(ModelRole::Default, request, cancelled.clone());
     let mut out = String::new();
@@ -655,6 +656,34 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                 // on its own (validated battery), so there is no
                                 // keyword pre-route — on any parse failure the
                                 // classifier still fails safe to CODING.
+                                // Pre-turn skill router (fail-safe; skipped when the
+                                // user already invoked a skill via /name). See
+                                // agent::skill_router — probe: adoption 0/8 -> 8/8.
+                                let user_message = if active_skill_reminder.is_none() {
+                                    match crate::cli::commands::agent::skill_router::route_task_to_skill(
+                                        &llm_worker,
+                                        &config.project_root,
+                                        &user_message,
+                                        &cancelled,
+                                    )
+                                    .await
+                                    {
+                                        Some(skill) => {
+                                            app.push_output(
+                                                &format!("  · task routed to skill '{skill}'"),
+                                                LineStyle::Status,
+                                            );
+                                            crate::cli::commands::agent::skill_router::rewrite_task_for_skill(
+                                                &skill,
+                                                &user_message,
+                                            )
+                                        }
+                                        None => user_message,
+                                    }
+                                } else {
+                                    user_message
+                                };
+
                                 let is_explore =
                                     classify_is_explore(&llm_worker, &user_message, &cancelled)
                                         .await;
@@ -995,6 +1024,12 @@ async fn run_agent_loop(
     // Number of distinct loops the model has been pulled out of in this
     // turn. We give one recovery; a second loop ends the turn for real.
     let mut loop_recoveries = 0u32;
+    // Read-loop escalation ladder (see run.rs for the full rationale): first
+    // detection gets REPEATED_READ_NUDGE; a re-detection forces a context
+    // compaction before the next request — breaking the cache-hot prefix is
+    // what actually ends the loop. Resets after each escalation.
+    let mut read_nudges = 0u32;
+    let mut force_compact_next_round = false;
     let mut calls_since_last_edit = 0u32;
     let mut successful_edits_since_plan_update = 0u32;
     let mut plan_update_requested = false;
@@ -1132,6 +1167,29 @@ async fn run_agent_loop(
         // select! so a long LLM-based summarization keeps the TUI responsive.
         {
             let pre = messages.len();
+            // Read-loop escalation (see REPEATED_READ_ESCALATION): the loop
+            // is sustained by the cache-hot prompt prefix, so break it
+            // deliberately even though no budget pressure asks for it. Runs
+            // before maybe_compress so refresh_current_state still lands on
+            // the tail.
+            if force_compact_next_round {
+                force_compact_next_round = false;
+                app.push_output(
+                    "  ⚠ Read loop persisted — forcing context compaction",
+                    LineStyle::Status,
+                );
+                force_compress_responsive(
+                    app,
+                    rx,
+                    terminal,
+                    messages,
+                    config,
+                    router,
+                    llm_worker,
+                    tool_def_tokens,
+                )
+                .await;
+            }
             {
                 let compress_fut = context::compressor::maybe_compress(
                     messages,
@@ -1187,6 +1245,7 @@ async fn run_agent_loop(
             tool_choice: None,
             max_tokens_override,
             chat_template_kwargs: Some(chat_template_kwargs),
+            cache_prompt: None,
         };
         log.llm_request(&request);
 
@@ -1769,16 +1828,33 @@ async fn run_agent_loop(
                 };
                 log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
 
-                // Read-only repetition: harmless, just wasted tokens.
-                // Surface a polite nudge inline and let processing continue.
+                // Read-only repetition: harmless per call, just wasted tokens.
+                // First detection: polite nudge, let processing continue.
+                // Re-detection: escalate — the nudge can't reach a
+                // cache-numerics rut, so force a compaction next round.
                 if !mutating {
-                    let result_msg = Message::tool_result(&tc.id, REPEATED_READ_NUDGE);
+                    read_nudges += 1;
+                    let escalate = read_nudges >= 2;
+                    let text = if escalate {
+                        read_nudges = 0;
+                        force_compact_next_round = true;
+                        REPEATED_READ_ESCALATION
+                    } else {
+                        REPEATED_READ_NUDGE
+                    };
+                    let result_msg = Message::tool_result(&tc.id, text);
                     messages.push(result_msg.clone());
                     conversation_history.push(result_msg);
                     app.push_output(
                         &format!(
-                            "  ⓘ Repeated read: {}({}) — nudge sent, continuing",
-                            tc.function.name, args_summary
+                            "  ⓘ Repeated read: {}({}) — {}, continuing",
+                            tc.function.name,
+                            args_summary,
+                            if escalate {
+                                "nudge failed, forcing compaction next round"
+                            } else {
+                                "nudge sent"
+                            }
                         ),
                         LineStyle::Status,
                     );

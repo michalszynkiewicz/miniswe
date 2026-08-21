@@ -511,6 +511,37 @@ pub fn mcp_tool_definition() -> ToolDefinition {
     }
 }
 
+/// The `skill` tool: present only while a harness-owned skill step-cursor
+/// is active (see `agent::skill_cursor`). The model calls
+/// `skill(action='done')` to signal it finished the current [SKILL STEP];
+/// the harness advances the cursor and injects the next step's distilled
+/// instructions. Exactly one step is in flight at a time, so there is no
+/// multi-step checklist to rubber-stamp (the failure mode of the retired
+/// plan-seeding approach).
+pub fn skill_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        r#type: "function".into(),
+        function: FunctionDefinition {
+            name: "skill".into(),
+            description: "Advance the guided skill steps. Call action='done' ONLY when the \
+                current [SKILL STEP]'s 'DONE WHEN' criterion is actually met — the next step's \
+                instructions then appear under [SKILL STEP]. Do not call it to skip a step you \
+                have not completed."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Use 'done' to mark the current skill step complete and receive the next one."
+                    }
+                },
+                "required": ["action"]
+            }),
+        },
+    }
+}
+
 pub fn spawn_agents_tool_definition() -> ToolDefinition {
     ToolDefinition {
         r#type: "function".into(),

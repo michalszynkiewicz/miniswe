@@ -24,6 +24,15 @@ pub struct ChatRequest {
     /// into the body under the well-known `chat_template_kwargs` key.
     #[serde(skip)]
     pub chat_template_kwargs: Option<Value>,
+    /// Per-request `cache_prompt` override for llama.cpp. `Some(false)` forces
+    /// a fresh (cold) prompt eval instead of reusing the slot's KV cache. Used
+    /// to break a q4-KV-cache-induced loop: reading the lossy 4-bit cache back
+    /// can flip a decision into a repeat (fixed-seed probe: cold proceeds,
+    /// warm loops), so on loop detection we force one cold prefill and the
+    /// model proceeds. `None` = server default (reuse). Merged into the body
+    /// directly (skipped from serde).
+    #[serde(skip)]
+    pub cache_prompt: Option<bool>,
 }
 
 /// A chat message (system, user, assistant, or tool).

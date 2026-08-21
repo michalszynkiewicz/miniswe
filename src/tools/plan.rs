@@ -19,6 +19,8 @@ use std::fs;
 use crate::config::Config;
 
 pub use actions::execute;
+pub use step::{Step, parse_steps, steps_to_markdown};
+pub use validate::MAX_PLAN_STEPS;
 
 /// Check if a plan has been created.
 pub fn plan_exists(config: &Config) -> bool {

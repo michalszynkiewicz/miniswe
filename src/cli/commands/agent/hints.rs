@@ -82,6 +82,16 @@ Stopping. Are you sure? Check the plan — if steps remain, continue.";
 pub const REPEATED_READ_NUDGE: &str = "\
 You just made this same read/inspection call 3 times in a row. The result hasn't changed. What specifically are you looking for? Try a narrower search, a different range, or move on to making an edit.";
 
+/// Escalation when the nudge failed: the model re-entered an identical read
+/// loop after a [`REPEATED_READ_NUDGE`]. Tail wording alone is inert here
+/// (warm-replay probe, 2026-07-15: 7-8/8 kept looping regardless of message
+/// — the rut lives in the cache-hot prompt prefix), so the agent loop also
+/// forces a context compaction before the next request, which broke the loop
+/// 8/8. Contains the "same read/inspection call" GUARD_MARKERS phrase so
+/// compaction never masks this message itself.
+pub const REPEATED_READ_ESCALATION: &str = "\
+You made this same read/inspection call 3 times in a row AGAIN — the result STILL has not changed, and the answer is not in this output. Older history has been compacted so you can re-approach. Re-orient from the plan and current state, then take a DIFFERENT action now: make an edit, run a check or validator, or consult the docs.";
+
 // ── Error-recovery hints ─────────────────────────────────────────────
 
 /// Injected as a user-role message after the model repeats the same

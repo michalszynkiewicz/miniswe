@@ -229,6 +229,7 @@ async fn try_ask_once(
         // return correct OLD/NEW in ~1-2 seconds. Servers that don't
         // recognise the field ignore it.
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+        cache_prompt: None,
     };
     let response = match router
         .chat_with_cancel(ModelRole::Fast, &request, cancelled)

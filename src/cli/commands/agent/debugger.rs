@@ -242,6 +242,7 @@ pub async fn run_debugger(
             tool_choice: None,
             max_tokens_override: None,
             chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+            cache_prompt: None,
         };
         let Some(resp) = drain(llm_worker, request, cancelled).await else {
             break;
@@ -295,6 +296,7 @@ pub async fn run_debugger(
             tool_choice: None,
             max_tokens_override: None,
             chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+            cache_prompt: None,
         };
         if let Some(resp) = drain(llm_worker, request, cancelled).await
             && let Some(c) = resp.choices.first().and_then(|c| c.message.content.clone())

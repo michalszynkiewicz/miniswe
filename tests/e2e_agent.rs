@@ -45,6 +45,7 @@ async fn llm_client_chat_plain_text() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -78,6 +79,7 @@ async fn llm_client_chat_tool_call() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -114,6 +116,7 @@ async fn llm_client_stream_plain_text() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -160,6 +163,7 @@ async fn llm_client_stream_captures_length_finish_and_usage() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -197,6 +201,7 @@ async fn llm_client_stream_tool_call() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -310,6 +315,7 @@ async fn llm_client_stream_idle_timeout_fires_on_hung_connection() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let start = std::time::Instant::now();
@@ -355,6 +361,7 @@ async fn llm_client_stream_idle_timeout_retries_and_eventually_gives_up() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let result = client.chat(&request).await;
@@ -391,6 +398,7 @@ async fn llm_client_chat_stream_idle_timeout_fires_on_hung_connection() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -441,6 +449,7 @@ async fn llm_client_chat_stream_idle_timeout_retries_when_no_progress() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -521,6 +530,7 @@ async fn llm_client_chat_stream_no_retry_after_partial_progress() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -599,6 +609,7 @@ async fn single_tool_call_flow_reads_file() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -643,6 +654,7 @@ async fn write_file_flow_creates_file_on_disk() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -703,6 +715,7 @@ async fn invalid_json_args_from_llm() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -759,6 +772,7 @@ async fn llm_api_error_returns_error() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let result = client.chat(&request).await;
@@ -800,6 +814,7 @@ async fn llm_chat_does_not_retry_truncated_tool_call_500() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let err = client
@@ -852,6 +867,7 @@ async fn llm_chat_retries_transient_503_and_succeeds() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -873,6 +889,7 @@ async fn llm_connection_refused() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let result = client.chat(&request).await;
@@ -906,6 +923,7 @@ async fn llm_stream_retries_transient_503_and_succeeds() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -956,6 +974,7 @@ async fn stream_cancellation_via_flag() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(true)); // pre-cancelled

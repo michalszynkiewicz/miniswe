@@ -22,6 +22,25 @@ use serde_json::Value;
 
 use crate::config::{ModelConfig, ToolCallFormat};
 
+/// Idle-window floor (secs) for a forced cold prefill (`cache_prompt=false`).
+/// A cold prompt eval reprocesses the whole context and emits no token until
+/// prefill completes; on a slow / CPU-offloaded model that first-token latency
+/// can exceed the normal stream-idle guard, which would then kill a
+/// legitimately-progressing prefill (silence ≠ no progress). The absolute
+/// `request_deadline_secs` still backstops a truly wedged server.
+const COLD_PREFILL_IDLE_SECS: u64 = 60;
+
+/// The idle timeout for one attempt: widened to [`COLD_PREFILL_IDLE_SECS`] when
+/// the request body forces a cold prefill, else the configured value.
+fn attempt_idle_timeout(body: &Value, configured_secs: u64) -> Duration {
+    let secs = if body.get("cache_prompt") == Some(&Value::Bool(false)) {
+        configured_secs.max(COLD_PREFILL_IDLE_SECS)
+    } else {
+        configured_secs
+    };
+    Duration::from_secs(secs)
+}
+
 /// Counter for dumped request bodies. Atomic so multi-threaded callers
 /// don't collide on filenames.
 static DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -180,9 +199,14 @@ impl LlmClient {
         if let Some(kwargs) = &request.chat_template_kwargs {
             body["chat_template_kwargs"] = kwargs.clone();
         }
+        // Per-request cache_prompt override (e.g. force a cold prefill to break
+        // a q4-KV-cache loop). The tool-call-leak retry below may also flip
+        // this to false mid-loop.
+        if let Some(cp) = request.cache_prompt {
+            body["cache_prompt"] = Value::Bool(cp);
+        }
         maybe_dump_request(&body);
         let connect_timeout = Duration::from_secs(self.config.request_timeout_secs);
-        let idle_timeout = Duration::from_secs(self.config.stream_idle_timeout_secs);
 
         let mut attempt = 0usize;
         let mut cache_busted = false;
@@ -201,6 +225,10 @@ impl LlmClient {
                     self.config.request_deadline_secs
                 );
             }
+            // Recomputed per attempt: the tool-call-leak retry below may flip
+            // cache_prompt to false mid-loop, and a cold prefill needs the
+            // wider idle window.
+            let idle_timeout = attempt_idle_timeout(&body, self.config.stream_idle_timeout_secs);
             let result = self
                 .stream_once_assembled(
                     &url,
@@ -589,9 +617,14 @@ impl LlmClient {
         if let Some(kwargs) = &request.chat_template_kwargs {
             body["chat_template_kwargs"] = kwargs.clone();
         }
+        // Per-request cache_prompt override (e.g. force a cold prefill to break
+        // a q4-KV-cache loop). The tool-call-leak retry below may also flip
+        // this to false mid-loop.
+        if let Some(cp) = request.cache_prompt {
+            body["cache_prompt"] = Value::Bool(cp);
+        }
         maybe_dump_request(&body);
         let connect_timeout = Duration::from_secs(self.config.request_timeout_secs);
-        let idle_timeout = Duration::from_secs(self.config.stream_idle_timeout_secs);
 
         let mut attempt = 0usize;
         // Absolute deadline across retries — see chat_with_cancel. The
@@ -607,6 +640,7 @@ impl LlmClient {
                 );
             }
             let mut had_progress = false;
+            let idle_timeout = attempt_idle_timeout(&body, self.config.stream_idle_timeout_secs);
             let result = {
                 let mut wrapped = |token: &str| {
                     had_progress = true;
@@ -908,6 +942,34 @@ fn retryable_status_from_message(msg: &str) -> Option<StatusCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_prefill_widens_idle_window() {
+        // cache_prompt=false → widened to the cold-prefill floor.
+        let body = serde_json::json!({"cache_prompt": false});
+        assert_eq!(
+            attempt_idle_timeout(&body, 30),
+            Duration::from_secs(COLD_PREFILL_IDLE_SECS)
+        );
+    }
+
+    #[test]
+    fn normal_request_keeps_configured_idle_window() {
+        // cache_prompt=true or absent → configured value, untouched.
+        for body in [
+            serde_json::json!({"cache_prompt": true}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(attempt_idle_timeout(&body, 30), Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn cold_prefill_never_shrinks_a_larger_configured_window() {
+        // A generous configured timeout wins over the floor (max, not set).
+        let body = serde_json::json!({"cache_prompt": false});
+        assert_eq!(attempt_idle_timeout(&body, 120), Duration::from_secs(120));
+    }
 
     #[test]
     fn truncated_tool_call_error_detected() {

@@ -517,6 +517,7 @@ async fn ask_accept_lsp_regression(router: &ModelRouter, path: &str, error_repor
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+        cache_prompt: None,
     };
     match router.chat(ModelRole::Fast, &request).await {
         Ok(response) => {

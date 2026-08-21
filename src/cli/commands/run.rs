@@ -21,8 +21,8 @@ use crate::cli::commands::agent::debugger;
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
     PERIOD2_LOOP_HINT, PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
-    PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE, is_file_write, is_prunable_refactor_failure,
-    loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
+    PREMATURE_EXIT_NUDGE, REPEATED_READ_ESCALATION, REPEATED_READ_NUDGE, is_file_write,
+    is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{
     is_mutating_call, is_period2_cycle, key_is_mutating, loop_call_key,
@@ -121,6 +121,47 @@ pub(crate) fn track_plan_step_failure(
 }
 
 #[cfg(test)]
+mod job_failure_tests {
+    use super::{failing_job_output, normalize_command, parse_finished_job_command};
+
+    #[test]
+    fn normalize_strips_cd_prefix_and_whitespace() {
+        assert_eq!(
+            normalize_command("cd app-with-deps-package &&  uds   run dev"),
+            "uds run dev"
+        );
+        assert_eq!(normalize_command("uds run dev"), "uds run dev");
+    }
+
+    #[test]
+    fn parse_finished_job_command_extracts_command() {
+        let content =
+            "[job 1 FINISHED]  $ cd pkg && uds run dev\n[shell: exit 1]\nunable to pull chart";
+        assert_eq!(
+            parse_finished_job_command(content).as_deref(),
+            Some("uds run dev")
+        );
+        assert_eq!(parse_finished_job_command("just some output"), None);
+    }
+
+    #[test]
+    fn failing_job_output_matches_normalized_shell_command() {
+        let mut failed = std::collections::HashMap::new();
+        failed.insert(
+            "uds run dev".to_string(),
+            "exit 128: bad chart ref".to_string(),
+        );
+        let args = serde_json::json!({"action": "run", "command": "cd pkg && uds run dev"});
+        let hit = failing_job_output("shell", &args, &failed);
+        assert_eq!(hit.map(|(c, _)| c), Some("uds run dev".to_string()));
+        // non-shell tool, or unrecorded command → no match
+        assert!(failing_job_output("file", &args, &failed).is_none());
+        let other = serde_json::json!({"action": "run", "command": "ls"});
+        assert!(failing_job_output("shell", &other, &failed).is_none());
+    }
+}
+
+#[cfg(test)]
 mod track_plan_step_failure_tests {
     use super::track_plan_step_failure;
 
@@ -173,6 +214,103 @@ pub(crate) fn write_gate_failure_output(config: &Config, output: &str) -> Option
     let rel = "last_gate_failure.txt";
     std::fs::write(config.miniswe_path(rel), output).ok()?;
     Some(format!(".miniswe/{rel}"))
+}
+
+/// Fetch, extract, and descend into `next` (a skill named by a handoff step).
+/// Returns true on success. `descend` consumes the invoking step, so on a
+/// failed extraction the cursor is left untouched and the caller decides what
+/// to do. Shared by name-based and body-based handoff detection.
+async fn descend_into_skill(
+    cursor: &mut crate::cli::commands::agent::skill_cursor::SkillCursor,
+    next: &str,
+    config: &Config,
+    llm_worker: &LlmWorkerHandle,
+    cancelled: &Arc<AtomicBool>,
+) -> bool {
+    use crate::cli::commands::agent::skill_router;
+    let Some(entry) = crate::skills::discover(&config.project_root)
+        .into_iter()
+        .find(|e| e.name == next)
+    else {
+        return false;
+    };
+    let Ok(loaded) = crate::skills::load(&entry.path) else {
+        return false;
+    };
+    let steps = skill_router::extract_skill_steps(llm_worker, &loaded.body, cancelled).await;
+    if steps.is_empty() {
+        return false;
+    }
+    let dir = entry
+        .path
+        .parent()
+        .unwrap_or(&config.project_root)
+        .to_path_buf();
+    cursor.descend(next, &dir, steps);
+    tui::print_status(&format!("[skills] handoff — descending into '{next}'"));
+    true
+}
+
+/// Normalize a shell command for cross-invocation matching: drop a leading
+/// `cd … &&` working-dir prefix and collapse whitespace, so the same
+/// underlying command matches regardless of where it was launched from.
+fn normalize_command(cmd: &str) -> String {
+    let tail = cmd.rsplit("&&").next().unwrap_or(cmd).trim();
+    tail.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// If a tool result reports a FAILED background job (`[job N FINISHED]  $ <cmd>`
+/// — e.g. a detached `uds run dev` deploy that exited non-zero), return the
+/// normalized command. Background jobs fail LATER, in a status/wait result,
+/// not on the launch call, so keying their failure by command is the only way
+/// a re-launched-and-re-failing deploy reaches the debugger.
+fn parse_finished_job_command(content: &str) -> Option<String> {
+    let line = content
+        .lines()
+        .find(|l| l.contains("FINISHED]") && l.contains("$ "))?;
+    let cmd = line.split("$ ").nth(1)?.trim();
+    (!cmd.is_empty()).then(|| normalize_command(cmd))
+}
+
+/// The recorded failure output for a shell tool call whose (normalized)
+/// command has a failing background job on record. Lets the loop-recovery
+/// ladder route a repeated failing deploy to the debugger.
+fn failing_job_output<'a>(
+    name: &str,
+    args: &serde_json::Value,
+    failed: &'a std::collections::HashMap<String, String>,
+) -> Option<(String, &'a str)> {
+    if name != "shell" {
+        return None;
+    }
+    let cmd = normalize_command(args.get("command")?.as_str()?);
+    failed.get(&cmd).map(|out| (cmd, out.as_str()))
+}
+
+/// Render the tail of the conversation into a compact transcript — the
+/// evidence of what the model just did and observed. Fed to the skill-step
+/// completion judge (see `skill_router::judge_step_done`) so it decides from
+/// actual recent activity, not the whole (possibly stale) history.
+fn recent_activity(messages: &[Message], n: usize, cap: usize) -> String {
+    let tail: Vec<&Message> = messages.iter().rev().take(n).collect();
+    let mut lines: Vec<String> = Vec::new();
+    for m in tail.into_iter().rev() {
+        if let Some(c) = &m.content {
+            let c = c.trim();
+            if !c.is_empty() {
+                lines.push(format!("[{}] {}", m.role, crate::truncate_chars(c, 500)));
+            }
+        }
+        for tc in m.tool_calls.iter().flatten() {
+            lines.push(format!(
+                "[{} call] {}({})",
+                m.role,
+                tc.function.name,
+                crate::truncate_chars(&tc.function.arguments, 160)
+            ));
+        }
+    }
+    crate::truncate_chars(&lines.join("\n"), cap)
 }
 
 /// debugger_judge_rewind`) and build the message to inject afterward.
@@ -400,7 +538,14 @@ pub async fn run(
     let tool_def_tokens =
         context::estimate_tokens(&serde_json::to_string(&tool_defs).unwrap_or_default());
 
-    let max_rounds = config.context.max_rounds;
+    // `MINISWE_MAX_ROUNDS` overrides the configured round cap without editing
+    // config.toml — used by the e2e harness to give long multi-phase skills
+    // (build → integrate → deploy) enough budget. Invalid/absent → config.
+    let max_rounds = std::env::var("MINISWE_MAX_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(config.context.max_rounds);
     let pause_at = config.context.pause_after_rounds;
     // Ceremony=Off (default, evidence-distilled): no plan gate, no
     // plan/no-plan nudges, all edit tools always visible, no phase
@@ -423,12 +568,54 @@ pub async fn run(
     // Number of distinct loops the model has been pulled out of in this
     // turn. We give one recovery; a second loop ends the turn for real.
     let mut loop_recoveries = 0u32;
+    // (call_key, failure output) of the most recent FAILED tool call. When the
+    // model loops on a call that keeps failing (e.g. `zarf package create`
+    // returning a lint error 10× — e2e 2026-07-17), this is the real error to
+    // hand the debugger. The per-step check can't surface it: it's a read-only
+    // existence proxy that PASSES while the command fails, so nothing else
+    // triggers recovery on a failing command's own exit code.
+    let mut last_tool_failure: Option<(String, String)> = None;
+    // Background-job failures keyed by their COMMAND. A detached deploy
+    // (`uds run dev`) fails in a later status/wait result, not on the launch,
+    // and each re-launch is a new job id — so the identical-call loop detector
+    // never sees the failing DEPLOY. Keyed by command, a repeated failing
+    // deploy still routes to the debugger via the recovery ladder (e2e
+    // 2026-07-17: the run never deployed because a bad chart git-ref made
+    // `uds run dev` fail, and nothing surfaced it to the debugger).
+    let mut failed_job_commands: std::collections::HashMap<String, String> = Default::default();
     let mut calls_since_last_edit = 0u32;
     let mut successful_edits_since_plan_update = 0u32;
     let mut plan_update_requested = false;
     let mut nudged_premature_exit = false;
     let mut nudged_live_jobs = false;
+    // Persistent skill-cursor finish-gate state: the step we're currently
+    // blocking premature-finish on, and how many times the model has tried to
+    // stop on it. A cursor with steps remaining means the task is NOT done, so
+    // the model must not be allowed to finish — but after it insists a few
+    // times we take the step as done and advance (anti-spin). Reset when the
+    // step changes.
+    let mut skill_exit_step: Option<String> = None;
+    let mut skill_exit_stops: usize = 0;
+    // Last skill-step judge "not done" reason surfaced to the model, so we
+    // don't repeat an identical nudge every judge cycle (repeats feed loops).
+    let mut last_judge_nudge: Option<String> = None;
     let mut jobs_poll_redirects = 0u32;
+    // Read-loop escalation ladder: first detection gets the polite
+    // REPEATED_READ_NUDGE; if the model re-enters the same identical-read
+    // loop, wording is proven inert (live 121347: 6 nudges, 0 effect) and the
+    // next detection forces a context compaction before the following request
+    // — breaking the cache-hot prefix is what actually ends the loop
+    // (warm-replay probe 2026-07-15: nudge 0-1/8, forced compaction 8/8).
+    // Resets after each escalation so a later, separate loop episode starts
+    // back at the cheap nudge.
+    let mut read_nudges = 0u32;
+    let mut force_compact_next_round = false;
+    // On loop detection, force ONE cold prompt eval (cache_prompt=false) next
+    // round. The q4-KV-cache readback can flip a decision into a repeat
+    // (fixed-seed probe 2026-07-16: cold prefill proceeds 12/12, warm cache
+    // loops); a fresh eval breaks it before the heavier nudge/compact/debugger
+    // ladder even runs. Reset once consumed.
+    let mut force_cold_prefill_next_round = false;
     let mut nudged_no_plan = false;
     // Consecutive reactive-compaction retries (context exhaustion signaled
     // by the server — see compressor::force_compress). Reset whenever a
@@ -473,6 +660,84 @@ pub async fn run(
         cancelled_for_handler.store(true, Ordering::Relaxed);
         eprintln!("\n\x1b[33m(interrupted — finishing current step)\x1b[0m");
     });
+
+    // Pre-turn skill router (fail-safe): a dedicated no-tools classifier
+    // maps the task onto one installed skill, then the task is rewritten to
+    // an imperative read-and-follow. Probe 2026-07-15: classifier 30/30,
+    // first-action skill adoption 0/8 -> 8/8. NONE/parse-failure/LLM-error
+    // all fall through to the original task unchanged.
+    use crate::cli::commands::agent::{skill_cursor, skill_router};
+    // Stale skill cursor from a previous session (unless --continue).
+    if !continue_session {
+        skill_cursor::clear(&config);
+    }
+    // On a --continue retry with a still-active cursor, DON'T re-route: the
+    // continuation message (e.g. "fix these validation errors") drags the
+    // router onto a narrow sub-skill and a fresh push would clobber the
+    // in-progress lifecycle cursor (uds e2e 2026-07-16: the umbrella
+    // build/integrate cursor got overwritten by uds-package-validate on
+    // retry). Keep the existing cursor; the continuation prompt flows to the
+    // model with the current [SKILL STEP] still injected.
+    let routed_message: String = if continue_session && skill_cursor::load(&config).is_active() {
+        tui::print_status("[skills] continuing in-progress step-cursor; skipping re-route");
+        message.to_string()
+    } else {
+        match skill_router::route_task_to_skill(
+            &llm_worker,
+            &config.project_root,
+            message,
+            &cancelled,
+        )
+        .await
+        {
+            Some(skill) => {
+                tui::print_status(&format!("[skills] task routed to skill '{skill}'"));
+                log.user_message(&format!("[skill-router] using '{skill}'"));
+                // Decoupled step-cursor execution: extract the skill's steps into
+                // a harness-owned cursor (separate from the model's plan.md, so
+                // they can't fight). Each round the CURRENT step's instructions
+                // are distilled just-in-time and re-injected under [SKILL STEP];
+                // the model signals skill(action='done') to advance. Falls back
+                // to plain read-and-follow if extraction yields nothing.
+                let mut used_cursor = false;
+                if let Some(entry) = crate::skills::discover(&config.project_root)
+                    .into_iter()
+                    .find(|e| e.name == skill)
+                    && let Ok(loaded) = crate::skills::load(&entry.path)
+                {
+                    let steps =
+                        skill_router::extract_skill_steps(&llm_worker, &loaded.body, &cancelled)
+                            .await;
+                    if !steps.is_empty() {
+                        let dir = entry
+                            .path
+                            .parent()
+                            .unwrap_or(&config.project_root)
+                            .to_path_buf();
+                        let mut cursor = skill_cursor::SkillCursor::default();
+                        cursor.push_skill(&skill, &dir, steps);
+                        skill_cursor::save(&config, &cursor);
+                        used_cursor = true;
+                        tui::print_status(&format!(
+                            "[skills] seeded step-cursor from '{skill}'; will distill + re-inject each step"
+                        ));
+                    }
+                }
+                if used_cursor {
+                    format!(
+                        "Handle this request by following the guided skill steps. The current step's \
+                     instructions appear under [SKILL STEP] in the current state — do exactly that \
+                     step, then call skill(action='done') to advance. Do not skip ahead or \
+                     improvise. Request: {message}"
+                    )
+                } else {
+                    skill_router::rewrite_task_for_skill(&skill, message)
+                }
+            }
+            None => message.to_string(),
+        }
+    };
+    let message: &str = &routed_message;
 
     // Initialize snapshot manager for revert support
     let snapshots = tools::snapshots::SnapshotManager::init(&config.project_root)
@@ -603,6 +868,202 @@ pub async fn run(
         round += 1;
         log.round_start(round);
 
+        // Skill step-cursor maintenance (harness-owned; runs before the LLM
+        // call so the [SKILL STEP] re-injection is current):
+        //  1. Handoff: if the current step delegates to an installed skill
+        //     not yet on the stack (e.g. build -> integrate), DESCEND into it
+        //     (extract its steps + push a frame). The model never resolves
+        //     the handoff name itself (a lookup a probe showed it won't do).
+        //  2. Safety valve: a step the model never signals done on is
+        //     force-advanced past a round cap so guidance can't freeze.
+        //  3. Distillation: cache the current step's self-contained
+        //     instructions (LLM) if not already cached.
+        {
+            const MAX_ROUNDS_PER_STEP: usize = 20;
+            let mut cursor = skill_cursor::load(&config);
+            if cursor.is_active() {
+                let installed: Vec<String> = crate::skills::discover(&config.project_root)
+                    .into_iter()
+                    .map(|e| e.name)
+                    .collect();
+                if let Some(next) = cursor.handoff_target(&installed)
+                    && !descend_into_skill(&mut cursor, &next, &config, &llm_worker, &cancelled)
+                        .await
+                {
+                    // Name-based handoff (umbrella "Invoke X skill" step) but
+                    // extraction failed — consume the invoke step so we don't
+                    // spin on it every round.
+                    cursor.mark_done();
+                    tui::print_status(&format!(
+                        "[skills] handoff '{next}' yielded no steps; skipping"
+                    ));
+                }
+                if cursor.is_active() {
+                    let n = cursor.note_round();
+                    if n > MAX_ROUNDS_PER_STEP {
+                        let name = cursor
+                            .current()
+                            .map(|(_, s)| s.name.clone())
+                            .unwrap_or_default();
+                        cursor.mark_done();
+                        tui::print_status(&format!(
+                            "[skills] step '{name}' exceeded {MAX_ROUNDS_PER_STEP} rounds — auto-advancing"
+                        ));
+                    } else if cursor.cached().is_none()
+                        && let Some(material) = cursor.current_material()
+                    {
+                        let step_name = cursor
+                            .current()
+                            .map(|(_, s)| s.name.clone())
+                            .unwrap_or_default();
+                        let instructions = skill_router::distill_step(
+                            &llm_worker,
+                            &material,
+                            &step_name,
+                            &cancelled,
+                        )
+                        .await;
+                        if !instructions.trim().is_empty() {
+                            cursor.cache(instructions);
+                            tui::print_status(&format!("[skills] distilled step '{step_name}'"));
+                        }
+                    }
+                    // Body-based handoff: the current step's PROSE may name a
+                    // sub-skill even when its NAME doesn't (the build skill's
+                    // final "Integrate" step → "continue with the
+                    // uds-package-integrate skill"). Fires only on the skill's
+                    // last step, and only once distilled (see handoff_in_body).
+                    // If we descend, the current step changes — skip this
+                    // round's check-gen/judge; they run next round on the
+                    // sub-skill's first step.
+                    let descended_body = if let Some(next) = cursor.handoff_in_body(&installed) {
+                        descend_into_skill(&mut cursor, &next, &config, &llm_worker, &cancelled)
+                            .await
+                    } else {
+                        false
+                    };
+                    if !descended_body {
+                        // Per-step completion check: turn the distilled step's
+                        // DONE WHEN into a read-only shell check (once per step).
+                        // While the step is active this becomes the effective
+                        // validation command (see the done-gate below), which
+                        // fires the debugger stack on projects with no configured
+                        // task-level check. None when not shell-checkable.
+                        if !cursor.check_attempted()
+                            && let Some(instr) = cursor.cached().map(str::to_string)
+                            && let Some(material) = cursor.current_material()
+                        {
+                            let step_name = cursor
+                                .current()
+                                .map(|(_, s)| s.name.clone())
+                                .unwrap_or_default();
+                            match skill_router::extract_done_when(&instr) {
+                                Some(done_when) => {
+                                    let check = skill_router::generate_step_check(
+                                        &llm_worker,
+                                        &material,
+                                        &step_name,
+                                        &done_when,
+                                        &cancelled,
+                                    )
+                                    .await;
+                                    match &check {
+                                        Some(c) => tui::print_status(&format!(
+                                            "[skills] step '{step_name}' check: {c}"
+                                        )),
+                                        None => tui::print_status(&format!(
+                                            "[skills] step '{step_name}' not shell-checkable"
+                                        )),
+                                    }
+                                    cursor.cache_check(check.unwrap_or_default());
+                                }
+                                None => cursor.cache_check(String::new()),
+                            }
+                        }
+                        // Periodic completion judge — the actual advance driver.
+                        // The model almost never calls skill(done) itself (e2e:
+                        // 2 calls in 4 attempts), so every JUDGE_EVERY rounds we
+                        // ask it out-of-band whether the step is done. On DONE the
+                        // step's check acts as a VETO (not an auto-advancer, which
+                        // would skip a creates-then-modifies step the instant its
+                        // file exists): check fails → hold + tell it; check passes
+                        // or is absent → advance. Probe: judge 40/40 honest (8/8
+                        // NOT DONE on stubs), so DONE is earned, not rubber-stamped.
+                        const JUDGE_EVERY: usize = 3;
+                        if n <= MAX_ROUNDS_PER_STEP
+                            && n.is_multiple_of(JUDGE_EVERY)
+                            && let Some(def) = cursor.cached().map(str::to_string)
+                        {
+                            let (skill_name, step_name) = cursor
+                                .current()
+                                .map(|(sk, st)| (sk.to_string(), st.name.clone()))
+                                .unwrap_or_default();
+                            let check = cursor.current_check().map(str::to_string);
+                            let recent = recent_activity(&messages, 8, 2600);
+                            let (judged_done, reason) = skill_router::judge_step_done(
+                                &llm_worker,
+                                &step_name,
+                                &def,
+                                &recent,
+                                &cancelled,
+                            )
+                            .await;
+                            if judged_done {
+                                let verdict = match &check {
+                                    Some(cmd) => validation::run_check_command(&config, cmd).await,
+                                    None => validation::CheckOutcome::Skipped,
+                                };
+                                if let validation::CheckOutcome::Fail(out) = verdict {
+                                    tui::print_status(&format!(
+                                        "[skills] '{step_name}' judged done but its check failed — holding"
+                                    ));
+                                    let msg = Message::user(&format!(
+                                        "[Status check on the '{step_name}' step: you consider it \
+                                     done, but its completion check failed:\n{out}\nThe step is \
+                                     NOT complete — fix this before moving on.]"
+                                    ));
+                                    messages.push(msg.clone());
+                                    conversation_history.push(msg);
+                                } else {
+                                    cursor.mark_done();
+                                    match cursor.current() {
+                                        Some((_, next)) => tui::print_status(&format!(
+                                            "[skills] '{step_name}' judged done → advancing to '{}'",
+                                            next.name
+                                        )),
+                                        None => tui::print_status(&format!(
+                                            "[skills] '{step_name}' judged done → {skill_name} skill complete"
+                                        )),
+                                    }
+                                }
+                            } else {
+                                // Surface the judge's reason to the model — it's
+                                // often the correct diagnosis the silent gate was
+                                // discarding (e2e: it flagged the tmp_repo build).
+                                // Dedup so an identical reason isn't re-nudged every
+                                // cycle (repeats feed loops).
+                                tui::print_status(&format!(
+                                    "[skills] '{step_name}' judged not done: {reason}"
+                                ));
+                                if !reason.is_empty()
+                                    && last_judge_nudge.as_deref() != Some(reason.as_str())
+                                {
+                                    last_judge_nudge = Some(reason.clone());
+                                    let msg = Message::user(&format!(
+                                        "[Status check on the '{step_name}' step — it is NOT done \
+                                     yet: {reason}\nAddress this specifically before continuing.]"
+                                    ));
+                                    messages.push(msg.clone());
+                                    conversation_history.push(msg);
+                                }
+                            }
+                        }
+                    }
+                }
+                skill_cursor::save(&config, &cursor);
+            }
+        }
+
         // Snapshot at start of each round for revert support
         if let Some(ref snap) = snapshots {
             let mut guard = snap.lock();
@@ -694,6 +1155,22 @@ pub async fn run(
 
         // Unified context compression — handles both tool results and conversation
         let pre_mask = messages.len();
+        // Read-loop escalation (see REPEATED_READ_ESCALATION): the loop is
+        // sustained by the cache-hot prompt prefix, so break it deliberately
+        // even though no budget pressure asks for it. Runs before
+        // maybe_compress so refresh_current_state still lands on the tail.
+        if force_compact_next_round {
+            force_compact_next_round = false;
+            tui::print_status("Read loop persisted — forcing context compaction.");
+            context::compressor::force_compress(
+                &mut messages,
+                &config,
+                &router,
+                &llm_worker,
+                tool_def_tokens,
+            )
+            .await;
+        }
         context::compressor::maybe_compress(
             &mut messages,
             &config,
@@ -726,7 +1203,12 @@ pub async fn run(
         let plan_set = tools::plan::plan_exists(&config);
         // Off: never hide edit tools (pass plan_exists=true). Strict:
         // legacy hide-until-plan behavior.
-        let visible = visible_tool_defs(&tool_defs, plan_set || !strict);
+        let mut visible = visible_tool_defs(&tool_defs, plan_set || !strict);
+        // Expose the skill(done) advance control only while a step-cursor is
+        // active — inert otherwise, so it never clutters non-skill turns.
+        if skill_cursor::load(&config).is_active() {
+            visible.push(tools::definitions::skill_tool_definition());
+        }
         // Mistral Small 4 honors `reasoning_effort` ("none"/"high"); other
         // models (Gemma, GPT-OSS, Devstral) use `enable_thinking` or
         // ignore the kwarg entirely. For Mistral 4 we want deep reasoning
@@ -751,12 +1233,23 @@ pub async fn run(
         } else {
             None
         };
+        // Consume a pending loop-break: force a single cold prompt eval.
+        let cache_prompt = if force_cold_prefill_next_round {
+            force_cold_prefill_next_round = false;
+            tui::print_status(
+                "[loop] forcing a cold prompt eval (cache_prompt=false) to break the KV-cache loop",
+            );
+            Some(false)
+        } else {
+            None
+        };
         let request = ChatRequest {
             messages: messages.clone(),
             tools: Some(visible),
             tool_choice: None,
             max_tokens_override,
             chat_template_kwargs: Some(chat_template_kwargs),
+            cache_prompt,
         };
         log.llm_request(&request);
 
@@ -979,6 +1472,73 @@ pub async fn run(
                         continue;
                     }
                 }
+                // Skill step-cursor finish-gate (PERSISTENT): a cursor with
+                // steps remaining means the whole task (build → integrate →
+                // deploy) is NOT done, so the model must not be allowed to
+                // finish here — it satisfices at the first artifact (e2e
+                // 2026-07-17: stopped at 65/3000 rounds with the cursor at
+                // build 9/18). On every stop attempt we block the finish and
+                // re-nudge; the 20-round safety valve guarantees each step
+                // advances, so the cursor always exhausts in bounded rounds
+                // and the model gets marched through the full lifecycle.
+                // Anti-spin: if it insists (stops SKILL_EXIT_MAX_STOPS times on
+                // the SAME step), take that as "done with this step" and advance
+                // the cursor rather than spinning to the valve.
+                {
+                    let mut cursor = skill_cursor::load(&config);
+                    if let Some((skill, step)) = cursor
+                        .current()
+                        .map(|(sk, st)| (sk.to_string(), st.name.clone()))
+                    {
+                        const SKILL_EXIT_MAX_STOPS: usize = 3;
+                        let key = format!("{skill}::{step}");
+                        if skill_exit_step.as_deref() != Some(&key) {
+                            skill_exit_step = Some(key);
+                            skill_exit_stops = 0;
+                        }
+                        skill_exit_stops += 1;
+                        if skill_exit_stops >= SKILL_EXIT_MAX_STOPS {
+                            cursor.mark_done();
+                            skill_cursor::save(&config, &cursor);
+                            skill_exit_step = None;
+                            skill_exit_stops = 0;
+                            let msg = match cursor.current() {
+                                Some((_, next)) => format!(
+                                    "[You kept trying to finish while on the '{step}' step — \
+                                     treating it as done. Next step: '{}' (see [SKILL STEP]). Do \
+                                     NOT stop: the task is not complete until the package is \
+                                     built, integrated, AND deployed.]",
+                                    next.name
+                                ),
+                                None => format!(
+                                    "[You kept trying to finish the '{step}' step — treating it as \
+                                     done. All {skill} skill steps are complete; verify the task \
+                                     (build → integrate → deploy) is truly finished before stopping.]"
+                                ),
+                            };
+                            let m = Message::user(&msg);
+                            messages.push(m.clone());
+                            conversation_history.push(m);
+                            tui::print_status(&format!(
+                                "[skills] model kept stopping on '{step}' — advancing cursor"
+                            ));
+                            continue;
+                        }
+                        let nudge = Message::user(&format!(
+                            "[Don't stop — the task is NOT done. You're on the '{step}' step of \
+                             the {skill} skill (build → integrate → deploy lifecycle); see \
+                             [SKILL STEP]. If this step is complete call skill(action='done'), \
+                             otherwise keep working it. Do not finish until the package is built, \
+                             integrated, AND deployed.]"
+                        ));
+                        messages.push(nudge.clone());
+                        conversation_history.push(nudge);
+                        tui::print_status(&format!(
+                            "[skills] blocked premature finish on '{step}' (stop #{skill_exit_stops})"
+                        ));
+                        continue;
+                    }
+                }
                 // Live-jobs finish-gate: finishing while background jobs run
                 // abandons them (session end kills them — a deploy started
                 // with background=true dies half-way). One nudge to wait or
@@ -1001,12 +1561,16 @@ pub async fn run(
                 // exits non-zero blocks the exit and feeds its output back so
                 // the model can fix a plumbed-but-not-consumed change (the
                 // change compiles + tests pass but the feature doesn't work).
-                // Default config has no command → this is a no-op.
-                // See docs/success-validation-design.md.
+                // Default config has no command → this is a no-op UNLESS a
+                // skill step is active with a generated completion check,
+                // which becomes the effective command (lighting up this gate
+                // + the debugger per-step). See docs/success-validation-design.md.
+                let effective_check = skill_cursor::current_check_command(&config)
+                    .or_else(|| config.validation.command().map(str::to_string));
                 if validation_blocks < config.validation.max_retries
-                    && config.validation.command().is_some()
+                    && let Some(check_cmd) = effective_check.as_deref()
                 {
-                    match validation::run_behavioral_check(&config).await {
+                    match validation::run_check_command(&config, check_cmd).await {
                         validation::CheckOutcome::Fail(output) => {
                             validation_blocks += 1;
                             // Record the model's completion rationale (its
@@ -1322,6 +1886,12 @@ pub async fn run(
         let mut all_prunable_failures = !tool_calls.is_empty();
         let mut prunable_errors: Vec<String> = Vec::new();
 
+        // Active skill step, folded into each loop key below so the SAME tool
+        // call on different steps (notably skill(done), byte-identical on every
+        // step) yields distinct keys — legitimately advancing through steps is
+        // not misread as a repeat, while a within-step rut (constant tag) is.
+        let active_step_tag = skill_cursor::current_step_tag(&config);
+
         for tc in &tool_calls {
             let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
                 Ok(v) => v,
@@ -1346,7 +1916,14 @@ pub async fn run(
             // (period-1), or the SAME two calls alternating (period-2 — the
             // edit↔revert oscillation that the streak counter is blind to
             // because every alternation resets it).
-            let call_key = loop_call_key(&tc.function.name, &args);
+            let call_key = {
+                let mut k = loop_call_key(&tc.function.name, &args);
+                if let Some(tag) = &active_step_tag {
+                    k.push('@');
+                    k.push_str(tag);
+                }
+                k
+            };
             if last_call_key.as_ref() == Some(&call_key) {
                 same_call_streak += 1;
             } else {
@@ -1356,6 +1933,27 @@ pub async fn run(
             recent_call_keys.push(call_key.clone());
             if recent_call_keys.len() > 12 {
                 recent_call_keys.remove(0);
+            }
+            // Soft loop-breaker for the "wandering grind": a call that recurs
+            // FREQUENTLY in the window even when INTERSPERSED (so it never
+            // trips the 3-consecutive detector below) — e.g. the model
+            // re-`ls -R`ing / re-`helm show`ing the chart between other calls.
+            // Force a cold prompt eval next round; correctness-safe (re-eval of
+            // the same prompt, nothing reverted/dropped) and may break a
+            // q4-cache-primed rut. Clear the window on fire so it must
+            // re-accumulate — bounds it to at most one cold eval per ~N repeats.
+            // 4 (not 5) in a 12-window: a period-3 cycle (A,B,C,A,B,C…) puts
+            // each element at exactly 12/3=4, so 4 catches period-2 AND
+            // period-3 wandering; 5 would miss period-3.
+            const COLD_PREFILL_FREQ: usize = 4;
+            if !force_cold_prefill_next_round
+                && recent_call_keys.iter().filter(|k| **k == call_key).count() >= COLD_PREFILL_FREQ
+            {
+                force_cold_prefill_next_round = true;
+                recent_call_keys.clear();
+                tui::print_status(&format!(
+                    "[loop] '{args_summary}' recurred {COLD_PREFILL_FREQ}x in the window — forcing a cold prompt eval next round"
+                ));
             }
             let period2 = is_period2_cycle(&recent_call_keys);
             if same_call_streak >= 3 || period2 {
@@ -1372,6 +1970,10 @@ pub async fn run(
                     is_mutating_call(&tc.function.name, &args)
                 };
                 log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
+                // Whatever branch handles this loop below, force a cold prompt
+                // eval next round — it's the cheapest, most reliable breaker
+                // (the loop is q4-KV-cache-induced; a fresh eval proceeds).
+                force_cold_prefill_next_round = true;
 
                 // Polling a status command while a background job runs is
                 // the unpaced form of monitoring — redirect to the paced one,
@@ -1408,16 +2010,32 @@ pub async fn run(
                     continue;
                 }
 
-                // Read-only repetition: harmless, just wasted tokens.
-                // Surface a polite nudge inline and let the for-loop
-                // continue so the model can react in subsequent rounds.
+                // Read-only repetition: harmless per call, just wasted tokens.
+                // First detection: polite nudge inline, let the for-loop
+                // continue. Re-detection: escalate — the nudge can't reach a
+                // cache-numerics rut, so force a compaction next round.
                 if !mutating {
-                    let result_msg = Message::tool_result(&tc.id, REPEATED_READ_NUDGE);
+                    read_nudges += 1;
+                    let escalate = read_nudges >= 2;
+                    let text = if escalate {
+                        read_nudges = 0;
+                        force_compact_next_round = true;
+                        REPEATED_READ_ESCALATION
+                    } else {
+                        REPEATED_READ_NUDGE
+                    };
+                    let result_msg = Message::tool_result(&tc.id, text);
                     messages.push(result_msg.clone());
                     conversation_history.push(result_msg);
                     tui::print_status(&format!(
-                        "Repeated read: {}({}) — nudge sent, continuing",
-                        tc.function.name, args_summary
+                        "Repeated read: {}({}) — {}, continuing",
+                        tc.function.name,
+                        args_summary,
+                        if escalate {
+                            "nudge failed, forcing compaction next round"
+                        } else {
+                            "nudge sent"
+                        }
                     ));
                     last_call_key = None;
                     same_call_streak = 0;
@@ -1462,19 +2080,73 @@ pub async fn run(
                 // debugger/judge at 2 blocks) instead of dying with the whole
                 // recovery stack idle. (Real case: a run died at 70s looping
                 // on a malformed replace_range while gate + judge never ran.)
-                // Without a gate: original behavior — stop the turn.
-                if config.validation.command().is_some()
+                // Without a gate: original behavior — stop the turn. An active
+                // skill step's completion check counts as the gate here too.
+                let effective_check = skill_cursor::current_check_command(&config)
+                    .or_else(|| config.validation.command().map(str::to_string));
+                // Failure text to route through the recovery ladder, if we
+                // should recover at all, in priority order:
+                //  - the LOOPING COMMAND ITSELF keeps FAILING (its real error) —
+                //    the missing trigger: a read-only per-step check can PASS
+                //    while `zarf package create` returns a lint error, so the
+                //    command's own failure never surfaced. A fresh-context
+                //    debugger fixes exactly this (probe: 10/10 on the flavor bug);
+                //  - else a check that FAILS → its output;
+                //  - else no check but a skill step IS active (Fix 2) →
+                //    synthesize the stuck state so a non-checkable investigative
+                //    loop still reaches the debugger.
+                let recover_output: Option<String> = if let Some((k, out)) = &last_tool_failure
+                    && *k == call_key
+                {
+                    Some(format!(
+                        "The agent is stuck repeating a tool call that keeps FAILING: \
+                         {}({}). Its latest error output:\n{out}\n\nDiagnose the root cause and \
+                         give the single concrete fix (exact command or edit) that makes it \
+                         succeed.",
+                        tc.function.name, args_summary
+                    ))
+                } else if let Some((cmd, out)) =
+                    failing_job_output(&tc.function.name, &args, &failed_job_commands)
+                {
+                    // The looping command launches a BACKGROUND job (e.g. the
+                    // detached `uds run dev` deploy) that keeps FAILING — its
+                    // failure lands in a status result, not the launch, so it
+                    // never tripped the foreground trigger above.
+                    Some(format!(
+                        "The agent keeps re-running a command whose background job FAILS: \
+                         `{cmd}`. Its latest error output:\n{out}\n\nDiagnose the root cause and \
+                         give the single concrete fix (exact command or edit) that makes it \
+                         succeed."
+                    ))
+                } else if let Some(cmd) = effective_check.as_deref() {
+                    match validation::run_check_command(&config, cmd).await {
+                        validation::CheckOutcome::Fail(o) => Some(o),
+                        _ => None,
+                    }
+                } else {
+                    let cursor = skill_cursor::load(&config);
+                    cursor.current().map(|(_, s)| {
+                        let def = cursor.cached().unwrap_or("");
+                        format!(
+                            "The agent is stuck in a repeating loop while executing the '{}' step \
+                             of a skill and is making no progress. Repeated tool call: {}({}). \
+                             The current step:\n{def}\n\nDiagnose why it is stuck and the single \
+                             concrete action that would unblock it — or, if the current state is \
+                             a dead end, whether to scrap and restart from a clean base.",
+                            s.name, tc.function.name, args_summary
+                        )
+                    })
+                };
+                if let Some(output) = recover_output
                     && validation_blocks < config.validation.max_retries
                 {
                     tui::print_error(&format!(
-                        "Loop detected again ({}({})) — routing through the done-gate instead of stopping",
+                        "Loop detected again ({}({})) — routing through the recovery ladder instead of stopping",
                         tc.function.name, args_summary
                     ));
-                    if let validation::CheckOutcome::Fail(output) =
-                        validation::run_behavioral_check(&config).await
                     {
                         validation_blocks += 1;
-                        // Fresh recovery budget for the rounds the gate grants.
+                        // Fresh recovery budget for the rounds the ladder grants.
                         loop_recoveries = 0;
                         last_call_key = None;
                         same_call_streak = 0;
@@ -1594,9 +2266,9 @@ pub async fn run(
                         conversation_history.push(msg);
                         continue 'round;
                     }
-                    // Gate passed (or skipped): the loop was on something the
-                    // check doesn't care about — fall through to the stop.
                 }
+                // No check failed and no skill cursor is active — the loop is
+                // on something the recovery ladder can't act on; stop the turn.
                 tui::print_error(&format!(
                     "Loop detected again ({}({})) after the recovery hint — stopping this turn",
                     tc.function.name, args_summary
@@ -1918,6 +2590,74 @@ pub async fn run(
                     let combined = crate::cli::commands::agent::subagent::format_outputs(outputs);
                     crate::tools::ToolResult::ok(combined)
                 }
+            } else if tc.function.name == "skill" {
+                // Harness-owned step cursor: the model signals it finished the
+                // current [SKILL STEP]; advance and announce the next one (its
+                // instructions arrive via [SKILL STEP] on the next round,
+                // distilled in round maintenance).
+                let action = args["action"].as_str().unwrap_or("done");
+                if action == "done" {
+                    let mut cursor = skill_cursor::load(&config);
+                    match cursor
+                        .current()
+                        .map(|(sk, st)| (sk.to_string(), st.name.clone()))
+                    {
+                        Some((skill, finished)) => {
+                            // Gate on the step's completion check with a
+                            // one-retry override: the FIRST skill(done) runs the
+                            // check and, on failure, is refused with the check
+                            // output; a SECOND consecutive skill(done) advances
+                            // anyway (the model overrules a possibly-wrong check —
+                            // the probe measured ~6% of checks over-specify and
+                            // false-fail, so the model needs an escape hatch).
+                            let check = cursor.current_check().map(str::to_string);
+                            let attempt = cursor.note_done_attempt();
+                            let blocked = match check.filter(|_| attempt < 2) {
+                                Some(cmd) => {
+                                    match validation::run_check_command(&config, &cmd).await {
+                                        validation::CheckOutcome::Fail(out) => Some(out),
+                                        _ => None,
+                                    }
+                                }
+                                None => None,
+                            };
+                            if let Some(out) = blocked {
+                                // Persist the incremented attempt; do NOT advance.
+                                skill_cursor::save(&config, &cursor);
+                                crate::tools::ToolResult::err(format!(
+                                    "Step '{finished}' does not meet its DONE WHEN yet — the \
+                                     completion check failed:\n{out}\nFix it and call \
+                                     skill(action='done') again. If you are certain the step is \
+                                     actually complete and the check is wrong, call it once more \
+                                     to override."
+                                ))
+                            } else {
+                                cursor.mark_done();
+                                skill_cursor::save(&config, &cursor);
+                                let msg = match cursor.current() {
+                                    Some((_, next)) => format!(
+                                        "Step '{finished}' marked done. Next step: '{}'. Its full \
+                                         instructions will appear under [SKILL STEP] — follow them \
+                                         exactly.",
+                                        next.name
+                                    ),
+                                    None => format!(
+                                        "Step '{finished}' marked done. All {skill} skill steps are \
+                                         complete — finish the task."
+                                    ),
+                                };
+                                crate::tools::ToolResult::ok(msg)
+                            }
+                        }
+                        None => crate::tools::ToolResult::err(
+                            "No active skill step to complete.".into(),
+                        ),
+                    }
+                } else {
+                    crate::tools::ToolResult::err(format!(
+                        "Unknown skill action '{action}'. Use action='done'."
+                    ))
+                }
             } else {
                 let tool_name = tc.function.name.clone();
                 let args = args.clone();
@@ -1967,6 +2707,27 @@ pub async fn run(
             log.tool_call(&tc.function.name, &args_summary, result.success, first_line);
             log.tool_result_detail(&tc.function.name, result.success, &result.content);
             tui::print_tool_result(&tc.function.name, result.success, first_line);
+
+            // Remember the last failing tool call keyed by its loop key, so a
+            // loop on a *failing* command can hand the real error to the
+            // debugger (see the loop-recovery ladder). Shell exit≠0 sets
+            // success=false, so this catches the `zarf package create` case.
+            if !result.success {
+                last_tool_failure = Some((
+                    loop_call_key(&tc.function.name, &args),
+                    crate::truncate_chars(result.content.trim(), 2000),
+                ));
+                // A FAILED background job (deploy) surfaces here (status/wait
+                // returns err) — record it by command so a re-launched failing
+                // deploy reaches the debugger even across job ids.
+                if let Some(cmd) = parse_finished_job_command(&result.content) {
+                    failed_job_commands
+                        .insert(cmd, crate::truncate_chars(result.content.trim(), 2000));
+                }
+            } else if let Some(cmd) = parse_finished_job_command(&result.content) {
+                // The same job command later SUCCEEDED — clear its stale failure.
+                failed_job_commands.remove(&cmd);
+            }
 
             if result.success && tc.function.name == "plan" {
                 successful_edits_since_plan_update = 0;

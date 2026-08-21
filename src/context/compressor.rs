@@ -109,12 +109,41 @@ fn first_history_idx(messages: &[Message]) -> usize {
         .unwrap_or(0)
 }
 
+/// Header line `compact_unified` writes in front of its summary. The
+/// existing-summary search in `compact_unified` matches on this same constant
+/// so writer and search can never drift apart again — they did once: the
+/// search looked for "[Session summary", a header no writer has produced
+/// since the outcome-focused-summaries rewrite (389bd4e), which silently
+/// disabled carry-forward and dropped prior summary facts from context on
+/// every compaction.
+const UNIFIED_SUMMARY_HEADER: &str = "[Your earlier work in this session]";
+
+/// Hard output cap (tokens) for the summarizer LLM call. A summary replaces a
+/// handful of old messages; without this the call inherits the agent's full
+/// `max_output_tokens` (8k) — enough for a repetition-loop runaway to GROW
+/// context instead of shrinking it (nemotron 3.5: three runs in a row emitted
+/// 25-36k-char fabricated changelogs, one growing history 16.8k→23k tokens).
+const SUMMARY_MAX_TOKENS: u64 = 1024;
+
 /// Recognize any in-context summary marker so the summarizer doesn't re-nest a
 /// previous summary into a new one.
 fn is_summary_marker(content: &str) -> bool {
     content.starts_with("[Your earlier work")
         || content.starts_with("[Session summary")
         || content.starts_with("[Summary of earlier conversation]")
+}
+
+/// Extract the carried-forward text from a previously injected summary
+/// message: drop the header line and the trailing "[Details: …]" archive
+/// pointer so only the summary content itself feeds the next summarization.
+fn strip_summary_envelope(content: &str) -> String {
+    content
+        .lines()
+        .filter(|l| !(is_summary_marker(l) || l.starts_with("[Details:")))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 /// One standardized stderr line per compaction event — grep'd by the
@@ -128,10 +157,15 @@ fn emit_compaction_metric(
     msgs_after: usize,
 ) {
     let elided = before_tokens.saturating_sub(after_tokens);
+    // `elided_tokens` is clamped at 0 (existing parsers expect \d+), which
+    // hides the pathological case where compaction GROWS context — the
+    // signed `delta_tokens` field, appended so existing regexes keep
+    // matching, is the one that can go negative.
+    let delta = after_tokens as i64 - before_tokens as i64;
     eprintln!(
         "[compaction] strategy={strategy} before_tokens={before_tokens} \
          after_tokens={after_tokens} elided_tokens={elided} \
-         msgs_before={msgs_before} msgs_after={msgs_after}"
+         msgs_before={msgs_before} msgs_after={msgs_after} delta_tokens={delta}"
     );
 }
 
@@ -359,6 +393,13 @@ fn format_current_state_block(config: &Config) -> Option<String> {
         block.push_str(s.trim_end());
         block.push('\n');
     }
+    // Just-in-time skill-step re-inject: when a skill cursor is active,
+    // append the CURRENT step's distilled instructions so the model executes
+    // from the manual, not from priors (uds-mcp e2e: it drifted after one
+    // read otherwise). One step at a time — nothing to rubber-stamp.
+    if let Some(step_block) = crate::cli::commands::agent::skill_cursor::active_step_block(config) {
+        block.push_str(&step_block);
+    }
     Some(block)
 }
 
@@ -567,7 +608,7 @@ async fn compact_unified(
             m.role == "user"
                 && m.content
                     .as_deref()
-                    .is_some_and(|c| c.starts_with("[Session summary"))
+                    .is_some_and(|c| c.starts_with(UNIFIED_SUMMARY_HEADER))
         })
         .map(|i| i + compress_start);
 
@@ -584,6 +625,7 @@ async fn compact_unified(
 
     let existing_summary = existing_summary_idx
         .and_then(|i| messages[i].content.clone())
+        .map(|c| strip_summary_envelope(&c))
         .unwrap_or_default();
 
     let msgs_before = messages.len();
@@ -610,7 +652,7 @@ async fn compact_unified(
     messages.truncate(compress_start);
 
     messages.push(Message::user(&format!(
-        "[Your earlier work in this session]\n{summary}\n[Details: file(action='read', path='.miniswe/session_archive.md'). Continue from where you left off.]"
+        "{UNIFIED_SUMMARY_HEADER}\n{summary}\n[Details: file(action='read', path='.miniswe/session_archive.md'). Continue from where you left off.]"
     )));
 
     messages.extend(after_split);
@@ -763,6 +805,13 @@ const GUARD_MARKERS: &[&str] = &[
     "You are in a loop",
     "You are in an edit↔revert loop",
     "same read/inspection call",
+    // replace_range's no-op rejection (tools/fast/replace_range.rs). Its
+    // loop-breaking power comes from the visible pile of repeated rejections,
+    // not just the newest one — the 2026-07-15 warm-replay probe showed the
+    // reworded guard escapes 7/8 with full history but 1/8 once masking eats
+    // older rejections (KEEP_RAW_OBS alone doesn't protect them: rejections
+    // interleave with reads and fall out of the newest-3 window).
+    "already match the content you provided",
 ];
 
 /// Guard exemption size cap. Guard texts ride on edit/revert results that
@@ -925,12 +974,16 @@ async fn llm_summarize_timeline(
     style: SummaryStyle,
 ) -> Option<String> {
     let max_prompt_chars = router.config_for(ModelRole::Fast).context_window * 3;
+    // The stated budget and the hard cap must agree — asking for "under
+    // 11k tokens" while capping at 1k invites truncated-mid-line output.
+    let budget_tokens = budget_tokens.min(SUMMARY_MAX_TOKENS as usize);
 
     let mut timeline = String::new();
     if !existing_summary.is_empty() {
         timeline.push_str(&format!("Previous summary:\n{existing_summary}\n\n"));
     }
     timeline.push_str("New messages to incorporate:\n");
+    let timeline_header_len = timeline.len();
 
     for msg in messages {
         let role = &msg.role;
@@ -976,6 +1029,21 @@ async fn llm_summarize_timeline(
         }
     }
 
+    // Empty window: every message was skipped (e.g. the window held only a
+    // previous summary marker). Asking an LLM to "list what you
+    // accomplished" over nothing coerces confabulation — probed live on
+    // nemotron: an empty timeline yielded a fully fabricated changelog
+    // (invented vm.rs/lexer.rs/parser.rs) 2/2 times. Skip the call: carry
+    // the existing summary forward unchanged, or signal the caller to use
+    // the heuristic fallback.
+    if timeline.len() == timeline_header_len {
+        eprintln!("[compressor] empty summarize window — skipping LLM call");
+        if !existing_summary.is_empty() {
+            return Some(existing_summary.to_string());
+        }
+        return None;
+    }
+
     let (system_prompt, prompt) = match style {
         SummaryStyle::Structured => (
             "List completed actions, one per line. Include exact signatures when functions were changed. No explanation.",
@@ -984,7 +1052,8 @@ async fn llm_summarize_timeline(
                  - file.rs: what changed (include exact function signatures if modified)\n\
                  - file.rs: ✗ attempted but failed — reason\n\
                  End with: Still need: [what's left]\n\
-                 Keep it under {budget_tokens} tokens. No process narrative.\n\n\
+                 Keep it under {budget_tokens} tokens. No process narrative.\n\
+                 If no files were changed in these messages, output exactly: No completed actions.\n\n\
                  {timeline}"
             ),
         ),
@@ -1005,8 +1074,12 @@ async fn llm_summarize_timeline(
         messages: vec![Message::system(system_prompt), Message::user(&prompt)],
         tools: None,
         tool_choice: None,
-        max_tokens_override: None,
+        // Hard cap, not just the prompt's "keep it under N" ask — a
+        // repetition-looping model ignores the ask and burns the full
+        // agent-level output budget otherwise.
+        max_tokens_override: Some(SUMMARY_MAX_TOKENS),
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+        cache_prompt: None,
     };
 
     let mut events = llm_worker.submit_non_streaming(ModelRole::Fast, request);
@@ -1019,6 +1092,20 @@ async fn llm_summarize_timeline(
         }
     };
     let text = response.choices.first()?.message.content.as_deref()?;
+    // Degenerate-summary guard: a summary REPLACES `messages` (the old
+    // summary message included), so one at least as large as its input is
+    // never compression — it's a runaway (repetition loop / fabricated
+    // changelog). Reject it; the caller falls back to heuristic_summarize,
+    // which only extracts from real tool results and cannot invent.
+    let input_tokens: usize = messages.iter().map(|m| msg_token_cost(m)).sum();
+    let summary_tokens = estimate_tokens(text);
+    if summary_tokens >= input_tokens {
+        eprintln!(
+            "[compressor] rejected degenerate summary ({summary_tokens} tokens >= \
+             {input_tokens}-token input) — falling back to heuristic"
+        );
+        return None;
+    }
     eprintln!(
         "[compressor] summarized {} messages into {} chars",
         messages.len(),
@@ -1364,6 +1451,10 @@ mod compaction_tests {
         assert!(is_guard_observation(
             "You just made this same read/inspection call 3 times in a row."
         ));
+        assert!(is_guard_observation(
+            "replace_range: lines L36-45 of chart/values.yaml already match the content you \
+             provided — nothing changed. The file ALREADY contains exactly this text."
+        ));
         assert!(!is_guard_observation("[file] src/main.rs: 40 lines"));
     }
 }
@@ -1508,5 +1599,88 @@ mod force_compress_tests {
         // System message IS counted — unlike needs_compression's history
         // total, this estimates the full prompt as the server sees it.
         assert!(without_tools >= 200);
+    }
+
+    #[test]
+    fn strip_summary_envelope_keeps_only_content() {
+        let injected = format!(
+            "{}\n- run.rs: threaded the new param\n- mod.rs: added flag\n\
+             [Details: file(action='read', path='.miniswe/session_archive.md'). Continue from where you left off.]",
+            super::UNIFIED_SUMMARY_HEADER
+        );
+        let stripped = super::strip_summary_envelope(&injected);
+        assert_eq!(
+            stripped,
+            "- run.rs: threaded the new param\n- mod.rs: added flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_writes_the_marker_its_search_looks_for() {
+        // Regression guard for the writer/search drift that silently killed
+        // carry-forward for months: the message compact_unified injects must
+        // start with the exact prefix its existing-summary search matches on.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path(), CompactionStrategy::Lazy);
+        let router = Arc::new(ModelRouter::new(&config));
+        let worker = LlmWorkerHandle::new(router.clone(), 1);
+
+        let mut messages = over_budget_messages();
+        force_compress(&mut messages, &config, &router, &worker, 0).await;
+
+        let summary_msg = messages
+            .iter()
+            .find(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(super::UNIFIED_SUMMARY_HEADER))
+            })
+            .expect("compact_unified should inject a summary the search can find");
+        assert!(super::is_summary_marker(
+            summary_msg.content.as_deref().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_summarize_window_short_circuits_without_llm() {
+        // A window holding only a previous summary marker builds an empty
+        // timeline; the summarizer must not ask an LLM to "list what you
+        // accomplished" over nothing (probed on nemotron: 2/2 fabricated
+        // changelogs). With an existing summary it is carried forward
+        // verbatim; without one the caller falls back to the heuristic.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path(), CompactionStrategy::Lazy);
+        let router = Arc::new(ModelRouter::new(&config));
+        let worker = LlmWorkerHandle::new(router.clone(), 1);
+
+        let blob = format!("{}\nold facts", super::UNIFIED_SUMMARY_HEADER);
+        let only_marker = [Message::user(&blob)];
+        let refs: Vec<&Message> = only_marker.iter().collect();
+
+        // The dead endpoint (config_in) would return None if the LLM path
+        // were reached; getting the existing summary back proves the
+        // short-circuit fired before any request.
+        let carried = super::llm_summarize_timeline(
+            &refs,
+            "earlier facts",
+            1000,
+            &router,
+            &worker,
+            super::SummaryStyle::Structured,
+        )
+        .await;
+        assert_eq!(carried.as_deref(), Some("earlier facts"));
+
+        let none = super::llm_summarize_timeline(
+            &refs,
+            "",
+            1000,
+            &router,
+            &worker,
+            super::SummaryStyle::Structured,
+        )
+        .await;
+        assert_eq!(none, None);
     }
 }
