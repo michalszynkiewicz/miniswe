@@ -127,12 +127,14 @@ pub fn cycle_loop_hint(period: usize) -> String {
     )
 }
 
-/// Injected after the server rejects the model's tool call with "Failed
-/// to parse tool call arguments as JSON" (see
-/// `crate::llm::TRUNCATED_TOOL_CALL_MARKER`). The previous assistant
-/// turn was streamed but never committed to history (the server dropped
-/// it), so we push this hint instead of a tool_result and let the agent
-/// try again with a smaller operation.
+/// Guidance for a tool call whose arguments were cut off by the output
+/// limit. Reaches the model two ways: as a user-role hint when the request
+/// itself failed (server-side "Failed to parse tool call arguments as
+/// JSON" — `crate::llm::TRUNCATED_TOOL_CALL_MARKER` — or our own streaming
+/// size cap), and appended to the tool_result of a call that arrived
+/// truncated and was stubbed by `crate::llm::sanitize_truncated_tool_calls`
+/// instead of being persisted (the server re-parses every historical
+/// call on every later request; one broken call failed them all).
 pub fn truncated_tool_call_hint(edit_mode: EditMode) -> &'static str {
     match edit_mode {
         EditMode::Smart => {

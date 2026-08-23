@@ -33,8 +33,10 @@ use crate::cli::commands::agent::validation;
 use crate::config::{Config, EditMode, ModelRole};
 use crate::context;
 use crate::llm::{
-    ChatRequest, Message, ModelRouter, is_context_exceeded_error, is_context_truncated_response,
-    is_truncated_tool_call_error,
+    ChatRequest, Message, ModelRouter, TRUNCATED_CALL_ABORT_AFTER, is_context_exceeded_error,
+    is_context_truncated_response, is_tool_call_args_cap_error, is_truncated_tool_call_error,
+    sanitize_truncated_tool_calls, scrub_unparseable_tool_calls, truncated_args_info,
+    truncated_args_tool_result,
 };
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
@@ -678,6 +680,13 @@ pub async fn run(
     // response is successfully consumed, so this bounds futile retries of
     // one failing request, not total compactions over a long run.
     let mut context_compact_retries: usize = 0;
+    // Consecutive LLM requests that died on a tool-call argument problem
+    // (server-side "Failed to parse tool call arguments" or our own
+    // streaming size cap) with no completed response in between. Each one
+    // costs a round but no model turn — Devstral spun 436 rounds in two
+    // seconds this way (2026-08-23 bench) once a truncated call sat in
+    // history. Escalates: scrub history → compact → abort the turn.
+    let mut truncated_call_errors_in_a_row: usize = 0;
     // How many times the behavioral done-gate has blocked completion this turn.
     let mut validation_blocks: usize = 0;
     // The model's stated rationale each time the gate blocked it — so a model
@@ -1385,10 +1394,71 @@ pub async fn run(
                     // Nothing could be freed — fall through to the normal
                     // error handling; retrying would fail identically.
                 }
+                if is_tool_call_args_cap_error(&err_str) {
+                    // Our streaming assembler aborted the generation because
+                    // an anchor-only tool's arguments outgrew the cap (see
+                    // llm::tool_call_args_cap). Nothing was persisted; tell
+                    // the model what it did and let it re-issue.
+                    truncated_call_errors_in_a_row += 1;
+                    if truncated_call_errors_in_a_row >= TRUNCATED_CALL_ABORT_AFTER {
+                        log.llm_error(&format!(
+                            "{truncated_call_errors_in_a_row} consecutive oversized tool calls — aborting turn"
+                        ));
+                        tui::print_error(
+                            "The model keeps emitting oversized tool-call arguments — giving up on this turn.",
+                        );
+                        had_error = true;
+                        break;
+                    }
+                    log.llm_error(&format!(
+                        "tool call aborted by the argument size cap: {err_str}"
+                    ));
+                    tui::print_status(
+                        "Tool call arguments exceeded the size cap — retrying with guidance.",
+                    );
+                    let hint = Message::user(&format!(
+                        "{err_str}. Anchor-style tools take identifiers and short expressions only — \
+                         never paste code bodies into their arguments. {}",
+                        truncated_tool_call_hint(config.tools.edit_mode)
+                    ));
+                    messages.push(hint.clone());
+                    conversation_history.push(hint);
+                    continue;
+                }
                 if is_truncated_tool_call_error(&err_str) {
-                    // Model hit max_tokens mid tool-call — the server
-                    // dropped the assistant turn, no tool_call_id was
-                    // issued. When the prompt is sitting near the context
+                    // The server's chat template could not parse some
+                    // assistant tool call's arguments as JSON. Two sources:
+                    // the model hit the output/context ceiling mid-call on
+                    // THIS request (non-streaming path, nothing persisted),
+                    // or a previously persisted call is broken and every
+                    // request will keep failing until it is gone. Handle
+                    // the second before doing anything else: it is the
+                    // 436-round spin.
+                    truncated_call_errors_in_a_row += 1;
+                    if truncated_call_errors_in_a_row >= 2 {
+                        let scrubbed = scrub_unparseable_tool_calls(&mut messages)
+                            + scrub_unparseable_tool_calls(&mut conversation_history);
+                        if scrubbed > 0 {
+                            log.llm_error(&format!(
+                                "scrubbed {scrubbed} unparseable tool call(s) from history after repeated parse failures — retrying"
+                            ));
+                            tui::print_status(
+                                "Repaired a truncated tool call left in history — retrying.",
+                            );
+                            continue;
+                        }
+                    }
+                    if truncated_call_errors_in_a_row >= TRUNCATED_CALL_ABORT_AFTER {
+                        log.llm_error(&format!(
+                            "{truncated_call_errors_in_a_row} consecutive tool-call parse failures with nothing left to repair — aborting turn"
+                        ));
+                        tui::print_error(
+                            "The server keeps rejecting tool-call arguments — giving up on this turn.",
+                        );
+                        had_error = true;
+                        break;
+                    }
+                    // When the prompt is sitting near the context
                     // window, the truncation is really context exhaustion
                     // (the server clamps generation to the remaining room):
                     // a hint can't fix that, compaction can.
@@ -1493,8 +1563,25 @@ pub async fn run(
         // A response made it through whole — any prior reactive-compaction
         // retries resolved this request; reset the budget for the next one.
         context_compact_retries = 0;
+        truncated_call_errors_in_a_row = 0;
 
-        let assistant_msg = &choice.message;
+        // Never let an unparseable tool call into history: the server's
+        // chat template re-parses every persisted call on every later
+        // request and fails the whole request when one is broken. Replace
+        // the cut-off arguments with a small valid stub; the tool loop
+        // below answers the stub with a "not executed, re-issue smaller"
+        // tool_result so the call/result pairing stays intact.
+        let mut assistant_msg = choice.message.clone();
+        let truncated_calls = sanitize_truncated_tool_calls(&mut assistant_msg);
+        if truncated_calls > 0 {
+            log.llm_error(&format!(
+                "{truncated_calls} tool call(s) arrived with unparseable arguments (cut off by the output limit) — stubbed before persisting"
+            ));
+            tui::print_status(
+                "A tool call was cut off by the output limit — it will not be executed.",
+            );
+        }
+        let assistant_msg = &assistant_msg;
 
         // Print newline after streaming content
         if assistant_msg.content.is_some() {
@@ -1964,12 +2051,13 @@ pub async fn run(
             let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
                 Ok(v) => v,
                 Err(e) => {
+                    // Unreachable after sanitize_truncated_tool_calls above,
+                    // kept as a belt-and-braces path. Never echo the raw
+                    // arguments back: that is the flood we just refused to
+                    // persist.
                     let result_msg = Message::tool_result(
                         &tc.id,
-                        &format!(
-                            "Invalid JSON in tool arguments: {e}\nRaw: {}",
-                            tc.function.arguments
-                        ),
+                        &format!("Invalid JSON in tool arguments: {e}"),
                     );
                     messages.push(result_msg.clone());
                     conversation_history.push(result_msg);
@@ -1977,6 +2065,34 @@ pub async fn run(
                     continue;
                 }
             };
+            if let Some(info) = truncated_args_info(&args) {
+                // A call stubbed by sanitize_truncated_tool_calls: the
+                // arguments were cut off by the output limit, so there is
+                // nothing to execute. Answer with guidance, not a run.
+                let result_msg = Message::tool_result(
+                    &tc.id,
+                    &format!(
+                        "{}\n\n{}",
+                        truncated_args_tool_result(&tc.function.name, &info),
+                        truncated_tool_call_hint(config.tools.edit_mode)
+                    ),
+                );
+                messages.push(result_msg.clone());
+                conversation_history.push(result_msg);
+                log.tool_debug(
+                    "agent",
+                    &format!(
+                        "{} call skipped: arguments truncated after {} chars",
+                        tc.function.name, info.original_chars
+                    ),
+                );
+                tui::print_tool_result(
+                    &tc.function.name,
+                    false,
+                    "arguments cut off by the output limit — not executed",
+                );
+                continue;
+            }
 
             let args_summary = summarize_args(&tc.function.name, &args);
 

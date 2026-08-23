@@ -32,8 +32,10 @@ use crate::cli::commands::agent::validation;
 use crate::config::{CeremonyMode, Config, EditMode, ModelRole};
 use crate::context;
 use crate::llm::{
-    ChatRequest, Message, ModelRouter, is_context_exceeded_error, is_context_truncated_response,
-    is_truncated_tool_call_error,
+    ChatRequest, Message, ModelRouter, TRUNCATED_CALL_ABORT_AFTER, is_context_exceeded_error,
+    is_context_truncated_response, is_tool_call_args_cap_error, is_truncated_tool_call_error,
+    sanitize_truncated_tool_calls, scrub_unparseable_tool_calls, truncated_args_info,
+    truncated_args_tool_result,
 };
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
@@ -1041,6 +1043,10 @@ async fn run_agent_loop(
     // response is successfully consumed; bounds futile retries of one
     // failing request, not total compactions over a long turn.
     let mut context_compact_retries: usize = 0;
+    // Consecutive LLM requests that died on a tool-call argument problem
+    // (server-side parse error or our streaming size cap) with no completed
+    // response in between. See run.rs for the escalation ladder.
+    let mut truncated_call_errors_in_a_row: usize = 0;
     // How many times the behavioral done-gate has blocked completion this turn.
     let mut validation_blocks: usize = 0;
     // The model's stated rationale each time the gate blocked it (bounded, auditable).
@@ -1299,16 +1305,80 @@ async fn run_agent_loop(
                                     // (primary path for compaction="lazy",
                                     // safety net for every other strategy).
                                     context_ceiling_hit = true;
+                                } else if is_tool_call_args_cap_error(&err_str) {
+                                    // Our streaming assembler aborted the
+                                    // generation: an anchor-only tool's
+                                    // arguments outgrew the cap. Nothing was
+                                    // persisted; hint and retry, or give up
+                                    // when the model keeps doing it.
+                                    truncated_call_errors_in_a_row += 1;
+                                    if truncated_call_errors_in_a_row
+                                        >= TRUNCATED_CALL_ABORT_AFTER
+                                    {
+                                        log.llm_error(&format!(
+                                            "{truncated_call_errors_in_a_row} consecutive oversized tool calls — aborting turn"
+                                        ));
+                                        // Falls through to `break None` below:
+                                        // no hint flag set, so the turn ends.
+                                        app.push_output(
+                                            "The model keeps emitting oversized tool-call arguments — giving up on this turn.",
+                                            LineStyle::Error,
+                                        );
+                                    } else {
+                                    log.llm_error(&format!(
+                                        "tool call aborted by the argument size cap: {err_str}"
+                                    ));
+                                    app.push_output(
+                                        "Tool call arguments exceeded the size cap — retrying with guidance.",
+                                        LineStyle::Status,
+                                    );
+                                    let hint = Message::user(&format!(
+                                        "{err_str}. Anchor-style tools take identifiers and short expressions only — \
+                                         never paste code bodies into their arguments. {}",
+                                        truncated_tool_call_hint(config.tools.edit_mode)
+                                    ));
+                                    messages.push(hint.clone());
+                                    conversation_history.push(hint);
+                                    truncated_tool_call_hint_pushed = true;
+                                    }
                                 } else if is_truncated_tool_call_error(&err_str) {
-                                    // Model hit max_tokens mid tool-call — the
-                                    // JSON couldn't be parsed server-side, so
-                                    // no tool_call_id was issued. When the
-                                    // prompt sits near the context window the
-                                    // truncation is really context exhaustion
-                                    // (the server clamps generation to the
-                                    // remaining room): a hint can't fix that,
-                                    // compaction can.
-                                    if context::compressor::estimated_context_tokens(
+                                    // The server's chat template could not
+                                    // parse some assistant tool call's
+                                    // arguments as JSON: either this
+                                    // response was cut off mid-call
+                                    // (nothing persisted), or a previously
+                                    // persisted call is broken and every
+                                    // request will fail until it is gone.
+                                    // Handle the second first — it is a
+                                    // zero-progress spin otherwise.
+                                    truncated_call_errors_in_a_row += 1;
+                                    let scrubbed = if truncated_call_errors_in_a_row >= 2 {
+                                        scrub_unparseable_tool_calls(messages)
+                                            + scrub_unparseable_tool_calls(conversation_history)
+                                    } else {
+                                        0
+                                    };
+                                    if scrubbed > 0 {
+                                        log.llm_error(&format!(
+                                            "scrubbed {scrubbed} unparseable tool call(s) from history after repeated parse failures — retrying"
+                                        ));
+                                        app.push_output(
+                                            "Repaired a truncated tool call left in history — retrying.",
+                                            LineStyle::Status,
+                                        );
+                                        truncated_tool_call_hint_pushed = true;
+                                    } else if truncated_call_errors_in_a_row
+                                        >= TRUNCATED_CALL_ABORT_AFTER
+                                    {
+                                        log.llm_error(&format!(
+                                            "{truncated_call_errors_in_a_row} consecutive tool-call parse failures with nothing left to repair — aborting turn"
+                                        ));
+                                        // Falls through to `break None`: turn ends.
+                                        app.push_output(
+                                            "The server keeps rejecting tool-call arguments — giving up on this turn.",
+                                            LineStyle::Error,
+                                        );
+                                    } else if context::compressor::estimated_context_tokens(
                                         messages,
                                         tool_def_tokens,
                                     ) > config.model.context_window * 3 / 4
@@ -1477,8 +1547,22 @@ async fn run_agent_loop(
         // A response made it through whole — any prior reactive-compaction
         // retries resolved this request; reset the budget for the next one.
         context_compact_retries = 0;
+        truncated_call_errors_in_a_row = 0;
 
-        let assistant_msg = &choice.message;
+        // Never persist an unparseable tool call (see run.rs): stub the
+        // cut-off arguments; the tool loop answers the stub with guidance.
+        let mut assistant_msg = choice.message.clone();
+        let truncated_calls = sanitize_truncated_tool_calls(&mut assistant_msg);
+        if truncated_calls > 0 {
+            log.llm_error(&format!(
+                "{truncated_calls} tool call(s) arrived with unparseable arguments (cut off by the output limit) — stubbed before persisting"
+            ));
+            app.push_output(
+                "A tool call was cut off by the output limit — it will not be executed.",
+                LineStyle::Status,
+            );
+        }
+        let assistant_msg = &assistant_msg;
 
         // Flush any remaining tokens
         app.flush_tokens();
@@ -1799,6 +1883,27 @@ async fn run_agent_loop(
                     continue;
                 }
             };
+            if let Some(info) = truncated_args_info(&args) {
+                // Stubbed by sanitize_truncated_tool_calls: nothing to run.
+                let result_msg = Message::tool_result(
+                    &tc.id,
+                    &format!(
+                        "{}\n\n{}",
+                        truncated_args_tool_result(&tc.function.name, &info),
+                        truncated_tool_call_hint(config.tools.edit_mode)
+                    ),
+                );
+                messages.push(result_msg.clone());
+                conversation_history.push(result_msg);
+                app.push_output(
+                    &format!(
+                        "  ✗ {}: arguments cut off by the output limit after {} chars — not executed",
+                        tc.function.name, info.original_chars
+                    ),
+                    LineStyle::ToolErr,
+                );
+                continue;
+            }
 
             let args_summary = summarize_args(&tc.function.name, &args);
 

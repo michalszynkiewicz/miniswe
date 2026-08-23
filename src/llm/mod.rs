@@ -4,10 +4,16 @@
 //! Handles streaming responses and tool call parsing.
 
 pub mod router;
+pub mod tool_call_repair;
 mod types;
 mod xml_tool_calls;
 
 pub use router::ModelRouter;
+pub use tool_call_repair::{
+    TOOL_CALL_ARGS_CAP_MARKER, TRUNCATED_CALL_ABORT_AFTER, is_tool_call_args_cap_error,
+    sanitize_truncated_tool_calls, scrub_unparseable_tool_calls, tool_call_args_cap,
+    truncated_args_info, truncated_args_tool_result,
+};
 pub use types::*;
 
 use std::sync::Arc;
@@ -466,6 +472,24 @@ impl LlmClient {
                                     }
                                     if let Some(args) = &func.arguments {
                                         entry.2.push_str(args);
+                                        // Anchor-only tools never need more
+                                        // than a few hundred chars; a call
+                                        // growing past the cap is the model
+                                        // pasting code into an anchor field.
+                                        // Abort now (the server cancels the
+                                        // slot on disconnect) instead of
+                                        // burning minutes until the context
+                                        // ceiling truncates it anyway.
+                                        if let Some(cap) = tool_call_args_cap(&entry.1)
+                                            && entry.2.len() > cap
+                                        {
+                                            bail!(
+                                                "{TOOL_CALL_ARGS_CAP_MARKER}: `{}` arguments \
+                                                 reached {} chars (cap {cap}) — generation aborted",
+                                                entry.1,
+                                                entry.2.len()
+                                            );
+                                        }
                                     }
                                 }
                             }
