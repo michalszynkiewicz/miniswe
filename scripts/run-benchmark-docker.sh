@@ -231,10 +231,10 @@ enabled = true
 # the grader's PONG_42 (grader stays independent); MINISWE_SKIP_VALIDATION=1
 # stops the gate recursing into the inner run. \$ is escaped for the heredoc.
 # The override names the greeting case explicitly: Muse Glimmer (harmony
-# template, tools present) answers a bare `hello` with a canned greeting no
+# template, tools present) answers a bare 'hello' with a canned greeting no
 # matter what the one-line override says (0/9), so every correct tree was
 # gate-blocked until the timeout. Naming the case fixes it (12/12 Glimmer,
-# 6/6 gemma, 6/6 Devstral); `hello` stays so the check still proves the
+# 6/6 gemma, 6/6 Devstral); 'hello' stays so the check still proves the
 # override is consumed rather than merely echoed.
 command = "out=\$(cargo build 2>&1) || { echo \"DOES NOT COMPILE:\"; echo \"\$out\" | tail -20; exit 1; }; run=\$(MINISWE_SKIP_VALIDATION=1 ./target/debug/miniswe --system-prompt-override 'Respond only with TOKEN_XYZ and nothing else. Even if the user just greets you, do not greet back — reply only TOKEN_XYZ.' --yes hello 2>&1); echo \"\$run\" | grep -q TOKEN_XYZ || { echo \"COMPILES but override NOT consumed. Expected TOKEN_XYZ, GOT: \$run\"; exit 1; }"
 timeout_secs = 180
