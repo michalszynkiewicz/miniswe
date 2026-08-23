@@ -20,6 +20,29 @@ pub fn parse_check(rel_path: &str, content: &str) -> Result<(), String> {
     parse_check_ext(ext, content)
 }
 
+/// Whether `parse_check` actually verifies files at `rel_path` — i.e. a
+/// grammar is compiled in for its extension. `parse_check` answers `Ok(())`
+/// for unsupported languages too, so callers that want to TRUST a clean
+/// parse (e.g. to discard an LSP diagnostic that contradicts it) must ask
+/// this first.
+pub fn parse_check_supported(rel_path: &str) -> bool {
+    parse_check_supported_ext(extension(rel_path))
+}
+
+#[cfg(feature = "tree-sitter")]
+fn parse_check_supported_ext(ext: &str) -> bool {
+    #[cfg(feature = "lang-yaml")]
+    if ext == "yaml" || ext == "yml" {
+        return true;
+    }
+    language_for(ext).is_some()
+}
+
+#[cfg(not(feature = "tree-sitter"))]
+fn parse_check_supported_ext(_ext: &str) -> bool {
+    false
+}
+
 /// Same as `parse_check` but takes an explicit extension (useful for tests
 /// and for callers that already know the language).
 #[cfg(feature = "tree-sitter")]
@@ -270,5 +293,13 @@ mod tests {
     fn yaml_syntax_error_caught() {
         let src = "key: :\n  bad indent\n";
         assert!(parse_check("bad.yaml", src).is_err());
+    }
+
+    #[test]
+    fn parse_check_supported_tracks_compiled_grammars() {
+        assert!(parse_check_supported("src/main.rs"));
+        assert!(parse_check_supported("deploy/values.yaml"));
+        assert!(!parse_check_supported("README.md"));
+        assert!(!parse_check_supported("Cargo.toml"));
     }
 }

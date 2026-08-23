@@ -9,7 +9,7 @@
 use crate::config::Config;
 use crate::lsp::LspClient;
 
-use super::ast::parse_check;
+use super::ast::{parse_check, parse_check_supported};
 use super::revisions::{Revision, RevisionStore};
 
 /// Max per-file LSP errors listed verbatim in the feedback. Over this,
@@ -65,14 +65,34 @@ pub async fn build_feedback(
     // Per-file LSP
     let abs_path = config.project_root.join(rel_path);
     let (file_diags, lsp_confirmed) = collect_file_diagnostics(&abs_path, config, lsp).await;
+    // A clean tree-sitter parse outranks an LSP parse error: rust-analyzer
+    // keeps the previous `cargo check` result (published with the CURRENT
+    // document version) until the next flycheck run completes, which is
+    // far longer than our diagnostic wait. So the call after a `revert`
+    // reports the reverted edit's "unclosed delimiter" on a file that is
+    // byte-identical to a compiling baseline — and the model, told its
+    // clean tree still has a syntax error, re-issues the same broken edit
+    // (Devstral `docker_20260823_114957`: 20× over 36 min).
+    let ast_verified = ast_ok && parse_check_supported(rel_path);
+    let (file_diags, stale_parse_errors) = if ast_verified {
+        drop_stale_parse_errors(file_diags)
+    } else {
+        (file_diags, 0)
+    };
     let file_errors = file_diags.len();
-    let file_lsp_line = if !lsp_confirmed && file_diags.is_empty() {
+    let mut file_lsp_line = if !lsp_confirmed && file_diags.is_empty() {
         // Don't claim "0 errors" when diagnostics never settled — that false
         // green is exactly what lets a small model ship a broken change.
         "[lsp file] pending — diagnostics didn't settle; run a check to confirm".to_string()
     } else {
         render_file_diagnostics(&file_diags)
     };
+    if stale_parse_errors > 0 {
+        file_lsp_line.push_str(&format!(
+            " (ignored {stale_parse_errors} stale parse error(s) from the previous analysis — \
+             the file parses now)"
+        ));
+    }
 
     // Project-wide LSP. When an edit INCREASES the error count, don't just show
     // a bare "+N" — surface WHERE the new errors are, especially in files OTHER
@@ -231,6 +251,35 @@ fn uri_to_rel(uri: &str, project_root: &std::path::Path) -> String {
         .strip_prefix(project_root)
         .map(|r| r.display().to_string())
         .unwrap_or_else(|_| p.to_string())
+}
+
+/// Split off LSP diagnostics that report a PARSE failure (rustc's delimiter
+/// family). Called only when tree-sitter has just verified the file parses,
+/// which makes every such diagnostic provably stale — left over from the
+/// previous analysis of content that no longer exists on disk. Returns the
+/// remaining diagnostics and how many were dropped.
+fn drop_stale_parse_errors(
+    diags: Vec<lsp_types::Diagnostic>,
+) -> (Vec<lsp_types::Diagnostic>, usize) {
+    let before = diags.len();
+    let kept: Vec<_> = diags
+        .into_iter()
+        .filter(|d| !is_parse_error_message(&d.message))
+        .collect();
+    let dropped = before - kept.len();
+    (kept, dropped)
+}
+
+/// rustc's parse-failure wordings — the ones a broken-then-reverted edit
+/// leaves behind. Deliberately narrow: a clean tree-sitter parse rules these
+/// out, but not the more lenient "expected one of …" family, which
+/// tree-sitter-rust can accept where rustc does not.
+fn is_parse_error_message(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("unclosed delimiter")
+        || m.contains("unexpected closing delimiter")
+        || m.contains("mismatched closing delimiter")
+        || m.contains("unexpected close delimiter")
 }
 
 fn render_file_diagnostics(diags: &[lsp_types::Diagnostic]) -> String {
@@ -518,6 +567,44 @@ mod tests {
         ];
         let table = render_revision_table("a.rs", &revs);
         assert!(table.contains("(+3 -2)"), "table missing delta: {table}");
+    }
+
+    fn diag(line: u32, message: &str) -> lsp_types::Diagnostic {
+        lsp_types::Diagnostic {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(line, 0),
+                lsp_types::Position::new(line, 1),
+            ),
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            message: message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stale_parse_errors_are_dropped_but_real_errors_kept() {
+        let diags = vec![
+            diag(384, "this file contains an unclosed delimiter"),
+            diag(340, "unexpected closing delimiter: `}`"),
+            diag(10, "mismatched closing delimiter: `)`"),
+            diag(
+                20,
+                "this function takes 6 arguments but 5 arguments were supplied",
+            ),
+        ];
+        let (kept, dropped) = drop_stale_parse_errors(diags);
+        assert_eq!(dropped, 3);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].message.contains("6 arguments"));
+    }
+
+    #[test]
+    fn expected_one_of_is_not_treated_as_stale() {
+        // tree-sitter can accept what rustc rejects here — keep it visible.
+        let diags = vec![diag(5, "expected one of `!` or `::`, found `x`")];
+        let (kept, dropped) = drop_stale_parse_errors(diags);
+        assert_eq!(dropped, 0);
+        assert_eq!(kept.len(), 1);
     }
 
     #[test]
