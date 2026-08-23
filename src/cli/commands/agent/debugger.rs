@@ -290,6 +290,13 @@ pub async fn run_debugger(
              nothing else: ROOT CAUSE (precise reason the check fails) and FIX (where and what \
              must change, described conceptually — not verbatim code you cannot compile-check).",
         ));
+        // The loop above sanitizes before every request; this one is built
+        // outside it and used to be sent raw. Its shape ends tool→user,
+        // which Mistral-family templates count as user→user (tool messages
+        // are invisible to the alternation check) → HTTP 500 on every
+        // attempt, and the diagnosis was lost after 7 retries (Devstral,
+        // 2026-08-23 bench). sanitize inserts the assistant bridge.
+        context::sanitize_messages(&mut messages);
         let request = ChatRequest {
             messages,
             tools: None,
