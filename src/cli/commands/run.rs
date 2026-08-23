@@ -20,12 +20,13 @@ use anyhow::Result;
 use crate::cli::commands::agent::debugger;
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
-    PERIOD2_LOOP_HINT, PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
-    PREMATURE_EXIT_NUDGE, REPEATED_READ_ESCALATION, REPEATED_READ_NUDGE, is_file_write,
-    is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
+    PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
+    PREMATURE_EXIT_NUDGE, REPEATED_READ_ESCALATION, REPEATED_READ_NUDGE, cycle_loop_hint,
+    is_file_write, is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint,
+    visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{
-    is_mutating_call, is_period2_cycle, key_is_mutating, loop_call_key_tagged,
+    cycle_period, is_mutating_call, key_is_file_edit, key_is_mutating, loop_call_key_tagged,
 };
 use crate::cli::commands::agent::spiral;
 use crate::cli::commands::agent::validation;
@@ -662,6 +663,15 @@ pub async fn run(
     // loops); a fresh eval breaks it before the heavier nudge/compact/debugger
     // ladder even runs. Reset once consumed.
     let mut force_cold_prefill_next_round = false;
+    // Window-detector fires this turn whose key was a FILE EDIT. The first
+    // one gets the cold eval above; if a byte-identical edit/revert STILL
+    // recurs after that, the cold eval has been tried and failed, and the
+    // next fire escalates to a forced compaction (the read-loop ladder's
+    // proven breaker). Devstral `docker_20260823_114957`: the window
+    // detector fired 16× on one edit↔revert↔plan(check) rut and cold-evaled
+    // every time; a temp-0.2 model reproduces the same call straight
+    // through a cold prefix.
+    let mut cold_prefill_edit_fires: u32 = 0;
     let mut nudged_no_plan = false;
     // Consecutive reactive-compaction retries (context exhaustion signaled
     // by the server — see compressor::force_compress). Reset whenever a
@@ -1217,7 +1227,9 @@ pub async fn run(
         // maybe_compress so refresh_current_state still lands on the tail.
         if force_compact_next_round {
             force_compact_next_round = false;
-            tui::print_status("Read loop persisted — forcing context compaction.");
+            tui::print_status(
+                "Loop persisted past the nudge/cold eval — forcing context compaction.",
+            );
             context::compressor::force_compress(
                 &mut messages,
                 &config,
@@ -2001,20 +2013,37 @@ pub async fn run(
             {
                 force_cold_prefill_next_round = true;
                 recent_call_keys.clear();
+                // Escalate on a RECURRING file edit: the first fire's cold
+                // eval didn't break it, so break the cache-hot prefix for
+                // real. Reads/checks/tests keep the cheap cold eval only —
+                // repeating those between different edits is normal.
+                let escalate = key_is_file_edit(&call_key) && {
+                    cold_prefill_edit_fires += 1;
+                    cold_prefill_edit_fires >= 2
+                };
+                if escalate {
+                    force_compact_next_round = true;
+                    cold_prefill_edit_fires = 0;
+                }
                 tui::print_status(&format!(
-                    "[loop] '{args_summary}' recurred {COLD_PREFILL_FREQ}x in the window — forcing a cold prompt eval next round"
+                    "[loop] '{args_summary}' recurred {COLD_PREFILL_FREQ}x in the window — {}",
+                    if escalate {
+                        "a cold prompt eval already failed to break it, forcing context compaction next round"
+                    } else {
+                        "forcing a cold prompt eval next round"
+                    }
                 ));
             }
-            let period2 = is_period2_cycle(&recent_call_keys);
-            if same_call_streak >= 3 || period2 {
-                // Period-2-only detection (not also a plain streak). Captured
+            let cycle = cycle_period(&recent_call_keys);
+            if same_call_streak >= 3 || cycle.is_some() {
+                // Cycle-only detection (not also a plain streak). Captured
                 // before any state resets below so messaging stays accurate.
-                let p2_only = period2 && same_call_streak < 3;
-                // A period-2 cycle is harmful if EITHER member mutates (the
-                // classic case is edit↔revert — both mutate; edit↔read still
-                // re-applies the same broken edit).
-                let mutating = if p2_only {
-                    let tail = &recent_call_keys[recent_call_keys.len().saturating_sub(2)..];
+                let cycle_only = cycle.filter(|_| same_call_streak < 3);
+                // A cycle is harmful if ANY member mutates (the classic case
+                // is edit↔revert — both mutate; edit↔read still re-applies
+                // the same broken edit).
+                let mutating = if let Some(period) = cycle_only {
+                    let tail = &recent_call_keys[recent_call_keys.len().saturating_sub(period)..];
                     tail.iter().any(|k| key_is_mutating(k))
                 } else {
                     is_mutating_call(&tc.function.name, &args)
@@ -2093,12 +2122,12 @@ pub async fn run(
                     continue;
                 }
 
-                let hint = if p2_only {
-                    PERIOD2_LOOP_HINT
+                let hint = if let Some(period) = cycle_only {
+                    cycle_loop_hint(period)
                 } else {
-                    loop_detected_hint(config.tools.edit_mode)
+                    loop_detected_hint(config.tools.edit_mode).to_string()
                 };
-                let result_msg = Message::tool_result(&tc.id, hint);
+                let result_msg = Message::tool_result(&tc.id, &hint);
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
 
@@ -2115,10 +2144,12 @@ pub async fn run(
                         "Loop detected: {}({}) {} — surfacing a hint, giving the model one more round",
                         tc.function.name,
                         args_summary,
-                        if p2_only {
-                            "alternating with the same partner call (period-2 cycle)"
+                        if let Some(period) = cycle_only {
+                            format!(
+                                "cycling through the same {period} calls (period-{period} cycle)"
+                            )
                         } else {
-                            "repeated 3 times"
+                            "repeated 3 times".to_string()
                         }
                     ));
                     break;

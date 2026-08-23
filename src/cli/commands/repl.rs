@@ -18,12 +18,13 @@ use tokio::sync::mpsc;
 use crate::cli::commands::agent::debugger;
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
-    PERIOD2_LOOP_HINT, PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
-    PREMATURE_EXIT_NUDGE, REPEATED_READ_ESCALATION, REPEATED_READ_NUDGE, is_file_write,
-    is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
+    PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
+    PREMATURE_EXIT_NUDGE, REPEATED_READ_ESCALATION, REPEATED_READ_NUDGE, cycle_loop_hint,
+    is_file_write, is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint,
+    visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{
-    is_mutating_call, is_period2_cycle, key_is_mutating, loop_call_key,
+    cycle_period, is_mutating_call, key_is_mutating, loop_call_key,
 };
 use crate::cli::commands::agent::permissions::permission_action;
 use crate::cli::commands::agent::spiral;
@@ -1815,13 +1816,13 @@ async fn run_agent_loop(
             if recent_call_keys.len() > 12 {
                 recent_call_keys.remove(0);
             }
-            let period2 = is_period2_cycle(&recent_call_keys);
-            if same_call_streak >= 3 || period2 {
-                // Period-2-only detection (not also a plain streak).
-                let p2_only = period2 && same_call_streak < 3;
-                // A period-2 cycle is harmful if EITHER member mutates.
-                let mutating = if p2_only {
-                    let tail = &recent_call_keys[recent_call_keys.len().saturating_sub(2)..];
+            let cycle = cycle_period(&recent_call_keys);
+            if same_call_streak >= 3 || cycle.is_some() {
+                // Cycle-only detection (not also a plain streak).
+                let cycle_only = cycle.filter(|_| same_call_streak < 3);
+                // A cycle is harmful if ANY member mutates.
+                let mutating = if let Some(period) = cycle_only {
+                    let tail = &recent_call_keys[recent_call_keys.len().saturating_sub(period)..];
                     tail.iter().any(|k| key_is_mutating(k))
                 } else {
                     is_mutating_call(&tc.function.name, &args)
@@ -1864,12 +1865,12 @@ async fn run_agent_loop(
                     continue;
                 }
 
-                let hint = if p2_only {
-                    PERIOD2_LOOP_HINT
+                let hint = if let Some(period) = cycle_only {
+                    cycle_loop_hint(period)
                 } else {
-                    loop_detected_hint(config.tools.edit_mode)
+                    loop_detected_hint(config.tools.edit_mode).to_string()
                 };
-                let result_msg = Message::tool_result(&tc.id, hint);
+                let result_msg = Message::tool_result(&tc.id, &hint);
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
 
@@ -1885,10 +1886,10 @@ async fn run_agent_loop(
                             "  ⚠ Loop detected: {}({}) {} — surfacing a hint, giving the model one more round",
                             tc.function.name,
                             args_summary,
-                            if p2_only {
-                                "alternating with the same partner call (period-2 cycle)"
+                            if let Some(period) = cycle_only {
+                                format!("cycling through the same {period} calls (period-{period} cycle)")
                             } else {
-                                "repeated 3 times"
+                                "repeated 3 times".to_string()
                             }
                         ),
                         LineStyle::Status,

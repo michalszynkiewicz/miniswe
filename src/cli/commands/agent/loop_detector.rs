@@ -27,29 +27,64 @@ pub fn loop_call_key_tagged(
     key
 }
 
-/// Repetitions of an alternating A/B pair that constitute a period-2 loop —
-/// the detection window is `2 * PERIOD2_REPS` calls (A,B,A,B,A,B).
-pub const PERIOD2_REPS: usize = 3;
+/// Repetitions of a cycle that constitute a loop — the detection window
+/// for a period-`p` cycle is `p * CYCLE_REPS` calls (A,B,A,B,A,B for p=2).
+pub const CYCLE_REPS: usize = 3;
+/// Kept for callers/tests that speak of the period-2 case specifically.
+pub const PERIOD2_REPS: usize = CYCLE_REPS;
+
+/// Longest cycle the detector looks for. The call-key window in the agent
+/// loop holds 12 keys, which fits `CYCLE_REPS` repetitions of a period-4
+/// cycle exactly; anything longer needs a wider window, not a bigger
+/// constant here.
+pub const MAX_CYCLE_PERIOD: usize = 4;
+
+/// Detect a short cycle at the END of the call-key history: the last
+/// `p * CYCLE_REPS` keys repeat a pattern of length `p` for some
+/// `2 <= p <= MAX_CYCLE_PERIOD`. Returns the SHORTEST such `p`, so a
+/// period-2 alternation is never reported as period-4 and a plain streak
+/// (period 1 — the consecutive detector owns that) is never reported at all.
+///
+/// The consecutive-identical detector is structurally blind to every one of
+/// these shapes — any change of call resets its streak to 1. Observed
+/// killing real bench runs:
+/// - period 2: a byte-identical `replace_range` that breaks the AST,
+///   followed by `revert` to the same rev, re-issued 130+ times until the
+///   wall-clock died (observation-masking arm, 2026-07-03 matrix);
+/// - period 3: the same edit → `revert` → `plan(check)` ("already checked")
+///   → the same edit, 20× over 36 minutes with the model narrating "let me
+///   take a completely different approach" every time (Devstral Small 2,
+///   `docker_20260823_114957`). The window detector saw it 16× but its
+///   only action was a cold prompt eval, which a temp-0.2 model reproduces
+///   straight through.
+pub fn cycle_period(history: &[String]) -> Option<usize> {
+    for period in 2..=MAX_CYCLE_PERIOD {
+        let need = period * CYCLE_REPS;
+        if history.len() < need {
+            return None; // longer periods need even more history
+        }
+        let tail = &history[history.len() - need..];
+        let pattern = &tail[..period];
+        // A pattern that is itself periodic (a,a / a,b,a,b) would have been
+        // caught at the shorter period already (or is a period-1 streak).
+        if pattern.iter().all(|k| k == &pattern[0]) {
+            continue;
+        }
+        if tail
+            .iter()
+            .enumerate()
+            .all(|(i, k)| k == &pattern[i % period])
+        {
+            return Some(period);
+        }
+    }
+    None
+}
 
 /// Detect a period-2 cycle at the END of the call-key history: the last
 /// `2 * PERIOD2_REPS` keys alternate A,B,A,B,A,B with A != B.
-///
-/// The consecutive-identical detector is structurally blind to this shape —
-/// an alternating pair resets its streak to 1 every round. Observed killing
-/// real bench runs: a byte-identical `replace_range` that breaks the AST,
-/// followed by `revert` to the same rev, re-issued 130+ times until the
-/// wall-clock died (observation-masking arm, 2026-07-03 matrix).
 pub fn is_period2_cycle(history: &[String]) -> bool {
-    let need = 2 * PERIOD2_REPS;
-    if history.len() < need {
-        return false;
-    }
-    let tail = &history[history.len() - need..];
-    let (a, b) = (&tail[0], &tail[1]);
-    if a == b {
-        return false; // period-1 streak — the consecutive detector owns that
-    }
-    tail.iter().step_by(2).all(|k| k == a) && tail.iter().skip(1).step_by(2).all(|k| k == b)
+    cycle_period(history) == Some(2)
 }
 
 /// Whether a stored call key (from `loop_call_key`) refers to a mutating
@@ -60,6 +95,28 @@ pub fn key_is_mutating(key: &str) -> bool {
     let (name, json) = key.split_once(':').unwrap_or((key, "{}"));
     let args: serde_json::Value = serde_json::from_str(json).unwrap_or(serde_json::json!({}));
     is_mutating_call(name, &args)
+}
+
+/// Whether a stored call key is a FILE EDIT (or a revert of one): the calls
+/// whose byte-identical recurrence is never legitimate. Repeating the same
+/// read, `cargo test` or `plan(check)` between different edits is a normal
+/// rhythm; re-issuing the exact same `replace_range`/`revert`/`refactor`
+/// four times in a dozen calls is a rut, whatever sits in between.
+pub fn key_is_file_edit(key: &str) -> bool {
+    let name = key.split_once(':').map(|(n, _)| n).unwrap_or(key);
+    matches!(
+        name,
+        "replace_range"
+            | "insert_at"
+            | "revert"
+            | "edit_file"
+            | "write_file"
+            | "delete_file"
+            | "refactor"
+            | "add_function_param"
+            | "drop_function_param"
+            | "rename_symbol"
+    )
 }
 
 /// True if the tool call mutates state (file contents, revision table,
@@ -269,6 +326,56 @@ mod tests {
     fn period2_rejects_broken_alternation() {
         let h = keys(&["a", "b", "a", "b", "b", "a"]);
         assert!(!is_period2_cycle(&h));
+        assert_eq!(cycle_period(&h), None);
+    }
+
+    #[test]
+    fn period3_cycle_detected_after_three_repetitions() {
+        // The Devstral r3 shape: edit → revert → plan(check) → edit …
+        let h = keys(&["e", "r", "p", "e", "r", "p", "e", "r", "p"]);
+        assert_eq!(cycle_period(&h), Some(3));
+        assert!(!is_period2_cycle(&h));
+        // Two repetitions are not enough — the third edit is what proves
+        // the "different approach" narration wrong.
+        let h = keys(&["e", "r", "p", "e", "r", "p"]);
+        assert_eq!(cycle_period(&h), None);
+    }
+
+    #[test]
+    fn period3_detected_at_tail_of_longer_history() {
+        let h = keys(&["x", "y", "e", "r", "p", "e", "r", "p", "e", "r", "p"]);
+        assert_eq!(cycle_period(&h), Some(3));
+    }
+
+    #[test]
+    fn period4_cycle_needs_twelve_keys_and_is_detected() {
+        let h = keys(&["a", "b", "c", "d", "a", "b", "c", "d", "a", "b", "c"]);
+        assert_eq!(cycle_period(&h), None);
+        let h = keys(&["a", "b", "c", "d", "a", "b", "c", "d", "a", "b", "c", "d"]);
+        assert_eq!(cycle_period(&h), Some(4));
+    }
+
+    #[test]
+    fn cycle_period_reports_the_shortest_period() {
+        // a,b ×6 is period 2, not period 4 — even though it also matches
+        // the period-4 pattern a,b,a,b.
+        let h = keys(&["a", "b", "a", "b", "a", "b", "a", "b", "a", "b", "a", "b"]);
+        assert_eq!(cycle_period(&h), Some(2));
+        // a,a,b ×3: period 3 (a,a,b is not itself periodic).
+        let h = keys(&["a", "a", "b", "a", "a", "b", "a", "a", "b"]);
+        assert_eq!(cycle_period(&h), Some(3));
+    }
+
+    #[test]
+    fn cycle_period_ignores_plain_streaks() {
+        let h = keys(&["a"; 12]);
+        assert_eq!(cycle_period(&h), None);
+    }
+
+    #[test]
+    fn cycle_period_rejects_a_cycle_that_broke_at_the_end() {
+        let h = keys(&["e", "r", "p", "e", "r", "p", "e", "r", "x"]);
+        assert_eq!(cycle_period(&h), None);
     }
 
     #[test]
@@ -294,6 +401,35 @@ mod tests {
             loop_call_key_tagged("write_file", &args, None),
             loop_call_key("write_file", &args)
         );
+    }
+
+    #[test]
+    fn key_is_file_edit_covers_edit_family_only() {
+        assert!(key_is_file_edit(&loop_call_key(
+            "replace_range",
+            &json!({"path": "x.rs", "start": 1, "end": 2, "content": "y"})
+        )));
+        assert!(key_is_file_edit(&loop_call_key(
+            "revert",
+            &json!({"path": "x.rs", "rev": 0})
+        )));
+        assert!(key_is_file_edit(&loop_call_key(
+            "refactor",
+            &json!({"action": "add_param", "position": "fn f("})
+        )));
+        assert!(!key_is_file_edit(&loop_call_key(
+            "file",
+            &json!({"action": "shell", "command": "cargo test"})
+        )));
+        assert!(!key_is_file_edit(&loop_call_key(
+            "plan",
+            &json!({"action": "check"})
+        )));
+        assert!(!key_is_file_edit(&loop_call_key_tagged(
+            "file",
+            &json!({"action": "read", "path": "x.rs"}),
+            Some("step")
+        )));
     }
 
     #[test]
