@@ -195,22 +195,27 @@ diagnostic_timeout_ms = 2000
 web_tools = $(_dis web_tools)
 plan = $(_dis plan)
 scratchpad = $(_dis scratchpad)
-# EXPERIMENTAL A/B knob. Default false = pure fast-mode (baseline). Launch with
-# AUTO_REVERT=true ./scripts/run-benchmark-docker.sh ... to force-revert the
-# brace-cascade loop (3+ consecutive broken-AST edits → revert to last clean rev).
-auto_revert_ast_cascade = ${AUTO_REVERT:-false}
-# EXPERIMENTAL A/B knob (GitHub #40). Default false. Launch with
-# REACTIVE_DEBUGGER=true ./scripts/run-benchmark-docker.sh ... to spin up a
-# fresh-context debugger sub-agent after the done-gate blocks twice in a turn.
-reactive_debugger = ${REACTIVE_DEBUGGER:-false}
+# The three flags below default to the CODE defaults (src/config/mod.rs) so a
+# plain run benches what users get. Until 2026-08-23 they defaulted to the
+# June A/B-experiment values (false/false/true), which silently confounded
+# every 08-20..23 run: with the debugger off gemma went 6,5,6 @ 1090/3403/677s
+# vs 6,6,6 @ 550/279/1411s with the code defaults. Override for A/B runs, e.g.
+# REACTIVE_DEBUGGER=false ./scripts/run-benchmark-docker.sh ...
+#
+# Force-revert the brace-cascade loop (3+ consecutive broken-AST edits → revert
+# to the last clean rev).
+auto_revert_ast_cascade = ${AUTO_REVERT:-true}
+# GitHub #40: fresh-context debugger sub-agent (+ judge REWIND) after the
+# done-gate blocks twice in a turn. This is the flag that carries the
+# first-attempt rate.
+reactive_debugger = ${REACTIVE_DEBUGGER:-true}
 # EXPERIMENTAL A/B knob. Default false. Launch with SPIRAL_RESET=true to detect a
 # revert-loop (same file reverted 3+×/turn) and inject a reset + forced replan.
 spiral_reset = ${SPIRAL_RESET:-false}
-# EXPERIMENTAL. Default TRUE for this experiment: after the done-gate blocks twice
-# in a turn, drop the polluted history + re-assemble a clean context (fresh-attempt
-# in-session) instead of grinding. Override with GATE_CONTEXT_RESET=false for the
-# A/B baseline.
-gate_context_reset = ${GATE_CONTEXT_RESET:-true}
+# EXPERIMENTAL, opt-in (code default false): after the done-gate blocks twice in
+# a turn, drop the polluted history + re-assemble a clean context instead of
+# grinding. Benched 06-19 with no clean win; GATE_CONTEXT_RESET=true to try it.
+gate_context_reset = ${GATE_CONTEXT_RESET:-false}
 
 [logging]
 level = "trace"
