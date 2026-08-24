@@ -216,6 +216,12 @@ spiral_reset = ${SPIRAL_RESET:-false}
 # a turn, drop the polluted history + re-assemble a clean context instead of
 # grinding. Benched 06-19 with no clean win; GATE_CONTEXT_RESET=true to try it.
 gate_context_reset = ${GATE_CONTEXT_RESET:-false}
+# T2c frozen-signature stuck check (default ON since 2026-08-24 after the live
+# A/B win — glimmer {6/6 @ 751s, 6/6 @ 800s} vs baseline {5/6 @ 3406s, 6/6 @
+# 2735s}; gemma + devstral no-regression): compiler/test signal unchanged 15
+# rounds AND 4+ min → append a stuck-note (red) or done-note (green + plan all
+# checked) to the round's last tool result. STUCK_CHECK=false to disable.
+stuck_check = ${STUCK_CHECK:-true}
 
 [logging]
 level = "trace"

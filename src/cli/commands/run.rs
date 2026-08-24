@@ -29,6 +29,7 @@ use crate::cli::commands::agent::loop_detector::{
     cycle_period, is_mutating_call, key_is_file_edit, key_is_mutating, loop_call_key_tagged,
 };
 use crate::cli::commands::agent::spiral;
+use crate::cli::commands::agent::stuck_check;
 use crate::cli::commands::agent::validation;
 use crate::config::{Config, EditMode, ModelRole};
 use crate::context;
@@ -675,6 +676,11 @@ pub async fn run(
     // through a cold prefix.
     let mut cold_prefill_edit_fires: u32 = 0;
     let mut nudged_no_plan = false;
+    // `tools.stuck_check`: T2c frozen-signature detector (see the module doc
+    // in agent/stuck_check.rs and the config field doc). Fed unconditionally
+    // (cheap string scans); fires only when the flag is on.
+    let session_start = std::time::Instant::now();
+    let mut stuck_tracker = stuck_check::StuckTracker::new();
     // Consecutive reactive-compaction retries (context exhaustion signaled
     // by the server — see compressor::force_compress). Reset whenever a
     // response is successfully consumed, so this bounds futile retries of
@@ -932,6 +938,7 @@ pub async fn run(
         }
         round += 1;
         log.round_start(round);
+        stuck_tracker.on_round(round, session_start.elapsed().as_secs_f64());
 
         // Skill step-cursor maintenance (harness-owned; runs before the LLM
         // call so the [SKILL STEP] re-injection is current):
@@ -2963,6 +2970,8 @@ pub async fn run(
                 prunable_errors.push(result.content.clone());
             }
 
+            stuck_tracker.on_tool(&tc.function.name, &args, result.success, &result.content);
+
             let result_msg = Message::tool_result(&tc.id, &result.content);
             messages.push(result_msg.clone());
             conversation_history.push(result_msg);
@@ -3146,6 +3155,67 @@ pub async fn run(
                 &format!(
                     "history pruned: dropped {} tool_result(s) after refactor validator failure",
                     prunable_errors.len()
+                ),
+            );
+        }
+
+        // `tools.stuck_check`: T2c frozen-signature fire → append the stuck/
+        // done note to the round's last tool result (the placement the
+        // warm-replay probes validated; a trailing user message was not what
+        // was tested). Runs AFTER history pruning so the note can't land on
+        // a tool result that was just truncated away.
+        if config.tools.stuck_check
+            && let Some(kind) =
+                stuck_tracker.check_fire(round, session_start.elapsed().as_secs_f64())
+        {
+            let plan_done =
+                tools::plan::plan_exists(&config) && !tools::plan::has_unchecked_steps(&config);
+            let note = if kind == stuck_check::StuckKind::Green && plan_done {
+                stuck_check::done_note()
+            } else {
+                let first_unchecked = tools::plan::parsed_steps(&config)
+                    .iter()
+                    .find(|(checked, _, _)| !checked)
+                    .and_then(|(_, n, _)| *n);
+                stuck_check::stuck_note(
+                    stuck_tracker.frozen_rounds(),
+                    stuck_tracker.frozen_minutes(),
+                    stuck_tracker.looping_read_path(),
+                    first_unchecked,
+                )
+            };
+            let mut appended = false;
+            for msgs in [&mut messages, &mut conversation_history] {
+                if let Some(m) = msgs.iter_mut().rev().find(|m| m.role == "tool")
+                    && let Some(c) = m.content.as_mut()
+                {
+                    c.push('\n');
+                    c.push_str(&note);
+                    appended = true;
+                }
+            }
+            if !appended {
+                // No tool result this round (pruned, or a pure-text reply
+                // survived the gates) — fall back to a user message.
+                let msg = Message::user(&note);
+                messages.push(msg.clone());
+                conversation_history.push(msg);
+            }
+            tui::print_status(&format!(
+                "[stuck-check] fired ({}) after {} frozen rounds",
+                if kind == stuck_check::StuckKind::Green {
+                    "green"
+                } else {
+                    "red"
+                },
+                stuck_tracker.frozen_rounds(),
+            ));
+            log.tool_debug(
+                "agent",
+                &format!(
+                    "stuck-check fired: kind={kind:?} plan_done={plan_done} frozen_rounds={} note={}",
+                    stuck_tracker.frozen_rounds(),
+                    crate::truncate_chars(&note, 120),
                 ),
             );
         }

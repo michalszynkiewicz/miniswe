@@ -605,6 +605,19 @@ pub struct ToolsConfig {
     /// runs, so the coupled config never actually tested this trigger cleanly)
     /// so it can be A/B'd in isolation. `true` since 2026-07-15 (bench-unconditional).
     pub plan_gate_debugger: bool,
+    /// EXPERIMENTAL. T2c frozen-signature stuck detection (gaps 9/10): when
+    /// the compiler/test signal (AST state, LSP project errors, failures,
+    /// check/gate/shell states) is unchanged for 15 rounds AND 4+ minutes,
+    /// append a note to the round's last tool result. Red signal → stuck-note
+    /// (broke glimmer's 110-round read loop 8/10 vs control 2/10); green +
+    /// every plan step checked → done-note teaching that a reply with no tool
+    /// call ends the task (finished the can't-stop dither 10/10 vs 1/10).
+    /// Offline trigger eval: 6/6 labeled stuck segments, 0 fires on all three
+    /// healthy Laguna runs (scripts/moments/trigger-eval.py, 2026-08-24).
+    /// `true` since 2026-08-24: live A/B win on glimmer ({6/6 @ 751s, 6/6 @
+    /// 800s} vs baseline {5/6 @ 3406s, 6/6 @ 2735s}), no regression on gemma
+    /// (6/6 @ 1000s, 0 fires) or devstral (6/6 @ 2463s, 1 correct Red fire).
+    pub stuck_check: bool,
 }
 
 /// Agent ceremony level — see `ToolsConfig::ceremony`.
@@ -668,6 +681,7 @@ impl Default for ToolsConfig {
             debugger_judge: true,
             debugger_judge_rewind: true,
             plan_gate_debugger: true,
+            stuck_check: true,
         }
     }
 }
