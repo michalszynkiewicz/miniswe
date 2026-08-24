@@ -1299,12 +1299,21 @@ pub async fn run(
         // during the planning phase (decomposing the task — exactly where
         // it goes wrong, picking the wrong file family) and fast execution
         // once a plan is set. Per-model gating keeps the cost localized.
-        let chat_template_kwargs = if config.model.is_mistral_small_4_family() {
-            let effort = if plan_set { "none" } else { "high" };
-            serde_json::json!({"reasoning_effort": effort})
-        } else {
-            serde_json::json!({"enable_thinking": false})
-        };
+        // `model.thinking` opts the main loop into thinking-mode reasoning at
+        // `thinking_temperature` (reasoning degenerates at code-task temps —
+        // see ModelConfig::thinking_temperature).
+        let (chat_template_kwargs, temperature_override) =
+            if config.model.is_mistral_small_4_family() {
+                let effort = if plan_set { "none" } else { "high" };
+                (serde_json::json!({"reasoning_effort": effort}), None)
+            } else if config.model.thinking {
+                (
+                    serde_json::json!({"enable_thinking": true}),
+                    Some(config.model.thinking_temperature),
+                )
+            } else {
+                (serde_json::json!({"enable_thinking": false}), None)
+            };
         // Mistral Small 4 with reasoning_effort=high needs significant
         // output budget. Probe data: at 8192 max_tokens the model hits
         // finish_reason=length after ~32K chars of reasoning_content with
@@ -1333,6 +1342,7 @@ pub async fn run(
             tool_choice: None,
             max_tokens_override,
             chat_template_kwargs: Some(chat_template_kwargs),
+            temperature_override,
             cache_prompt,
         };
         log.llm_request(&request);

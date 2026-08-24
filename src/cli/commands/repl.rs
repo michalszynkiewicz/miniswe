@@ -85,6 +85,7 @@ async fn classify_is_explore(
         tool_choice: None,
         max_tokens_override: Some(8),
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+        temperature_override: None,
         cache_prompt: None,
     };
     let mut events = llm_worker.submit(ModelRole::Default, request, cancelled.clone());
@@ -1231,13 +1232,20 @@ async fn run_agent_loop(
         // Off: never hide edit tools (pass plan_exists=true). Strict: legacy
         // hide-until-plan behavior.
         let visible = visible_tool_defs(tool_defs, plan_set || !strict);
-        // Build request. See run.rs for the per-model reasoning_effort logic.
-        let chat_template_kwargs = if config.model.is_mistral_small_4_family() {
-            let effort = if plan_set { "none" } else { "high" };
-            serde_json::json!({"reasoning_effort": effort})
-        } else {
-            serde_json::json!({"enable_thinking": false})
-        };
+        // Build request. See run.rs for the per-model reasoning_effort and
+        // thinking-mode logic.
+        let (chat_template_kwargs, temperature_override) =
+            if config.model.is_mistral_small_4_family() {
+                let effort = if plan_set { "none" } else { "high" };
+                (serde_json::json!({"reasoning_effort": effort}), None)
+            } else if config.model.thinking {
+                (
+                    serde_json::json!({"enable_thinking": true}),
+                    Some(config.model.thinking_temperature),
+                )
+            } else {
+                (serde_json::json!({"enable_thinking": false}), None)
+            };
         // Bump output budget for Mistral 4 — see run.rs for rationale
         // (probe data: 8K truncates with empty content, 16K emits clean
         // correct output at ~6K tokens used).
@@ -1252,6 +1260,7 @@ async fn run_agent_loop(
             tool_choice: None,
             max_tokens_override,
             chat_template_kwargs: Some(chat_template_kwargs),
+            temperature_override,
             cache_prompt: None,
         };
         log.llm_request(&request);

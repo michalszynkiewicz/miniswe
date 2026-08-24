@@ -106,6 +106,16 @@ pub struct ModelConfig {
     pub context_window: usize,
     /// Sampling temperature (low for code tasks)
     pub temperature: f64,
+    /// Enable thinking-mode reasoning (`enable_thinking: true`) on the main
+    /// agent loop and the debugger. Mechanical sub-roles (edit apply,
+    /// summarizer, routers) always run without thinking — they don't benefit
+    /// and reasoning tokens would slow their tight loops.
+    pub thinking: bool,
+    /// Sampling temperature for thinking-mode requests. Reasoning traces
+    /// degenerate at code-task temperatures (Nemotron 3.5 whitespace-flood
+    /// probes; Unsloth recommends 0.6 for Nemotron thinking vs 0.2 instruct),
+    /// so thinking requests override `temperature` with this value.
+    pub thinking_temperature: f64,
     /// Maximum output tokens per response
     pub max_output_tokens: usize,
     /// Ceiling on the connect phase of an LLM request — from send to
@@ -735,6 +745,8 @@ impl Default for ModelConfig {
             model: "devstral-small-2".into(),
             context_window: 50000,
             temperature: 0.15,
+            thinking: false,
+            thinking_temperature: 0.6,
             max_output_tokens: 16384,
             request_timeout_secs: 30,
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),

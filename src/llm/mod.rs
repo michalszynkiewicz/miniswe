@@ -188,7 +188,11 @@ impl LlmClient {
         // idle connections, even though the public API returns a single
         // ChatResponse to the caller.
         body["model"] = Value::String(self.config.model.clone());
-        body["temperature"] = Value::from(self.config.temperature);
+        body["temperature"] = Value::from(
+            request
+                .temperature_override
+                .unwrap_or(self.config.temperature),
+        );
         // Per-request override wins, otherwise the model's configured
         // default. Some callers (e.g. refactor's ask_rewrite) need more
         // budget for thinking-mode models that emit reasoning tokens
@@ -629,7 +633,11 @@ impl LlmClient {
 
         let mut body = serde_json::to_value(request)?;
         body["model"] = Value::String(self.config.model.clone());
-        body["temperature"] = Value::from(self.config.temperature);
+        body["temperature"] = Value::from(
+            request
+                .temperature_override
+                .unwrap_or(self.config.temperature),
+        );
         let max_tokens = request
             .max_tokens_override
             .unwrap_or(self.config.max_output_tokens as u64);

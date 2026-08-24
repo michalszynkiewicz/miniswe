@@ -1152,6 +1152,7 @@ async fn llm_summarize_timeline(
         // agent-level output budget otherwise.
         max_tokens_override: Some(SUMMARY_MAX_TOKENS),
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+        temperature_override: None,
         cache_prompt: None,
     };
 

@@ -120,6 +120,7 @@ async fn ask_with_budget(
         tool_choice: None,
         max_tokens_override: Some(max_tokens),
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+        temperature_override: None,
         cache_prompt: None,
     };
     let mut events = llm_worker.submit(ModelRole::Default, request, cancelled.clone());

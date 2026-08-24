@@ -24,6 +24,13 @@ pub struct ChatRequest {
     /// into the body under the well-known `chat_template_kwargs` key.
     #[serde(skip)]
     pub chat_template_kwargs: Option<Value>,
+    /// Per-request override for `temperature`, used by thinking-mode
+    /// requests: reasoning traces need a higher temperature than code-task
+    /// sampling (see `ModelConfig::thinking_temperature`). `None` = the
+    /// model config's `temperature`. Merged into the body by the client,
+    /// like `max_tokens_override`.
+    #[serde(skip)]
+    pub temperature_override: Option<f64>,
     /// Per-request `cache_prompt` override for llama.cpp. `Some(false)` forces
     /// a fresh (cold) prompt eval instead of reusing the slot's KV cache. Used
     /// to break a q4-KV-cache-induced loop: reading the lossy 4-bit cache back

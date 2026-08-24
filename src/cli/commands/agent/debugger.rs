@@ -236,12 +236,20 @@ pub async fn run_debugger(
             break;
         }
         context::sanitize_messages(&mut messages);
+        // Diagnosis benefits from reasoning: follow the main loop's
+        // `model.thinking` opt-in (mechanical sub-roles stay non-thinking).
         let request = ChatRequest {
             messages: messages.clone(),
             tools: Some(tool_defs.clone()),
             tool_choice: None,
             max_tokens_override: None,
-            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+            chat_template_kwargs: Some(
+                serde_json::json!({"enable_thinking": config.model.thinking}),
+            ),
+            temperature_override: config
+                .model
+                .thinking
+                .then_some(config.model.thinking_temperature),
             cache_prompt: None,
         };
         let Some(resp) = drain(llm_worker, request, cancelled).await else {
@@ -302,7 +310,13 @@ pub async fn run_debugger(
             tools: None,
             tool_choice: None,
             max_tokens_override: None,
-            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+            chat_template_kwargs: Some(
+                serde_json::json!({"enable_thinking": config.model.thinking}),
+            ),
+            temperature_override: config
+                .model
+                .thinking
+                .then_some(config.model.thinking_temperature),
             cache_prompt: None,
         };
         if let Some(resp) = drain(llm_worker, request, cancelled).await

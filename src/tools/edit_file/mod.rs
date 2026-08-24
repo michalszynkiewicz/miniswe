@@ -1632,6 +1632,7 @@ async fn request_patch(
             tool_choice: None,
             max_tokens_override: None,
             chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+            temperature_override: None,
             cache_prompt: None,
         };
 
@@ -1770,6 +1771,7 @@ async fn request_patch_for_region(
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+        temperature_override: None,
         cache_prompt: None,
     };
 
@@ -1938,6 +1940,7 @@ async fn request_preplan_steps(
             tool_choice: None,
             max_tokens_override: None,
             chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+            temperature_override: None,
             cache_prompt: None,
         };
 
@@ -2128,6 +2131,7 @@ async fn request_preplan_steps(
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+        temperature_override: None,
         cache_prompt: None,
     };
 
