@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use lsp_types::*;
 use serde_json::Value;
-use tokio::task::JoinHandle;
+use std::thread::JoinHandle;
 
 use crate::lsp::transport::LspTransport;
 
@@ -145,7 +145,15 @@ impl LspClient {
         let transport = Arc::new(LspTransport::new(stdin));
 
         let transport_clone = Arc::clone(&transport);
-        let reader_handle = tokio::task::spawn_blocking(move || {
+        // Plain OS thread, NOT tokio spawn_blocking: a wedged-server
+        // restart runs inside the per-tool-call current_thread runtime,
+        // and dropping such a runtime WAITS for its in-flight blocking
+        // tasks. A reader spawned there would pin the tool worker thread
+        // forever once the tool returned (the reader only exits when the
+        // server dies) — the silent half of the 08-22/08-24 harness
+        // hang. An OS thread outlives any runtime and exits on stdout
+        // EOF when the server is killed.
+        let reader_handle = std::thread::spawn(move || {
             LspTransport::reader_loop(transport_clone, stdout);
         });
 
@@ -274,8 +282,9 @@ impl LspClient {
         *self.transport.write() = transport;
         {
             let mut handle = self.reader_handle.lock();
-            let old = std::mem::replace(&mut *handle, reader_handle);
-            old.abort();
+            // The old reader thread exits on its own: killing the old
+            // child closed its stdout. Dropping the handle detaches it.
+            drop(std::mem::replace(&mut *handle, reader_handle));
         }
         self.ready.store(true, Ordering::Release);
         // Replay opened files so queries hit an indexed workspace again.
@@ -287,7 +296,18 @@ impl LspClient {
             if let Ok(parsed) = uri.parse::<lsp_types::Uri>()
                 && let Some(path) = uri_to_path(&parsed)
             {
-                let _ = self.notify_file_changed(&path);
+                // Files deleted since they were opened (bench reverts do
+                // this) simply drop out of the replay.
+                if !path.exists() {
+                    continue;
+                }
+                if self.notify_file_changed(&path).is_err() {
+                    // The NEW server is already refusing writes — each
+                    // further attempt costs up to the stdin-write
+                    // deadline, so don't grind through the rest of the
+                    // list. The retried request surfaces the failure.
+                    break;
+                }
             }
         }
         let _ = self.wait_for_idle(Duration::from_secs(60)).await;
@@ -625,6 +645,9 @@ impl LspClient {
     /// deadline elapsed, which a busy-but-healthy server can also cause.
     fn infra_class(e: &anyhow::Error) -> Option<InfraFailure> {
         let s = format!("{e:#}").to_lowercase();
+        // "failed to write" also catches the transport's stdin-write
+        // deadline ("failed to write to lsp stdin: ...") — a server that
+        // stops draining its pipe is wedged, not busy.
         if s.contains("channel closed")
             || s.contains("broken pipe")
             || s.contains("failed to write")

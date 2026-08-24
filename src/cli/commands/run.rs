@@ -2594,8 +2594,8 @@ pub async fn run(
                 let lsp = lsp_client.clone();
                 let cancelled = cancelled.clone();
                 let log = log.clone();
-                match tool_pool
-                    .submit(move || {
+                await_tool_job(
+                    tool_pool.submit(move || {
                         let runtime = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
@@ -2614,15 +2614,10 @@ pub async fn run(
                                 .await
                             })
                             .map_err(|e| format!("edit_file error: {e}"))
-                    })
-                    .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => crate::tools::ToolResult::err(e),
-                    Err(_) => {
-                        crate::tools::ToolResult::err("Tool worker dropped edit_file job".into())
-                    }
-                }
+                    }),
+                    "edit_file",
+                )
+                .await
             } else if tc.function.name == "refactor"
                 || matches!(
                     tc.function.name.as_str(),
@@ -2639,8 +2634,8 @@ pub async fn run(
                 let log_for_job = log.clone();
                 let revisions_for_job = fast_revisions.clone();
                 let cancelled = cancelled.clone();
-                match tool_pool
-                    .submit(move || {
+                await_tool_job(
+                    tool_pool.submit(move || {
                         let runtime = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
@@ -2659,15 +2654,10 @@ pub async fn run(
                                 .await
                             })
                             .map_err(|e| format!("refactor error: {e}"))
-                    })
-                    .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => crate::tools::ToolResult::err(e),
-                    Err(_) => {
-                        crate::tools::ToolResult::err("Tool worker dropped refactor job".into())
-                    }
-                }
+                    }),
+                    "refactor",
+                )
+                .await
             } else if (tc.function.name == "shell" && args["action"].as_str() == Some("run"))
                 || (tc.function.name == "file" && file_action == "shell")
             {
@@ -2705,8 +2695,8 @@ pub async fn run(
                 let lsp = lsp_client.clone();
                 let revisions = fast_revisions.clone();
                 let baseline = fast_baseline_errors;
-                match tool_pool
-                    .submit(move || {
+                await_tool_job(
+                    tool_pool.submit(move || {
                         let runtime = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
@@ -2730,15 +2720,10 @@ pub async fn run(
                                 .await
                             })
                             .map_err(|e| format!("fast tool error: {e}"))
-                    })
-                    .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => crate::tools::ToolResult::err(e),
-                    Err(_) => {
-                        crate::tools::ToolResult::err("Tool worker dropped fast tool job".into())
-                    }
-                }
+                    }),
+                    &tc.function.name,
+                )
+                .await
             } else if tc.function.name == "mcp_use" {
                 let server = args["server"].as_str().unwrap_or("").to_string();
                 let tool = args["tool"].as_str().unwrap_or("").to_string();
@@ -2878,8 +2863,8 @@ pub async fn run(
                 let config = config.clone();
                 let perms = perms.clone();
                 let lsp = lsp_client.clone();
-                match tool_pool
-                    .submit(move || {
+                await_tool_job(
+                    tool_pool.submit(move || {
                         let runtime = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
@@ -2896,13 +2881,10 @@ pub async fn run(
                                 .await
                             })
                             .map_err(|e| format!("Tool error: {e}"))
-                    })
-                    .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => crate::tools::ToolResult::err(e),
-                    Err(_) => crate::tools::ToolResult::err("Tool worker dropped job".into()),
-                }
+                    }),
+                    &tc.function.name,
+                )
+                .await
             };
 
             if !result.success
@@ -3284,6 +3266,42 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Hard ceiling on how long the agent loop waits for a worker-pool tool
+/// job. Every wait inside a tool is individually bounded (LLM calls 600s,
+/// LSP requests 10-30s, LSP stdin writes 5s), so a job that outlives this
+/// ceiling is stuck in something unpreemptable. Returning an error keeps
+/// the run alive — the alternative was the 08-22/08-24 harness hang,
+/// where one wedged refactor silently voided the rest of a bench run.
+/// Generous enough that a legitimate many-callsite refactor on a slow
+/// local model stays well under it.
+const TOOL_JOB_DEADLINE_SECS: u64 = 1200;
+
+/// Await a worker-pool tool job, bounded by [`TOOL_JOB_DEADLINE_SECS`].
+/// On expiry the job is abandoned: the worker thread finishes (or errors
+/// out of its own bounded waits) later, and its late result is discarded
+/// along with the dropped oneshot receiver.
+async fn await_tool_job(
+    rx: tokio::sync::oneshot::Receiver<Result<crate::tools::ToolResult, String>>,
+    tool_name: &str,
+) -> crate::tools::ToolResult {
+    match tokio::time::timeout(std::time::Duration::from_secs(TOOL_JOB_DEADLINE_SECS), rx).await {
+        Ok(Ok(Ok(r))) => r,
+        Ok(Ok(Err(e))) => crate::tools::ToolResult::err(e),
+        Ok(Err(_)) => crate::tools::ToolResult::err(format!("Tool worker dropped {tool_name} job")),
+        Err(_) => {
+            eprintln!(
+                "[tool] {tool_name} exceeded {TOOL_JOB_DEADLINE_SECS}s — abandoning the job \
+                 (worker presumed wedged)"
+            );
+            crate::tools::ToolResult::err(format!(
+                "✗ {tool_name} timed out after {TOOL_JOB_DEADLINE_SECS}s and was abandoned. Its \
+                 edits may or may not have landed — re-read the affected file(s) before editing \
+                 further, and do not repeat the same call."
+            ))
+        }
+    }
 }
 
 async fn await_shell_job_run(

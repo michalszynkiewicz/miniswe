@@ -4,6 +4,8 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::process::ChildStdin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use serde_json::Value;
@@ -18,27 +20,74 @@ pub(crate) enum ProgressKind {
     Report,
 }
 
+/// Max messages queued for the stdin writer thread before senders start
+/// waiting (and, after `write_timeout`, erroring out).
+const WRITE_QUEUE_CAP: usize = 64;
+
 /// JSON-RPC transport for LSP communication.
 pub struct LspTransport {
-    writer: parking_lot::Mutex<BufWriter<ChildStdin>>,
+    /// Queue feeding the dedicated stdin writer thread. Bounded: when the
+    /// server stops draining its stdin pipe (the 08-22/08-24 bench wedge),
+    /// the queue fills and `write_message` errors out after `write_timeout`
+    /// instead of blocking forever in a sync `write_all` that no tokio
+    /// timer can preempt.
+    write_tx: std_mpsc::SyncSender<Vec<u8>>,
+    /// How long `write_message` waits for queue space before declaring the
+    /// server wedged. 5s in production, short in tests.
+    write_timeout: Duration,
     pub(crate) pending: DashMap<i64, oneshot::Sender<Value>>,
     pub(crate) diagnostics: DashMap<String, Vec<lsp_types::Diagnostic>>,
     /// In-flight `$/progress` tokens. Inserted on `begin`, refreshed on
     /// `report`, removed on `end`. Emptiness == server is idle.
     pub(crate) progress: DashMap<String, ProgressKind>,
     next_id: AtomicI64,
-    pub(crate) crashed: AtomicBool,
+    /// Shared with the stdin writer thread (which sets it when the pipe
+    /// breaks), hence `Arc` rather than a bare field.
+    pub(crate) crashed: Arc<AtomicBool>,
 }
 
 impl LspTransport {
     pub fn new(stdin: ChildStdin) -> Self {
+        Self::with_write_timeout(stdin, Duration::from_secs(5))
+    }
+
+    /// Like [`Self::new`] but with an explicit stdin-write deadline —
+    /// tests use a short one so exercising the wedged-server path does
+    /// not cost 5 wall-clock seconds.
+    pub(crate) fn with_write_timeout(stdin: ChildStdin, write_timeout: Duration) -> Self {
+        // All stdin writes happen on this dedicated thread. A wedged
+        // server (alive but not reading its pipe) blocks the thread in
+        // `write_all` once the pipe buffer fills — but that only ever
+        // stalls this thread, never an agent thread: senders enqueue
+        // with a deadline and fail fast. Killing the server closes the
+        // pipe's read end, the blocked write returns EPIPE, and the
+        // thread exits.
+        let (write_tx, write_rx) = std_mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE_CAP);
+        let crashed = Arc::new(AtomicBool::new(false));
+        let crashed_writer = Arc::clone(&crashed);
+        std::thread::spawn(move || {
+            let mut writer = BufWriter::new(stdin);
+            while let Ok(buf) = write_rx.recv() {
+                if writer
+                    .write_all(&buf)
+                    .and_then(|()| writer.flush())
+                    .is_err()
+                {
+                    // Pipe broken — the server process is gone. Senders
+                    // see a disconnected queue from now on.
+                    crashed_writer.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        });
         Self {
-            writer: parking_lot::Mutex::new(BufWriter::new(stdin)),
+            write_tx,
+            write_timeout,
             pending: DashMap::new(),
             diagnostics: DashMap::new(),
             progress: DashMap::new(),
             next_id: AtomicI64::new(1),
-            crashed: AtomicBool::new(false),
+            crashed,
         }
     }
 
@@ -86,16 +135,46 @@ impl LspTransport {
         self.write_message(&msg)
     }
 
-    /// Write a Content-Length framed message to stdin.
+    /// Frame a message and enqueue it for the stdin writer thread.
+    ///
+    /// Never blocks indefinitely: if the queue stays full for
+    /// `write_timeout`, the server is not draining its pipe — a busy
+    /// rust-analyzer still reads stdin promptly, so that is wedge
+    /// evidence, not load. The error wording ("failed to write") is
+    /// deliberately what `LspClient::infra_class` classifies as a HARD
+    /// infra failure, routing callers into the restart path.
     fn write_message(&self, msg: &Value) -> anyhow::Result<()> {
         let body = serde_json::to_string(msg)?;
-        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+        let mut framed = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        framed.extend_from_slice(body.as_bytes());
 
-        let mut writer = self.writer.lock();
-        writer.write_all(header.as_bytes())?;
-        writer.write_all(body.as_bytes())?;
-        writer.flush()?;
-        Ok(())
+        let deadline = Instant::now() + self.write_timeout;
+        let mut msg_bytes = framed;
+        loop {
+            match self.write_tx.try_send(msg_bytes) {
+                Ok(()) => return Ok(()),
+                Err(std_mpsc::TrySendError::Full(again)) => {
+                    if Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "failed to write to lsp stdin: write queue not drained for {:?} \
+                             (server wedged — alive but not reading its pipe)",
+                            self.write_timeout
+                        );
+                    }
+                    msg_bytes = again;
+                    // Bounded busy-wait (<= write_timeout total). Callers
+                    // may sit on an async runtime, but a short bounded
+                    // sleep beats wiring async plumbing through every
+                    // notification site.
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                    anyhow::bail!(
+                        "failed to write to lsp stdin: writer thread exited (server process gone)"
+                    );
+                }
+            }
+        }
     }
 
     /// Run the reader loop on stdout. Call from a blocking thread.
@@ -414,5 +493,41 @@ mod tests {
             }),
         );
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn write_message_errors_instead_of_blocking_when_stdin_not_drained() {
+        // A process that never reads its stdin — stand-in for the wedged
+        // rust-analyzer that voided two bench runs (08-22, 08-24). With
+        // the old direct `write_all`, this test would hang forever once
+        // the pipe buffer filled; now the bounded queue must surface a
+        // HARD-classified error instead.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let stdin = child.stdin.take().expect("stdin");
+        let t = LspTransport::with_write_timeout(stdin, Duration::from_millis(200));
+
+        // Saturate pipe buffer (~64KB) + writer queue (WRITE_QUEUE_CAP
+        // slots): 200 x 32KB is far beyond both.
+        let blob = "x".repeat(32 * 1024);
+        let mut got_err = None;
+        for _ in 0..200 {
+            if let Err(e) = t.send_notification("test/blob", json!({ "data": &blob })) {
+                got_err = Some(format!("{e:#}"));
+                break;
+            }
+        }
+        let err = got_err.expect("writes kept succeeding against a non-draining pipe");
+        assert!(
+            err.contains("failed to write to lsp stdin"),
+            "error must carry the HARD infra-failure wording, got: {err}"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
