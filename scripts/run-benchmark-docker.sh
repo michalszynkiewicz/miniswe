@@ -21,6 +21,13 @@
 #                -m $HOME/models/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf \
 #                --port 8464 -c 60000
 #   # then: ./scripts/run-benchmark-docker.sh --model gemma-4-26B-A4B-it
+#
+# Env knobs (all optional, defaults = the historical bench config):
+#   THINKING=true            model.thinking arm (main loop + debugger think)
+#   CTX_WINDOW=100000        model.context_window (default 60000)
+#   MAX_OUTPUT_TOKENS=10000  model.max_output_tokens (default 8000)
+#   STREAM_IDLE_SECS=90      model.stream_idle_timeout_secs (default 30)
+#   COMPACTION=unified       context.compaction (default lazy)
 
 set -euo pipefail
 
@@ -145,7 +152,14 @@ generate_config() {
     # size, but data showed that starves the model on multi-file changes
     # (Devstral regressed from 6/6 to 0/6). The leak is rare and now
     # has a retry-on-leak path; budget starvation is the bigger problem.
-    local CTX_WINDOW=60000
+    # CTX_WINDOW env overrides the 60K default (2026-08-22, for long-context
+    # models like Muse Glimmer). Everything downstream scales by fraction of
+    # context_window (compaction trigger, per-tool-result masking cap =
+    # ctx/10 chars, literal-replace line cap), so no code change is needed —
+    # but those caps DO move with it, so a larger window is its own arm, not
+    # a free change. Past ~60K also consider STREAM_IDLE_SECS: a post-
+    # compaction cold prefill is silent until the first token.
+    local CTX_WINDOW="${CTX_WINDOW:-60000}"
     local REPO_MAP_BUDGET=5000
 
     cat <<TOML
@@ -155,16 +169,28 @@ endpoint = "http://localhost:8464"
 model = "${MODEL}"
 context_window = ${CTX_WINDOW}
 temperature = ${TEMPERATURE}
-max_output_tokens = 8000
+# EXPERIMENTAL A/B knob. THINKING=true enables thinking-mode reasoning on the
+# main loop + debugger (at thinking_temperature 0.6); sub-roles stay instruct.
+thinking = ${THINKING:-false}
+# MAX_OUTPUT_TOKENS env: raise together with --reasoning-budget for heavier
+# thinking arms (default 8000 = every run through 2026-08-22).
+max_output_tokens = ${MAX_OUTPUT_TOKENS:-8000}
+# STREAM_IDLE_SECS env: idle guard between streamed chunks (config default 30).
+# A cold prefill emits nothing until it finishes — at ~1000 tok/s a 50K
+# prompt is ~50s of silence — so raise this for >60K windows / slow prefill.
+stream_idle_timeout_secs = ${STREAM_IDLE_SECS:-30}
 
 [context]
 repo_map_budget = ${REPO_MAP_BUDGET}
 max_rounds = ${MAX_ROUNDS}
 pause_after_rounds = 99999
-# Conversation-compaction strategy A/B knob. Default unified = current
-# production behavior. COMPACTION=sliding_window|rolling_summary|observation_masking
+# Conversation-compaction strategy A/B knob. Default lazy = production default
+# (Config::default) and what the 2026-07-14 gemma 6/6 reference runs used.
+# NOTE: this defaulted to "unified" until 2026-08-22, so the 08-20..22 nemotron
+# runs and the 08-22 gemma thinking run ran unified.
+# COMPACTION=unified|sliding_window|rolling_summary|observation_masking|tiered...
 # ./scripts/run-benchmark-docker.sh ... to compare. See run-compaction-bench.sh.
-compaction = "${COMPACTION:-unified}"
+compaction = "${COMPACTION:-lazy}"
 
 [context.providers]
 profile = $(_dis profile)
