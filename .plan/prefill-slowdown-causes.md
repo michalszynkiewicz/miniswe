@@ -133,10 +133,56 @@ whose price scales with context**, not a slow-run-only defect. Measured rollback
 distance in the 09:36 run: 25 rounds pure, 61 rounds 257-1024 tok, 5 rounds
 1025-4096 tok, none beyond. The 61 rolled back fine (median 809 tok prefilled).
 
-**Still unresolved:** in the real run, 16 tasks did a full prefill from zero
-without `cache_prompt=false` and without a rollback >4096 tok. The controlled
-cliff measurement (`scratchpad/cliff.py`) is meant to pin the rollback threshold
-that explains them.
+### RESOLVED 2026-08-25 — the threshold is exactly 512 tokens
+
+Narrowing probe (`scratchpad/cliff.py`, `cliff2.py`) at a fixed 21,490-token
+context, rewinding by a controlled number of tokens:
+
+| rewind | prefilled | time |
+|---|---|---|
+| 448 tok | 424 | 0.37s |
+| 496 tok | 472 | 0.42s |
+| **512 tok** | **496** | **0.41s** |
+| **528 tok** | **21,491 (FULL)** | **13.27s** |
+| 560 / 576 / 608 / 640 / 768 tok | 21,491 (FULL) | ~13.2s |
+
+A rewind of 512 tokens or less is served by trimming the KV tail. One token more
+and the whole sequence is cleared. There is no gradient — it is a hard step, and
+it is structural (sliding-window attention), not a tunable heuristic.
+
+On this content `/tokenize` gives **3.47 bytes/token** (8 real blocks: 1580 ch →
+453 tok, 1591 ch → 460 tok), so the cliff is **≈1778 bytes**.
+
+### Why that explains the 6x wall-time spread
+
+The `[CURRENT STATE]` block always sat at the very end of the previous prompt,
+so **the rewind was exactly the block's own size**. Wall time was therefore a
+step function of plan size:
+
+| run | median block tok | wall |
+|---|---|---|
+| 08-25 10:05 | **558 (OVER)** | **3423s** |
+| 08-25 09:36 | 484 (max 506 — six tokens short) | 1599s |
+| 08-25 11:35 | 190 | 1887s |
+| 08-25 12:51 | 186 | 1550s |
+| 08-25 13:05 | 188 | 516s |
+| 08-24 16:50 | 148 | 304s |
+
+The block is also near-static — byte-identical round-to-round 76-100% of the
+time across the six runs; the 3423s run never changed it once in 103 rounds.
+So the 3423s run paid a full re-prefill every round to re-append bytes that
+had not changed.
+
+That is the 16 unexplained full prefills: not `cache_prompt=false`, not a large
+rollback — a ~1.9 KB block re-appended over the cliff.
+
+**Fixed in fcd8378** (`refresh_current_state`): blocks over 1500 bytes go
+sticky (left in place while byte-identical; appended with the stale copy
+retained, capped at 3, when they change and the live copy has drifted past the
+budget). Blocks under the budget keep the every-round re-anchor — that rewind
+is cheap and recency is better. `[SKILL STEP]` rounds always re-anchor.
+Replay across all six runs, full re-prefills caused by the block:
+`102→1`, `3→3`, `0→5`, `1→1`, `1→1`, `0→0`.
 
 ## 2. CONFIRMED cause B — single KV slot, evicted by sub-role calls
 
