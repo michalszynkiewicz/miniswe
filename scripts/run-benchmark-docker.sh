@@ -352,6 +352,21 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
         2> /output/stderr_attempt${ATTEMPT}.txt \
         || true
 
+    # Degradation scan. miniswe can lose its LSP — and with it the whole
+    # refactor toolset — and still run to completion, producing a score that
+    # looks like an ordinary result. One run in 38 did exactly that: the
+    # rust-analyzer download failed, add_param was unavailable for the entire
+    # session, the model fell back to sed, and the resulting 4/6 was nearly
+    # reported as a model regression. Surface it so it can never be averaged
+    # in silently.
+    if grep -q "LSP: DEGRADED" /output/stderr_attempt${ATTEMPT}.txt 2>/dev/null; then
+        echo "=== DEGRADED: attempt ${ATTEMPT} ran without LSP (refactor tools unavailable) ==="
+        {
+            echo "attempt ${ATTEMPT}: LSP unavailable"
+            grep -m1 "LSP: not available" /output/stderr_attempt${ATTEMPT}.txt || true
+        } >> /output/DEGRADED.txt 2>/dev/null || true
+    fi
+
     # Logs, scratchpad, tool_history, sessions, and index are all already on
     # the host volume via the .miniswe → /output/miniswe_state symlink.
     # Only git state needs an explicit capture here.
@@ -599,6 +614,12 @@ SCRIPT
     echo "    ${final_line}"
     echo "    rounds=${rounds} attempts=${attempts} wall=${wall_s}s"
     grep -E "(compile|build|help|parse|test|smoke):(PASS|FAIL)" "${variant_dir}/container.log" | tail -6 | sed 's/^/    /'
+
+    # A run that lost its LSP is not comparable to one that had it — say so
+    # next to the score, not 300 lines deep in stderr.
+    if grep -q "=== DEGRADED:" "${variant_dir}/container.log" 2>/dev/null; then
+        grep "=== DEGRADED:" "${variant_dir}/container.log" | sort -u | sed 's/^/    !! /'
+    fi
     echo ""
 }
 
@@ -628,7 +649,9 @@ for d in "${RESULTS_DIR}"/*/; do
     wall=$(cat "$d/wall_s.txt" 2>/dev/null || echo "?")
     attempts=$(grep -c "=== ATTEMPT .* remaining" "$d/container.log" 2>/dev/null || echo "?")
     result=$(grep "=== FINAL:" "$d/container.log" 2>/dev/null | grep -oE "[0-9]+/[0-9]+" || echo "?/?")
-    printf "%-20s %8s %4s %7ss  %s\n" "$name" "$local_rounds" "$attempts" "$wall" "$result"
+    degraded=""
+    grep -q "=== DEGRADED:" "$d/container.log" 2>/dev/null && degraded="  !! DEGRADED (no LSP — result not comparable)"
+    printf "%-20s %8s %4s %7ss  %s%s\n" "$name" "$local_rounds" "$attempts" "$wall" "$result" "$degraded"
 done
 echo "================================================================="
 echo ""

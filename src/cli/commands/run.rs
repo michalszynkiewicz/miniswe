@@ -546,7 +546,18 @@ pub async fn run(
                 Some(Arc::new(client))
             }
             Err(e) => {
-                tui::print_status(&format!("LSP: not available ({e})"));
+                // `{e:#}` not `{e}`: the whole cause chain matters here. The
+                // outer context alone reads as an unexplained "failed to get
+                // rust-analyzer binary" and hides whether it was an HTTP
+                // status, a bad gzip, or a binary that would not exec.
+                tui::print_status(&format!("LSP: not available ({e:#})"));
+                // Stable, greppable marker. Losing the LSP silently removes
+                // the refactor tools, and the session still runs to completion
+                // and produces a plausible score — that is how a benchmark 4/6
+                // caused by a failed download got read as a model regression.
+                tui::print_status(
+                    "LSP: DEGRADED — refactor tools (add_param/drop_param/rename) unavailable",
+                );
                 None
             }
         }
