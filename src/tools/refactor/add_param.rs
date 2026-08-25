@@ -29,8 +29,8 @@ use crate::tools::{ToolDetail, ToolResult};
 use super::ast_span;
 use super::model_edit::{apply_rewrite, ask_rewrite_validated};
 use super::sites::{
-    StagedEdit, commit_staged, ensure_ready, extract_window, find_callsites,
-    resolve_function_location,
+    CallSite, StagedEdit, callsite_window, commit_staged, ensure_ready, extract_window,
+    find_callsites, reanchor_callsite, resolve_function_location,
 };
 use super::validation::{ArgSchema, validate};
 
@@ -210,16 +210,20 @@ pub async fn execute(
     // Idempotency guard: re-adding a parameter that already exists stacks a
     // duplicate argument at EVERY callsite. Observed churn (seeded bench): a
     // small model calls add_param on the same function repeatedly and the call
-    // sites balloon to 8–12 args until the file won't compile. If the param is
-    // already present, refuse and point at the actual fix — editing the one
-    // callsite that should carry the real value, not re-adding the parameter.
-    let new_param_name = new_param
-        .split(':')
-        .next()
-        .unwrap_or(new_param)
-        .trim()
-        .trim_start_matches("mut ")
-        .trim();
+    // sites balloon to 8–12 args until the file won't compile.
+    //
+    // But "the signature already has it" is TWO states, not one, and only the
+    // first deserves a refusal:
+    //   a) done — every callsite already passes the argument. Re-adding stacks
+    //      duplicates. Refuse.
+    //   b) HALF-APPLIED — a previous add_param rewrote the signature and then
+    //      failed on some callsites (PARTIAL). The tree does not compile, and
+    //      the one tool that can repair it in bulk locks itself out on exactly
+    //      the state it exists to fix. Observed live: that lockout is where the
+    //      model gives up on the refactor and reaches for `sed -i` across the
+    //      callsites, which is how a 6/6 run turns into a corrupted test file.
+    // Distinguish them mechanically (arg count vs param count) and re-sync (b).
+    let new_param_name = param_ident(new_param);
     if !new_param_name.is_empty()
         && ast_span::has_param(
             &original_signature_source,
@@ -228,14 +232,23 @@ pub async fn execute(
             new_param_name,
         )
     {
-        return Ok(ToolResult::err(format!(
-            "✗ add_param: `{function_name}` already has a parameter named `{new_param_name}` — \
-             not adding a duplicate (that would stack another `{default_value}` argument at every \
-             callsite and break the build). If a value is not being threaded through, the fix is \
-             NOT to add the parameter again: EDIT the specific callsite that should pass the real \
-             value (replace its `{default_value}` placeholder with the actual expression), then \
-             re-run your check."
-        )));
+        return resync_or_refuse(
+            config,
+            router,
+            lsp,
+            log,
+            revisions,
+            cancelled,
+            &abs_path,
+            path_str,
+            &original_signature_source,
+            line_0,
+            column_0,
+            function_name,
+            new_param_name,
+            default_value,
+        )
+        .await;
     }
 
     // 1. Update the signature itself. The snippet starts at the function's
@@ -317,95 +330,37 @@ pub async fn execute(
         )));
     }
 
-    let mut report = Vec::new();
-    let mut callsite_failures = Vec::new();
     let pos_human = position.human();
     // Bookend the per-callsite prompt with the actual OLD/NEW signatures.
     // The model can compare them positionally to figure out where the new
     // argument belongs without us having to encode that as a numeric index.
-    let old_signature = sig_rewrite.old.clone();
-    let new_signature = sig_rewrite.new.clone();
+    let instruction = format!(
+        "A function's signature was modified: a new parameter was added {pos_human}. \
+         Update the call expression at the FIRST line of the snippet below to match the new \
+         signature: insert the literal expression `{fill}` at the matching argument position. \
+         Change ONLY that one call.\n\
+         \n\
+         Old signature:\n{old_signature}\n\
+         \n\
+         New signature:\n{new_signature}",
+        pos_human = pos_human,
+        fill = default_value,
+        old_signature = sig_rewrite.old,
+        new_signature = sig_rewrite.new,
+    );
 
-    for site in &callsites {
-        let rel = display_path(&site.path, config);
-        let instruction = format!(
-            "A function's signature was modified: a new parameter was added {pos_human}. \
-             Update the call expression at the FIRST line of the snippet below to match the new \
-             signature: insert the literal expression `{fill}` at the matching argument position. \
-             Change ONLY that one call.\n\
-             \n\
-             Old signature:\n{old_signature}\n\
-             \n\
-             New signature:\n{new_signature}",
-            pos_human = pos_human,
-            fill = default_value,
-        );
-
-        // Resolve which source content we'll edit (staged copy if this
-        // file has already been touched in this refactor, fresh read
-        // otherwise). We need it both for validation during retries and
-        // for the final apply.
-        let (original, src) = match staged.get(&site.path) {
-            Some(edit) => (edit.original.clone(), edit.updated.clone()),
-            None => match std::fs::read_to_string(&site.path) {
-                Ok(s) => (s.clone(), s),
-                Err(e) => {
-                    callsite_failures.push(format!(
-                        "{}:{}: read failed: {}",
-                        rel,
-                        site.line + 1,
-                        e
-                    ));
-                    continue;
-                }
-            },
-        };
-        // Deterministic OLD (same rationale as the signature rewrite above):
-        // a live replay of a historical bench failure confirmed multi-line
-        // callsites — one argument per line, the common rustfmt style —
-        // hit the identical "OLD line N doesn't match source" failure.
-        let known_old = ast_span::callsite_span(&src, &rel, site.line, site.column);
-        // ask_rewrite_validated retries when the model produces a
-        // syntactically-valid OLD/NEW that nonetheless can't be applied —
-        // e.g. a paraphrased / lazy OLD that doesn't match at the LSP-
-        // resolved anchor line. Without this the model gets exactly one
-        // shot per callsite even on cases where retry would succeed.
-        let rewrite = match ask_rewrite_validated(
-            router,
-            log,
-            &format!("callsite:{rel}:{}", site.line + 1),
-            &instruction,
-            &site.window,
-            known_old.as_deref(),
-            cancelled,
-            |r| apply_rewrite(&src, r, site.line).map(|_| ()),
-        )
-        .await
-        {
-            Ok(Some(r)) => r,
-            Ok(None) => unreachable!(),
-            Err(e) => {
-                callsite_failures.push(format!("{}:{}: {}", rel, site.line + 1, e));
-                continue;
-            }
-        };
-        // Validator already verified apply succeeds; this re-runs to
-        // produce the final updated source. (Cheap pure function.)
-        match apply_rewrite(&src, &rewrite, site.line) {
-            Ok(updated) => {
-                staged.insert(site.path.clone(), StagedEdit { original, updated });
-                report.push(format!(
-                    "  • {}:{} now passes `{}`",
-                    rel,
-                    site.line + 1,
-                    default_value
-                ));
-            }
-            Err(e) => {
-                callsite_failures.push(format!("{}:{}: {}", rel, site.line + 1, e));
-            }
-        }
-    }
+    let (report, callsite_failures) = rewrite_callsites(
+        router,
+        log,
+        config,
+        cancelled,
+        &callsites,
+        function_name,
+        &instruction,
+        default_value,
+        &mut staged,
+    )
+    .await;
 
     // 3. Commit edits.
     commit_staged(&staged, config, revisions, "change_signature.add_param")?;
@@ -496,6 +451,317 @@ pub async fn execute(
     // Note: we do NOT auto-revert on partial failure. The user (agent) gets
     // the per-callsite report and can decide whether to keep, fix, or
     // git-revert the changes — same trade-off discussed in the design.
+
+    Ok(if callsite_failures.is_empty() {
+        ToolResult::ok(out)
+    } else {
+        ToolResult::err_with_detail(
+            out,
+            ToolDetail::PartialSignatureChange {
+                action: "add_param",
+                total,
+                succeeded,
+                callsite_failures,
+                callsite_report: report,
+            },
+        )
+    })
+}
+
+/// Rewrite each callsite to match the new signature, staging the edits.
+///
+/// Returns `(report, failures)`, one line per callsite. Split out of
+/// `execute` because it is driven from two places: the ordinary path, right
+/// after the signature is rewritten, and the re-sync path, which repairs a
+/// half-applied refactor where the signature already carries the parameter
+/// but some callsites were never updated.
+#[allow(clippy::too_many_arguments)]
+async fn rewrite_callsites(
+    router: &ModelRouter,
+    log: Option<&SessionLog>,
+    config: &Config,
+    cancelled: Option<&AtomicBool>,
+    callsites: &[CallSite],
+    function_name: &str,
+    instruction: &str,
+    default_value: &str,
+    staged: &mut BTreeMap<PathBuf, StagedEdit>,
+) -> (Vec<String>, Vec<String>) {
+    let mut report = Vec::new();
+    let mut callsite_failures = Vec::new();
+
+    for site in callsites {
+        let rel = display_path(&site.path, config);
+        // Resolve which source content we'll edit (staged copy if this
+        // file has already been touched in this refactor, fresh read
+        // otherwise). We need it both for validation during retries and
+        // for the final apply.
+        let (original, src) = match staged.get(&site.path) {
+            Some(edit) => (edit.original.clone(), edit.updated.clone()),
+            None => match std::fs::read_to_string(&site.path) {
+                Ok(s) => (s.clone(), s),
+                Err(e) => {
+                    callsite_failures.push(format!(
+                        "{}:{}: read failed: {}",
+                        rel,
+                        site.line + 1,
+                        e
+                    ));
+                    continue;
+                }
+            },
+        };
+        // The LSP resolved this position against the file as its index saw
+        // it, which is not necessarily the content we are about to edit.
+        // Re-anchor before building the window or the OLD block.
+        let Some((line, column)) = reanchor_callsite(&src, site.line, function_name) else {
+            callsite_failures.push(format!(
+                "{}:{}: no call to `{function_name}` found near this line in the current file \
+                 — it was probably moved or removed since the LSP indexed it. Edit this \
+                 callsite directly.",
+                rel,
+                site.line + 1
+            ));
+            continue;
+        };
+        // Re-cut the window whenever the anchor moved: the stored one came
+        // from the indexed content at the stale line and can start partway
+        // into the argument list, which leaves the model guessing at OLD.
+        let window = if line == site.line {
+            site.window.clone()
+        } else {
+            callsite_window(&src, line)
+        };
+        // Deterministic OLD (same rationale as the signature rewrite above):
+        // a live replay of a historical bench failure confirmed multi-line
+        // callsites — one argument per line, the common rustfmt style —
+        // hit the identical "OLD line N doesn't match source" failure.
+        let known_old = ast_span::callsite_span(&src, &rel, line, column);
+        // ask_rewrite_validated retries when the model produces a
+        // syntactically-valid OLD/NEW that nonetheless can't be applied —
+        // e.g. a paraphrased / lazy OLD that doesn't match at the LSP-
+        // resolved anchor line. Without this the model gets exactly one
+        // shot per callsite even on cases where retry would succeed.
+        let rewrite = match ask_rewrite_validated(
+            router,
+            log,
+            &format!("callsite:{rel}:{}", line + 1),
+            instruction,
+            &window,
+            known_old.as_deref(),
+            cancelled,
+            |r| apply_rewrite(&src, r, line).map(|_| ()),
+        )
+        .await
+        {
+            Ok(Some(r)) => r,
+            Ok(None) => unreachable!(),
+            Err(e) => {
+                callsite_failures.push(format!("{}:{}: {}", rel, line + 1, e));
+                continue;
+            }
+        };
+        // Validator already verified apply succeeds; this re-runs to
+        // produce the final updated source. (Cheap pure function.)
+        match apply_rewrite(&src, &rewrite, line) {
+            Ok(updated) => {
+                staged.insert(site.path.clone(), StagedEdit { original, updated });
+                report.push(format!(
+                    "  • {}:{} now passes `{}`",
+                    rel,
+                    line + 1,
+                    default_value
+                ));
+            }
+            Err(e) => {
+                callsite_failures.push(format!("{}:{}: {}", rel, line + 1, e));
+            }
+        }
+    }
+
+    (report, callsite_failures)
+}
+
+/// The bare identifier of a parameter declaration: `mut cfg: &Config` -> `cfg`.
+fn param_ident(decl: &str) -> &str {
+    decl.split(':')
+        .next()
+        .unwrap_or(decl)
+        .trim()
+        .trim_start_matches("mut ")
+        .trim()
+}
+
+/// `add_param` on a function whose signature ALREADY declares the parameter.
+///
+/// Refuses when the refactor is genuinely done (every callsite passes the
+/// argument), re-syncs when it is half-applied (signature updated, some
+/// callsites never were). "Cannot tell" always falls to refusal: the guard
+/// exists to stop argument stacking, and a wrong re-sync stacks arguments at
+/// every site it touches, which is the exact damage it is meant to prevent.
+/// Concretely, refusal is the answer when the parameter list cannot be parsed,
+/// when callsites cannot be resolved, and — per callsite — whenever
+/// `arg_count` returns `None` or a count that is not short.
+#[allow(clippy::too_many_arguments)]
+async fn resync_or_refuse(
+    config: &Config,
+    router: &ModelRouter,
+    lsp: &LspClient,
+    log: Option<&SessionLog>,
+    revisions: Option<&RevisionStore>,
+    cancelled: Option<&AtomicBool>,
+    abs_path: &std::path::Path,
+    path_str: &str,
+    source: &str,
+    line_0: u32,
+    column_0: u32,
+    function_name: &str,
+    new_param_name: &str,
+    default_value: &str,
+) -> Result<ToolResult> {
+    // The original refusal. Kept verbatim: it is the message the model sees on
+    // every legitimately-redundant call, and it already points at the real fix
+    // (edit the one callsite that should carry the value).
+    let refuse = |checked: Option<usize>| {
+        let checked_note = match checked {
+            Some(n) => format!(" All {n} callsite(s) already pass it."),
+            None => String::new(),
+        };
+        Ok(ToolResult::err(format!(
+            "✗ add_param: `{function_name}` already has a parameter named `{new_param_name}` — \
+             not adding a duplicate (that would stack another `{default_value}` argument at every \
+             callsite and break the build).{checked_note} If a value is not being threaded through, \
+             the fix is NOT to add the parameter again: EDIT the specific callsite that should pass \
+             the real value (replace its `{default_value}` placeholder with the actual expression), \
+             then re-run your check."
+        )))
+    };
+
+    let Some(params) = ast_span::param_names(source, path_str, line_0 as usize) else {
+        return refuse(None);
+    };
+    let expected = params.len();
+    let ordinal = params.iter().position(|p| param_ident(p) == new_param_name);
+
+    let Ok(callsites) = find_callsites(lsp, config, abs_path, line_0, column_0).await else {
+        return refuse(None);
+    };
+    if callsites.is_empty() {
+        return refuse(None);
+    }
+
+    // A callsite is out of date only if we can COUNT its arguments and the
+    // count is short. Anything else — unparseable, a non-call reference, an
+    // argument count at or above the parameter count — is left alone.
+    let mut stale = Vec::new();
+    let mut in_sync = 0usize;
+    for site in callsites {
+        let rel = display_path(&site.path, config);
+        let Ok(src) = std::fs::read_to_string(&site.path) else {
+            continue;
+        };
+        let Some((line, column)) = reanchor_callsite(&src, site.line, function_name) else {
+            continue;
+        };
+        match ast_span::arg_count(&src, &rel, line, column) {
+            Some(n) if n < expected => stale.push(site),
+            Some(_) => in_sync += 1,
+            None => {}
+        }
+    }
+
+    if stale.is_empty() {
+        return refuse(Some(in_sync));
+    }
+
+    if let Some(log) = log {
+        log.tool_debug(
+            "change_signature",
+            &format!(
+                "add_param re-sync path={path_str} name={function_name} \
+                 param={new_param_name} expected_args={expected} \
+                 stale={} in_sync={in_sync}",
+                stale.len()
+            ),
+        );
+    }
+
+    let signature = ast_span::signature_span(source, path_str, line_0 as usize)
+        .unwrap_or_else(|| function_name.to_string());
+    // The ordinal is what a bare "add the argument" prompt cannot supply: with
+    // a placeholder like `None` the model has no type information to infer the
+    // position from, and appending it at the end silently reorders arguments.
+    let ordinal_hint = match ordinal {
+        Some(i) => format!(" It is argument {} of {expected}.", i + 1),
+        None => String::new(),
+    };
+    let instruction = format!(
+        "This call is out of date: the function's signature declares a parameter \
+         `{new_param_name}` that this call does not pass.{ordinal_hint} Update the call \
+         expression at the FIRST line of the snippet below to insert the literal expression \
+         `{default_value}` at that argument position. Change ONLY that one call.\n\
+         \n\
+         Signature:\n{signature}"
+    );
+
+    let mut staged: BTreeMap<PathBuf, StagedEdit> = BTreeMap::new();
+    let total = stale.len();
+    let (report, callsite_failures) = rewrite_callsites(
+        router,
+        log,
+        config,
+        cancelled,
+        &stale,
+        function_name,
+        &instruction,
+        default_value,
+        &mut staged,
+    )
+    .await;
+    commit_staged(&staged, config, revisions, "change_signature.add_param")?;
+
+    let succeeded = report.len();
+    let mut out = String::new();
+    if callsite_failures.is_empty() {
+        out.push_str(&format!(
+            "✓ add_param: `{function_name}` already declared `{new_param_name}`, so the signature \
+             was left alone — but {total} callsite(s) had not been updated to pass it. Those are \
+             now filled with the placeholder `{default_value}`.\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "✗ add_param PARTIAL re-sync: `{function_name}` already declared `{new_param_name}`; \
+             of the {total} callsite(s) that were not passing it, {succeeded} were repaired and \
+             {failed} were not. The project will NOT compile until the rest are fixed — edit them \
+             directly.\nFailures:\n",
+            failed = callsite_failures.len(),
+        ));
+        for f in &callsite_failures {
+            out.push_str(&format!("  • {f}\n"));
+        }
+    }
+    if !report.is_empty() {
+        out.push_str(
+            "Callsites updated (each now passes the placeholder — edit any that should carry \
+             the real value):\n",
+        );
+        for line in &report {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if in_sync > 0 {
+        out.push_str(&format!(
+            "({in_sync} other callsite(s) were already passing it and were not touched.)\n"
+        ));
+    }
+    out.push_str(
+        "\nNext: the placeholder callsites above are NOT finished. For each callsite that \
+         must pass a real value: read it, then edit it DIRECTLY with replace_range or \
+         insert_at, replacing the placeholder argument with the real value. Do NOT call \
+         refactor again for this — the parameter already exists and add_param will be \
+         rejected; direct edits are the correct tool for this step.",
+    );
 
     Ok(if callsite_failures.is_empty() {
         ToolResult::ok(out)

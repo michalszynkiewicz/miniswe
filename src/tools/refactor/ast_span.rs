@@ -212,6 +212,82 @@ pub fn callsite_span(_source: &str, _path: &str, _line_0: u32, _column_0: u32) -
     None
 }
 
+/// Verbatim text of each parameter declared by the function whose signature
+/// starts at `from_line` (0-based), in order, excluding a leading `self`
+/// receiver.
+///
+/// The count is paired with [`arg_count`] to tell a genuinely-redundant
+/// `add_param` (every callsite already passes the argument) apart from a
+/// half-applied one (the signature has the parameter, some callsites do not).
+/// `self` is excluded precisely so the two are comparable: a method's callsite
+/// arguments never include the receiver, so counting it here would make every
+/// method call look permanently out of sync. The texts themselves let the
+/// caller state WHICH argument position is missing, which is the one thing a
+/// re-sync prompt needs that a bare count cannot give it.
+///
+/// `None` on any uncertainty — unsupported language, parse failure, no
+/// matching definition. Callers must treat that as "cannot tell", never as
+/// "no parameters".
+#[cfg(feature = "tree-sitter")]
+pub fn param_names(source: &str, path: &str, from_line: usize) -> Option<Vec<String>> {
+    let ext = extension(path);
+    let tree = parse(ext, source)?;
+    let byte = first_non_ws_byte_on_line(source, from_line)?;
+    let def = find_ancestor(tree.root_node(), byte, definition_node_kinds(ext))?;
+    let params = def.child_by_field_name("parameters")?;
+    let mut cursor = params.walk();
+    Some(
+        params
+            .children(&mut cursor)
+            .filter(|c| c.is_named() && !is_self_parameter(source, c))
+            .map(|c| source[c.start_byte()..c.end_byte()].trim().to_string())
+            .collect(),
+    )
+}
+
+#[cfg(not(feature = "tree-sitter"))]
+pub fn param_names(_source: &str, _path: &str, _from_line: usize) -> Option<Vec<String>> {
+    None
+}
+
+/// Whether a parameter node is the `self` receiver (`self`, `&self`,
+/// `&mut self`, `mut self`).
+#[cfg(feature = "tree-sitter")]
+fn is_self_parameter(source: &str, node: &Node<'_>) -> bool {
+    if node.kind() == "self_parameter" {
+        return true;
+    }
+    let text = source[node.start_byte()..node.end_byte()].trim();
+    let stripped = text
+        .trim_start_matches('&')
+        .trim_start()
+        .trim_start_matches("mut ")
+        .trim();
+    stripped == "self"
+}
+
+/// Number of arguments passed at the call expression starting at `line_0`
+/// (0-based), with `column_0` disambiguating an earlier call on the same line.
+///
+/// `None` on any uncertainty, including when the reference is not a call at
+/// all (a plain value use, an import) — the ancestor walk simply finds no
+/// call-kind node. Callers must treat that as "cannot tell".
+#[cfg(feature = "tree-sitter")]
+pub fn arg_count(source: &str, path: &str, line_0: u32, column_0: u32) -> Option<usize> {
+    let ext = extension(path);
+    let tree = parse(ext, source)?;
+    let byte = byte_offset_for(source, line_0 as usize, column_0 as usize)?;
+    let call = find_ancestor(tree.root_node(), byte, call_node_kinds(ext))?;
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    Some(args.children(&mut cursor).filter(|c| c.is_named()).count())
+}
+
+#[cfg(not(feature = "tree-sitter"))]
+pub fn arg_count(_source: &str, _path: &str, _line_0: u32, _column_0: u32) -> Option<usize> {
+    None
+}
+
 /// Best-effort check: does the function whose signature starts at
 /// `from_line` (0-based) already have a parameter named `param_name`?
 /// Used to make `add_param` idempotent. False-negative-only by design
@@ -714,5 +790,81 @@ mod has_param_tests {
         assert!(has_param(src, "m.rs", 0, "name"));
         assert!(!has_param(src, "m.rs", 0, "V"));
         assert!(!has_param(src, "m.rs", 0, "K"));
+    }
+}
+
+#[cfg(all(test, feature = "tree-sitter", feature = "lang-rust"))]
+mod param_arg_count_tests {
+    use super::{arg_count, param_names};
+
+    // The real shape from the bench task: the parameter is appended last and
+    // the callsites are one-argument-per-line rustfmt style.
+    const DEF: &str = "fn assemble(\n    config: &Config,\n    history: &[Msg],\n    system_prompt_override: Option<&str>,\n) -> String {\n    body\n}";
+
+    #[test]
+    fn counts_parameters_in_order() {
+        let names = param_names(DEF, "m.rs", 0).expect("parsed");
+        assert_eq!(
+            names,
+            vec![
+                "config: &Config",
+                "history: &[Msg]",
+                "system_prompt_override: Option<&str>"
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_commas_do_not_inflate_the_count() {
+        let src = "fn f(map: HashMap<K, V>, name: String) {}";
+        assert_eq!(param_names(src, "m.rs", 0).expect("parsed").len(), 2);
+    }
+
+    // `self` is excluded so a method's parameter count is directly comparable
+    // to its callsites' argument counts, which never include the receiver.
+    #[test]
+    fn self_receiver_is_not_a_parameter() {
+        let src = "impl T {\n    fn go(&mut self, a: u8, b: u8) {}\n}";
+        assert_eq!(param_names(src, "m.rs", 1).expect("parsed").len(), 2);
+    }
+
+    #[test]
+    fn unparseable_input_yields_none() {
+        assert!(param_names("not rust at all", "m.rs", 0).is_none());
+    }
+
+    #[test]
+    fn counts_call_arguments() {
+        let src = "fn c() {\n    let x = assemble(&config, &history);\n}";
+        // column of `assemble`
+        let col = src.lines().nth(1).unwrap().find("assemble").unwrap() as u32;
+        assert_eq!(arg_count(src, "m.rs", 1, col), Some(2));
+    }
+
+    #[test]
+    fn counts_multiline_call_arguments() {
+        let src = "fn c() {\n    let x = context::assemble(\n        &config,\n        &history,\n    );\n}";
+        let col = src.lines().nth(1).unwrap().find("assemble").unwrap() as u32;
+        assert_eq!(arg_count(src, "m.rs", 1, col), Some(2));
+    }
+
+    // The half-applied state this whole pair exists to detect: signature has
+    // three parameters, the callsite still passes two.
+    #[test]
+    fn short_callsite_is_detectably_short() {
+        let call = "fn c() {\n    let x = assemble(&config, &history);\n}";
+        let col = call.lines().nth(1).unwrap().find("assemble").unwrap() as u32;
+        let params = param_names(DEF, "m.rs", 0).expect("parsed").len();
+        assert!(arg_count(call, "m.rs", 1, col).expect("parsed") < params);
+    }
+
+    // A non-call reference (a plain value use) must read as "cannot tell",
+    // never as zero arguments — zero would look maximally out of sync and
+    // trigger a re-sync on a site that has no argument list at all.
+    #[test]
+    fn non_call_reference_yields_none() {
+        let src = "fn c() {\n    let f = assemble;\n}";
+        let col = src.lines().nth(1).unwrap().find("assemble").unwrap() as u32;
+        assert_eq!(arg_count(src, "m.rs", 1, col), None);
     }
 }
