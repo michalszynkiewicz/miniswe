@@ -404,7 +404,7 @@ use crate::cli::commands::agent::skill_cursor;
 /// empty.
 fn format_current_state_block(config: &Config) -> Option<String> {
     let plan = crate::tools::plan::load_plan(config);
-    let scratchpad = std::fs::read_to_string(config.miniswe_path("scratchpad.md"))
+    let scratchpad = std::fs::read_to_string(config.session_path("scratchpad.md"))
         .ok()
         .filter(|s| !s.trim().is_empty());
     // Just-in-time skill-step re-inject: when a skill cursor is active,
@@ -626,6 +626,7 @@ mod current_state_tests {
         std::fs::create_dir_all(dir.join(".miniswe")).unwrap();
         let mut config = Config::default();
         config.project_root = dir.to_path_buf();
+        config.ensure_session_dir().unwrap();
         config
     }
 
@@ -692,7 +693,7 @@ mod current_state_tests {
 
         // A plan alongside the stale cursor still yields a block — just
         // without the [SKILL STEP] section.
-        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+        std::fs::write(config.session_path("plan.md"), "1. step one\n").unwrap();
         let block = format_current_state_block(&config).unwrap();
         assert!(block.contains("[PLAN]"), "{block}");
         assert!(!block.contains("[SKILL STEP]"), "{block}");
@@ -702,7 +703,7 @@ mod current_state_tests {
     fn appends_to_last_message_when_state_exists() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = config_in(tmp.path());
-        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+        std::fs::write(config.session_path("plan.md"), "1. step one\n").unwrap();
 
         let mut msgs = vec![Message::user("do the task"), Message::assistant("ok")];
         refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
@@ -721,7 +722,7 @@ mod current_state_tests {
     fn replaces_old_block_instead_of_accumulating() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = config_in(tmp.path());
-        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+        std::fs::write(config.session_path("plan.md"), "1. step one\n").unwrap();
 
         let mut msgs = vec![Message::tool_result("call1", "first result")];
         refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
@@ -736,7 +737,7 @@ mod current_state_tests {
         );
 
         // A later round: a fresh tool result gets pushed, plan changes.
-        std::fs::write(config.miniswe_path("plan.md"), "1. [x] step one\n").unwrap();
+        std::fs::write(config.session_path("plan.md"), "1. [x] step one\n").unwrap();
         msgs.push(Message::tool_result("call2", "second result"));
         refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
 
@@ -801,7 +802,7 @@ mod current_state_tests {
         // next refresh notices the block is gone and re-appends it.
         let tmp = tempfile::TempDir::new().unwrap();
         let config = config_in(tmp.path());
-        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+        std::fs::write(config.session_path("plan.md"), "1. step one\n").unwrap();
 
         let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
         refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
@@ -824,7 +825,7 @@ mod current_state_tests {
         // must reject it and rebuild a clean copy on the newest message.
         let tmp = tempfile::TempDir::new().unwrap();
         let config = config_in(tmp.path());
-        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+        std::fs::write(config.session_path("plan.md"), "1. step one\n").unwrap();
 
         let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
         refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
@@ -851,7 +852,7 @@ mod current_state_tests {
         let body: String = (1..=60)
             .map(|i| format!("{i}. {tag} — a plan step with enough text to matter\n"))
             .collect();
-        std::fs::write(config.miniswe_path("plan.md"), body).unwrap();
+        std::fs::write(config.session_path("plan.md"), body).unwrap();
     }
 
     #[test]
@@ -862,7 +863,7 @@ mod current_state_tests {
         // trade on the runs whose plan never approached the cliff.
         let tmp = tempfile::TempDir::new().unwrap();
         let config = config_in(tmp.path());
-        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+        std::fs::write(config.session_path("plan.md"), "1. step one\n").unwrap();
 
         let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
         refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
@@ -924,12 +925,12 @@ mod current_state_tests {
         // Case 2: the rewind fits in the trim budget, so keep history clean.
         let tmp = tempfile::TempDir::new().unwrap();
         let config = config_in(tmp.path());
-        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+        std::fs::write(config.session_path("plan.md"), "1. step one\n").unwrap();
 
         let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
         refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
         msgs.push(Message::tool_result("call2", "short"));
-        std::fs::write(config.miniswe_path("plan.md"), "1. [x] step one\n").unwrap();
+        std::fs::write(config.session_path("plan.md"), "1. [x] step one\n").unwrap();
         refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
 
         assert_eq!(find_current_state(&msgs).len(), 1);
@@ -1967,6 +1968,7 @@ mod force_compress_tests {
         std::fs::create_dir_all(dir.join(".miniswe")).unwrap();
         let mut config = Config::default();
         config.project_root = dir.to_path_buf();
+        config.ensure_session_dir().unwrap();
         config.model.endpoint = "http://127.0.0.1:9".into();
         config.model.max_retries = 0;
         config.model.context_window = 60_000;

@@ -129,7 +129,7 @@ fn scratchpad_not_in_system_prompt() {
     let (_tmp, config) = helpers::create_test_project();
 
     fs::write(
-        config.miniswe_path("scratchpad.md"),
+        config.session_path("scratchpad.md"),
         "## Current Task\nImplement auth\n\n## Plan\n1. Add middleware\n",
     )
     .unwrap();
@@ -152,7 +152,7 @@ fn plan_not_in_system_prompt() {
     let (_tmp, config) = helpers::create_test_project();
 
     fs::write(
-        config.miniswe_path("plan.md"),
+        config.session_path("plan.md"),
         "1. Add the flag\n2. Wire it through\n",
     )
     .unwrap();

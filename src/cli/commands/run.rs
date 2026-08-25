@@ -511,13 +511,22 @@ pub async fn run(
     // Registry for background jobs (explicit background=true + promoted).
     let job_registry = Arc::new(tools::jobs::JobRegistry::default());
 
-    // Clear stale scratchpad/plan from previous sessions — unless this
-    // is a `--continue` invocation, in which case the model is meant to
-    // pick up where the previous session left off.
-    if !continue_session {
-        let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
-        let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+    // Session working state (plan.md, scratchpad.md) lives in a private
+    // per-session directory, so there is nothing stale to clear and no
+    // shared path a concurrent or nested run could wipe out from under us.
+    // `--continue` adopts the previous session's directory rather than
+    // opening a fresh one.
+    let sessions_dir = config.sessions_dir();
+    if continue_session && let Some(previous) = crate::config::session::last_id(&sessions_dir) {
+        config.session_id = previous;
     }
+    let _ = config.ensure_session_dir();
+    crate::config::session::record_last(&sessions_dir, &config.session_id);
+    crate::config::session::prune(
+        &sessions_dir,
+        crate::config::session::RETENTION,
+        &config.session_id,
+    );
 
     tui::print_header(if plan_only {
         "Plan Mode (read-only)"
@@ -1797,8 +1806,8 @@ pub async fn run(
                                 // repo-map to the clean baseline so the fresh agent
                                 // doesn't see the reverted-away structure.
                                 tools::reindex_project_incremental(&config);
-                                let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
-                                let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+                                let _ = std::fs::remove_file(config.session_path("plan.md"));
+                                let _ = std::fs::remove_file(config.session_path("scratchpad.md"));
                                 let assembled = context::assemble(
                                     &config,
                                     message,
@@ -1916,9 +1925,9 @@ pub async fn run(
                                         // per-edit reindex path doesn't cover it).
                                         tools::reindex_project_incremental(&config);
                                         let _ =
-                                            std::fs::remove_file(config.miniswe_path("plan.md"));
+                                            std::fs::remove_file(config.session_path("plan.md"));
                                         let _ = std::fs::remove_file(
-                                            config.miniswe_path("scratchpad.md"),
+                                            config.session_path("scratchpad.md"),
                                         );
                                         let assembled = context::assemble(
                                             &config,
@@ -2434,9 +2443,9 @@ pub async fn run(
                                         }
                                     }
                                     tools::reindex_project_incremental(&config);
-                                    let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+                                    let _ = std::fs::remove_file(config.session_path("plan.md"));
                                     let _ =
-                                        std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+                                        std::fs::remove_file(config.session_path("scratchpad.md"));
                                     let assembled = context::assemble(
                                         &config,
                                         message,
@@ -3045,8 +3054,8 @@ pub async fn run(
                                     }
                                 }
                                 tools::reindex_project_incremental(&config);
-                                let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
-                                let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+                                let _ = std::fs::remove_file(config.session_path("plan.md"));
+                                let _ = std::fs::remove_file(config.session_path("scratchpad.md"));
                                 let assembled = context::assemble(
                                     &config,
                                     message,

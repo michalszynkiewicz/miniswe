@@ -31,9 +31,9 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
         ));
     }
 
-    let scratchpad_path = config.miniswe_path("scratchpad.md");
+    let scratchpad_path = config.session_path("scratchpad.md");
 
-    // Ensure .miniswe directory exists
+    // Ensure the session state directory exists
     if let Some(parent) = scratchpad_path.parent() {
         fs::create_dir_all(parent)?;
     }

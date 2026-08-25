@@ -360,12 +360,22 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
     #[allow(unused_assignments)]
     let mut snapshots: Option<Arc<Mutex<tools::snapshots::SnapshotManager>>> = None;
 
-    // Clear stale scratchpad/plan — unless `--continue` is set, in which
-    // case carry the previous session's state forward.
-    if !continue_session {
-        let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
-        let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+    // Session working state (plan.md, scratchpad.md) lives in a private
+    // per-session directory, so there is nothing stale to clear and no
+    // shared path a concurrent or nested run could wipe out from under us.
+    // `--continue` adopts the previous session's directory rather than
+    // opening a fresh one.
+    let sessions_dir = config.sessions_dir();
+    if continue_session && let Some(previous) = crate::config::session::last_id(&sessions_dir) {
+        config.session_id = previous;
     }
+    let _ = config.ensure_session_dir();
+    crate::config::session::record_last(&sessions_dir, &config.session_id);
+    crate::config::session::prune(
+        &sessions_dir,
+        crate::config::session::RETENTION,
+        &config.session_id,
+    );
 
     // Initialize MCP
     let mcp_config = McpConfig::load(&config.project_root)?;
@@ -513,10 +523,10 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                     conversation_history.clear();
                                     if input == "/new" {
                                         let _ = std::fs::remove_file(
-                                            config.miniswe_path("scratchpad.md"),
+                                            config.session_path("scratchpad.md"),
                                         );
                                         let _ =
-                                            std::fs::remove_file(config.miniswe_path("plan.md"));
+                                            std::fs::remove_file(config.session_path("plan.md"));
                                         app.push_output(
                                             "Cleared history, scratchpad, and plan.",
                                             LineStyle::Status,
@@ -2931,8 +2941,8 @@ fn scrap_restart(
     // Whole-tree revert touched many files outside the per-edit reindex path —
     // resync the symbol index / repo-map to the clean baseline.
     tools::reindex_project_incremental(config);
-    let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
-    let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+    let _ = std::fs::remove_file(config.session_path("plan.md"));
+    let _ = std::fs::remove_file(config.session_path("scratchpad.md"));
     let assembled = context::assemble(config, goal, &[], false, mcp_summary);
     app.push_output(done, LineStyle::Status);
     assembled.messages

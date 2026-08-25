@@ -72,7 +72,10 @@ async fn run_compile_check(config: &Config) -> (bool, String) {
 /// Execute the plan tool.
 pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Result<ToolResult> {
     let action = args["action"].as_str().unwrap_or("set");
-    let plan_path = config.miniswe_dir().join("plan.md");
+    let plan_path = config.session_path("plan.md");
+    // The session directory is created lazily — `set` may be the first
+    // thing this session writes.
+    config.ensure_session_dir()?;
 
     match action {
         "set" => {

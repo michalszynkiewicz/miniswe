@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub mod session;
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -36,6 +38,12 @@ pub struct Config {
     /// Resolved project root directory (not serialized).
     #[serde(skip)]
     pub project_root: PathBuf,
+    /// Id of this process's session (not serialized). Session working
+    /// state — `plan.md`, `scratchpad.md` — lives under
+    /// `.miniswe/sessions/<session_id>/` so concurrent or nested miniswe
+    /// runs in one project can't clobber each other. See `config::session`.
+    #[serde(skip)]
+    pub session_id: String,
     /// Whether current-state refresh injects the active skill-step block
     /// (`[SKILL STEP]`). Runtime-only: set by the headless `run` surface,
     /// which registers the `skill` tool the block tells the model to call.
@@ -723,6 +731,7 @@ impl Default for Config {
             tools: ToolsConfig::default(),
             validation: ValidationConfig::default(),
             project_root: PathBuf::from("."),
+            session_id: session::new_id(),
             skill_step_injection: false,
         }
     }
@@ -869,6 +878,28 @@ impl Config {
     /// Path to a specific file within the project's `.miniswe/`.
     pub fn miniswe_path(&self, relative: &str) -> PathBuf {
         self.miniswe_dir().join(relative)
+    }
+
+    /// Directory holding every session's state directory.
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.miniswe_dir().join("sessions")
+    }
+
+    /// This session's private state directory.
+    pub fn session_dir(&self) -> PathBuf {
+        self.sessions_dir().join(&self.session_id)
+    }
+
+    /// Path to a file within this session's state directory. Use this for
+    /// anything a concurrent or nested run must not see or overwrite.
+    pub fn session_path(&self, relative: &str) -> PathBuf {
+        self.session_dir().join(relative)
+    }
+
+    /// Create this session's state directory. Call before writing session
+    /// state; cheap and idempotent.
+    pub fn ensure_session_dir(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(self.session_dir())
     }
 
     /// Check if this project has been initialized (`miniswe init` was run).
