@@ -49,8 +49,15 @@ pub fn is_file_write(tool_name: &str) -> bool {
 /// The runtime gate stays in place as defense-in-depth.
 ///
 /// Tools field is a per-request OpenAI parameter, so swapping mid-session
-/// is supported. The transition fires once (on first plan(action='set'))
-/// per session — that's a single prompt-cache miss, not per-turn churn.
+/// is supported, but it lives in the prompt prefix: every flip invalidates
+/// the KV cache from token zero. Callers therefore pass a *latched* flag —
+/// once a plan has existed in the current context segment, the wide tool
+/// list stays wide even if `plan.md` later goes away. Only a SCRAP, which
+/// throws the whole context out and reassembles it, restarts the ceremony.
+///
+/// (Before per-session state directories, a nested miniswe run deleting the
+/// parent's `plan.md` retracted these tools mid-run — 3-18% of rounds across
+/// three benchmark runs, each flip costing a full re-prefill.)
 pub fn visible_tool_defs(
     all: &[crate::llm::ToolDefinition],
     plan_exists: bool,

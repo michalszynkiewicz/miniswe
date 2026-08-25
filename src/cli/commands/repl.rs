@@ -1083,6 +1083,9 @@ async fn run_agent_loop(
     const REVERT_TO_GREEN_BLOCKS: usize = 6;
     let mut last_green_round: usize = 0;
     let mut red_streak: usize = 0;
+    // Ceremony-gate latch — see run.rs for the rationale. Reset on every
+    // SCRAP, which reassembles the context and restarts the ceremony.
+    let mut plan_ever_set = false;
 
     'round: loop {
         if had_error {
@@ -1239,9 +1242,11 @@ async fn run_agent_loop(
 
         // Hide edit tools until a plan exists; see visible_tool_defs.
         let plan_set = tools::plan::plan_exists(config);
+        plan_ever_set |= plan_set;
         // Off: never hide edit tools (pass plan_exists=true). Strict: legacy
-        // hide-until-plan behavior.
-        let visible = visible_tool_defs(tool_defs, plan_set || !strict);
+        // hide-until-plan behavior, latched so a plan that goes away mid-segment
+        // cannot retract tools the model has already been shown.
+        let visible = visible_tool_defs(tool_defs, plan_ever_set || !strict);
         // Build request. See run.rs for the per-model reasoning_effort and
         // thinking-mode logic.
         let (chat_template_kwargs, temperature_override) =
@@ -1667,6 +1672,7 @@ async fn run_agent_loop(
                             // reset the context. Fires once per turn.
                             if config.tools.gate_restart && !restart_fired {
                                 restart_fired = true;
+                                plan_ever_set = false;
                                 *messages =
                                     scrap_restart(app, config, goal, mcp_summary, snapshots, false);
                                 conversation_history.clear();
@@ -1745,6 +1751,7 @@ async fn run_agent_loop(
                                 let msg = match verdict {
                                     debugger::DebuggerVerdict::Scrap if !restart_fired => {
                                         restart_fired = true;
+                                        plan_ever_set = false;
                                         *messages = scrap_restart(
                                             app,
                                             config,
@@ -2083,6 +2090,7 @@ async fn run_agent_loop(
                             let msg = match verdict {
                                 debugger::DebuggerVerdict::Scrap if !restart_fired => {
                                     restart_fired = true;
+                                    plan_ever_set = false;
                                     *messages = scrap_restart(
                                         app,
                                         config,
@@ -2681,6 +2689,7 @@ async fn run_agent_loop(
                         let extra_msg = match verdict {
                             debugger::DebuggerVerdict::Scrap if !restart_fired => {
                                 restart_fired = true;
+                                plan_ever_set = false;
                                 *messages =
                                     scrap_restart(app, config, goal, mcp_summary, snapshots, true);
                                 conversation_history.clear();

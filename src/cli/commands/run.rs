@@ -951,6 +951,11 @@ pub async fn run(
     const REVERT_TO_GREEN_BLOCKS: usize = 6;
     let mut last_green_round: usize = 0;
     let mut red_streak: usize = 0;
+    // Ceremony-gate latch: whether this context segment has ever had a plan.
+    // Tool *visibility* only ever widens within a segment — see
+    // `visible_tool_defs`. Reset wherever the context is scrapped and
+    // reassembled, because that restarts the ceremony deliberately.
+    let mut plan_ever_set = false;
 
     'round: loop {
         if had_error {
@@ -1305,9 +1310,11 @@ pub async fn run(
         // Hide edit tools from the model until a plan exists. See
         // visible_tool_defs for rationale.
         let plan_set = tools::plan::plan_exists(&config);
+        plan_ever_set |= plan_set;
         // Off: never hide edit tools (pass plan_exists=true). Strict:
-        // legacy hide-until-plan behavior.
-        let mut visible = visible_tool_defs(&tool_defs, plan_set || !strict);
+        // legacy hide-until-plan behavior, latched so a plan that goes away
+        // mid-segment cannot retract tools the model has already been shown.
+        let mut visible = visible_tool_defs(&tool_defs, plan_ever_set || !strict);
         // Expose the skill(done) advance control only while a step-cursor is
         // active — inert otherwise, so it never clutters non-skill turns.
         if skill_cursor::load(&config).is_active() {
@@ -1807,6 +1814,7 @@ pub async fn run(
                                 // doesn't see the reverted-away structure.
                                 tools::reindex_project_incremental(&config);
                                 let _ = std::fs::remove_file(config.session_path("plan.md"));
+                                plan_ever_set = false;
                                 let _ = std::fs::remove_file(config.session_path("scratchpad.md"));
                                 let assembled = context::assemble(
                                     &config,
@@ -1929,6 +1937,7 @@ pub async fn run(
                                         let _ = std::fs::remove_file(
                                             config.session_path("scratchpad.md"),
                                         );
+                                        plan_ever_set = false;
                                         let assembled = context::assemble(
                                             &config,
                                             message,
@@ -2444,6 +2453,7 @@ pub async fn run(
                                     }
                                     tools::reindex_project_incremental(&config);
                                     let _ = std::fs::remove_file(config.session_path("plan.md"));
+                                    plan_ever_set = false;
                                     let _ =
                                         std::fs::remove_file(config.session_path("scratchpad.md"));
                                     let assembled = context::assemble(
@@ -3055,6 +3065,7 @@ pub async fn run(
                                 }
                                 tools::reindex_project_incremental(&config);
                                 let _ = std::fs::remove_file(config.session_path("plan.md"));
+                                plan_ever_set = false;
                                 let _ = std::fs::remove_file(config.session_path("scratchpad.md"));
                                 let assembled = context::assemble(
                                     &config,
