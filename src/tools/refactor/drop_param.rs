@@ -20,8 +20,8 @@ use crate::tools::{ToolDetail, ToolResult};
 use super::ast_span;
 use super::model_edit::{apply_rewrite, ask_rewrite_validated};
 use super::sites::{
-    StagedEdit, commit_staged, ensure_ready, extract_window, find_callsites,
-    resolve_function_location,
+    StagedEdit, callsite_window, commit_staged, ensure_ready, extract_window, find_callsites,
+    reanchor_callsite, resolve_function_location,
 };
 use super::validation::{ArgSchema, validate};
 
@@ -190,20 +190,41 @@ pub async fn execute(
                 }
             },
         };
+        // The LSP resolved this position against the file as its index saw
+        // it, which is not necessarily the content we are about to edit.
+        // Re-anchor before building the window or the OLD block.
+        let Some((line, column)) = reanchor_callsite(&src, site.line, function_name) else {
+            callsite_failures.push(format!(
+                "{}:{}: no call to `{function_name}` found near this line in the current file \
+                 — it was probably moved or removed since the LSP indexed it. Edit this \
+                 callsite directly.",
+                rel,
+                site.line + 1
+            ));
+            continue;
+        };
+        // Re-cut the window whenever the anchor moved: the stored one came
+        // from the indexed content at the stale line and can start partway
+        // into the argument list, which leaves the model guessing at OLD.
+        let window = if line == site.line {
+            site.window.clone()
+        } else {
+            callsite_window(&src, line)
+        };
         // Deterministic OLD (same rationale as the signature rewrite above).
-        let known_old = ast_span::callsite_span(&src, &rel, site.line, site.column);
+        let known_old = ast_span::callsite_span(&src, &rel, line, column);
         // Validator-aware retries: if the model produces an OLD/NEW that
         // can't be applied at the LSP-resolved anchor (e.g. paraphrased
         // input), retry with a fresh inference pass.
         let rewrite = match ask_rewrite_validated(
             router,
             log,
-            &format!("callsite:{rel}:{}", site.line + 1),
+            &format!("callsite:{rel}:{}", line + 1),
             &instruction,
-            &site.window,
+            &window,
             known_old.as_deref(),
             cancelled,
-            |r| apply_rewrite(&src, r, site.line).map(|_| ()),
+            |r| apply_rewrite(&src, r, line).map(|_| ()),
         )
         .await
         {
@@ -212,22 +233,22 @@ pub async fn execute(
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("side-effecting") {
-                    side_effect_warnings.push(format!("{}:{}: {}", rel, site.line + 1, msg));
+                    side_effect_warnings.push(format!("{}:{}: {}", rel, line + 1, msg));
                 } else {
-                    callsite_failures.push(format!("{}:{}: {}", rel, site.line + 1, msg));
+                    callsite_failures.push(format!("{}:{}: {}", rel, line + 1, msg));
                 }
                 continue;
             }
         };
         // Validator already verified apply succeeds; re-run to produce
         // the final updated source.
-        match apply_rewrite(&src, &rewrite, site.line) {
+        match apply_rewrite(&src, &rewrite, line) {
             Ok(updated) => {
                 staged.insert(site.path.clone(), StagedEdit { original, updated });
-                report.push(format!("  • {}:{} updated", rel, site.line + 1));
+                report.push(format!("  • {}:{} updated", rel, line + 1));
             }
             Err(e) => {
-                callsite_failures.push(format!("{}:{}: {}", rel, site.line + 1, e));
+                callsite_failures.push(format!("{}:{}: {}", rel, line + 1, e));
             }
         }
     }
