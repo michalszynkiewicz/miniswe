@@ -1,0 +1,101 @@
+# Overnight 2026-08-22/23 — raw execution log (newest at bottom)
+23:52 gemma server up: start-gemma4.sh, KV q8_0 (new default), ctx 60000; llama-server 17,586 MiB (q4_0 was 17,244 on 08-22 evening) — only +0.34 GB, within the 20 GB budget
+23:54 gemma baseline run 1 started: THINKING=false, --timeout 3400 --max-rounds 600 --model gemma4 → benchmark_results/docker_20260822_235433__*gemma*
+23:56 config verified: compaction=lazy, thinking=false, context_window=60000, max_output_tokens=8000, stream_idle=30, temp 0.2
+      CONFOUND NOTED: run-benchmark-docker.sh defaults set auto_revert_ast_cascade=false, reactive_debugger=false, gate_context_reset=true
+      (same as every 08-20..22 docker run), but the 07-14 "6,6,6" references (compaction_20260714_*, lazy/run1) ran
+      auto_revert=true, reactive_debugger=true, gate_context_reset=false (= the code defaults). So "baseline" tonight
+      = docker-script defaults, not the 07-14 flags. Plan: if the baseline pair is not 6/6 or slow, rerun with
+      AUTO_REVERT=true REACTIVE_DEBUGGER=true GATE_CONTEXT_RESET=false (existing env knobs) before blaming q8_0/lazy.
+00:14 gemma baseline run 1: 6/6 attempt 1, 330 rounds, wall 1090s (refs 07-14: 299/481/1336s)
+00:17 gemma baseline run 2 started (server restarted)
+00:20 run 2 attempt 1: 5/6 in 65 rounds (~6 min) — test:FAIL (tests/e2e_context.rs edited to pass 7th arg to context::assemble, which takes 6; smoke PASS). Attempt 2 running.
+00:46 run 2 attempt 2 (started 00:20 from attempt-1 tree): read-loop pathology — round 337, 248/318 tool calls are file(read) of the
+      same 3 ranges (src/context/mod.rs L280-353, compress.rs L330-400); cargo check FAILED 5x on ONE error (mod.rs:341 "takes 2 args
+      but 3 supplied"); loop detector logs "repeated 3x" every ~20s but nothing escalates. Chain: model called refactor add_param with
+      the schema's literal placeholder `new_param: Option<String>` (contract-example leak), then drop_param'd it, leaving a stale
+      3-arg call at L341. Expect it to burn the remaining ~50 min → run 2 likely ends 5/6.
+01:05 run 2 attempt 2 HARNESS HANG: cargo check went OK at 00:48, then at 00:52:46 model called refactor add_param(compress_history,
+      used_tokens); log shows ask_rewrite parsed OLD/NEW, stderr shows "[lsp] request failed on a wedged rust-analyzer — restarting it (1/2)"
+      at 00:52:56 + a fresh rust-analyzer spawned; since then NO log line, NO llm request (server idle since 00:52:51), miniswe 0% CPU,
+      all 46 threads sleeping. Every LSP await I can find is bounded (initialize 30s, requests 10s, wait_for_idle ≤60s, ensure_ready 60s),
+      so the wedge is somewhere in the restart → retry path of change_signature. Cannot ptrace (container runs as root). Left to the
+      bench timeout (kills at ~01:11). Second harness-hang class after the LLM-request hang (1a7eed9).
+01:12 run 2 FINAL 5/6 (attempt1 5/6, attempt2 2/6 after hang), rounds=849 wall=3403s. Next: q4_0 KV rerun per user rule.
+01:15 gemma baseline run 3 started with KV q4_0 (llama-server 17,218 MiB)
+01:23 run 3 (q4_0) attempt 1: 5/6 (~9 min) — regression: basic_assembly_includes_system_prompt fails (messages[0] role user, system msg dropped w/o override); smoke PASS. Attempt 2 running.
+01:24 run 3 (q4_0) FINAL 6/6 on attempt 2 (attempt 2 took ~1 min), wall wall=677s
+01:31 nemotron instruct run started: THINKING=false, lazy, patched template, n-cpu-moe 99 (as before)
+01:57 nemotron instruct: round 158, 68x cargo build exit 101 on the SAME error (no field system_prompt_override on Config; run.rs:138), ~30 replace_range on run.rs L131-138; plan rewritten to 17 'steps' (markdown headers counted). Heading for timeout.
+02:23 nemotron instruct lazy FINAL 4/6 timeout wall=3427s rounds=478 (test FAIL, smoke FAIL)
+02:25 nemotron THINKING=true lazy run started → benchmark_results/docker_20260823_022349__home_michal_models_Nemotron-3.5-Lightni
+03:22  nemotron THINKING=true lazy run DONE: 6/6 (!) — docker_20260823_022349, wall 3460s (timeout), 193 agent rounds.
+       Feature fully done by 02:48 CEST (round 110, 24 min in): 81-line diff over cli/mod.rs, config/mod.rs, context/mod.rs, main.rs,
+       cargo test green, smoke PONG_42. Then 83 rounds of "The implementation is complete" + a tool call attached every time
+       (plan check / cargo build / echo complete) — 18 completion claims, the turn never ended, timeout reaped it; bench checks
+       ran on the finished tree → 6/6. 1 compaction, 7 cargo test calls (instruct run: see below), no floods, no git resets.
+       Longest stalls 243s/187s/146s = LLM requests after compaction (CPU experts prefill). Last request idle-timed-out (30s).
+03:25  stopped llama-nemotron; next: devstral 60k fit check.
+03:24  devstral 60k fit: MINISWE_CTX_SIZE=60000 start-devstral-small-2.sh (UD-Q4_K_XL 14.5 GB, q8_0 KV) → llama-server 19,090 MiB,
+       card total 22,497/24,576 MiB (≈3.4 GB is other processes). Fits under the 20 GB budget with ~1 GB to spare. Launching run 1.
+04:18  devstral run 1 DONE: 6/6 on attempt 2, wall 3169s — docker_20260823_032502. Attempt 1 = 267 rounds / 50 min / 5 compactions,
+       5/6 (smoke FAIL): classic "wired to nothing" — threaded the new param but passed `None,  // No system prompt override in REPL yet`
+       at both call sites (run.rs, repl.rs). Attempt 2 (393s left, 26 rounds) replaced both Nones with the value → PONG_42.
+       Churn: 76 replace_range, 67 revert (!), 18 refactor (add_param retried 4x on repl.rs), 7 loop detections, only 4 cargo test calls.
+04:19  restarting llama-devstral for run 2.
+04:37  devstral run 2 DONE: 6/6 on attempt 1, wall 1051s, 113 rounds — docker_20260823_041911. Stopped llama-devstral. Next: Glimmer pre-flight.
+04:38  Glimmer pre-flight: start-muse-glimmer-30b.sh (KQuant-17GB-Q4_K_M, ctx 131072, f16 KV, strength=medium, budget 2000) → 17,582 MiB,
+       loads clean (server notes template supports --reasoning-preserve). Harmony-style template (<|start|>assistant<|message|>…<|eot|>),
+       template default strength 'high', launcher passes medium. Probe (think): tool call parsed OK, 74 gen tok @ 21.0 tok/s,
+       prefill 695 tok/s, reasoning 85 chars. Launching bench run 1 (THINKING=true, CTX_WINDOW=60000).
+05:00  Glimmer run 1: declared done at round 58 (02:49 UTC, 10.5 min) with a complete-looking diff (cli/mod.rs, main.rs, run.rs, repl.rs,
+       context/mod.rs, tests/e2e_context.rs). Done-gate rejected it: "COMPILES but override NOT consumed … GOT: Hello! How can I help you today?".
+       Model then fell into a read loop (run.rs:145-155 re-read, [loop] x4, "Understood." replies), no further edits.
+05:25  DIAGNOSED (proxy-captured the gate's inner request, replayed against the server): the code is fine. Glimmer IGNORES the gate's
+       system prompt ("Respond only with TOKEN_XYZ and nothing else" + user "hello") whenever >=2 of the fixture's tool definitions
+       are in the request: 0/6 compliance (answers "Hello! How can I help you today?" / "pong"; reasoning literally says
+       "No special instruction"). Same request with 0-1 tools → TOKEN_XYZ. The bench's SMOKE wording ("You must respond with exactly
+       the text PONG_42 and nothing else. No explanation, no formatting, just PONG_42.") → PONG_42 5/5 with all 11 tools.
+       ⇒ the done-gate is model-dependent; it is rejecting a correct solution and the model will not "finish anyway".
+05:37  Glimmer run 1 DONE: 6/6 at the timeout (3429s, 186 rounds) — docker_20260823_043849. Tree was correct since round 58 (10.5 min);
+       gate held it hostage 46 min (139 file reads). reasoning_strength low/high/xhigh: no effect on gate compliance (0/9).
+       Wording probes w/ all 11 tools: weak+hello 0/6, weak+ping 0/3 ("pong"), strong+hello 0/8 (greeting reflex wins), strong+ping 4/4,
+       smoke wording+ping 5/5. /apply-template shows why: the template concatenates the system text with ~2k+ chars of tool-protocol
+       boilerplate into ONE system block; a one-line instruction becomes a buried preamble.
+05:39  Glimmer run 2 with a SCRATCH copy of the bench script (gate-v2: strong TOKEN_XYZ wording + user "ping"; nothing else changed;
+       repo script untouched). Authorized by the user's "try obvious tweaks if Glimmer fails" rule. NOT comparable to other rows.
+06:29 Glimmer run 2 (gate-v2 scratch, docker_20260823_054018) FINAL 6/6 after 3 attempts, 2786s, 158+36+48 rounds. Gate-v2 accepted first done claim (0 rejections); attempt 1 = 5/6 (test crate 13x E0061: hand-edited signature then refactor add_param refused as duplicate, 78 re-reads of tests/e2e_context.rs, gave up); attempt 2 = 31 reads, zero edits, 'Understood.' x3; attempt 3 = 13 replace_range in 2 min -> 6/6. llama-glimmer stopped, gemma server starting for thinking arm.
+06:30 gemma thinking run launched: docker_20260823_062952 (THINKING=true, CTX 60000, lazy, q8_0 KV launcher default, repo script = original gate wording). Expect landing ≤ 07:28.
+06:43 gemma thinking (docker_20260823_062952) FINAL 6/6 attempt 1, 743s, 86 rounds, 0 loops, 0 compactions. Starting flag-matched gemma instruct pair (AUTO_REVERT=true REACTIVE_DEBUGGER=true GATE_CONTEXT_RESET=false) — restart server first.
+06:45 flag-matched gemma instruct run 1 launched: docker_20260823_064417 (AUTO_REVERT=true REACTIVE_DEBUGGER=true GATE_CONTEXT_RESET=false THINKING=false, lazy, 60k)
+06:54 flag-matched gemma run 1 (docker_20260823_064417) FINAL 6/6 attempt 1, 550s, 111 rounds. Restarting server for run 2.
+06:55 flag-matched gemma run 2 launched: docker_20260823_065509
+07:00 flag-matched gemma run 2 (docker_20260823_065509) FINAL 6/6 attempt 1, 279s, 57 rounds. Pair = 550s/279s both first-attempt. Running a 3rd.
+07:01 flag-matched gemma run 3 launched: docker_20260823_070105
+07:25 flag-matched gemma run 3 (docker_20260823_070105) FINAL 6/6 attempt 2, 1411s, 165+46 rounds (attempt 1: 57 replace_range/20 reverts/3 loops). Triple = 6,6,6 @ 550/279/1411s, first-attempt 2/3 — same shape as 07-14 (299/481/1336s, 2/3). Stopping gemma server; all planned runs done.
+07:28 All planned runs complete. Summary written at top of .plan/2026-08-22.md; scoreboard updated; llama-gemma stopped, bench containers removed. GPU free.
+11:53 Glimmer rerun under fixed script (2fdc48c+88ba610): docker_20260823_112750 = 6/6 attempt 1, 1113s/91 rounds. New finding: gate inner run wipes outer plan.md (run.rs session-start clear). Driver started 11:49: devstral r3, devstral r4, gemma-thinking r2.
+12:48 devstral r3 docker_20260823_114957 = 0/6 at timeout (320 rounds, 83 replace_range/62 revert, period-3 loop on one broken edit from min 9 to the end; window detector fired 16x with cold-eval only; stale LSP after revert).
+13:45 devstral r4 docker_20260823_124659 = 4/6 at round cap 601 (436 rounds = truncation spin x2 on a persisted invalid-JSON tool call; main.rs untouched). gemma-thinking r2 started 13:44.
+[13:59] gemma-think-r2 docker_20260823_134416 — fixed script: 6/6 attempt 1, 855s, 105 rounds; 0 gate blocks, 0 debugger fires, 3 "recurred 4x" cold-evals, 1 context-window-exceeded compaction. Driver ALL DONE, llama-gemma4 stopped.
+16:09 Harness fixes for devstral r3/r4 committed one by one (29577c4 period-3/4 cycle detector + window escalation; e6025f8 stale LSP parse errors after revert; 3fc77fa never persist a truncated tool call + anchor-arg cap + parse-error spin guard; 1879294 debugger final-report sanitize — the "roles must alternate" 500 was THIS request, not the refactor prune: replay of dump 000391 (post-prune, with bridge) renders fine, dump 000037 (debugger nudge, tool→user) = 500; 7d418e9 heredoc backtick nit). Gemma-4 MoE smoke launched on a fresh llama-gemma4: docker_20260823_160906 (THINKING=false, lazy, 60k, code-default flags verified in config.toml).
+16:16 gemma smoke docker_20260823_160906 = 6/6 attempt 1, 298s, 187 rounds, 94 tool calls, 0 loop/debugger/gate events, stale-LSP suppression fired on config/mod.rs reverts. llama-gemma4 stopped; fresh llama-devstral (60k) up; devstral r5 launched: docker_20260823_161629 (config verified: lazy, 60k, thinking=false, temp 0.2, code-default flags).
+16:47 devstral r5 docker_20260823_161629 = 6/6 attempt 1, 1021s, 196 rounds, 117 tool calls (33 replace_range/30 file/14 plan/13 shell/9 revert/3 refactor); 1 loop note, 1 ctx-overflow compaction, stale-LSP suppression x6; 0 parse errors, 0 debugger 500s. Restarting llama-devstral for r6.
+16:49 devstral r6 launched: docker_20260823_164918__home_michal_models_devstral-small-2_Dev (fresh server, config verified)
+17:10 Laguna prep (while r6 runs): bartowski Laguna-XS-2.1-IQ4_XS.gguf downloaded (18.21 GB, ~3 min); GGUF header arch=laguna, hparams match config.json, embedded template == HF (enable_thinking kwarg, GLM-style <tool_call>); start-laguna-xs.sh written (IQ4_XS, ctx 60k, KV q8_0, --n-cpu-moe 6 ≈ 17.5 GB, temp 1.0/top-k 20/top-p 1.0, enable_thinking=false default). Bench --model is a free label — no script change needed.
+17:10 r6 observation: 14:53-15:00 UTC the model repeated an IDENTICAL malformed refactor(add_param) call 21x (position field contained "wait, let me fix the format:[TOOL_CALLS]refactor[ARGS]{"); [loop] "repeated 3x" fired 7x with no escalation; escaped on its own at 15:00 → manual callsite threading. GAP: period-1 identical FAILING call needs escalation (not just a note).
+17:27 devstral r6 docker_20260823_164918 = 6/6 attempt 1, 2212s, 276 rounds, 156 tool calls (46 file/44 replace_range/20 shell/16 refactor/13 plan/12 revert); 2 ctx-overflow compactions, 0 parse errors, 0 debugger 500s, 0 gate blocks; the 21x identical malformed refactor spin (14:53-15:00) cost ~7 min (see 17:10). Devstral under fixes: 2/2 at 6/6. Stopping llama-devstral; starting llama-laguna.
+17:29 llama-laguna up (IQ4_XS, 60k, q8_0 KV, n-cpu-moe 6): 17.2 GB VRAM (20.5 GB total on card), loaded from page cache in 5s. Probes: tool call clean (finish=tool_calls, empty content, 129 tok/s decode, 504 tok/s prefill); tool-result round trip clean (one-sentence answer); enable_thinking=true gave an immediate tool call with NO reasoning_content (note for a thinking arm — server suggests --reasoning-preserve). Laguna r1 launched: docker_20260823_172958 (THINKING=false, lazy, 60k, temp 0.2, code-default flags verified).
+17:41 Laguna r1 docker_20260823_172958 = 6/6 attempt 1, 640s, 372 rounds (131 requests), 129 tool calls (55 shell/29 file/24 plan/14 replace_range/5 revert/1 refactor/1 insert_at), 9 failed (4 = shell schema slips); 0 loop/debugger/gate/auto-revert/compaction events. Fastest non-gemma first-try pass (gemma: 279-550s). Quirks: shell-first (sed -i + python heredoc edits bypass edit guards), 23-step markdown plan checked off at the end. Findings: .plan/findings/laguna-xs-2026-08-23.md. llama-laguna stopped.
+19:03 Queue per user: nemotron x1 (cross-out run) → North Mini Code x2 → Glimmer x2 → Laguna x2. llama-nemotron up (launcher defaults: all experts on CPU, q4_0 KV, 60k, patched template; 7.0 GB VRAM, probe tool call clean @ 45.8 tok/s). Nemotron r6 launched: docker_20260823_190216__home_michal_models_Nemotron-3.5-Lightni (THINKING=false, lazy, 60k, temp 0.2, code-default flags + harness fixes, config verified).
+20:00 nemotron r6 docker_20260823_190216 = 5/6 at timeout (3426s, 946 rounds / 364 requests, 355 tool calls: 275 shell, 46 plan, 18 file, 11 replace_range, 5 refactor). Smoke FAIL ("Pong!" — override wired to nothing). Diff = 5 lines in src/cli/mod.rs (flag declared only). Last edit at 17:15 UTC (12 min in); the remaining 45 min were 86x `cargo test` (26 passed every time), 153x `echo` (71x "=== COMPLETE ==="), 42x `git diff --stat`, 56x grep — a completion claim + no-op tool call every round, `done` never called, so 0 gate blocks / 0 judge fires / 0 compactions; [loop] fired 7x (echo 4x recurred ×6) and was ignored. Same "done-but-can't-stop" shape as 022349 but with a hollow tree. Nemotron crossed out: 6 instruct runs, never a 6/6. Stopping llama-nemotron; North Mini Code next.
+20:04 llama-north up (UD-Q4_K_M, 60k, q8_0 KV, n-cpu-moe 10; ~17 GB VRAM, 98 tok/s decode). Probes: tool call + round trip clean; no-system-message leak quirk (6/6) irrelevant to bench. North r1 launched: docker_20260823_200353 (THINKING=false, lazy, 60k, temp 0.2, code-default flags, config verified).
+21:01 North r1 docker_20260823_200353 = 0/6 (compile FAIL), 3407s timeout, 457 rounds, 274 calls (258 file reads). 2 replace_range edits both dropped the 'pub enum Command {' header (broken AST, 22 errs), then 235x read src/cli/mod.rs for 55 min; nudge+cold-eval+57 forced compactions (18k->15.7k, nothing to remove) all failed; no 3rd edit → no cascade, no revert → no hint, no done → no judge. NEW GAP 10: read-loop ladder has no terminal step (proposal: after K failed forced compactions w/ broken AST, revert to last ast=ok rev + post-revert hint, or fire the judge). Restarting llama-north for r2.
+21:04 llama-north restarted fresh (20.3 GB on card). North r2 launched: docker_20260823_210331 (same config, verified).
+21:45 North r2 (docker_20260823_210331) KILLED at ~42 min per user ("kill it and run it as thinking"): same read loop as r1 but WORSE — 169+ reads of src/cli/mod.rs, ZERO edit attempts on a clean tree, 10+ forced compactions. No wall_s/smoke (aborted). Public docs say the model is trained for interleaved thinking and "works best with thinking enabled" → thinking arm instead of a second instruct run.
+21:53 llama-north restarted with MINISWE_REASONING=true (template reasoning=true, open <|START_THINKING|>). Probes: think 171/1677 chars, finish=tool_calls, correct replace_range on a synthetic edit. North thinking run launched: docker_20260823_215011 (THINKING=true → temp 0.6 via thinking_temperature, lazy, 60k, config verified). Timeout ~22:50.
+22:50 North thinking (docker_20260823_215011): 5/6 at timeout (3424s, 571 rounds/408 req). smoke PASS; only cargo test FAIL — model widened context::assemble to 6 args + updated test crate but missed ONE call site (e2e_context.rs:434). Last edit 83s before timeout; compile gate had just named that exact error. 74 replace_range/33 revert/27 shell, 6-file diff incl. main.rs + tests. 2 benign loop notes, 0 gate/debugger/judge/forced-compactions, done never called. Verdict: thinking-on is binary for this model (instruct 0/6 + killed read-loop vs 5/6-one-edit-short). Recorded in findings + scoreboard. Next: stop llama-north, Glimmer r1.
+23:49 Glimmer queue-r1 (docker_20260823_225151): 5/6 after 3 attempts (3406s, 415 rounds). Attempt 1: flag wired, then 25-min read loop on e2e_context.rs:54 (112 reads, 14 loop notes, ladder never escalated — jittered reads reset the counter = gap 10 failure mode #2); ended turn mid-loop, tree 5/6. Attempt 2: ZERO edits, "Understood.", end. Attempt 3: 11 edits, 14 errs → 2, clock death. Same terminal error as North thinking (e2e_context.rs:434 E0061). Reproduces 054018's read-loop. Next: fresh server, Glimmer r2.
+00:37 Glimmer queue-r2 (docker_20260823_235146): 6/6 attempt 1 (2735s, 388 rounds) — tree GREEN at minute 10 via refactor(add_param, fill_in=None) threading all 14 test call sites mechanically; then 35 min of re-reading e2e_context.rs on a green tree (23 loop notes, 0 escalations) before ending turn. r1-vs-r2 fork = tool choice: hand-edit signature → 14-callsite chase + loop; add_param → no long pole at all. Missing harness move both ways: "green tree + N rounds no edit → run done-gate". Next: Laguna ×2.
+00:50 Laguna queue-r1 (docker_20260824_004000): 6/6 attempt 1, 566s (341 rounds) — faster than the 640s debut. Same profile as run 1: shell-heavy (63 shell / 15 replace_range / 27 file), 0 loops/gate/debugger, 1 compaction, full 6-file diff incl. test crate. Laguna n=2, both clean first-try. Next: fresh server, Laguna queue-r2 (final queue item).
+01:05 Laguna queue-r2 (docker_20260824_005124): 6/6 attempt 1, 792s (288 rounds). Same profile (35 shell/13 replace_range/31 file, 4 benign loop notes, 0 gate/debugger), full 6-file diff. Laguna n=3: 640s/566s/792s, ALL 6/6 first-try — the only model besides gemma with a 100% clean record. QUEUE COMPLETE. Server stopped, card back to baseline.
