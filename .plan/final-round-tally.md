@@ -1,4 +1,4 @@
-# Final round — tally (updated 2026-08-25 12:16)
+# Final round — tally (updated 2026-08-25 15:40)
 
 ## Per-run protocol
 1. `docker ps --format '{{.Names}}' | grep -iE "llama|cuda" | xargs -r docker rm -f`
@@ -11,7 +11,14 @@ NEVER edit run-benchmark-docker.sh while a run is in flight — bash re-reads th
 file by byte offset; run 8 died with "syntax error near unexpected token" at the
 results table for exactly this reason (the benchmark itself had already finished).
 
-## Results (pre-fix binary unless noted)
+## Binary generations (READ BEFORE COMPARING WALL TIMES)
+- **G0** — before the LSP / stale-anchor / lockout fixes.
+- **G1** — those three fixes in (rows marked POST-FIX below).
+- **G2** — G1 + `fcd8378`, the 512-token-cliff fix. Wall times are NOT comparable
+  across generations for any run whose plan block crossed ~1778 B; see the
+  contamination scan below.
+
+## Results
 | # | Model | Mode | Result | Wall | Rounds | Decode | defect | verdict |
 |---|---|---|---|---|---|---|---|---|
 | 1 | Gemma 4 26B | instruct | 6/6 a1 | 419s | 166 | 94.2 | none | KEEP |
@@ -24,6 +31,28 @@ results table for exactly this reason (the benchmark itself had already finished
 | 8 | Laguna XS | thinking | **6/6 a1** | **481s** | **167** | **130.3/130.4** | none (POST-FIX, zero sed) | REPLACED 13:14 — was 6/6 a2 1887s w/ PARTIAL 15/16 + sed |
 | 9 | Muse Glimmer 30B | thinking | 6/6 a1 | 657s | 77 calls | 21.5/21.1 | none | KEEP |
 | 10 | Muse Glimmer 30B | thinking | 6/6 a1 | 571s | 67 calls | 20.1/19.3 | none | KEEP |
+| 11 | Laguna XS | instruct | **6/6 a1** | **514s** | **375** | **130.1/129.0** | none (**G2**, cliff-fix verification) | KEEP |
+
+### Run 11 — the cliff fix, verified live (15:24-15:34)
+Same model/arm/config as rows 5 and 6. Defect scan clean. Decode 130.1/129.0 =
+normal band, so no hardware confound.
+
+| run | main calls | sub-role | median block | rounds >cliff | wall | result |
+|---|---|---|---|---|---|---|
+| 10:05 (G1) | 124 | 9  | 1936 B | **103** | 3423s | 4/6 |
+| 15:24 (G2) | 142 | 1  | **2270 B** | **120** | **514s** | **6/6 a1** |
+
+Run 11 is the *same regime as the 3423s failure, only worse* — bigger plan, more
+over-cliff rounds — and it paid 2 full re-prefills instead of 103 (109,005
+prefill tokens over 145 events, matching the 08-24 FAST run's 109,104 while
+doing 5x the rounds). Block parked behind the tail in 117 of 121 block-bearing
+rounds; only 4 relocations.
+
+**Do not over-claim it against rows 5/6.** Those had median blocks of 647 B and
+1602 B (max 1756 — never crossed), i.e. **0** over-cliff rounds; their cost was
+sub-role KV eviction (25 and 47 sub-role calls vs 1 here). The fix kills the
+catastrophic tail; it does not explain the whole 1550s -> 514s gap. Sub-role
+eviction remains unaddressed.
 
 ## Queue after the reruns (all on the fixed binary)
 - ~~Laguna XS instruct rerun~~ DONE
@@ -35,6 +64,31 @@ results table for exactly this reason (the benchmark itself had already finished
 - gpt-oss-20b x2, high effort only (add --chat-template-kwargs '{"reasoning_effort":"high"}' to start-gpt-oss-20b.sh, thinking=false)
 - Mistral Small 4 x2
 - Laguna S 2.1 x2 (last — 73 GB, slowest)
+
+## Contamination scan (which G0/G1 results the cliff bug actually touched)
+`scratchpad/contam.py` — counts rounds whose state block exceeded ~1778 B (512
+tok at the measured 3.47 B/tok). Under G0/G1 each such round forced a FULL
+re-prefill.
+
+| run | rounds | median B | over cliff |
+|---|---|---|---|
+| 20260825_080756 gemma-4-26B | 471 | 1832 | **236** |
+| 20260825_100518 Laguna XS   | 124 | 1936 | **103** (already replaced) |
+| 20260824_162908 Laguna XS   |  50 | 1821 | **27** |
+| 20260824_005124 Laguna XS   | 103 | 1740 | 22 |
+| 20260820_175942 Nemotron    | 115 |  586 | 14 |
+| 20260823_172958 Laguna XS   | 131 | 1610 | 12 |
+| 20260824_165637 gemma-4-26B | 535 |  489 | 11 |
+
+Everything else is 0-2 rounds. **Rebench rule:** redo a run only if it is
+contaminated AND it either timed out or is a headline number in the post.
+Contamination inflates wall time; it only flips pass/fail when the run hit the
+timeout (exactly the 4/6 3423s case). A comfortable 6/6 that was merely slower
+than it would be today gets a footnote, not a rerun.
+
+Caveat: the cliff is a **sliding-window-attention** property. Laguna and Gemma 4
+are SWA. Whether Mistral Small 4 / Devstral / gpt-oss are affected is unverified
+— add one `scratchpad/cliff.py` probe (~1 min) at server start per model.
 
 ## End of round
 - posts/benchmarking-small-models.md: per-model recent-run bands (gemma 5/6s INCLUDED), fill Decode col
