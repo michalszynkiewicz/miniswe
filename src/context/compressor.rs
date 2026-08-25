@@ -186,16 +186,15 @@ pub async fn maybe_compress(
     // they're the only two pieces of context the agent itself mutates
     // mid-run, which made the system prompt go stale between refreshes
     // (see `config::ProvidersConfig`'s doc comment). Instead, the current
-    // state is kept on the tail of the message list, refreshed here,
-    // unconditionally, every time compression runs (i.e. every round).
-    // This has to live in front of every compaction strategy's dispatch,
-    // not be gated on "did plan/scratchpad change" or "is this strategy
-    // about to actually do work": the risk isn't the content changing, it's
-    // an unchanged block quietly aging until some strategy's cutoff reaches
-    // past it and drops or summarizes it away. Refreshing every round keeps
-    // it permanently at 0 rounds old, which every strategy here treats as
-    // "too recent to touch" by construction.
-    refresh_current_state(messages, config);
+    // state is kept on the message list and reconciled here, every round,
+    // in front of every compaction strategy's dispatch. Reconciled, not
+    // re-appended: an unchanged block stays put, because moving it rewrites
+    // history the inference server has already cached. See
+    // `refresh_current_state` for why that costs a full re-prefill.
+    refresh_current_state(messages, config, StateRefresh::Sticky);
+    // Sampled AFTER the reconcile above, so that its own append is not
+    // mistaken for a compaction and does not trigger the repair pass.
+    let before = compaction_fingerprint(messages);
 
     match config.context.compaction {
         CompactionStrategy::Unified => {
@@ -272,10 +271,37 @@ pub async fn maybe_compress(
         // Reactive: never compact proactively. Compaction happens only via
         // `force_compress`, driven from the round loop when the server
         // itself signals context exhaustion. (refresh_current_state above
-        // still ran — the current-state block stays on the tail regardless
-        // of strategy.)
+        // still ran — the current-state block is reconciled regardless of
+        // strategy.)
         CompactionStrategy::Lazy => {}
     }
+
+    // Repair pass, but only when compaction actually rewrote the message
+    // list. It may have dropped or mangled the message carrying the block,
+    // so re-anchor in the same round rather than leaving the model a round
+    // without its plan — and sweep any superseded copies while we are here.
+    // Free at exactly this moment: the server's cached prefix is already
+    // invalid. Skipped otherwise (Lazy compacts on almost no round), because
+    // an unconditional re-anchor here would restore the very behaviour this
+    // is undoing.
+    if compaction_fingerprint(messages) != before {
+        refresh_current_state(messages, config, StateRefresh::Reanchor);
+    }
+}
+
+/// Cheap change-detector for "did a compaction strategy rewrite the message
+/// list": message count plus total content length. Compaction always changes
+/// at least one of the two — it replaces spans of messages with a shorter
+/// summary — while a round that merely appends leaves both untouched,
+/// because `refresh_current_state` runs before this is first sampled.
+fn compaction_fingerprint(messages: &[Message]) -> (usize, usize) {
+    (
+        messages.len(),
+        messages
+            .iter()
+            .map(|m| m.content.as_deref().map_or(0, str::len))
+            .sum(),
+    )
 }
 
 /// Cap on consecutive `force_compress`-and-retry cycles for one failing
@@ -372,6 +398,8 @@ pub async fn force_compress(
 /// most one live copy exists at a time, always on the last message.
 const CURRENT_STATE_MARKER: &str = "\n\n[CURRENT STATE]\n";
 
+use crate::cli::commands::agent::skill_cursor;
+
 /// Build the current-state block (plan + scratchpad), or `None` if both are
 /// empty.
 fn format_current_state_block(config: &Config) -> Option<String> {
@@ -414,17 +442,68 @@ fn format_current_state_block(config: &Config) -> Option<String> {
     Some(block)
 }
 
-/// Strip any previously-appended current-state block from `messages`
-/// (wherever it landed), then append a fresh one to the last message.
-/// Unconditional and called every round (see `maybe_compress`'s call site)
-/// so the block is never more than 0 rounds old — every compaction
-/// strategy here treats the most recent message as too new to touch, so a
-/// block re-attached every round can never be dropped or summarized away.
+/// Rewind budget for relocating the current-state block, in bytes.
 ///
-/// Appending to an EXISTING message's content (rather than inserting a new
-/// message) is role-order-safe by construction: it never introduces a new
-/// role transition, so it can't break strict chat templates.
-fn refresh_current_state(messages: &mut [Message], config: &Config) {
+/// llama.cpp reuses a cached prompt only as a pure EXTENSION; a shorter
+/// prefix is served by trimming the KV tail, and past a hard threshold it
+/// cannot trim at all and re-prefills the whole prompt from token zero.
+/// That threshold measured at exactly 512 tokens on build 10524 (Laguna XS,
+/// sliding-window attention): a 512-token rewind cost 496 tokens of prefill,
+/// a 528-token rewind cost the full 21,491. At the ~3.47 bytes/token this
+/// content runs, 1500 bytes is ~432 tokens — under the cliff with margin.
+///
+/// This is why the block's SIZE used to decide a run's wall time. The old
+/// unconditional refresh always rewound by exactly one block, so a plan that
+/// grew past ~512 tokens flipped every round from a free tail-trim to a full
+/// re-prefill: across six Laguna runs the five with a 148-484 token block ran
+/// 304-1887s, and the one with a 558-token block ran 3423s.
+const STATE_REWIND_BUDGET: usize = 1500;
+
+/// How many superseded copies of the block may sit in history before we pay
+/// once to sweep them. Each costs its own size in context until the next
+/// compaction reclaims it.
+const MAX_STALE_STATE_COPIES: usize = 3;
+
+/// Whether `refresh_current_state` may leave the block where it is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateRefresh {
+    /// Normal round: avoid rewriting cached history wherever possible.
+    Sticky,
+    /// Compaction just rewrote the message list, so the server's cached
+    /// prefix is already invalid — re-anchor and sweep stale copies for free.
+    Reanchor,
+}
+
+/// Byte offsets of every current-state block, oldest first, as
+/// `(message index, offset of the marker within that message)`.
+fn find_current_state(messages: &[Message]) -> Vec<(usize, usize)> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            m.content
+                .as_deref()
+                .and_then(|c| c.find(CURRENT_STATE_MARKER))
+                .map(|pos| (i, pos))
+        })
+        .collect()
+}
+
+/// Bytes that would be discarded by rewriting the block at `(idx, pos)` —
+/// i.e. everything from that marker to the end of the prompt.
+fn rewind_cost(messages: &[Message], idx: usize, pos: usize) -> usize {
+    messages[idx]
+        .content
+        .as_deref()
+        .map_or(0, |c| c.len() - pos)
+        + messages[idx + 1..]
+            .iter()
+            .map(|m| m.content.as_deref().map_or(0, str::len))
+            .sum::<usize>()
+}
+
+/// Strip every current-state block from `messages`.
+fn strip_current_state(messages: &mut [Message]) {
     for m in messages.iter_mut() {
         if let Some(content) = &m.content
             && let Some(pos) = content.find(CURRENT_STATE_MARKER)
@@ -432,7 +511,100 @@ fn refresh_current_state(messages: &mut [Message], config: &Config) {
             m.content = Some(content[..pos].to_string());
         }
     }
-    let Some(block) = format_current_state_block(config) else {
+}
+
+/// Reconcile the current-state block against `plan.md` / `scratchpad.md` /
+/// the skill cursor, moving it as little as possible.
+///
+/// The whole point is to avoid rewriting history the inference server has
+/// already cached (see `STATE_REWIND_BUDGET`). Three cases:
+///
+/// 0. **Small enough to move cheaply** — re-anchor every round, as the
+///    original design did. A block sitting at the tail rewinds by exactly its
+///    own size, so while that stays inside [`STATE_REWIND_BUDGET`] the move
+///    is nearly free and keeps both history and recency ideal.
+/// 1. **Unchanged** — leave it exactly where it is. Nothing is rewritten, so
+///    the prompt stays a pure extension and the cache is reused in full.
+///    This is the common case by a wide margin: across six Laguna XS runs the
+///    rendered block was byte-identical on 76-100% of rounds, and the 3423s
+///    run never changed it once in 103 rounds.
+/// 2. **Changed, and the old copy is near the tail** — strip and re-append.
+///    The rewind fits in the server's trim budget, so it is nearly free and
+///    keeps history clean.
+/// 3. **Changed, and the old copy has drifted far back** — append the new
+///    block and leave the superseded one in place. Stripping it would rewind
+///    past the cliff and re-prefill everything; leaving it costs its size in
+///    context until `MAX_STALE_STATE_COPIES` or the next compaction sweeps.
+///
+/// The guarantee the old always-refresh behaviour provided — that the block
+/// can never be summarized away, because every strategy treats the newest
+/// message as too new to touch — is preserved by repair rather than by
+/// relocation: if compaction drops or mangles the carrier, the comparison
+/// below stops matching and the block is rebuilt. `maybe_compress` also calls
+/// this with [`StateRefresh::Reanchor`] after a compaction that actually
+/// changed the message list, when re-anchoring is free.
+///
+/// Exception: while a `[SKILL STEP]` is being injected, recency is
+/// load-bearing rather than cosmetic — the uds-mcp e2e drifted back to the
+/// model's priors when the step was not the freshest thing in context — so
+/// those rounds re-anchor unconditionally and keep paying for it.
+///
+/// Appending to an EXISTING message's content (rather than inserting a new
+/// message) is role-order-safe by construction: it never introduces a new
+/// role transition, so it can't break strict chat templates.
+fn refresh_current_state(messages: &mut [Message], config: &Config, mode: StateRefresh) {
+    let block = format_current_state_block(config);
+    let copies = find_current_state(messages);
+    let has_skill_step = block
+        .as_deref()
+        .is_some_and(|b| b.contains(skill_cursor::SKILL_STEP_MARKER));
+    // Stickiness is only worth its complexity for a block big enough that
+    // re-anchoring it would cross the cliff. A block at the tail rewinds by
+    // exactly its own size, so a small one is re-anchored every round exactly
+    // as before: nearly free (a 480-token rewind measured 0.40s), history
+    // stays clean, and the block stays maximally recent, which is what the
+    // original design wanted. Replayed over six Laguna runs this is the
+    // difference between a strict improvement and a trade — the four runs
+    // with a 148-190 token block come out byte-identical to the old
+    // behaviour, while the 558-token run drops from 102 full re-prefills to 1.
+    let sticky = mode == StateRefresh::Sticky
+        && !has_skill_step
+        && block
+            .as_deref()
+            .is_some_and(|b| b.len() > STATE_REWIND_BUDGET);
+
+    // Case 1: the newest copy already says exactly this. Leave it alone.
+    if sticky
+        && let Some(block) = block.as_deref()
+        && let Some(&(i, pos)) = copies.last()
+        && messages[i]
+            .content
+            .as_deref()
+            .is_some_and(|c| &c[pos..] == block)
+    {
+        return;
+    }
+
+    // Case 3: relocating would rewind past the server's trim budget, so
+    // append alongside instead of rewriting. Only while the stale copies
+    // stay within budget — past that, sweeping once is the cheaper trade.
+    // The newest copy must not already be on the message we are about to
+    // append to, or the two would fuse into one content string and every
+    // later comparison would see a doubled block and append again forever.
+    let tail_is_clear = copies.last().is_none_or(|&(i, _)| i + 1 < messages.len());
+    let append_only = sticky
+        && block.is_some()
+        && tail_is_clear
+        && copies.len() < MAX_STALE_STATE_COPIES
+        && copies
+            .first()
+            .is_some_and(|&(i, pos)| rewind_cost(messages, i, pos) > STATE_REWIND_BUDGET);
+
+    // Case 2 (and every non-sticky path): rewrite history and re-anchor.
+    if !append_only {
+        strip_current_state(messages);
+    }
+    let Some(block) = block else {
         return;
     };
     if let Some(last) = messages.last_mut() {
@@ -443,7 +615,10 @@ fn refresh_current_state(messages: &mut [Message], config: &Config) {
 
 #[cfg(test)]
 mod current_state_tests {
-    use super::{CURRENT_STATE_MARKER, format_current_state_block, refresh_current_state};
+    use super::{
+        CURRENT_STATE_MARKER, MAX_STALE_STATE_COPIES, STATE_REWIND_BUDGET, StateRefresh,
+        find_current_state, format_current_state_block, refresh_current_state,
+    };
     use crate::config::Config;
     use crate::llm::Message;
 
@@ -530,7 +705,7 @@ mod current_state_tests {
         std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
 
         let mut msgs = vec![Message::user("do the task"), Message::assistant("ok")];
-        refresh_current_state(&mut msgs, &config);
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
 
         let content = msgs.last().unwrap().content.as_deref().unwrap();
         assert!(content.contains("[CURRENT STATE]"));
@@ -549,7 +724,7 @@ mod current_state_tests {
         std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
 
         let mut msgs = vec![Message::tool_result("call1", "first result")];
-        refresh_current_state(&mut msgs, &config);
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
         assert_eq!(
             msgs[0]
                 .content
@@ -563,7 +738,7 @@ mod current_state_tests {
         // A later round: a fresh tool result gets pushed, plan changes.
         std::fs::write(config.miniswe_path("plan.md"), "1. [x] step one\n").unwrap();
         msgs.push(Message::tool_result("call2", "second result"));
-        refresh_current_state(&mut msgs, &config);
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
 
         // Old block gone from msgs[0], new one only on the last message.
         assert!(
@@ -580,35 +755,278 @@ mod current_state_tests {
     }
 
     #[test]
-    fn refreshes_every_round_even_when_state_is_unchanged() {
-        // The bug this guards against: a block parked on an old message and
-        // never moved would eventually be compacted away. Simulate several
-        // "rounds" with unchanged plan content and confirm the block always
-        // ends up on the newest message, never left behind on an old one.
+    fn unchanged_block_stays_put_across_rounds() {
+        // The whole point of the stickiness: an unchanged block must NOT be
+        // moved, because relocating it rewinds the prompt past llama.cpp's
+        // 512-token reuse threshold and forces a full re-prefill. Simulate
+        // several rounds with unchanged plan content and confirm the block
+        // never leaves the message it was first anchored to, and that
+        // exactly one copy exists throughout.
         let tmp = tempfile::TempDir::new().unwrap();
         let config = config_in(tmp.path());
-        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+        write_big_plan(&config, "step one");
 
         let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
-        refresh_current_state(&mut msgs, &config);
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+        let anchored = msgs[0].content.clone().unwrap();
+        assert!(anchored.contains("[PLAN]"));
 
         for i in 2..=5 {
             msgs.push(Message::tool_result(
                 &format!("call{i}"),
                 &format!("round {i} result"),
             ));
-            refresh_current_state(&mut msgs, &config); // unchanged plan content
+            refresh_current_state(&mut msgs, &config, StateRefresh::Sticky); // unchanged plan content
         }
 
-        for m in &msgs[..msgs.len() - 1] {
+        assert_eq!(
+            msgs[0].content.as_deref().unwrap(),
+            anchored,
+            "carrier message must be byte-identical across rounds"
+        );
+        for (i, m) in msgs.iter().enumerate().skip(1) {
             assert!(
                 !m.content.as_deref().unwrap().contains(CURRENT_STATE_MARKER),
-                "block should not linger on an old message: {:?}",
+                "no second copy on message {i}: {:?}",
                 m.content
             );
         }
-        let last_content = msgs.last().unwrap().content.as_deref().unwrap();
-        assert!(last_content.contains("[PLAN]"));
+    }
+
+    #[test]
+    fn re_anchors_when_compaction_drops_the_carrier() {
+        // The guarantee the old unconditional refresh provided: the block can
+        // never be summarized away. Now it is provided by repair instead of
+        // by relocation — if the message carrying the block disappears, the
+        // next refresh notices the block is gone and re-appends it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+
+        let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+        assert!(msgs[0].content.as_deref().unwrap().contains("[PLAN]"));
+
+        // Compaction eats the carrier and leaves a summary in its place.
+        msgs[0] = Message::user("[summary of earlier rounds]");
+        msgs.push(Message::tool_result("call2", "round 2 result"));
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+
+        let last = msgs.last().unwrap().content.as_deref().unwrap();
+        assert!(last.contains("[PLAN]"), "block must be restored: {last}");
+        assert!(!msgs[0].content.as_deref().unwrap().contains("[PLAN]"));
+    }
+
+    #[test]
+    fn re_anchors_when_the_carrier_content_was_rewritten() {
+        // Weaker damage than a drop: the marker survives but the block text
+        // was mangled (a summarizer folding it into prose). The byte-compare
+        // must reject it and rebuild a clean copy on the newest message.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+
+        let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+
+        let mangled = msgs[0].content.as_deref().unwrap().replace("step one", "…");
+        msgs[0].content = Some(mangled);
+        msgs.push(Message::tool_result("call2", "round 2 result"));
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+
+        assert_eq!(msgs[0].content.as_deref().unwrap(), "round 1 result");
+        let last = msgs.last().unwrap().content.as_deref().unwrap();
+        assert!(last.contains("step one"), "{last}");
+        assert_eq!(last.matches("[PLAN]").count(), 1);
+    }
+
+    /// A tool result big enough to push the rewind past STATE_REWIND_BUDGET.
+    fn bulky(n: usize) -> String {
+        "x".repeat(n)
+    }
+
+    /// Write a plan large enough that re-anchoring its block would cross the
+    /// rewind budget — the only case in which stickiness engages.
+    fn write_big_plan(config: &Config, tag: &str) {
+        let body: String = (1..=60)
+            .map(|i| format!("{i}. {tag} — a plan step with enough text to matter\n"))
+            .collect();
+        std::fs::write(config.miniswe_path("plan.md"), body).unwrap();
+    }
+
+    #[test]
+    fn small_block_is_re_anchored_every_round() {
+        // Below the rewind budget the old behaviour is already cheap, so keep
+        // it: the block follows the newest message and history stays clean.
+        // This is what makes the change a strict improvement rather than a
+        // trade on the runs whose plan never approached the cliff.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+
+        let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+        for i in 2..=4 {
+            msgs.push(Message::tool_result(&format!("call{i}"), "result"));
+            refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+        }
+
+        assert_eq!(find_current_state(&msgs).len(), 1);
+        assert_eq!(msgs[0].content.as_deref().unwrap(), "round 1 result");
+        assert!(
+            msgs.last()
+                .unwrap()
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("[PLAN]"),
+            "small block must ride the tail"
+        );
+    }
+
+    #[test]
+    fn far_drifted_block_appends_instead_of_rewinding() {
+        // Case 3: the block parked, the conversation moved on by more than
+        // the rewind budget, and now the plan changed. Stripping the old copy
+        // would rewind past the cliff and re-prefill everything, so the new
+        // block is appended alongside and the superseded copy stays put.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        write_big_plan(&config, "step one");
+
+        let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+        let carrier = msgs[0].content.clone().unwrap();
+
+        msgs.push(Message::tool_result(
+            "call2",
+            &bulky(STATE_REWIND_BUDGET + 100),
+        ));
+        write_big_plan(&config, "step one done");
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+
+        assert_eq!(
+            msgs[0].content.as_deref().unwrap(),
+            carrier,
+            "history before the tail must not be rewritten"
+        );
+        let last = msgs.last().unwrap().content.as_deref().unwrap();
+        assert!(last.contains("step one done"), "new block appended");
+        assert_eq!(
+            find_current_state(&msgs).len(),
+            2,
+            "one superseded, one live"
+        );
+    }
+
+    #[test]
+    fn nearby_block_is_stripped_rather_than_duplicated() {
+        // Case 2: the rewind fits in the trim budget, so keep history clean.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        std::fs::write(config.miniswe_path("plan.md"), "1. step one\n").unwrap();
+
+        let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+        msgs.push(Message::tool_result("call2", "short"));
+        std::fs::write(config.miniswe_path("plan.md"), "1. [x] step one\n").unwrap();
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+
+        assert_eq!(find_current_state(&msgs).len(), 1);
+        assert_eq!(msgs[0].content.as_deref().unwrap(), "round 1 result");
+    }
+
+    #[test]
+    fn stale_copies_never_exceed_the_cap() {
+        // Append-only is bounded: superseded blocks may accumulate, but once
+        // they hit MAX_STALE_STATE_COPIES we pay one rewind to sweep. Drive
+        // many far-drifted changes and assert the count never runs away and
+        // that a sweep really happens.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
+        let mut swept = false;
+        let mut peak = 0;
+
+        for i in 1..=12 {
+            write_big_plan(&config, &format!("step {i}"));
+            refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+            let n = find_current_state(&msgs).len();
+            assert!(
+                n <= MAX_STALE_STATE_COPIES,
+                "round {i}: {n} copies exceeds the cap"
+            );
+            peak = peak.max(n);
+            if n == 1 && i > 1 {
+                swept = true;
+            }
+            msgs.push(Message::tool_result(
+                &format!("call{i}"),
+                &bulky(STATE_REWIND_BUDGET + 100),
+            ));
+        }
+
+        assert!(peak > 1, "append-only path never engaged");
+        assert!(swept, "cap never triggered a sweep");
+        let last = find_current_state(&msgs).last().copied().unwrap();
+        let live = &msgs[last.0].content.as_deref().unwrap()[last.1..];
+        assert!(
+            live.contains("step 12 "),
+            "newest copy must be live: {live}"
+        );
+    }
+
+    #[test]
+    fn reanchor_mode_sweeps_and_moves_unconditionally() {
+        // What maybe_compress uses after a compaction that rewrote history:
+        // the cached prefix is already dead, so consolidate for free.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_in(tmp.path());
+        write_big_plan(&config, "step one");
+
+        let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+        msgs.push(Message::tool_result("call2", "round 2 result"));
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+        assert!(msgs[0].content.as_deref().unwrap().contains("[PLAN]"));
+
+        refresh_current_state(&mut msgs, &config, StateRefresh::Reanchor);
+        assert_eq!(msgs[0].content.as_deref().unwrap(), "round 1 result");
+        assert!(msgs[1].content.as_deref().unwrap().contains("[PLAN]"));
+    }
+
+    #[test]
+    fn active_skill_step_re_anchors_every_round() {
+        // Carve-out: with a [SKILL STEP] injected, recency is load-bearing
+        // (the model drifts back to its priors when the step isn't the
+        // freshest thing in context), so those rounds keep relocating the
+        // block and keep paying the re-prefill.
+        use crate::cli::commands::agent::skill_cursor::{self, SkillCursor};
+        use crate::cli::commands::agent::skill_router::SkillStep;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = config_in(tmp.path());
+        config.skill_step_injection = true;
+        let mut cursor = SkillCursor::default();
+        cursor.push_skill(
+            "uds-package",
+            tmp.path(),
+            vec![SkillStep {
+                name: "Create the package".into(),
+                anchor: "## Create".into(),
+            }],
+        );
+        skill_cursor::save(&config, &cursor);
+
+        let mut msgs = vec![Message::tool_result("call1", "round 1 result")];
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
+        assert!(msgs[0].content.as_deref().unwrap().contains("[SKILL STEP]"));
+
+        msgs.push(Message::tool_result("call2", "round 2 result"));
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky); // unchanged step content
+
+        assert_eq!(msgs[0].content.as_deref().unwrap(), "round 1 result");
+        let last = msgs.last().unwrap().content.as_deref().unwrap();
+        assert!(last.contains("[SKILL STEP]"), "{last}");
     }
 
     #[test]
@@ -616,7 +1034,7 @@ mod current_state_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = config_in(tmp.path());
         let mut msgs = vec![Message::tool_result("call1", "a result")];
-        refresh_current_state(&mut msgs, &config);
+        refresh_current_state(&mut msgs, &config, StateRefresh::Sticky);
         assert_eq!(msgs[0].content.as_deref().unwrap(), "a result");
     }
 }

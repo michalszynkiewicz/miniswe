@@ -359,6 +359,11 @@ pub fn current_step_tag(config: &Config) -> Option<String> {
     load(config).step_tag()
 }
 
+/// Marker opening the `[SKILL STEP]` section of the [CURRENT STATE] block.
+/// Shared with `context::compressor`, which keys the current-state block's
+/// re-anchoring policy on whether a skill step is present.
+pub const SKILL_STEP_MARKER: &str = "[SKILL STEP]";
+
 /// The `[SKILL STEP]` block for the [CURRENT STATE] re-injection: the
 /// current step's distilled instructions (if computed), else a minimal
 /// placeholder until the loop distills it. `None` when no skill is active.
@@ -370,7 +375,7 @@ pub fn active_step_block(config: &Config) -> Option<String> {
         None => format!("(preparing instructions for step '{}'…)", step.name),
     };
     Some(format!(
-        "[SKILL STEP] From the {skill} skill — do THIS step now, following it exactly. \
+        "{SKILL_STEP_MARKER} From the {skill} skill — do THIS step now, following it exactly. \
          When its DONE WHEN criterion is met, call skill(action='done') to get the next step; \
          do not skip ahead or improvise.\n{body}\n"
     ))
