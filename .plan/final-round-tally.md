@@ -65,30 +65,54 @@ eviction remains unaddressed.
 - Mistral Small 4 x2
 - Laguna S 2.1 x2 (last — 73 GB, slowest)
 
-## Contamination scan (which G0/G1 results the cliff bug actually touched)
-`scratchpad/contam.py` — counts rounds whose state block exceeded ~1778 B (512
-tok at the measured 3.47 B/tok). Under G0/G1 each such round forced a FULL
-re-prefill.
+## Contamination scan (CORRECTED 15:5x — the cliff is PER-MODEL)
+
+**The 512-token cliff is not a llama.cpp constant — it is the model's own
+`attention.sliding_window`.** Laguna XS's metadata says exactly 512, which is
+why the probe matched to the token. Read straight from the GGUF files:
+
+| model | `attention.sliding_window` | cliff @3.47 B/tok |
+|---|---|---|
+| gpt-oss-20b | **128** | ~444 B |
+| Laguna XS / Laguna S | **512** | ~1776 B |
+| Gemma 4 26B / 31B | 1024 | ~3553 B |
+| Muse Glimmer 30B | 2048 | ~7106 B |
+| North Mini Code | 4096 | ~14212 B |
+| Devstral (mistral3), Mistral Small 4, Nemotron 3.5, Qwen3.8 | *(absent — full attention)* | no cliff |
+
+Re-scanned all 223 runs against each model's own window
+(`scratchpad/contam2.py`). **Only 5 runs ever crossed, and all 5 are Laguna XS:**
 
 | run | rounds | median B | over cliff |
 |---|---|---|---|
-| 20260825_080756 gemma-4-26B | 471 | 1832 | **236** |
-| 20260825_100518 Laguna XS   | 124 | 1936 | **103** (already replaced) |
-| 20260824_162908 Laguna XS   |  50 | 1821 | **27** |
-| 20260824_005124 Laguna XS   | 103 | 1740 | 22 |
-| 20260820_175942 Nemotron    | 115 |  586 | 14 |
-| 20260823_172958 Laguna XS   | 131 | 1610 | 12 |
-| 20260824_165637 gemma-4-26B | 535 |  489 | 11 |
+| 20260825_152440 (run 11, G2 — fix absorbed them) | 142 | 2270 | 120 |
+| 20260825_100518 (the 4/6 @ 3423s) | 124 | 1936 | 103 |
+| 20260824_162908 |  50 | 1821 | 27 |
+| 20260824_005124 | 103 | 1740 | 22 |
+| 20260823_172958 | 131 | 1610 | 13 |
 
-Everything else is 0-2 rounds. **Rebench rule:** redo a run only if it is
-contaminated AND it either timed out or is a headline number in the post.
-Contamination inflates wall time; it only flips pass/fail when the run hit the
-timeout (exactly the 4/6 3423s case). A comfortable 6/6 that was merely slower
-than it would be today gets a footnote, not a rerun.
+An earlier version of this table applied Laguna's threshold to every model and
+wrongly flagged two gemma runs (`20260825_080756`, `20260824_165637`) and a
+Nemotron run. **Those are clean** — gemma's window is 2x wider than the blocks
+involved, and Nemotron has no window at all. No gemma/Glimmer/Devstral/Nemotron/
+North result needs a rerun on cliff grounds.
 
-Caveat: the cliff is a **sliding-window-attention** property. Laguna and Gemma 4
-are SWA. Whether Mistral Small 4 / Devstral / gpt-oss are affected is unverified
-— add one `scratchpad/cliff.py` probe (~1 min) at server start per model.
+**Rebench rule (revised):** nothing needs redoing. The only run the bug plausibly
+broke was the 4/6 @ 3423s, already replaced by run 11.
+
+## OPEN — `STATE_REWIND_BUDGET` is hardcoded for Laguna, and gpt-oss is in the queue
+`fcd8378` uses a fixed 1500 B budget, correct for Laguna's 512-token window.
+**gpt-oss-20b's window is 128 tokens (~444 B)**, so blocks between ~444 B and
+1500 B would still relocate every round and blow its cache — the fix would not
+engage where it is needed most. Our blocks run 500-2300 B.
+
+`/props` does not expose the window, so it cannot be discovered at runtime; it
+needs to be configured. Proposal: a `context.state_rewind_budget` setting
+(bytes, default 1500 = today's behaviour), set per model in the launcher/arm
+settings, with a sentinel meaning "full attention -> never sticky, always
+re-anchor" for Devstral / Mistral Small 4 / Nemotron / Qwen. That also *raises*
+the budget for gemma (~3200 B) and Glimmer, removing stickiness those models
+never needed. **Decide this before the gpt-oss runs.**
 
 ## End of round
 - posts/benchmarking-small-models.md: per-model recent-run bands (gemma 5/6s INCLUDED), fill Decode col
