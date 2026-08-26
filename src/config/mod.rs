@@ -226,6 +226,48 @@ impl ModelConfig {
             None => false,
         }
     }
+
+    /// True if the served model's attention window is narrower than a typical
+    /// `[CURRENT STATE]` block, so re-anchoring that block every round throws
+    /// away the whole KV cache instead of trimming its tail.
+    ///
+    /// llama.cpp reuses a cached prompt only as a pure EXTENSION. A shorter
+    /// prefix is normally served by trimming the KV tail, but positions older
+    /// than a sliding-window model's window cannot be rolled back to at all,
+    /// so the sequence is cleared and re-prefilled from token zero. The
+    /// threshold is exactly that model's `attention.sliding_window` — measured
+    /// on Laguna XS at 512 tokens, where a 512-token rewind cost 496 tokens of
+    /// prefill and a 528-token rewind cost the full 21,491.
+    ///
+    /// Only two families we run sit below a real block (~600 bytes median,
+    /// ~2.3 KB on long plans): Laguna 2.1 at 512 tokens (~1.8 KB) and
+    /// gpt-oss-20b at 128 (~444 B). Gemma 4 (1024), Muse Glimmer (2048) and
+    /// North Mini Code (4096) are wide enough that re-anchoring never crosses
+    /// the cliff, and Devstral / Mistral Small 4 / Nemotron 3.5 / Qwen3 use
+    /// full attention and have no cliff at all.
+    ///
+    /// Unknown models answer `false`, which is both the safe default and the
+    /// empirically better one: replaying 223 benchmark runs, always
+    /// re-anchoring won or tied on every family except these two, and it never
+    /// leaves a superseded copy in history.
+    ///
+    /// Matched against the server-reported identity rather than the
+    /// user-supplied alias, same as [`Self::is_mistral_small_4_family`]. Every
+    /// llama-server we run reports the GGUF path, which carries the family
+    /// name.
+    pub fn has_narrow_attention_window(&self) -> bool {
+        // Unlike the reasoning_effort gate, this falls back to the configured
+        // alias when the probe failed. A silent `None` would disable the
+        // stickiness on exactly the models that need it, and the alias is a
+        // usable signal here: the benchmark harness writes the full GGUF path
+        // into `model`, and so does anyone pointing miniswe at a local file.
+        let name = self
+            .probed_model
+            .as_deref()
+            .unwrap_or(&self.model)
+            .to_ascii_lowercase();
+        name.contains("laguna") || name.contains("gpt-oss")
+    }
 }
 
 /// Token budget allocation for context assembly.
