@@ -11,6 +11,7 @@ pub mod display;
 pub mod hints;
 pub mod loop_detector;
 pub mod permissions;
+pub mod prune_reads;
 pub mod skill_cursor;
 pub mod skill_router;
 pub mod spiral;

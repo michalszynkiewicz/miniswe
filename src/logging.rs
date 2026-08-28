@@ -127,6 +127,15 @@ impl SessionLog {
         self.write(&format!("[loop] {name}({args_summary}) repeated {count}x"));
     }
 
+    /// Log a read-pruning pass. Same level as `loop_detected`: this is a loop
+    /// intervention, and a bench post-mortem has to be able to count how often
+    /// it fired without turning on trace logging for a whole run.
+    pub fn reads_pruned(&self, pairs: usize, keys: usize, deepest: &str) {
+        self.write(&format!(
+            "[prune] dropped {pairs} repeated call/result pairs across {keys} key(s); deepest {deepest}"
+        ));
+    }
+
     // ── Debug level: full interactions ───────────────────────────────
 
     /// Log the user's message (debug level).

@@ -32,12 +32,17 @@ pub struct ChatRequest {
     #[serde(skip)]
     pub temperature_override: Option<f64>,
     /// Per-request `cache_prompt` override for llama.cpp. `Some(false)` forces
-    /// a fresh (cold) prompt eval instead of reusing the slot's KV cache. Used
-    /// to break a q4-KV-cache-induced loop: reading the lossy 4-bit cache back
-    /// can flip a decision into a repeat (fixed-seed probe: cold proceeds,
-    /// warm loops), so on loop detection we force one cold prefill and the
-    /// model proceeds. `None` = server default (reuse). Merged into the body
-    /// directly (skipped from serde).
+    /// a fresh (cold) prompt eval instead of reusing the slot's KV cache.
+    /// `None` = server default (reuse). Merged into the body directly
+    /// (skipped from serde).
+    ///
+    /// Set by the tool-call-leak retry in `llm::mod` — a leaked call is
+    /// evidence the cached prefix itself is bad, so the resend must not reuse
+    /// it. The agent loop no longer forces cold prefills on loop detection: a
+    /// corpus audit of 680 forced prefills found no break-rate benefit and a
+    /// large cost (a ~40k-token re-prefill is ~58s, up to ~250s on
+    /// Mistral-Small-4). See the `window_edit_fires` comment in
+    /// `cli::commands::run`.
     #[serde(skip)]
     pub cache_prompt: Option<bool>,
 }

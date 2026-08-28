@@ -27,6 +27,7 @@ use crate::cli::commands::agent::loop_detector::{
     cycle_period, is_mutating_call, key_is_mutating, loop_call_key,
 };
 use crate::cli::commands::agent::permissions::permission_action;
+use crate::cli::commands::agent::prune_reads::prune_repeated_reads;
 use crate::cli::commands::agent::spiral;
 use crate::cli::commands::agent::validation;
 use crate::config::{CeremonyMode, Config, EditMode, ModelRole};
@@ -1187,6 +1188,24 @@ async fn run_agent_loop(
         // conversation, every round (matching run.rs). Driven through a
         // select! so a long LLM-based summarization keeps the TUI responsive.
         {
+            // See `agent::prune_reads` — surgically drop the middle of a deep
+            // run of identical reads, which compaction structurally cannot
+            // reach (it summarizes the oldest end; the loop is in the newest).
+            let pruned = prune_repeated_reads(messages);
+            if !pruned.is_empty() {
+                log.reads_pruned(
+                    pruned.removed / 2,
+                    pruned.keys,
+                    pruned.deepest.as_deref().unwrap_or("?"),
+                );
+                app.push_output(
+                    &format!(
+                        "  ⋯ pruned {} repeated calls from context",
+                        pruned.removed / 2
+                    ),
+                    LineStyle::Status,
+                );
+            }
             let pre = messages.len();
             // Read-loop escalation (see REPEATED_READ_ESCALATION): the loop
             // is sustained by the cache-hot prompt prefix, so break it

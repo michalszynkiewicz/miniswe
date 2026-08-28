@@ -28,6 +28,7 @@ use crate::cli::commands::agent::hints::{
 use crate::cli::commands::agent::loop_detector::{
     cycle_period, is_mutating_call, key_is_file_edit, key_is_mutating, loop_call_key_tagged,
 };
+use crate::cli::commands::agent::prune_reads::prune_repeated_reads;
 use crate::cli::commands::agent::spiral;
 use crate::cli::commands::agent::stuck_check;
 use crate::cli::commands::agent::validation;
@@ -680,21 +681,29 @@ pub async fn run(
     // back at the cheap nudge.
     let mut read_nudges = 0u32;
     let mut force_compact_next_round = false;
-    // On loop detection, force ONE cold prompt eval (cache_prompt=false) next
-    // round. The q4-KV-cache readback can flip a decision into a repeat
-    // (fixed-seed probe 2026-07-16: cold prefill proceeds 12/12, warm cache
-    // loops); a fresh eval breaks it before the heavier nudge/compact/debugger
-    // ladder even runs. Reset once consumed.
-    let mut force_cold_prefill_next_round = false;
-    // Window-detector fires this turn whose key was a FILE EDIT. The first
-    // one gets the cold eval above; if a byte-identical edit/revert STILL
-    // recurs after that, the cold eval has been tried and failed, and the
-    // next fire escalates to a forced compaction (the read-loop ladder's
-    // proven breaker). Devstral `docker_20260823_114957`: the window
-    // detector fired 16× on one edit↔revert↔plan(check) rut and cold-evaled
-    // every time; a temp-0.2 model reproduces the same call straight
-    // through a cold prefix.
-    let mut cold_prefill_edit_fires: u32 = 0;
+    // Window-detector fires this turn whose key was a FILE EDIT. A single
+    // recurrence can still be a legitimate retry; a byte-identical
+    // edit/revert recurring a SECOND time in the window is a rut, and
+    // escalates to a forced compaction (the read-loop ladder's proven
+    // breaker). Devstral `docker_20260823_114957`: the window detector fired
+    // 16× on one edit<->revert<->plan(check) rut.
+    //
+    // Loop detection used to also force a cold prompt eval
+    // (`cache_prompt=false`) here, on the theory that lossy q4-KV-cache
+    // readback flips a decision into a repeat. A corpus audit of every bench
+    // run 08-23..08-26 refuted it: 680 forced cold prefills, and the loop key
+    // was gone from the next 6 calls only 9.1% of the time against 19.3% for
+    // warm 2-streaks (a comparison biased in cold's FAVOUR would still have
+    // to beat that). On the two models where it cost the most it did
+    // essentially nothing -- Muse-Glimmer 2/117 breaks, North-Mini-Code
+    // 1/210 -- while a re-prefill of a ~40k prompt costs ~58s (Glimmer, 48%
+    // of one run's wall clock; North 75%; Mistral-Small-4 ~250s per fire).
+    // The apparent "it changed the call" successes were the loop's own
+    // periodicity: devstral cycled replace_range -> revert -> plan(check)
+    // through 16 consecutive cold prefills. `ChatRequest::cache_prompt`
+    // itself stays -- `llm/mod.rs` still uses it for the tool-call-leak
+    // retry, which is a different mechanism with its own evidence.
+    let mut window_edit_fires: u32 = 0;
     let mut nudged_no_plan = false;
     // `tools.stuck_check`: T2c frozen-signature detector (see the module doc
     // in agent/stuck_check.rs and the config field doc). Fed unconditionally
@@ -1260,6 +1269,30 @@ pub async fn run(
             ));
         }
 
+        // Drop the middle of any deep run of identical read/inspection pairs
+        // BEFORE compaction: compaction only ever summarizes the oldest end,
+        // and a read loop lives in the newest messages, so every forced
+        // compaction used to leave the repeats untouched and raise their
+        // share of the prompt. See `agent::prune_reads`.
+        let pruned = prune_repeated_reads(&mut messages);
+        if !pruned.is_empty() {
+            log.reads_pruned(
+                pruned.removed / 2,
+                pruned.keys,
+                pruned.deepest.as_deref().unwrap_or("?"),
+            );
+            tui::print_status(&format!(
+                "[prune] dropped {} repeated {} from context{}",
+                pruned.removed / 2,
+                if pruned.keys == 1 { "call" } else { "calls" },
+                pruned
+                    .deepest
+                    .as_deref()
+                    .map(|d| format!(" (deepest: {d})"))
+                    .unwrap_or_default()
+            ));
+        }
+
         // Unified context compression — handles both tool results and conversation
         let pre_mask = messages.len();
         // Read-loop escalation (see REPEATED_READ_ESCALATION): the loop is
@@ -1268,9 +1301,7 @@ pub async fn run(
         // maybe_compress so refresh_current_state still lands on the tail.
         if force_compact_next_round {
             force_compact_next_round = false;
-            tui::print_status(
-                "Loop persisted past the nudge/cold eval — forcing context compaction.",
-            );
+            tui::print_status("Loop persisted past the nudge — forcing context compaction.");
             context::compressor::force_compress(
                 &mut messages,
                 &config,
@@ -1353,16 +1384,6 @@ pub async fn run(
         } else {
             None
         };
-        // Consume a pending loop-break: force a single cold prompt eval.
-        let cache_prompt = if force_cold_prefill_next_round {
-            force_cold_prefill_next_round = false;
-            tui::print_status(
-                "[loop] forcing a cold prompt eval (cache_prompt=false) to break the KV-cache loop",
-            );
-            Some(false)
-        } else {
-            None
-        };
         let request = ChatRequest {
             messages: messages.clone(),
             tools: Some(visible),
@@ -1370,7 +1391,8 @@ pub async fn run(
             max_tokens_override,
             chat_template_kwargs: Some(chat_template_kwargs),
             temperature_override,
-            cache_prompt,
+            // Never forced from the agent loop; see `window_edit_fires`.
+            cache_prompt: None,
         };
         log.llm_request(&request);
 
@@ -2162,37 +2184,32 @@ pub async fn run(
             // FREQUENTLY in the window even when INTERSPERSED (so it never
             // trips the 3-consecutive detector below) — e.g. the model
             // re-`ls -R`ing / re-`helm show`ing the chart between other calls.
-            // Force a cold prompt eval next round; correctness-safe (re-eval of
-            // the same prompt, nothing reverted/dropped) and may break a
-            // q4-cache-primed rut. Clear the window on fire so it must
-            // re-accumulate — bounds it to at most one cold eval per ~N repeats.
+            // Clear the window on fire so it must re-accumulate — bounds the
+            // escalation below to at most one fire per ~N repeats.
             // 4 (not 5) in a 12-window: a period-3 cycle (A,B,C,A,B,C…) puts
             // each element at exactly 12/3=4, so 4 catches period-2 AND
             // period-3 wandering; 5 would miss period-3.
-            const COLD_PREFILL_FREQ: usize = 4;
-            if !force_cold_prefill_next_round
-                && recent_call_keys.iter().filter(|k| **k == call_key).count() >= COLD_PREFILL_FREQ
-            {
-                force_cold_prefill_next_round = true;
+            const WINDOW_REPEAT_FREQ: usize = 4;
+            if recent_call_keys.iter().filter(|k| **k == call_key).count() >= WINDOW_REPEAT_FREQ {
                 recent_call_keys.clear();
-                // Escalate on a RECURRING file edit: the first fire's cold
-                // eval didn't break it, so break the cache-hot prefix for
-                // real. Reads/checks/tests keep the cheap cold eval only —
-                // repeating those between different edits is normal.
+                // Escalate on a RECURRING file edit: one recurrence can be a
+                // legitimate retry, a second is a rut, so break the cache-hot
+                // prefix for real. Reads/checks/tests are exempt — repeating
+                // those between different edits is a normal rhythm.
                 let escalate = key_is_file_edit(&call_key) && {
-                    cold_prefill_edit_fires += 1;
-                    cold_prefill_edit_fires >= 2
+                    window_edit_fires += 1;
+                    window_edit_fires >= 2
                 };
                 if escalate {
                     force_compact_next_round = true;
-                    cold_prefill_edit_fires = 0;
+                    window_edit_fires = 0;
                 }
                 tui::print_status(&format!(
-                    "[loop] '{args_summary}' recurred {COLD_PREFILL_FREQ}x in the window — {}",
+                    "[loop] '{args_summary}' recurred {WINDOW_REPEAT_FREQ}x in the window{}",
                     if escalate {
-                        "a cold prompt eval already failed to break it, forcing context compaction next round"
+                        " — forcing context compaction next round"
                     } else {
-                        "forcing a cold prompt eval next round"
+                        ""
                     }
                 ));
             }
@@ -2211,10 +2228,6 @@ pub async fn run(
                     is_mutating_call(&tc.function.name, &args)
                 };
                 log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
-                // Whatever branch handles this loop below, force a cold prompt
-                // eval next round — it's the cheapest, most reliable breaker
-                // (the loop is q4-KV-cache-induced; a fresh eval proceeds).
-                force_cold_prefill_next_round = true;
 
                 // Polling a status command while a background job runs is
                 // the unpaced form of monitoring — redirect to the paced one,

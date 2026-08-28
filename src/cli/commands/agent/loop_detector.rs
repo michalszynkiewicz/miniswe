@@ -54,9 +54,9 @@ pub const MAX_CYCLE_PERIOD: usize = 4;
 /// - period 3: the same edit → `revert` → `plan(check)` ("already checked")
 ///   → the same edit, 20× over 36 minutes with the model narrating "let me
 ///   take a completely different approach" every time (Devstral Small 2,
-///   `docker_20260823_114957`). The window detector saw it 16× but its
-///   only action was a cold prompt eval, which a temp-0.2 model reproduces
-///   straight through.
+///   `docker_20260823_114957`). The window detector saw it 16× but at the
+///   time its only action was a cold prompt eval, which a temp-0.2 model
+///   reproduces straight through; it now escalates to a forced compaction.
 pub fn cycle_period(history: &[String]) -> Option<usize> {
     for period in 2..=MAX_CYCLE_PERIOD {
         let need = period * CYCLE_REPS;

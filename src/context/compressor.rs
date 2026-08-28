@@ -1401,6 +1401,11 @@ const GUARD_MARKERS: &[&str] = &[
     // older rejections (KEEP_RAW_OBS alone doesn't protect them: rejections
     // interleave with reads and fall out of the newest-3 window).
     "already match the content you provided",
+    // The read-pruner's note on the surviving pair
+    // (`agent::prune_reads::PRUNE_NOTE_MARKER`) — it is the only remaining
+    // record that the loop happened at all, so masking it a round later
+    // would hand the repeats straight back.
+    "[pruned]",
 ];
 
 /// Guard exemption size cap. Guard texts ride on edit/revert results that
@@ -1413,7 +1418,7 @@ const GUARD_MAX_CHARS: usize = 4000;
 
 /// True if this tool-result content carries corrective/guard guidance that
 /// must survive observation masking.
-fn is_guard_observation(content: &str) -> bool {
+pub(crate) fn is_guard_observation(content: &str) -> bool {
     content.len() <= GUARD_MAX_CHARS && GUARD_MARKERS.iter().any(|m| content.contains(m))
 }
 
