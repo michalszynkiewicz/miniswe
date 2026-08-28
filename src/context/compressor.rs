@@ -398,8 +398,6 @@ pub async fn force_compress(
 /// most one live copy exists at a time, always on the last message.
 const CURRENT_STATE_MARKER: &str = "\n\n[CURRENT STATE]\n";
 
-use crate::cli::commands::agent::skill_cursor;
-
 /// Build the current-state block (plan + scratchpad), or `None` if both are
 /// empty.
 fn format_current_state_block(config: &Config) -> Option<String> {
@@ -585,10 +583,27 @@ fn strip_current_state(messages: &mut [Message]) {
 /// this with [`StateRefresh::Reanchor`] after a compaction that actually
 /// changed the message list, when re-anchoring is free.
 ///
-/// Exception: while a `[SKILL STEP]` is being injected, recency is
-/// load-bearing rather than cosmetic — the uds-mcp e2e drifted back to the
-/// model's priors when the step was not the freshest thing in context — so
-/// those rounds re-anchor unconditionally and keep paying for it.
+/// `[SKILL STEP]` rounds used to be excepted from stickiness on the theory
+/// that recency is load-bearing there — the uds-mcp e2e had drifted back to
+/// the model's priors when the step was not the freshest thing in context.
+/// That carve-out was never measured on its own (the six runs replayed for
+/// the policy above carried no skill cursor), and on a narrow-window model it
+/// inverts the whole point of this function: a skill-routed run re-anchors
+/// every round, and every one of those rewinds crosses the window.
+///
+/// Measured on a live Laguna S 2.1 app-with-deps run: 89 requests, ZERO
+/// prefix reuse on the main loop (the small fast-role calls, which carry no
+/// block, reused ~3.7k tokens every time), the prompt re-prefilled in full
+/// from token zero on all 28 main-loop rounds as it grew 7.9k -> 22.7k
+/// tokens. 48.2 of 63 minutes of wall clock — 79% — was prompt evaluation.
+///
+/// So stickiness now applies to skill-step rounds too. It is still gated on
+/// [`Config::has_narrow_attention_window`], which is false for every
+/// wide-attention model, so this changes behaviour only where the cliff is
+/// real (Laguna, gpt-oss); everywhere else those rounds still re-anchor.
+/// Recency is not actually lost in the common case: the block is byte-
+/// identical 76-100% of rounds, and Case 1 leaves the live copy where it
+/// already is rather than moving it backwards.
 ///
 /// Appending to an EXISTING message's content (rather than inserting a new
 /// message) is role-order-safe by construction: it never introduces a new
@@ -596,9 +611,6 @@ fn strip_current_state(messages: &mut [Message]) {
 fn refresh_current_state(messages: &mut [Message], config: &Config, mode: StateRefresh) {
     let block = format_current_state_block(config);
     let copies = find_current_state(messages);
-    let has_skill_step = block
-        .as_deref()
-        .is_some_and(|b| b.contains(skill_cursor::SKILL_STEP_MARKER));
     // Stickiness pays for itself only where re-anchoring crosses the model's
     // attention window. Everywhere else it is a pure loss: it buys nothing on
     // a model that can trim its KV tail, and it risks leaving a superseded
@@ -606,9 +618,7 @@ fn refresh_current_state(messages: &mut [Message], config: &Config, mode: StateR
     // block's size — the byte threshold it replaces over-parked badly, going
     // sticky on 23% of Nemotron rounds and 40% of Laguna rounds, more than
     // half of which were re-anchors that would have been free.
-    let sticky = mode == StateRefresh::Sticky
-        && !has_skill_step
-        && config.model.has_narrow_attention_window();
+    let sticky = mode == StateRefresh::Sticky && config.model.has_narrow_attention_window();
 
     // Case 1: the newest copy already says exactly this. Leave it alone.
     if sticky
