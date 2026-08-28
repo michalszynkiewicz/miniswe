@@ -53,6 +53,9 @@ BASELINE_SHA="cc34d2626faf32c1b6dd1b8b33af693fb936b098"
 ACTIVE_CONTAINER_NAME=""
 ACTIVE_TMP_SCRIPT=""
 
+# GPU telemetry + llama-server provenance (docs/gpu-hardening.md items 2, 5)
+source "${REPO_DIR}/scripts/bench-gpu.sh"
+
 cleanup() {
     set +e
 
@@ -63,6 +66,8 @@ cleanup() {
     if [[ -n "${ACTIVE_TMP_SCRIPT}" ]]; then
         rm -f "${ACTIVE_TMP_SCRIPT}" >/dev/null 2>&1 || true
     fi
+
+    gpu_telemetry_stop
 
     docker image rm -f "${IMAGE_NAME}" >/dev/null 2>&1 || true
 }
@@ -136,6 +141,9 @@ if ! curl -fsS --max-time 5 "${LLAMA_ENDPOINT}/v1/models" > /dev/null 2>&1; then
     echo "Override the endpoint with: LLAMA_ENDPOINT=http://host:port ${0##*/} ..." >&2
     exit 1
 fi
+
+gpu_bench_start "${RESULTS_DIR}"
+echo ""
 
 # Build image
 echo "Building Docker image..."
@@ -688,5 +696,7 @@ for d in "${RESULTS_DIR}"/*/; do
     printf "%-20s %8s %4s %7ss  %s%s\n" "$name" "$local_rounds" "$attempts" "$wall" "$result" "$degraded"
 done
 echo "================================================================="
+
+gpu_bench_finish "${RESULTS_DIR}"
 echo ""
 echo "Detailed results: ${RESULTS_DIR}/"

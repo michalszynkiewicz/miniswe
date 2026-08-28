@@ -27,6 +27,9 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# GPU telemetry + llama-server provenance (docs/gpu-hardening.md items 2, 5)
+source "${REPO_DIR}/scripts/bench-gpu.sh"
 IMAGE_NAME="miniswe-bench"
 
 # Probe the running llama-server for the loaded model so the result dir is
@@ -46,6 +49,7 @@ ACTIVE_TMP_SCRIPT=""
 
 cleanup() {
     set +e
+    gpu_telemetry_stop
 
     if [[ -n "${ACTIVE_CONTAINER_NAME}" ]]; then
         docker rm -f "${ACTIVE_CONTAINER_NAME}" >/dev/null 2>&1 || true
@@ -83,6 +87,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 mkdir -p "${RESULTS_DIR}"
+gpu_bench_start "${RESULTS_DIR}"
 
 echo "=== Docker-isolated provider benchmark (FAST MODE) ==="
 echo "Image:    ${IMAGE_NAME}"
@@ -540,5 +545,6 @@ for d in "${RESULTS_DIR}"/*/; do
     printf "%-24s %8s %4s %7ss  %s\n" "$name" "$local_rounds" "$attempts" "$wall" "$result"
 done
 echo "================================================================="
+gpu_bench_finish "${RESULTS_DIR}"
 echo ""
 echo "Detailed results: ${RESULTS_DIR}/"

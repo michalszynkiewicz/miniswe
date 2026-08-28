@@ -15,6 +15,9 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# GPU telemetry + llama-server provenance (docs/gpu-hardening.md items 2, 5)
+source "${REPO_DIR}/scripts/bench-gpu.sh"
 IMAGE_NAME="miniswe-bench"   # reuse the benchmark image (built from current tree)
 
 FIXTURE=""
@@ -43,10 +46,11 @@ MODEL_TAG="$(curl -fsS --max-time 3 "${LLAMA_ENDPOINT}/v1/models" 2>/dev/null \
 MODEL_TAG="${MODEL_TAG:-unknown}"
 RESULTS_DIR="${REPO_DIR}/benchmark_results/replay_$(date +%Y%m%d_%H%M%S)_${MODEL_TAG}"
 ACTIVE_CONTAINER=""
-cleanup() { set +e; [[ -n "$ACTIVE_CONTAINER" ]] && docker rm -f "$ACTIVE_CONTAINER" >/dev/null 2>&1; docker image rm -f "$IMAGE_NAME" >/dev/null 2>&1; }
+cleanup() { set +e; gpu_telemetry_stop; [[ -n "$ACTIVE_CONTAINER" ]] && docker rm -f "$ACTIVE_CONTAINER" >/dev/null 2>&1; docker image rm -f "$IMAGE_NAME" >/dev/null 2>&1; }
 trap cleanup EXIT INT TERM
 
 mkdir -p "$RESULTS_DIR"
+gpu_bench_start "$RESULTS_DIR"
 echo "=== Replay benchmark ==="
 echo "Fixture:  $FIXTURE"
 echo "Model:    $MODEL"
@@ -163,4 +167,5 @@ for d in "$RESULTS_DIR"/run*/; do
     res=$(grep -oE "=== FINAL: [0-9]+/[0-9]+" "$d/container.log" 2>/dev/null | tail -1 | grep -oE "[0-9]+/[0-9]+" || echo "?/?")
     printf "  %s: %s  (wall %ss)\n" "$(basename "$d")" "$res" "$(cat "$d/wall_s.txt" 2>/dev/null)"
 done
+gpu_bench_finish "$RESULTS_DIR"
 echo "Detailed: $RESULTS_DIR/"
