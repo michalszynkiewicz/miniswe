@@ -141,11 +141,19 @@ pub struct ModelConfig {
     /// case of a legitimate prefill exceeding this just costs one extra
     /// retry cycle, safely bounded by `request_deadline_secs`.
     pub request_timeout_secs: u64,
-    /// Idle timeout (seconds) for streamed LLM responses. If no token
-    /// activity is observed for this many seconds the request is killed
-    /// and retried as a transient failure. Distinguishes "stuck
-    /// connection" from "model thinking hard" — a model that is
-    /// producing tokens steadily, even slowly, is *not* idle.
+    /// Idle-timeout FLOOR (seconds) for streamed LLM responses. If no token
+    /// activity is observed for this long the request is killed and retried
+    /// as a transient failure. Distinguishes "stuck connection" from "model
+    /// thinking hard" — a model that is producing tokens steadily, even
+    /// slowly, is *not* idle.
+    ///
+    /// A floor, not the whole story: prompt *prefill* emits no token at all,
+    /// so `attempt_idle_timeout` widens this per request to cover the prompt
+    /// the server has to evaluate (capped at `request_deadline_secs`). At the
+    /// old flat 30s a warm request whose cached prefix had been evicted was
+    /// killed mid-prefill — 215 times in one run, ~61% of its wall clock.
+    /// 120s covers a ~5k-token re-prefill on a CPU-offloaded MoE outright,
+    /// and the size-aware widening covers the rest.
     #[serde(default = "default_stream_idle_timeout_secs")]
     pub stream_idle_timeout_secs: u64,
     /// Absolute wall-clock deadline (seconds) for a single logical LLM
@@ -194,7 +202,7 @@ pub enum ToolCallFormat {
 }
 
 fn default_stream_idle_timeout_secs() -> u64 {
-    30
+    120
 }
 
 fn default_request_deadline_secs() -> u64 {

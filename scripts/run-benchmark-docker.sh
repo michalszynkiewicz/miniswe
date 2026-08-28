@@ -26,8 +26,11 @@
 #   THINKING=true            model.thinking arm (main loop + debugger think)
 #   CTX_WINDOW=100000        model.context_window (default 60000)
 #   MAX_OUTPUT_TOKENS=10000  model.max_output_tokens (default 8000)
-#   STREAM_IDLE_SECS=90      model.stream_idle_timeout_secs (default 30)
+#   STREAM_IDLE_SECS=90      model.stream_idle_timeout_secs floor (default 120)
 #   COMPACTION=unified       context.compaction (default lazy)
+#   GPU_SAMPLE_INTERVAL=10   seconds between nvidia-smi samples (0 = off)
+#   LLAMA_CONTAINER_FILTER   docker name filter for the server container
+#                            (default: llama-server-)
 
 set -euo pipefail
 
@@ -175,10 +178,15 @@ thinking = ${THINKING:-false}
 # MAX_OUTPUT_TOKENS env: raise together with --reasoning-budget for heavier
 # thinking arms (default 8000 = every run through 2026-08-22).
 max_output_tokens = ${MAX_OUTPUT_TOKENS:-8000}
-# STREAM_IDLE_SECS env: idle guard between streamed chunks (config default 30).
-# A cold prefill emits nothing until it finishes — at ~1000 tok/s a 50K
-# prompt is ~50s of silence — so raise this for >60K windows / slow prefill.
-stream_idle_timeout_secs = ${STREAM_IDLE_SECS:-30}
+# STREAM_IDLE_SECS env: idle-guard FLOOR between streamed chunks. Prefill emits
+# nothing until it finishes, so the harness widens this per request to cover the
+# prompt at MIN_PREFILL_TOKENS_PER_SEC (capped at request_deadline_secs) — this
+# value only sets the lower bound, which matters for the small fast-role calls
+# that carry no large prompt of their own. Keep it equal to the code default
+# (see default_stream_idle_timeout_secs); a stale literal here silently
+# overrides it. At the old flat 30 a warm request whose cached prefix had been
+# evicted died mid-prefill 215 times in one run, ~61% of its wall clock.
+stream_idle_timeout_secs = ${STREAM_IDLE_SECS:-120}
 
 [context]
 repo_map_budget = ${REPO_MAP_BUDGET}
