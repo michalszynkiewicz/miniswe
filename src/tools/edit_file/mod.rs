@@ -660,6 +660,7 @@ async fn execute_preplanned_steps(
                 });
             }
             Err(e) => {
+                let e = *e;
                 log_debug(
                     log,
                     path_str,
@@ -733,7 +734,7 @@ async fn execute_planned_steps(
     success_label: &str,
     baseline_lsp_errors: Option<usize>,
     perms: Option<&PermissionManager>,
-) -> std::result::Result<SplitResult, PlannedExecutionFailure> {
+) -> std::result::Result<SplitResult, Box<PlannedExecutionFailure>> {
     let mut current = current_base.to_string();
     let mut completed_count = 0usize;
     let dropped_count = dropped.len();
@@ -814,7 +815,7 @@ async fn execute_planned_steps(
                                 ));
                             }
                             RelocateOutcome::Rejected => {
-                                return Err(PlannedExecutionFailure {
+                                return Err(Box::new(PlannedExecutionFailure {
                                     current_content: current.clone(),
                                     message: format!(
                                         "{message}Pre-plan step {} literal L{}-L{} failed after {} completed step(s): {literal_error}; relocated candidate rejected by planner\n",
@@ -830,10 +831,10 @@ async fn execute_planned_steps(
                                     completed_steps: completed_records.clone(),
                                     failed_step: Some(step.clone()),
                                     lsp_regression: None,
-                                });
+                                }));
                             }
                             RelocateOutcome::NoCandidate => {
-                                return Err(PlannedExecutionFailure {
+                                return Err(Box::new(PlannedExecutionFailure {
                                     current_content: current.clone(),
                                     message: format!(
                                         "{message}Pre-plan step {} literal L{}-L{} failed after {} completed step(s): {literal_error}; no relocation candidate found in file\n",
@@ -849,7 +850,7 @@ async fn execute_planned_steps(
                                     completed_steps: completed_records.clone(),
                                     failed_step: Some(step.clone()),
                                     lsp_regression: None,
-                                });
+                                }));
                             }
                         }
                     }
@@ -870,15 +871,17 @@ async fn execute_planned_steps(
                     log,
                 )
                 .await
-                .map_err(|e| PlannedExecutionFailure {
-                    current_content: current.clone(),
-                    message: format!(
-                        "{message}Pre-plan {region_label} failed after {completed_count} completed step(s): {e}\n",
-                    ),
-                    error: format!("{region_label} failed: {e}"),
-                    completed_steps: completed_records.clone(),
-                    failed_step: Some(step.clone()),
-                    lsp_regression: None,
+                .map_err(|e| {
+                    Box::new(PlannedExecutionFailure {
+                        current_content: current.clone(),
+                        message: format!(
+                            "{message}Pre-plan {region_label} failed after {completed_count} completed step(s): {e}\n",
+                        ),
+                        error: format!("{region_label} failed: {e}"),
+                        completed_steps: completed_records.clone(),
+                        failed_step: Some(step.clone()),
+                        lsp_regression: None,
+                    })
                 })?;
 
                 if count == 0 {
@@ -933,7 +936,7 @@ async fn execute_planned_steps(
             ValidationError::LspRegression(reg) => Some(reg),
             ValidationError::Other(_) => None,
         };
-        PlannedExecutionFailure {
+        Box::new(PlannedExecutionFailure {
             current_content: current.clone(),
             message: format!(
                 "{message}Pre-plan validation failed after {completed_count}/{planned_count} completed step(s): {error_summary}\n"
@@ -942,7 +945,7 @@ async fn execute_planned_steps(
             completed_steps: completed_records.clone(),
             failed_step: None,
             lsp_regression,
-        }
+        })
     })?;
     if let Some(note) = validation_note {
         message.push_str(&note);
