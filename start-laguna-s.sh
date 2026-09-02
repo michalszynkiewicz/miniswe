@@ -38,6 +38,20 @@
 # 60-70 GB/s puts the ceiling near 30 tok/s -> plan on 12-20 tok/s.
 # Needs ~68 GB of free RAM for the offloaded experts.
 #
+# LOAD MODE. llama.cpp warns at load that this exact config is a bad pairing:
+# "tensor overrides to CPU are used with mmap enabled - consider using
+# --load-mode none for better performance". It is not cosmetic. On the 08-28
+# app-with-deps run the model was 69 GB on disk but only 55.2 GB resident
+# (RssFile), with 1.9 GB of llama-server swapped out -- ~14 GB of the CPU-side
+# experts were being faulted from disk on a model that reads those experts on
+# EVERY token, which taxes both prefill (165 tok/s) and decode (19.3 tok/s).
+# `none` drops mmap and loads the tensors outright, so the experts land in
+# anonymous memory the page cache cannot evict. Costs a slower cold start (a
+# real 69 GB read) and shows up as ~69 GB anon rather than as page cache --
+# budget that against the k3d cluster the uds-mcp e2e deploys on the same box.
+# MINISWE_LOAD_MODE=mmap+mlock pins the mmap instead (run-llama-cuda.sh already
+# passes --ulimit memlock=-1 --cap-add IPC_LOCK); =auto restores pre-08-30.
+#
 # THINKING: same chat-template contract as Laguna XS — the template keys on
 # the `enable_thinking` kwarg (default false -> prefills `</think>` so the
 # model answers directly). miniswe sends the kwarg per request. CAVEAT:
@@ -61,6 +75,7 @@ MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/Laguna-S-2.1-GGUF}"
 CTX_SIZE="${MINISWE_CTX_SIZE:-60000}"
 KV_TYPE="${MINISWE_KV_TYPE:-q8_0}"
 NCMOE="${MINISWE_NCMOE:-40}"
+LOAD_MODE="${MINISWE_LOAD_MODE:-none}"
 THREADS="${MINISWE_THREADS:-16}"
 PORT="${MINISWE_PORT:-8464}"
 
@@ -81,6 +96,7 @@ echo "  Model:     $MODEL"
 echo "  Context:   $CTX_SIZE tokens, KV $KV_TYPE (12 of 48 layers cache full context)"
 echo "  Experts:   $NCMOE/48 MoE layers' experts on CPU (0 = all on GPU)"
 echo "  Threads:   $THREADS"
+echo "  Load mode: $LOAD_MODE (none = no mmap, experts stay resident; slower start)"
 echo "  Port:      $PORT"
 echo "  Expect:    ~12-20 tok/s; needs ~68 GB free RAM for offloaded experts."
 echo ""
@@ -94,6 +110,7 @@ exec "$(dirname "$0")/scripts/run-llama-cuda.sh" \
     --cache-type-v "$KV_TYPE" \
     --n-gpu-layers 999 \
     --n-cpu-moe "$NCMOE" \
+    --load-mode "$LOAD_MODE" \
     --flash-attn on \
     --threads "$THREADS" \
     --threads-batch 32 \

@@ -704,6 +704,8 @@ mod current_state_tests {
                 anchor: "## Create".into(),
             }],
         );
+        // Only a distilled step renders; an undistilled one produces no block.
+        cursor.cache("Run `uds zarf dev lint` on the generated package.".into());
         skill_cursor::save(&config, &cursor);
 
         let block = format_current_state_block(&config).expect("cursor alone must produce a block");
@@ -1113,6 +1115,7 @@ mod current_state_tests {
                 anchor: "## Create".into(),
             }],
         );
+        cursor.cache("Run `uds zarf dev lint` on the generated package.".into());
         skill_cursor::save(&config, &cursor);
 
         let mut msgs = vec![Message::tool_result("call1", "round 1 result")];

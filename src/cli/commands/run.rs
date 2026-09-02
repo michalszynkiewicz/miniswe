@@ -280,6 +280,558 @@ async fn descend_into_skill(
     true
 }
 
+/// Resolve the current step's prose-level handoff: the token matcher proposes
+/// candidates, the MODEL decides, the verdict is cached for the life of the
+/// step. `None` = stay in the current skill.
+///
+/// The split is the point. Deterministic matching was asked to answer a
+/// question it cannot represent — "does control transfer, or is this a
+/// cross-reference?" — and on 2026-08-30 it read
+/// `uds-package-integrate`'s "following the Cluster Setup procedure in the
+/// `uds-package` skill" as a handoff, tore down the integration phase and
+/// spent 55 rounds inside a reference document. Every guard it had (last step
+/// only, not on the stack, token boundaries, first mention) did its job; the
+/// rule simply never modelled the distinction. So retrieval stays here and
+/// judgement moves to `classify_handoff`, which sees the same prose plus a
+/// menu it cannot invent an answer outside of.
+///
+/// Leaves the verdict OPEN (uncached) when there is no prose to judge yet, so
+/// an undistilled step whose anchor did not resolve gets decided on a later
+/// pass instead of being silently recorded as "no handoff".
+async fn resolve_handoff(
+    cursor: &mut crate::cli::commands::agent::skill_cursor::SkillCursor,
+    installed: &[String],
+    llm_worker: &LlmWorkerHandle,
+    cancelled: &Arc<AtomicBool>,
+) -> Option<String> {
+    use crate::cli::commands::agent::skill_router;
+    if cursor.handoff_decided() {
+        return cursor.cached_handoff().map(str::to_string);
+    }
+    let prose = cursor.handoff_prose()?;
+    let candidates = cursor.handoff_candidates(&prose, installed);
+    if candidates.is_empty() {
+        cursor.cache_handoff(String::new());
+        return None;
+    }
+    let name = cursor
+        .current()
+        .map(|(_, s)| s.name.clone())
+        .unwrap_or_default();
+    let verdict =
+        skill_router::classify_handoff(llm_worker, &name, &prose, &candidates, cancelled).await;
+    let menu = candidates.join(", ");
+    match &verdict {
+        Some(target) => tui::print_status(&format!(
+            "[skills] step '{name}' hands off to '{target}' (named: {menu})"
+        )),
+        None => tui::print_status(&format!(
+            "[skills] step '{name}' only references {menu} — no handoff"
+        )),
+    }
+    cursor.cache_handoff(verdict.clone().unwrap_or_default());
+    verdict
+}
+
+/// Distil the current step's instructions if they aren't cached yet.
+async fn distill_current(
+    cursor: &mut crate::cli::commands::agent::skill_cursor::SkillCursor,
+    llm_worker: &LlmWorkerHandle,
+    cancelled: &Arc<AtomicBool>,
+) {
+    use crate::cli::commands::agent::skill_router;
+    if cursor.cached().is_some() {
+        return;
+    }
+    let Some(material) = cursor.current_material() else {
+        return;
+    };
+    let name = cursor
+        .current()
+        .map(|(_, s)| s.name.clone())
+        .unwrap_or_default();
+    let instructions = skill_router::distill_step(llm_worker, &material, &name, cancelled).await;
+    if instructions.trim().is_empty() {
+        // An empty distillation would leave the step uncached, and an uncached
+        // step is INVISIBLE: no [SKILL STEP] block, no DONE WHEN check, no
+        // judge. The raw section is verbose but real — always preferable to
+        // parking the cursor on nothing.
+        tui::print_status(&format!(
+            "[skills] step '{name}' did not distil — using its raw section"
+        ));
+        cursor.cache(material);
+    } else {
+        cursor.cache(instructions);
+        tui::print_status(&format!("[skills] distilled step '{name}'"));
+    }
+}
+
+/// Ready the cursor's current step for the LLM call: distil its instructions,
+/// resolve a prose-level handoff, generate its DONE WHEN check. Returns true
+/// if it descended into a sub-skill — the current step then changed, so the
+/// caller must not judge it this round.
+///
+/// The invariant it exists to hold: **a step the cursor is parked on is
+/// visible to the model**. Returning true used to double as an early exit,
+/// which broke that — descending left the sub-skill's FIRST step undistilled
+/// for the rest of the round, so it rendered as no `[SKILL STEP]` block at
+/// all, with no check and no judge. The uds-mcp e2e run of 2026-08-28 lost
+/// `uds-package-integrate`'s `VerifyInputs` exactly that way: the model saw no
+/// step, read that as nothing-to-do, called `skill(done)`, and the cursor
+/// advanced past a step it had never shown. Signalling the caller and
+/// finishing preparation are separate jobs; only the former is a `return`.
+///
+/// Called in the normal pre-round position AND again after every advance,
+/// because every guard downstream keys on the distilled body: the
+/// handoff decision, the check that vetoes a premature
+/// `skill(done)`, the judge, and the `[SKILL STEP]` block itself. An advance
+/// that left the new step unprepared therefore surfaced a content-free step
+/// with every safety valve simultaneously disarmed. That is exactly how the
+/// live uds-mcp e2e lost its integration phase: the judge (which runs LAST
+/// here, and is the primary advance driver) moved the cursor onto the build
+/// skill's final handoff step after that round's distillation had already
+/// run, so the step went out empty, the model dutifully called `done` on it,
+/// and the frame popped before the handoff to `uds-package-integrate` ever
+/// got a round.
+async fn prepare_step(
+    cursor: &mut crate::cli::commands::agent::skill_cursor::SkillCursor,
+    installed: &[String],
+    config: &Config,
+    llm_worker: &LlmWorkerHandle,
+    cancelled: &Arc<AtomicBool>,
+) -> bool {
+    use crate::cli::commands::agent::skill_router;
+    if !cursor.is_active() {
+        return false;
+    }
+    fn step_name(cursor: &crate::cli::commands::agent::skill_cursor::SkillCursor) -> String {
+        cursor
+            .current()
+            .map(|(_, s)| s.name.clone())
+            .unwrap_or_default()
+    }
+    // Descending lands the cursor on a DIFFERENT step, which then needs the
+    // same preparation — so loop rather than return. The handoff decision
+    // fires only on a frame's last step and a fresh frame starts at idx 0, so
+    // in practice this goes round at most twice; the cap keeps termination a
+    // local argument instead of resting on descend()'s on_stack() check.
+    const MAX_DESCENTS: usize = 3;
+    let mut descended = false;
+    for _ in 0..MAX_DESCENTS {
+        // Handoff decision BEFORE distillation. `resolve_handoff` reads the
+        // step's verbatim source section, so it needs no distilled body — and
+        // `descend()` CONSUMES the invoking step, so distilling first spends a
+        // 4k-token generation over the whole skill tree on a step that will
+        // never get a round. Live 2026-08-30: 'DeployTestEnvironment' was
+        // distilled and descended past in the same breath.
+        if let Some(next) = resolve_handoff(cursor, installed, llm_worker, cancelled).await
+            && descend_into_skill(cursor, &next, config, llm_worker, cancelled).await
+        {
+            descended = true;
+            continue;
+        }
+        distill_current(cursor, llm_worker, cancelled).await;
+        // Second pass: a step whose anchor could not be located in the source
+        // had no prose above, so its verdict was deliberately left open. The
+        // distilled body is the fallback.
+        if let Some(next) = resolve_handoff(cursor, installed, llm_worker, cancelled).await
+            && descend_into_skill(cursor, &next, config, llm_worker, cancelled).await
+        {
+            descended = true;
+            continue;
+        }
+        break;
+    }
+    // Per-step completion check: turn the distilled step's DONE WHEN into a
+    // read-only shell check (once per step). While the step is active this
+    // becomes the effective validation command (see the done-gate below),
+    // which fires the debugger stack on projects with no configured
+    // task-level check. None when not shell-checkable.
+    if !cursor.check_attempted()
+        && let Some(instr) = cursor.cached().map(str::to_string)
+        && let Some(material) = cursor.current_material()
+    {
+        let name = step_name(cursor);
+        match skill_router::extract_done_when(&instr) {
+            Some(done_when) => {
+                let check = skill_router::generate_step_check(
+                    llm_worker, &material, &name, &done_when, cancelled,
+                )
+                .await;
+                match &check {
+                    Some(c) => tui::print_status(&format!("[skills] step '{name}' check: {c}")),
+                    None => {
+                        tui::print_status(&format!("[skills] step '{name}' not shell-checkable"))
+                    }
+                }
+                cursor.cache_check(check.unwrap_or_default());
+            }
+            None => cursor.cache_check(String::new()),
+        }
+    }
+    descended
+}
+
+/// Surface what an advance left behind. Silent in the normal case; loud when
+/// a step was abandoned rather than finished, because that is precisely the
+/// thing the old `mark_done`-for-everything path made invisible.
+fn report_cursor_gaps(cursor: &crate::cli::commands::agent::skill_cursor::SkillCursor) {
+    if let Some(skill) = cursor.rewound_into() {
+        let step = cursor
+            .current()
+            .map(|(_, s)| s.name.clone())
+            .unwrap_or_default();
+        tui::print_status(&format!(
+            "[skills] {skill} reached its last step with work outstanding — \
+             returning to '{step}' rather than reporting complete"
+        ));
+    }
+    let dropped = cursor.dropped_unfinished();
+    if !dropped.is_empty() {
+        tui::print_status(&format!(
+            "[skills] INCOMPLETE — {} step(s) never finished: {}",
+            dropped.len(),
+            dropped.join(", ")
+        ));
+    }
+}
+
+/// Escalate the active skill step to the fresh-context step judge and apply
+/// its verdict. Shared by the two escalation triggers — the stuck_check Red
+/// fire (frozen signals) and the K-th blocked premature finish at the
+/// stop-valve — with `trigger` the one preformatted sentence telling the
+/// judge which signal tripped. Side effects per verdict: RETRY sets
+/// `*force_compact` and resets the step's round counter; ABANDON marks the
+/// step abandoned (NOT done). Returns the note to inject, or `None` when no
+/// step is active or the judge produced nothing (caller falls back to its
+/// plain nudge/note).
+#[allow(clippy::too_many_arguments)]
+async fn step_judge_escalation(
+    goal: &str,
+    trigger: &str,
+    config: &Config,
+    llm_worker: &LlmWorkerHandle,
+    tool_defs: &[crate::llm::ToolDefinition],
+    perms: &Arc<PermissionManager>,
+    lsp_client: &Option<Arc<LspClient>>,
+    fast_revisions: &Option<Arc<tools::RevisionStore>>,
+    fast_baseline_errors: usize,
+    cancelled: &Arc<AtomicBool>,
+    force_compact: &mut bool,
+) -> Option<String> {
+    use crate::cli::commands::agent::skill_cursor;
+    let mut cursor = skill_cursor::load(config);
+    let (skill_name, step_name) = cursor
+        .current()
+        .map(|(sk, st)| (sk.to_string(), st.name.clone()))?;
+    let instructions = cursor
+        .cached()
+        .map(str::to_string)
+        .unwrap_or_else(|| "(the step was never distilled)".to_string());
+    let check = cursor.current_check().map(str::to_string);
+    tui::print_status(&format!("[step-judge] asking on '{step_name}': {trigger}"));
+    let verdict = debugger::run_step_judge(
+        goal,
+        &skill_name,
+        &step_name,
+        &instructions,
+        check.as_deref(),
+        cursor.rounds_on_current(),
+        trigger,
+        config,
+        llm_worker,
+        tool_defs,
+        perms,
+        lsp_client,
+        fast_revisions,
+        fast_baseline_errors,
+        cancelled,
+    )
+    .await?;
+    let (report, label, follow_up) = match verdict {
+        debugger::StepVerdict::Continue(r) => (
+            r,
+            "CONTINUE",
+            "The step is doable and the work is close — apply the fix and finish it.".to_string(),
+        ),
+        debugger::StepVerdict::Retry(r) => {
+            *force_compact = true;
+            cursor.reset_current_rounds();
+            skill_cursor::save(config, &cursor);
+            (
+                r,
+                "RETRY",
+                format!(
+                    "The current approach is a dead end; the conversation will be compacted next \
+                     round. Re-approach '{step_name}' fresh, guided by the report."
+                ),
+            )
+        }
+        debugger::StepVerdict::Abandon(r) => {
+            cursor.mark_abandoned();
+            skill_cursor::save(config, &cursor);
+            report_cursor_gaps(&cursor);
+            // Abandoning a frame's LAST step rewinds back onto it (its own
+            // first abandoned step) for one final pass; a second ABANDON
+            // there pops the frame with the gap reported.
+            let next = cursor.current().map(|(_, s)| s.name.clone());
+            let follow = match next {
+                Some(next) if next != step_name => format!(
+                    "It is recorded as abandoned, NOT done. Stop working on it and proceed with \
+                     the '{next}' step."
+                ),
+                _ => "It is recorded as abandoned, NOT done. Do not grind on it further — follow \
+                      the [SKILL STEP] guidance shown next round, or the remaining task if the \
+                      skill has ended."
+                    .to_string(),
+            };
+            (r, "ABANDON", follow)
+        }
+    };
+    tui::print_status(&format!("[step-judge] {label} on '{step_name}'"));
+    Some(format!(
+        "[Step judge: a fresh-context read-only analyst reviewed the stuck '{step_name}' step \
+         and chose {label}. Its report:\n{report}\n{follow_up}]"
+    ))
+}
+
+/// Regression cover for `prepare_step`'s core invariant: **the step the cursor
+/// is parked on when this returns is one the model will actually see.** These
+/// drive the real function against a canned LLM endpoint, because the only way
+/// to prove the invariant is to let a real descend happen mid-call — that is
+/// exactly the moment the 2026-08-28 uds-mcp e2e lost a step at.
+#[cfg(test)]
+mod prepare_step_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use tempfile::TempDir;
+    use wiremock::matchers::{body_string_contains, method, path as url_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::prepare_step;
+    use crate::cli::commands::agent::skill_cursor::SkillCursor;
+    use crate::cli::commands::agent::skill_router::SkillStep;
+    use crate::config::Config;
+    use crate::llm::ModelRouter;
+    use crate::runtime::LlmWorkerHandle;
+
+    // `skills::discover` also scans the real `~/.ai/skills`, so fixture names
+    // have to be ones no installed skill will answer to.
+    const PARENT: &str = "probe-handoff-parent";
+    const CHILD: &str = "probe-handoff-child";
+    const PARENT_DISTILLATION: &str = "INSTRUCTIONS: hand off to the integration skill.";
+
+    /// One-chunk SSE: `LlmWorkerHandle::submit` always sets `stream: true`.
+    fn sse(content: &str) -> ResponseTemplate {
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "choices": [{"delta": {"content": content}, "finish_reason": null}]
+            })
+        );
+        ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+    }
+
+    fn write_skill(root: &Path, name: &str, body: &str) -> PathBuf {
+        let dir = root.join(".ai").join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), body).unwrap();
+        dir
+    }
+
+    /// Both skills on disk, with the cursor parked on the parent's final step
+    /// — whose prose names the child. The shape of the real
+    /// `uds-package-build` → `uds-package-integrate` moment.
+    fn fixture(root: &Path) -> SkillCursor {
+        let parent_dir = write_skill(
+            root,
+            PARENT,
+            &format!(
+                "# Parent\n\n## Assemble\nAssemble the package.\n\n\
+                 ## EnterIntegrationPhase\nThe build phase is complete. \
+                 Continue with the {CHILD} skill.\n"
+            ),
+        );
+        write_skill(
+            root,
+            CHILD,
+            "# Child\n\n## VerifyInputs\nConfirm the package directory exists.\n\n\
+             ## ConfigureNetworking\nExpose the service.\n",
+        );
+        let step = |name: &str| SkillStep {
+            name: name.to_string(),
+            anchor: format!("## {name}"),
+        };
+        let mut cursor = SkillCursor::default();
+        cursor.push_skill(
+            PARENT,
+            &parent_dir,
+            vec![step("Assemble"), step("EnterIntegrationPhase")],
+        );
+        cursor.mark_done();
+        assert_eq!(
+            cursor.current().map(|(_, s)| s.name.as_str()),
+            Some("EnterIntegrationPhase")
+        );
+        assert!(
+            cursor.cached().is_none(),
+            "the replayed moment is an undistilled final step"
+        );
+        cursor
+    }
+
+    /// Answers every LLM call this fixture provokes: the handoff classifier on
+    /// the parent's final step, step extraction for the child, and the child's
+    /// first distillation — `verify_inputs`, the value under test. That
+    /// distillation carries no `DONE WHEN`, so no check is generated and the
+    /// mocked surface stays exactly these three calls.
+    ///
+    /// `verdict` is what the classifier answers for the parent's final step —
+    /// `CHILD` for a real handoff, `"NONE"` for a step that only references
+    /// the other skill.
+    ///
+    /// The parent's own distillation is mounted with an exact call count,
+    /// verified when the server drops at the end of `run`. On a handoff it is
+    /// 0: the decision reads the step's verbatim source, so it runs BEFORE
+    /// distillation, and `descend()` then consumes the invoking step —
+    /// distilling it would be pure waste. On `NONE` it is 1: the step keeps
+    /// its round, so it must be visible.
+    async fn mock_llm(server: &MockServer, verdict: &str, verify_inputs: &str) {
+        let mount = |matcher: &'static str, reply: ResponseTemplate| {
+            Mock::given(method("POST"))
+                .and(url_path("/v1/chat/completions"))
+                .and(body_string_contains(matcher))
+                .respond_with(reply)
+        };
+        mount("Handoff target?", sse(verdict)).mount(server).await;
+        mount(
+            "ordered execution checklist",
+            sse(&serde_json::json!([
+                {"step": "VerifyInputs", "anchor": "## VerifyInputs"},
+                {"step": "ConfigureNetworking", "anchor": "## ConfigureNetworking"},
+            ])
+            .to_string()),
+        )
+        .mount(server)
+        .await;
+        mount(
+            "Distill the step: 'EnterIntegrationPhase'",
+            sse(PARENT_DISTILLATION),
+        )
+        .expect(u64::from(verdict.trim() != CHILD))
+        .mount(server)
+        .await;
+        mount("Distill the step: 'VerifyInputs'", sse(verify_inputs))
+            .mount(server)
+            .await;
+    }
+
+    fn config_for(root: &Path, endpoint: &str) -> Config {
+        let mut config = Config::default();
+        config.project_root = root.to_path_buf();
+        config.model.endpoint = endpoint.to_string();
+        config.model.provider = "openai-compatible".to_string();
+        config.model.max_retries = 1;
+        config
+    }
+
+    /// Run the real `prepare_step` over the fixture, with the handoff
+    /// classifier answered by `verdict` and the child's first distillation by
+    /// `verify_inputs`.
+    async fn run(verdict: &str, verify_inputs: &str) -> (TempDir, SkillCursor, bool) {
+        let server = MockServer::start().await;
+        mock_llm(&server, verdict, verify_inputs).await;
+        let temp = TempDir::new().unwrap();
+        let mut cursor = fixture(temp.path());
+        let config = config_for(temp.path(), &server.uri());
+        let worker = LlmWorkerHandle::new(Arc::new(ModelRouter::new(&config)), 1);
+        let installed = [PARENT.to_string(), CHILD.to_string()];
+        let descended = prepare_step(
+            &mut cursor,
+            &installed,
+            &config,
+            &worker,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        (temp, cursor, descended)
+    }
+
+    #[tokio::test]
+    async fn descending_leaves_the_sub_skills_first_step_distilled() {
+        let (_temp, cursor, descended) =
+            run(CHILD, "INSTRUCTIONS: confirm the package directory exists.").await;
+
+        assert!(descended, "the parent's final step hands off to the child");
+        assert_eq!(
+            cursor
+                .current()
+                .map(|(sk, s)| (sk.to_string(), s.name.clone())),
+            Some((CHILD.to_string(), "VerifyInputs".to_string())),
+            "the cursor must land on the child's FIRST step"
+        );
+        // The regression. This was None: `return true` on a successful
+        // descend doubled as an early exit, so the step the cursor now sat on
+        // never got distilled. An undistilled step renders as no [SKILL STEP]
+        // block, with no check and no judge — the model saw nothing to do,
+        // called skill(done), and the step was consumed unseen.
+        assert!(
+            cursor
+                .cached()
+                .unwrap_or_default()
+                .contains("confirm the package directory"),
+            "the child's first step must be distilled before prepare_step returns, got {:?}",
+            cursor.cached()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_distillation_falls_back_to_the_raw_section() {
+        // `distill_step` returns "" on any LLM failure, and caching nothing
+        // would reproduce the invisible-step bug by a second route. The raw
+        // material is verbose but real, so it stands in.
+        let (_temp, cursor, _) = run(CHILD, "").await;
+
+        assert!(
+            cursor
+                .cached()
+                .unwrap_or_default()
+                .contains("Confirm the package directory exists"),
+            "an empty distillation must fall back to the step's raw material, got {:?}",
+            cursor.cached()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_the_classifier_clears_keeps_its_round() {
+        // The mirror failure, from the uds-mcp e2e run of 2026-08-30. The
+        // deterministic matcher read `uds-package-integrate`'s
+        // `DeployTestEnvironment` — "following the Cluster Setup procedure in
+        // the `uds-package` skill" — as a handoff and descended into a
+        // reference document with no steps. 55 of that run's 305 rounds went
+        // there, and `DeployTestEnvironment`, consumed by the descend, never
+        // got a round or a DONE WHEN check. A `NONE` verdict has to leave the
+        // step exactly where it is, distilled and checkable.
+        let (_temp, cursor, descended) = run("NONE", "unreached").await;
+
+        assert!(!descended, "a reference is not a handoff");
+        assert_eq!(
+            cursor
+                .current()
+                .map(|(sk, s)| (sk.to_string(), s.name.clone())),
+            Some((PARENT.to_string(), "EnterIntegrationPhase".to_string())),
+            "the cursor must stay on the step that only referenced the skill"
+        );
+        assert_eq!(
+            cursor.cached(),
+            Some(PARENT_DISTILLATION),
+            "a step that keeps its round must be distilled"
+        );
+    }
+}
+
 /// Normalize a shell command for cross-invocation matching: drop a leading
 /// `cd … &&` working-dir prefix and collapse whitespace, so the same
 /// underlying command matches regardless of where it was launched from.
@@ -667,9 +1219,23 @@ pub async fn run(
     // step changes.
     let mut skill_exit_step: Option<String> = None;
     let mut skill_exit_stops: usize = 0;
+    // How many times the blocked-stop path has escalated to the step judge on
+    // the CURRENT step (reset with skill_exit_stops on step change) — the
+    // judge fires on every SKILL_EXIT_MAX_STOPS-th blocked stop, capped.
+    let mut stop_judge_fires: usize = 0;
     // Last skill-step judge "not done" reason surfaced to the model, so we
     // don't repeat an identical nudge every judge cycle (repeats feed loops).
     let mut last_judge_nudge: Option<String> = None;
+    // Log-only judge-veto observation (2026-09-01 e2e: skill(done) bypassed a
+    // standing not-done verdict on 4 unchecked steps): the completion judge's
+    // last not-done verdict as (skill::step key, reason, edits_total at the
+    // time). When skill(done) lands on an UNCHECKED step with a standing
+    // verdict and no mutating edit since, we LOG what an enforced veto would
+    // have done — enforcement waits on measured live judge quality.
+    let mut last_judge_block: Option<(String, String, usize)> = None;
+    // Running count of successful mutating edits (stuck_check::is_mutating_edit)
+    // — the freshness clock for last_judge_block.
+    let mut edits_total: usize = 0;
     let mut jobs_poll_redirects = 0u32;
     // Read-loop escalation ladder: first detection gets the polite
     // REPEATED_READ_NUDGE; if the model re-enters the same identical-read
@@ -980,12 +1546,18 @@ pub async fn run(
         //     not yet on the stack (e.g. build -> integrate), DESCEND into it
         //     (extract its steps + push a frame). The model never resolves
         //     the handoff name itself (a lookup a probe showed it won't do).
-        //  2. Safety valve: a step the model never signals done on is
-        //     force-advanced past a round cap so guidance can't freeze.
-        //  3. Distillation: cache the current step's self-contained
-        //     instructions (LLM) if not already cached.
+        //  2. prepare_step: distil the current step, resolve a prose-level
+        //     handoff, generate its DONE WHEN check. Runs once in the normal
+        //     position AND again after every advance in this block — see the
+        //     note on prepare_step for why an unprepared step is dangerous.
+        // There is deliberately NO per-step round budget here — a fixed cap
+        // is a refuted rounds-only trigger and fires unavoidably on an
+        // unsatisfiable step (rationale at STEP_JUDGE_PROMPT). A stuck step
+        // escalates to the step judge through two triggers instead: the
+        // stuck_check Red fire (frozen signals), and every K-th blocked
+        // premature finish at the stop-valve (the model insisting the task
+        // is done while steps remain).
         {
-            const MAX_ROUNDS_PER_STEP: usize = 20;
             let mut cursor = skill_cursor::load(&config);
             if cursor.is_active() {
                 let installed: Vec<String> = crate::skills::discover(&config.project_root)
@@ -1004,10 +1576,16 @@ pub async fn run(
                     const MAX_HANDOFF_FAILURES: usize = 3;
                     let n = cursor.note_handoff_failure();
                     if n >= MAX_HANDOFF_FAILURES {
-                        cursor.mark_done();
+                        // Abandoned, not done: skipping an invoke step skips
+                        // the entire sub-skill behind it. Not guarded by
+                        // may_auto_advance — the blocker here is an extraction
+                        // that will not resolve, so holding on the step would
+                        // retry it forever instead of grinding on real work.
+                        cursor.mark_abandoned();
                         tui::print_status(&format!(
-                            "[skills] handoff '{next}' yielded no steps {n}x; skipping"
+                            "[skills] handoff '{next}' yielded no steps {n}x; skipping (sub-skill NOT run)"
                         ));
+                        report_cursor_gaps(&cursor);
                     } else {
                         tui::print_status(&format!(
                             "[skills] handoff '{next}' yielded no steps (attempt {n}); will retry"
@@ -1016,98 +1594,25 @@ pub async fn run(
                 }
                 if cursor.is_active() {
                     let n = cursor.note_round();
-                    if n > MAX_ROUNDS_PER_STEP {
-                        let name = cursor
-                            .current()
-                            .map(|(_, s)| s.name.clone())
-                            .unwrap_or_default();
-                        cursor.mark_done();
-                        tui::print_status(&format!(
-                            "[skills] step '{name}' exceeded {MAX_ROUNDS_PER_STEP} rounds — auto-advancing"
-                        ));
-                    } else if cursor.cached().is_none()
-                        && let Some(material) = cursor.current_material()
+                    if !prepare_step(&mut cursor, &installed, &config, &llm_worker, &cancelled)
+                        .await
                     {
-                        let step_name = cursor
-                            .current()
-                            .map(|(_, s)| s.name.clone())
-                            .unwrap_or_default();
-                        let instructions = skill_router::distill_step(
-                            &llm_worker,
-                            &material,
-                            &step_name,
-                            &cancelled,
-                        )
-                        .await;
-                        if !instructions.trim().is_empty() {
-                            cursor.cache(instructions);
-                            tui::print_status(&format!("[skills] distilled step '{step_name}'"));
-                        }
-                    }
-                    // Body-based handoff: the current step's PROSE may name a
-                    // sub-skill even when its NAME doesn't (the build skill's
-                    // final "Integrate" step → "continue with the
-                    // uds-package-integrate skill"). Fires only on the skill's
-                    // last step, and only once distilled (see handoff_in_body).
-                    // If we descend, the current step changes — skip this
-                    // round's check-gen/judge; they run next round on the
-                    // sub-skill's first step.
-                    let descended_body = if let Some(next) = cursor.handoff_in_body(&installed) {
-                        descend_into_skill(&mut cursor, &next, &config, &llm_worker, &cancelled)
-                            .await
-                    } else {
-                        false
-                    };
-                    if !descended_body {
-                        // Per-step completion check: turn the distilled step's
-                        // DONE WHEN into a read-only shell check (once per step).
-                        // While the step is active this becomes the effective
-                        // validation command (see the done-gate below), which
-                        // fires the debugger stack on projects with no configured
-                        // task-level check. None when not shell-checkable.
-                        if !cursor.check_attempted()
-                            && let Some(instr) = cursor.cached().map(str::to_string)
-                            && let Some(material) = cursor.current_material()
-                        {
-                            let step_name = cursor
-                                .current()
-                                .map(|(_, s)| s.name.clone())
-                                .unwrap_or_default();
-                            match skill_router::extract_done_when(&instr) {
-                                Some(done_when) => {
-                                    let check = skill_router::generate_step_check(
-                                        &llm_worker,
-                                        &material,
-                                        &step_name,
-                                        &done_when,
-                                        &cancelled,
-                                    )
-                                    .await;
-                                    match &check {
-                                        Some(c) => tui::print_status(&format!(
-                                            "[skills] step '{step_name}' check: {c}"
-                                        )),
-                                        None => tui::print_status(&format!(
-                                            "[skills] step '{step_name}' not shell-checkable"
-                                        )),
-                                    }
-                                    cursor.cache_check(check.unwrap_or_default());
-                                }
-                                None => cursor.cache_check(String::new()),
-                            }
-                        }
-                        // Periodic completion judge — the actual advance driver.
-                        // The model almost never calls skill(done) itself (e2e:
-                        // 2 calls in 4 attempts), so every JUDGE_EVERY rounds we
-                        // ask it out-of-band whether the step is done. On DONE the
+                        // Periodic completion judge — the out-of-band advance
+                        // driver, for models that don't call skill(done) on
+                        // their own (an early e2e model managed 2 calls in 4
+                        // attempts). Do NOT assume it is the primary path: the
+                        // 2026-08-28 Laguna run advanced 14 steps by the
+                        // model's own done-tool call against 2 from this judge,
+                        // so changes to the done-tool handler sit on the hot
+                        // path. Every JUDGE_EVERY rounds we ask out-of-band
+                        // whether the step is done. On DONE the
                         // step's check acts as a VETO (not an auto-advancer, which
                         // would skip a creates-then-modifies step the instant its
                         // file exists): check fails → hold + tell it; check passes
                         // or is absent → advance. Probe: judge 40/40 honest (8/8
                         // NOT DONE on stubs), so DONE is earned, not rubber-stamped.
                         const JUDGE_EVERY: usize = 3;
-                        if n <= MAX_ROUNDS_PER_STEP
-                            && n.is_multiple_of(JUDGE_EVERY)
+                        if n.is_multiple_of(JUDGE_EVERY)
                             && let Some(def) = cursor.cached().map(str::to_string)
                         {
                             let (skill_name, step_name) = cursor
@@ -1142,6 +1647,7 @@ pub async fn run(
                                     conversation_history.push(msg);
                                 } else {
                                     cursor.mark_done();
+                                    last_judge_block = None;
                                     match cursor.current() {
                                         Some((_, next)) => tui::print_status(&format!(
                                             "[skills] '{step_name}' judged done → advancing to '{}'",
@@ -1151,6 +1657,21 @@ pub async fn run(
                                             "[skills] '{step_name}' judged done → {skill_name} skill complete"
                                         )),
                                     }
+                                    report_cursor_gaps(&cursor);
+                                    // The judge runs LAST in this block, so the
+                                    // step it advances onto has missed this
+                                    // round's preparation. Prepare it now — an
+                                    // unprepared step goes out with no body, no
+                                    // DONE WHEN check to veto a premature done,
+                                    // and no handoff resolution.
+                                    prepare_step(
+                                        &mut cursor,
+                                        &installed,
+                                        &config,
+                                        &llm_worker,
+                                        &cancelled,
+                                    )
+                                    .await;
                                 }
                             } else {
                                 // Surface the judge's reason to the model — it's
@@ -1160,6 +1681,13 @@ pub async fn run(
                                 // cycle (repeats feed loops).
                                 tui::print_status(&format!(
                                     "[skills] '{step_name}' judged not done: {reason}"
+                                ));
+                                // Record the standing verdict for the log-only
+                                // judge-veto check in the skill(done) handler.
+                                last_judge_block = Some((
+                                    format!("{skill_name}::{step_name}"),
+                                    reason.clone(),
+                                    edits_total,
                                 ));
                                 if !reason.is_empty()
                                     && last_judge_nudge.as_deref() != Some(reason.as_str())
@@ -1699,12 +2227,12 @@ pub async fn run(
                 // finish here — it satisfices at the first artifact (e2e
                 // 2026-07-17: stopped at 65/3000 rounds with the cursor at
                 // build 9/18). On every stop attempt we block the finish and
-                // re-nudge; the 20-round safety valve guarantees each step
-                // advances, so the cursor always exhausts in bounded rounds
-                // and the model gets marched through the full lifecycle.
+                // re-nudge; there is no per-step round budget anymore
+                // (rationale at STEP_JUDGE_PROMPT), so a step ends only via
+                // skill(done), a judge advance, or an abandon.
                 // Anti-spin: if it insists (stops SKILL_EXIT_MAX_STOPS times on
                 // the SAME step), take that as "done with this step" and advance
-                // the cursor rather than spinning to the valve.
+                // the cursor rather than spinning forever on the nudge.
                 {
                     let mut cursor = skill_cursor::load(&config);
                     if let Some((skill, step)) = cursor
@@ -1716,24 +2244,30 @@ pub async fn run(
                         if skill_exit_step.as_deref() != Some(&key) {
                             skill_exit_step = Some(key);
                             skill_exit_stops = 0;
+                            stop_judge_fires = 0;
                         }
                         skill_exit_stops += 1;
-                        if skill_exit_stops >= SKILL_EXIT_MAX_STOPS {
-                            cursor.mark_done();
+                        // As with the round cap, a frame's last step is never
+                        // retired out-of-band: the model stopping on it is not
+                        // evidence the phase is over. Falling through leaves
+                        // the nudge below to push it back to work.
+                        if skill_exit_stops >= SKILL_EXIT_MAX_STOPS && cursor.may_auto_advance() {
+                            cursor.mark_abandoned();
                             skill_cursor::save(&config, &cursor);
                             skill_exit_step = None;
                             skill_exit_stops = 0;
+                            stop_judge_fires = 0;
                             let msg = match cursor.current() {
                                 Some((_, next)) => format!(
                                     "[You kept trying to finish while on the '{step}' step — \
-                                     treating it as done. Next step: '{}' (see [SKILL STEP]). Do \
-                                     NOT stop: the task is not complete until the package is \
-                                     built, integrated, AND deployed.]",
+                                     moving you off it. It is NOT complete. Next step: '{}' (see \
+                                     [SKILL STEP]). Do NOT stop: the task is not complete until \
+                                     the package is built, integrated, AND deployed.]",
                                     next.name
                                 ),
                                 None => format!(
-                                    "[You kept trying to finish the '{step}' step — treating it as \
-                                     done. All {skill} skill steps are complete; verify the task \
+                                    "[You kept trying to finish the '{step}' step — moving you off \
+                                     it. That was the last {skill} step; verify the task \
                                      (build → integrate → deploy) is truly finished before stopping.]"
                                 ),
                             };
@@ -1741,9 +2275,51 @@ pub async fn run(
                             messages.push(m.clone());
                             conversation_history.push(m);
                             tui::print_status(&format!(
-                                "[skills] model kept stopping on '{step}' — advancing cursor"
+                                "[skills] model kept stopping on '{step}' — abandoning it (NOT done)"
                             ));
+                            report_cursor_gaps(&cursor);
                             continue;
+                        }
+                        // A step the anti-spin valve can't retire (a frame's
+                        // LAST step — may_auto_advance()=false) used to mean
+                        // nudge-forever: the 2026-09-01 e2e logged 70 blocked
+                        // finishes on DeployTestEnvironment with no
+                        // escalation. Repeated insistence that the task is
+                        // done is the cleanest can't-finish signal we have,
+                        // so every SKILL_EXIT_MAX_STOPS-th blocked stop asks
+                        // the step judge (capped per step); judge failure
+                        // falls through to the plain nudge.
+                        const STOP_JUDGE_MAX_FIRES: usize = 3;
+                        if skill_exit_stops >= SKILL_EXIT_MAX_STOPS
+                            && skill_exit_stops.is_multiple_of(SKILL_EXIT_MAX_STOPS)
+                            && stop_judge_fires < STOP_JUDGE_MAX_FIRES
+                        {
+                            stop_judge_fires += 1;
+                            let trigger = format!(
+                                "It has tried to declare the whole task finished \
+                                 {skill_exit_stops} times while on this step; the harness \
+                                 refused each time because steps remain."
+                            );
+                            if let Some(note) = step_judge_escalation(
+                                message,
+                                &trigger,
+                                &config,
+                                &llm_worker,
+                                &tool_defs,
+                                &perms,
+                                &lsp_client,
+                                &fast_revisions,
+                                fast_baseline_errors,
+                                &cancelled,
+                                &mut force_compact_next_round,
+                            )
+                            .await
+                            {
+                                let m = Message::user(&note);
+                                messages.push(m.clone());
+                                conversation_history.push(m);
+                                continue;
+                            }
                         }
                         let nudge = Message::user(&format!(
                             "[Don't stop — the task is NOT done. You're on the '{step}' step of \
@@ -2863,6 +3439,7 @@ pub async fn run(
                             // the probe measured ~6% of checks over-specify and
                             // false-fail, so the model needs an escape hatch).
                             let check = cursor.current_check().map(str::to_string);
+                            let unchecked = check.is_none();
                             let attempt = cursor.note_done_attempt();
                             let blocked = match check.filter(|_| attempt < 2) {
                                 Some(cmd) => {
@@ -2884,7 +3461,82 @@ pub async fn run(
                                      to override."
                                 ))
                             } else {
-                                cursor.mark_done();
+                                // LOG-ONLY judge-veto observation (2026-09-01
+                                // e2e: 4 unchecked steps advanced right over a
+                                // standing not-done verdict). An UNCHECKED
+                                // step leans on the judge alone, so when one
+                                // gets a done with a standing verdict and no
+                                // mutating edit since (the verdict can't be
+                                // stale), record what an enforced veto would
+                                // have refused. Enforcement waits on measured
+                                // live judge quality — verdicts have been
+                                // observed zero times in the field.
+                                if unchecked
+                                    && let Some((key, reason, at_edits)) = &last_judge_block
+                                    && *key == format!("{skill}::{finished}")
+                                    && *at_edits == edits_total
+                                {
+                                    tui::print_status(&format!(
+                                        "[skills] judge-veto (log-only) on '{finished}': {reason}"
+                                    ));
+                                }
+                                last_judge_block = None;
+                                // prepare_step guarantees the parked step is
+                                // distilled, so a `done` here is always a
+                                // verdict on something the model was actually
+                                // shown. If that ever stops holding the step
+                                // was invisible this round and the verdict is
+                                // meaningless — say so rather than let it pass
+                                // silently, as it did before the loop in
+                                // prepare_step closed that window.
+                                if cursor.cached().is_none() {
+                                    tui::print_status(&format!(
+                                        "[skills] warning: done on '{finished}' while undistilled \
+                                         — the step was never shown"
+                                    ));
+                                }
+                                // A skill's LAST step often exists only to hand
+                                // off (build → integrate). Resolve that BEFORE
+                                // mark_done pops the frame: once popped there is
+                                // no cursor left to descend from, and the run
+                                // ends the build → integrate → validate lifecycle
+                                // a phase early while reporting success. Live
+                                // e2e: `done` on the build skill's
+                                // EnterIntegrationPhase step silently dropped the
+                                // Package CR, networking, Postgres, SSO,
+                                // monitoring and validation steps.
+                                let installed: Vec<String> =
+                                    crate::skills::discover(&config.project_root)
+                                        .into_iter()
+                                        .map(|e| e.name)
+                                        .collect();
+                                let handed_off = match resolve_handoff(
+                                    &mut cursor,
+                                    &installed,
+                                    &llm_worker,
+                                    &cancelled,
+                                )
+                                .await
+                                {
+                                    Some(next) => {
+                                        descend_into_skill(
+                                            &mut cursor,
+                                            &next,
+                                            &config,
+                                            &llm_worker,
+                                            &cancelled,
+                                        )
+                                        .await
+                                    }
+                                    None => false,
+                                };
+                                // descend() already consumed the invoking step —
+                                // marking done as well would skip the sub-skill's
+                                // first step.
+                                if !handed_off {
+                                    cursor.mark_done();
+                                }
+                                report_cursor_gaps(&cursor);
                                 skill_cursor::save(&config, &cursor);
                                 let msg = match cursor.current() {
                                     Some((_, next)) => format!(
@@ -2892,6 +3544,16 @@ pub async fn run(
                                          instructions will appear under [SKILL STEP] — follow them \
                                          exactly.",
                                         next.name
+                                    ),
+                                    // The frame popped. That only means every
+                                    // step is complete when none were abandoned
+                                    // on the way — say which are outstanding
+                                    // rather than inviting a finish over them.
+                                    None if !cursor.dropped_unfinished().is_empty() => format!(
+                                        "Step '{finished}' marked done, but the {skill} skill ends \
+                                         with unfinished steps: {}. Those were never completed — \
+                                         go back and finish them before you stop.",
+                                        cursor.dropped_unfinished().join(", ")
                                     ),
                                     None => format!(
                                         "Step '{finished}' marked done. All {skill} skill steps are \
@@ -3006,6 +3668,14 @@ pub async fn run(
             }
 
             stuck_tracker.on_tool(&tc.function.name, &args, result.success, &result.content);
+            if result.success
+                && stuck_check::is_mutating_edit(
+                    &tc.function.name,
+                    args.get("action").and_then(|a| a.as_str()).unwrap_or(""),
+                )
+            {
+                edits_total += 1;
+            }
 
             let result_msg = Message::tool_result(&tc.id, &result.content);
             messages.push(result_msg.clone());
@@ -3204,9 +3874,41 @@ pub async fn run(
             && let Some(kind) =
                 stuck_tracker.check_fire(round, session_start.elapsed().as_secs_f64())
         {
+            // Red fire while a skill step is active → the fresh-context step
+            // judge decides instead of the generic note (the removed
+            // MAX_ROUNDS_PER_STEP valve's replacement — rationale at
+            // STEP_JUDGE_PROMPT). The helper performs each verdict's side
+            // effects and returns one injected note; judge failure leaves
+            // `escalation` unset so the plain note goes out below. Bounded
+            // by the tracker's MAX_FIRES and the run's max_rounds.
+            let escalation: Option<String> = if kind == stuck_check::StuckKind::Red {
+                let trigger = format!(
+                    "Its observable state (compiler/test/check signals) has been frozen for the \
+                     last {} rounds.",
+                    stuck_tracker.frozen_rounds()
+                );
+                step_judge_escalation(
+                    message,
+                    &trigger,
+                    &config,
+                    &llm_worker,
+                    &tool_defs,
+                    &perms,
+                    &lsp_client,
+                    &fast_revisions,
+                    fast_baseline_errors,
+                    &cancelled,
+                    &mut force_compact_next_round,
+                )
+                .await
+            } else {
+                None
+            };
             let plan_done =
                 tools::plan::plan_exists(&config) && !tools::plan::has_unchecked_steps(&config);
-            let note = if kind == stuck_check::StuckKind::Green && plan_done {
+            let note = if let Some(esc) = escalation {
+                esc
+            } else if kind == stuck_check::StuckKind::Green && plan_done {
                 stuck_check::done_note()
             } else {
                 let first_unchecked = tools::plan::parsed_steps(&config)

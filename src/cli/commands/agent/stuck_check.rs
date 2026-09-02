@@ -47,6 +47,14 @@ const EDIT_TOOLS: [&str; 5] = [
     "refactor",
 ];
 
+/// A successful call to one of these actually mutates the tree (`refactor`
+/// only for its mutating actions). Shared with run.rs's edit counter so
+/// "has the model edited since X" means the same thing everywhere.
+pub fn is_mutating_edit(name: &str, action: &str) -> bool {
+    EDIT_TOOLS.contains(&name)
+        && (name != "refactor" || matches!(action, "add_param" | "drop_param" | "rename"))
+}
+
 /// Which side of the signal the frozen episode is on. The caller picks the
 /// note: `Green` + all plan steps checked → done-note, everything else →
 /// stuck-note.
@@ -161,17 +169,13 @@ impl StuckTracker {
             self.read_path = None;
         }
 
-        if ok && EDIT_TOOLS.contains(&name) {
-            let mutating =
-                name != "refactor" || matches!(action, "add_param" | "drop_param" | "rename");
-            if mutating {
-                self.edit_happened = true;
-                // NOTE: deliberately no direct resig here (that was T2b,
-                // 4/6). An edit unfreezes only through the signal it
-                // changes — the [ast]/[lsp project] markers in its own
-                // result, scanned below. A no-op edit that moves nothing
-                // stays frozen.
-            }
+        if ok && is_mutating_edit(name, action) {
+            self.edit_happened = true;
+            // NOTE: deliberately no direct resig here (that was T2b,
+            // 4/6). An edit unfreezes only through the signal it
+            // changes — the [ast]/[lsp project] markers in its own
+            // result, scanned below. A no-op edit that moves nothing
+            // stays frozen.
         }
 
         if !ok {
@@ -243,7 +247,14 @@ impl StuckTracker {
             Some((n, h(&format!("{n}|{detail}"))))
         });
         if let Some((n, lsp)) = lsp {
-            self.green = Some(n == 0);
+            // Asymmetric: n>0 indicts, n==0 does NOT acquit. Zero LSP errors
+            // only proves syntax — on a YAML/helm tree it stays 0 while
+            // builds and deploys fail (2026-09-01 e2e: green pinned true for
+            // the whole run, so Red — the step judge's trigger — was
+            // unreachable). Green must be earned by a check/gate/test/build.
+            if n > 0 {
+                self.green = Some(false);
+            }
             if self.lsp_hash != Some(lsp) {
                 self.lsp_hash = Some(lsp);
                 changed = true;
@@ -490,6 +501,50 @@ mod tests {
             }
         }
         assert_eq!(fired, Some(StuckKind::Green));
+    }
+
+    #[test]
+    fn lsp_zero_alone_does_not_acquit_to_green() {
+        // The 2026-09-01 e2e: YAML edits report `[lsp project] 0 errors`
+        // (syntax-only proof) while the deploy fails — that must NOT count
+        // as green, or Red (the step judge's only stuck trigger) becomes
+        // structurally unreachable on non-cargo trees.
+        let mut t = StuckTracker::new();
+        arm(&mut t);
+        t.on_round(2, 20.0);
+        t.on_tool(
+            "replace_range",
+            &json!({"path": "chart/values.yaml", "start": 1, "end": 2}),
+            true,
+            "edited\n[ast] ok\n[lsp project] 0 errors",
+        );
+        let mut fired = None;
+        for r in 3..40 {
+            let now = 20.0 + r as f64 * 25.0;
+            t.on_round(r, now);
+            t.on_tool(
+                "file",
+                &json!({"action": "read", "path": "chart/values.yaml"}),
+                true,
+                read_result(),
+            );
+            if let Some(k) = t.check_fire(r, now) {
+                fired = Some(k);
+                break;
+            }
+        }
+        assert_eq!(fired, Some(StuckKind::Red));
+    }
+
+    #[test]
+    fn mutating_edit_predicate() {
+        assert!(is_mutating_edit("replace_range", ""));
+        assert!(is_mutating_edit("write_file", ""));
+        assert!(is_mutating_edit("refactor", "rename"));
+        assert!(is_mutating_edit("refactor", "add_param"));
+        assert!(!is_mutating_edit("refactor", "callers"));
+        assert!(!is_mutating_edit("file", "read"));
+        assert!(!is_mutating_edit("shell", ""));
     }
 
     #[test]

@@ -19,6 +19,9 @@ miniswe is built around one principle: **give the model the right tools and let 
 - **Context compression** — when the conversation grows past budget, older turns are LLM-summarized and archived to `.miniswe/session_archive.md`.
 - **MCP support** — connect any MCP server via `.mcp.json` (Claude Code compatible). *Not yet tested end-to-end.*
 - **Permission model** — path jailing, shell approval, per-query web access, MCP approval.
+- **Skills** — guided multi-step workflows from `.ai/skills/<name>/SKILL.md` (project) or `~/.ai/skills/` (global): a router picks the right skill for the task and the harness walks the model through its steps.
+- **Background jobs & sub-agents** — long-running commands run as managed background jobs; `spawn_agents` runs independent sub-tasks concurrently.
+- **Self-monitoring** — stuck detection, read-loop breaking, and read-only debugger/judge sub-agents that diagnose stalls and decide whether to continue, retry fresh, or abandon a step.
 
 ## Install
 
@@ -66,13 +69,14 @@ In the REPL, `/new` clears history+scratchpad+plan, `/clear` clears history, `/h
 
 ## Tools
 
-The model sees four grouped tools plus a few editing primitives (and `mcp_use` when MCP is configured):
+The model sees five grouped tools plus a few editing primitives (and `mcp_use` when MCP is configured, `skill` while a skill is active):
 
-- **`file`** — `read`, `delete`, `search` (ripgrep), `shell`, `revert`.
+- **`file`** — `read`, `delete`, `search` (ripgrep), `revert`.
 - **`code`** — `goto_definition`, `find_references`, `diagnostics`, `repo_map`, `project_info`, `architecture_notes`.
 - **`web`** — `search` (Serper, falls back to GitHub repo search), `fetch` (URL → markdown).
 - **`plan`** — `set`, `check`, `refine`, `show`, `scratchpad`.
-- **Editing primitives** — `replace_range`, `insert_at`, `write_file`, `revert`, `show_rev`, `check` (run the project compiler). Each edit returns AST + LSP feedback and a revision table so the model can see breakage and roll back.
+- **`shell`** — `run` (foreground, or `background=true` for deploys/servers), `wait`, `status`, `kill`; long foreground commands auto-promote to background jobs.
+- **Editing primitives** — `replace_range`, `insert_at`, `write_file`, `refactor` (`add_param`, `drop_param`, `rename`), `revert`, `show_rev`, `check` (run the project compiler). Each edit returns AST + LSP feedback and a revision table so the model can see breakage and roll back.
 
 ## Configuration
 

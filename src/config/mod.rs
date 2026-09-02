@@ -124,7 +124,18 @@ pub struct ModelConfig {
     /// probes; Unsloth recommends 0.6 for Nemotron thinking vs 0.2 instruct),
     /// so thinking requests override `temperature` with this value.
     pub thinking_temperature: f64,
-    /// Maximum output tokens per response
+    /// Maximum output tokens per response. This is a runaway BRAKE, not a
+    /// capability budget: a real tool call is small (the 08-28 app-with-deps
+    /// run had a 93-token median generation, p90 289, and the largest output
+    /// the harness actually consumed was 1077 tokens), while a repetition
+    /// loop inside a tool argument runs to whatever ceiling this sets. At
+    /// 16384 that cost three requests 583s/571s/451s -- 26.7 min, 10% of all
+    /// server time -- and at least two were discarded outright ("arguments
+    /// were cut off by the output limit", "generation truncated by context
+    /// ceiling"). `tool_call_repair` already recovers from those; the cap
+    /// decides how long it waits first. Models that genuinely need more get
+    /// it explicitly (see the Mistral Small 4 reasoning override in `run.rs`)
+    /// or from a bench script's own config.
     pub max_output_tokens: usize,
     /// Ceiling on the connect phase of an LLM request — from send to
     /// receiving response headers (the start of the SSE stream), not the
@@ -806,7 +817,7 @@ impl Default for ModelConfig {
             temperature: 0.15,
             thinking: false,
             thinking_temperature: 0.6,
-            max_output_tokens: 16384,
+            max_output_tokens: 4096,
             request_timeout_secs: 30,
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             request_deadline_secs: default_request_deadline_secs(),

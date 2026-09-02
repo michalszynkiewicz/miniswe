@@ -175,6 +175,58 @@ pub async fn extract_skill_steps(
     parse_steps(&out)
 }
 
+/// Decide whether a skill step HANDS OFF to another installed skill (control
+/// moves there) or merely REFERENCES one (the work stays here).
+///
+/// The deterministic token matcher that used to answer this on its own was
+/// never able to: it models "an installed skill is named in the last step's
+/// prose", and a *locative cross-reference to a section of another skill* has
+/// exactly that shape. Live 2026-08-30, `uds-package-integrate`'s final
+/// `DeployTestEnvironment` step says "following the Cluster Setup procedure in
+/// the `uds-package` skill" — the matcher descended into `uds-package`, a
+/// reference document with no phase steps at all, and 55 rounds (18% of the
+/// run) went into executing a five-step plan the extractor invented from it.
+/// The distinguishing signal is grammatical, not lexical, which is why this is
+/// a model call.
+///
+/// Scoped deliberately as a CLASSIFIER, not an escape hatch the model invokes:
+/// every proactive affordance this harness has offered has gone unused (the
+/// `[SKILLS]` listing, 0 reads / 6 runs; the saved shell-output pointer, 17
+/// writes / 0 reads on that same run), while narrow classifiers with a
+/// supplied candidate list have carried their probes (task router 30/30, step
+/// extraction 10/10, step checks 30/32).
+///
+/// Fail-safe to None, and asymmetrically so: a false negative keeps working in
+/// the current skill and is recoverable; a false positive tore down a phase.
+/// `candidates` comes from the token matcher, so the model picks a target it
+/// cannot invent.
+pub async fn classify_handoff(
+    llm_worker: &LlmWorkerHandle,
+    step_name: &str,
+    prose: &str,
+    candidates: &[String],
+    cancelled: &Arc<AtomicBool>,
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let sys = "You decide whether one step of a skill HANDS OFF to another skill.\n\
+        HANDOFF: after this step the work CONTINUES in the named skill — \"continue with the X \
+        skill\", \"invoke X\", \"proceed to the X phase\".\n\
+        REFERENCE: the work stays in the CURRENT skill and only cites another skill's content — \
+        \"following the Cluster Setup procedure in the X skill\", \"see X for the deploy rules\", \
+        \"as described in X\".\n\
+        Answer with exactly one candidate name, or NONE. Default to NONE: name a skill only if \
+        the step's own text says the work continues there. No explanation.";
+    let user = format!(
+        "Current step: {step_name}\n\nStep text:\n{prose}\n\nCandidates: {}\n\nHandoff target?",
+        candidates.join(", ")
+    );
+    let messages = vec![Message::system(sys), Message::user(&user)];
+    let out = ask(llm_worker, messages, cancelled).await;
+    parse_handoff_verdict(&out, candidates)
+}
+
 /// Distill ONE skill step into self-contained, verbatim-faithful
 /// instructions plus a completion criterion, from the skill material
 /// (SKILL.md + its sub-files). This is the just-in-time step-cursor
@@ -488,6 +540,44 @@ fn parse_pick(raw: &str, names: &[String]) -> Pick {
     Pick::Invalid
 }
 
+/// Parse a handoff verdict conservatively. An exact candidate name is the
+/// contract; anything else is salvaged only when unambiguous.
+///
+/// NONE is checked BEFORE the containment fallback on purpose: the natural
+/// chatty answer here is "NONE — the step only cites `uds-package`", which
+/// names a candidate while explicitly declining it. `parse_pick`'s
+/// containment-first salvage would read that as a handoff, i.e. turn the
+/// single most likely stray reply into the exact failure this classifier
+/// exists to prevent.
+fn parse_handoff_verdict(raw: &str, candidates: &[String]) -> Option<String> {
+    let t = raw
+        .trim()
+        .trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == '*')
+        .trim()
+        .trim_end_matches('.')
+        .trim();
+    if t.is_empty() {
+        return None;
+    }
+    for n in candidates {
+        if t.eq_ignore_ascii_case(n) {
+            return Some(n.clone());
+        }
+    }
+    let lower = t.to_lowercase();
+    if super::skill_cursor::contains_token(&lower, "none") {
+        return None;
+    }
+    let hits: Vec<&String> = candidates
+        .iter()
+        .filter(|n| super::skill_cursor::contains_token(&lower, &n.to_lowercase()))
+        .collect();
+    match hits.as_slice() {
+        [one] => Some((*one).clone()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,5 +752,80 @@ mod tests {
         assert!(r.starts_with("Read .ai/skills/uds-package/SKILL.md"));
         assert!(r.contains("follow its instructions"));
         assert!(r.ends_with("deploy the app"));
+    }
+
+    #[test]
+    fn handoff_verdict_accepts_the_exact_contract_and_light_decoration() {
+        let cands = vec![
+            "uds-package-integrate".to_string(),
+            "uds-package-validate".to_string(),
+        ];
+        for raw in [
+            "uds-package-integrate",
+            "  uds-package-integrate  ",
+            "`uds-package-integrate`",
+            "uds-package-integrate.",
+            "**uds-package-integrate**",
+            "UDS-Package-Integrate",
+        ] {
+            assert_eq!(
+                parse_handoff_verdict(raw, &cands).as_deref(),
+                Some("uds-package-integrate"),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn handoff_verdict_declines_on_none_even_when_a_candidate_is_quoted() {
+        // The most likely stray reply names the skill it is REFUSING. Reading
+        // that as a handoff is the exact 2026-08-30 failure, so NONE has to
+        // beat containment.
+        let cands = vec!["uds-package".to_string()];
+        for raw in [
+            "NONE",
+            "none",
+            "NONE.",
+            "NONE — the step only cites `uds-package` for its cluster procedure",
+            "None: uds-package is referenced, not invoked",
+        ] {
+            assert_eq!(parse_handoff_verdict(raw, &cands), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn handoff_verdict_fails_safe_on_ambiguity_and_junk() {
+        let cands = vec![
+            "uds-package-integrate".to_string(),
+            "uds-package-validate".to_string(),
+        ];
+        // Two candidates named with no NONE: undecidable, so stay put.
+        assert_eq!(
+            parse_handoff_verdict(
+                "either uds-package-integrate or uds-package-validate",
+                &cands
+            ),
+            None
+        );
+        assert_eq!(parse_handoff_verdict("", &cands), None);
+        assert_eq!(parse_handoff_verdict("¯\\_(ツ)_/¯", &cands), None);
+        // A skill that was never offered cannot be conjured.
+        assert_eq!(parse_handoff_verdict("uds-package-publish", &cands), None);
+        // No candidates at all: nothing to pick.
+        assert_eq!(parse_handoff_verdict("uds-package-integrate", &[]), None);
+    }
+
+    #[test]
+    fn handoff_verdict_salvages_a_single_unambiguous_name() {
+        let cands = vec!["uds-package-integrate".to_string()];
+        assert_eq!(
+            parse_handoff_verdict("Handoff target: uds-package-integrate", &cands).as_deref(),
+            Some("uds-package-integrate")
+        );
+        // …but not one buried in a path.
+        assert_eq!(
+            parse_handoff_verdict("see chart/uds-package-integrate.yaml", &cands),
+            None
+        );
     }
 }

@@ -123,3 +123,57 @@ async fn shell_promotion_and_jobs_wait_end_to_end() {
         "check probe output missing from round 3 context"
     );
 }
+
+/// A `shell` call that puts the command text in `action` instead of the
+/// literal verb must get the corrected call back verbatim, not a list of
+/// verb names. Regression test for the schema collapse in
+/// app-with-deps-todo-skills-miniswe-20260830-214306 attempt 0, where 32 of
+/// 88 shell calls were malformed and the model responded to the old
+/// "Use 'run' (command)" wording by adding `command` while leaving the
+/// command text in `action`.
+#[tokio::test]
+async fn shell_action_holding_command_text_echoes_the_corrected_call() {
+    let (_tmp, config) = helpers::create_test_project();
+    let perms = miniswe::tools::permissions::PermissionManager::headless(&config);
+    let registry = miniswe::tools::jobs::JobRegistry::default();
+
+    // Quotes and shell metacharacters must survive into the example.
+    let cmd = r#"ls -la chart/ && echo "done" 2>/dev/null"#;
+    let result = miniswe::tools::jobs::execute(
+        &serde_json::json!({ "action": cmd, "timeout": 10 }),
+        &config,
+        &perms,
+        &registry,
+        None,
+    )
+    .await;
+
+    assert!(
+        !result.success,
+        "wrong action should fail: {}",
+        result.content
+    );
+    let expected = serde_json::json!({ "action": "run", "command": cmd }).to_string();
+    assert!(
+        result.content.contains(&expected),
+        "error must echo the corrected call {expected}, got: {}",
+        result.content
+    );
+
+    // A missing `action` has no command to echo — it must not suggest an
+    // empty one.
+    let missing = miniswe::tools::jobs::execute(
+        &serde_json::json!({ "timeout": 10 }),
+        &config,
+        &perms,
+        &registry,
+        None,
+    )
+    .await;
+    assert!(!missing.success);
+    assert!(
+        !missing.content.contains(r#""command":"""#),
+        "missing action must not suggest an empty command: {}",
+        missing.content
+    );
+}

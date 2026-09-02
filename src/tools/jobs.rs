@@ -141,9 +141,21 @@ pub async fn execute(
         "status" => status(args, config, registry),
         "wait" => wait(args, config, perms, registry, cancelled).await,
         "kill" => kill(args, config, registry),
-        other => ToolResult::err(format!(
-            "shell: unknown action '{other}'. Use 'run' (command), 'wait' (id, secs, optional check), 'status' or 'kill'."
-        )),
+        // `action` must be the literal verb, not the command text. Models that
+        // get this wrong re-send the command in `action` and only add `command`
+        // alongside it, so echo the exact corrected call rather than naming the
+        // verbs — `json!` keeps the example valid when the command contains
+        // quotes or shell metacharacters.
+        other => ToolResult::err(match other {
+            "" => "shell: 'action' is required: run|wait|status|kill. \
+                   Run a command: {\"action\":\"run\",\"command\":\"ls -la\"}"
+                .to_string(),
+            cmd => format!(
+                "shell: 'action' must be literally run|wait|status|kill, not the command text. \
+                 Retry as: {}",
+                serde_json::json!({"action": "run", "command": cmd})
+            ),
+        }),
     }
 }
 
