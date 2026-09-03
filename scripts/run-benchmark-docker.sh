@@ -76,7 +76,11 @@ trap cleanup EXIT INT TERM
 
 # Defaults
 TIMEOUT=1800
-MAX_ROUNDS=50
+# Every stored baseline run since 2026-08-26 used --max-rounds 600 (the
+# round-45 "approaching tool limit" warning was hitting mid-implementation
+# on this bare default of 50, an 8x-smaller budget that voided a run on
+# 2026-09-03 with no regression signal — see benchmark_results/docker_20260903_190724*).
+MAX_ROUNDS=600
 MAX_ATTEMPTS=3
 TEMPERATURE=0.2
 MODEL="devstral-small-2"
