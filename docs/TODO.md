@@ -203,6 +203,31 @@ skill_step_injection (in flight), loop detector, long-running jobs.
 5. C: after the edit_file hunks land.
 Estimated A+B ≈ 600-900 lines and 8 config knobs; C ≈ 5k lines.
 
+## CI: speed up the test job without dropping tests
+
+The `test` job runs `cargo build --all-targets` then `cargo test`, which executes the
+test *binaries* sequentially — the lib tests, e2e_lsp, e2e_jobs and every other
+integration suite run back-to-back, and the e2e suites are dominated by waiting
+(LSP settle windows, job pacing), not CPU. Plan, in order of payoff:
+
+1. **cargo-nextest** (`taiki-e/install-action@nextest`, then
+   `cargo nextest run --locked --profile ci`): one parallel pool across all binaries.
+   Replaces the `--nocapture` hang-diagnosis rationale with something better:
+   per-test timing, `slow-timeout` (flag + terminate a hung test and print its
+   captured output), immediate failure output. Nextest skips doctests — add a
+   `cargo test --doc` step if we have any.
+2. Drop the separate `cargo build --locked --all-targets` step — nextest builds what
+   it needs; bench/example compile breakage is already caught by
+   `clippy --all-targets -D warnings` in the lint job.
+3. `CARGO_PROFILE_DEV_DEBUG=line-tables-only` in the test job env: faster
+   compile/link, smaller rust-cache, backtraces keep file:line.
+4. Only if still slow: mold/lld for linking the many test binaries; nextest
+   `--partition count:N/M` across a 2-runner matrix.
+
+Caveat: cross-binary parallelism means several rust-analyzer instances at once on a
+4-vCPU runner; if the LSP e2e tests get flaky under load, cap their concurrency with
+nextest test-groups instead of serializing everything.
+
 ## Bench harness: derive the "Model:" header from the server, not a constant
 
 `scripts/run-benchmark-docker.sh:74` hardcodes `MODEL="devstral-small-2"`, so the run

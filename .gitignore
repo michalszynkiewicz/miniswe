@@ -7,4 +7,6 @@ models/
 tmp
 scripts/moments/
 __pycache__/
-/ /
+.claude/
+tests/skill_handoff_realdata.rs
+docs/app-with-deps-e2e-review.md
