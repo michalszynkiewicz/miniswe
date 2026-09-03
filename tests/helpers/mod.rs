@@ -58,6 +58,7 @@ fetch_backend = "jina"
     let mut config = Config::default();
     config.project_root = project_root;
     config.model.max_retries = 1;
+    config.ensure_session_dir().unwrap();
 
     (temp, config)
 }

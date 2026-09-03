@@ -618,7 +618,7 @@ async fn task_update_creates_scratchpad() {
         result.content
     );
 
-    let path = config.miniswe_path("scratchpad.md");
+    let path = config.session_path("scratchpad.md");
     assert!(path.exists());
     let disk = fs::read_to_string(path).unwrap();
     assert_eq!(disk, scratchpad);

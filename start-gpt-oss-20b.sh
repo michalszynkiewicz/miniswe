@@ -58,6 +58,7 @@ echo ""
 
 exec "$(dirname "$0")/scripts/run-llama-cuda.sh" \
     --jinja \
+    --chat-template-kwargs '{"reasoning_effort":"high"}' \
     --model "$MODEL" \
     --ctx-size "$CTX_SIZE" \
     --cache-type-k q4_0 \

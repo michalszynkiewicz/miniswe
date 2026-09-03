@@ -130,6 +130,8 @@ async fn run_single_subagent(
             tool_choice: None,
             max_tokens_override: None,
             chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+            temperature_override: None,
+            cache_prompt: None,
         };
 
         let mut llm_events = llm_worker.submit(ModelRole::Default, request, cancelled.clone());

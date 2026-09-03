@@ -18,21 +18,25 @@ use tokio::sync::mpsc;
 use crate::cli::commands::agent::debugger;
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
-    PERIOD2_LOOP_HINT, PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
-    PREMATURE_EXIT_NUDGE, REPEATED_READ_NUDGE, is_file_write, is_prunable_refactor_failure,
-    loop_detected_hint, truncated_tool_call_hint, visible_tool_defs,
+    PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
+    PREMATURE_EXIT_NUDGE, REPEATED_READ_ESCALATION, REPEATED_READ_NUDGE, cycle_loop_hint,
+    is_file_write, is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint,
+    visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{
-    is_mutating_call, is_period2_cycle, key_is_mutating, loop_call_key,
+    cycle_period, is_mutating_call, key_is_mutating, loop_call_key,
 };
 use crate::cli::commands::agent::permissions::permission_action;
+use crate::cli::commands::agent::prune_reads::prune_repeated_reads;
 use crate::cli::commands::agent::spiral;
 use crate::cli::commands::agent::validation;
 use crate::config::{CeremonyMode, Config, EditMode, ModelRole};
 use crate::context;
 use crate::llm::{
-    ChatRequest, Message, ModelRouter, is_context_exceeded_error, is_context_truncated_response,
-    is_truncated_tool_call_error,
+    ChatRequest, Message, ModelRouter, TRUNCATED_CALL_ABORT_AFTER, is_context_exceeded_error,
+    is_context_truncated_response, is_tool_call_args_cap_error, is_truncated_tool_call_error,
+    sanitize_truncated_tool_calls, scrub_unparseable_tool_calls, truncated_args_info,
+    truncated_args_tool_result,
 };
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
@@ -82,6 +86,8 @@ async fn classify_is_explore(
         tool_choice: None,
         max_tokens_override: Some(8),
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+        temperature_override: None,
+        cache_prompt: None,
     };
     let mut events = llm_worker.submit(ModelRole::Default, request, cancelled.clone());
     let mut out = String::new();
@@ -355,12 +361,22 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
     #[allow(unused_assignments)]
     let mut snapshots: Option<Arc<Mutex<tools::snapshots::SnapshotManager>>> = None;
 
-    // Clear stale scratchpad/plan — unless `--continue` is set, in which
-    // case carry the previous session's state forward.
-    if !continue_session {
-        let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
-        let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
+    // Session working state (plan.md, scratchpad.md) lives in a private
+    // per-session directory, so there is nothing stale to clear and no
+    // shared path a concurrent or nested run could wipe out from under us.
+    // `--continue` adopts the previous session's directory rather than
+    // opening a fresh one.
+    let sessions_dir = config.sessions_dir();
+    if continue_session && let Some(previous) = crate::config::session::last_id(&sessions_dir) {
+        config.session_id = previous;
     }
+    let _ = config.ensure_session_dir();
+    crate::config::session::record_last(&sessions_dir, &config.session_id);
+    crate::config::session::prune(
+        &sessions_dir,
+        crate::config::session::RETENTION,
+        &config.session_id,
+    );
 
     // Initialize MCP
     let mcp_config = McpConfig::load(&config.project_root)?;
@@ -508,10 +524,10 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                     conversation_history.clear();
                                     if input == "/new" {
                                         let _ = std::fs::remove_file(
-                                            config.miniswe_path("scratchpad.md"),
+                                            config.session_path("scratchpad.md"),
                                         );
                                         let _ =
-                                            std::fs::remove_file(config.miniswe_path("plan.md"));
+                                            std::fs::remove_file(config.session_path("plan.md"));
                                         app.push_output(
                                             "Cleared history, scratchpad, and plan.",
                                             LineStyle::Status,
@@ -655,6 +671,34 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                 // on its own (validated battery), so there is no
                                 // keyword pre-route — on any parse failure the
                                 // classifier still fails safe to CODING.
+                                // Pre-turn skill router (fail-safe; skipped when the
+                                // user already invoked a skill via /name). See
+                                // agent::skill_router — probe: adoption 0/8 -> 8/8.
+                                let user_message = if active_skill_reminder.is_none() {
+                                    match crate::cli::commands::agent::skill_router::route_task_to_skill(
+                                        &llm_worker,
+                                        &config.project_root,
+                                        &user_message,
+                                        &cancelled,
+                                    )
+                                    .await
+                                    {
+                                        Some(skill) => {
+                                            app.push_output(
+                                                &format!("  · task routed to skill '{skill}'"),
+                                                LineStyle::Status,
+                                            );
+                                            crate::cli::commands::agent::skill_router::rewrite_task_for_skill(
+                                                &skill,
+                                                &user_message,
+                                            )
+                                        }
+                                        None => user_message,
+                                    }
+                                } else {
+                                    user_message
+                                };
+
                                 let is_explore =
                                     classify_is_explore(&llm_worker, &user_message, &cancelled)
                                         .await;
@@ -995,6 +1039,12 @@ async fn run_agent_loop(
     // Number of distinct loops the model has been pulled out of in this
     // turn. We give one recovery; a second loop ends the turn for real.
     let mut loop_recoveries = 0u32;
+    // Read-loop escalation ladder (see run.rs for the full rationale): first
+    // detection gets REPEATED_READ_NUDGE; a re-detection forces a context
+    // compaction before the next request — breaking the cache-hot prefix is
+    // what actually ends the loop. Resets after each escalation.
+    let mut read_nudges = 0u32;
+    let mut force_compact_next_round = false;
     let mut calls_since_last_edit = 0u32;
     let mut successful_edits_since_plan_update = 0u32;
     let mut plan_update_requested = false;
@@ -1005,6 +1055,10 @@ async fn run_agent_loop(
     // response is successfully consumed; bounds futile retries of one
     // failing request, not total compactions over a long turn.
     let mut context_compact_retries: usize = 0;
+    // Consecutive LLM requests that died on a tool-call argument problem
+    // (server-side parse error or our streaming size cap) with no completed
+    // response in between. See run.rs for the escalation ladder.
+    let mut truncated_call_errors_in_a_row: usize = 0;
     // How many times the behavioral done-gate has blocked completion this turn.
     let mut validation_blocks: usize = 0;
     // The model's stated rationale each time the gate blocked it (bounded, auditable).
@@ -1030,6 +1084,9 @@ async fn run_agent_loop(
     const REVERT_TO_GREEN_BLOCKS: usize = 6;
     let mut last_green_round: usize = 0;
     let mut red_streak: usize = 0;
+    // Ceremony-gate latch — see run.rs for the rationale. Reset on every
+    // SCRAP, which reassembles the context and restarts the ceremony.
+    let mut plan_ever_set = false;
 
     'round: loop {
         if had_error {
@@ -1131,7 +1188,48 @@ async fn run_agent_loop(
         // conversation, every round (matching run.rs). Driven through a
         // select! so a long LLM-based summarization keeps the TUI responsive.
         {
+            // See `agent::prune_reads` — surgically drop the middle of a deep
+            // run of identical reads, which compaction structurally cannot
+            // reach (it summarizes the oldest end; the loop is in the newest).
+            let pruned = prune_repeated_reads(messages);
+            if !pruned.is_empty() {
+                log.reads_pruned(
+                    pruned.removed / 2,
+                    pruned.keys,
+                    pruned.deepest.as_deref().unwrap_or("?"),
+                );
+                app.push_output(
+                    &format!(
+                        "  ⋯ pruned {} repeated calls from context",
+                        pruned.removed / 2
+                    ),
+                    LineStyle::Status,
+                );
+            }
             let pre = messages.len();
+            // Read-loop escalation (see REPEATED_READ_ESCALATION): the loop
+            // is sustained by the cache-hot prompt prefix, so break it
+            // deliberately even though no budget pressure asks for it. Runs
+            // before maybe_compress so refresh_current_state still lands on
+            // the tail.
+            if force_compact_next_round {
+                force_compact_next_round = false;
+                app.push_output(
+                    "  ⚠ Read loop persisted — forcing context compaction",
+                    LineStyle::Status,
+                );
+                force_compress_responsive(
+                    app,
+                    rx,
+                    terminal,
+                    messages,
+                    config,
+                    router,
+                    llm_worker,
+                    tool_def_tokens,
+                )
+                .await;
+            }
             {
                 let compress_fut = context::compressor::maybe_compress(
                     messages,
@@ -1163,16 +1261,25 @@ async fn run_agent_loop(
 
         // Hide edit tools until a plan exists; see visible_tool_defs.
         let plan_set = tools::plan::plan_exists(config);
+        plan_ever_set |= plan_set;
         // Off: never hide edit tools (pass plan_exists=true). Strict: legacy
-        // hide-until-plan behavior.
-        let visible = visible_tool_defs(tool_defs, plan_set || !strict);
-        // Build request. See run.rs for the per-model reasoning_effort logic.
-        let chat_template_kwargs = if config.model.is_mistral_small_4_family() {
-            let effort = if plan_set { "none" } else { "high" };
-            serde_json::json!({"reasoning_effort": effort})
-        } else {
-            serde_json::json!({"enable_thinking": false})
-        };
+        // hide-until-plan behavior, latched so a plan that goes away mid-segment
+        // cannot retract tools the model has already been shown.
+        let visible = visible_tool_defs(tool_defs, plan_ever_set || !strict);
+        // Build request. See run.rs for the per-model reasoning_effort and
+        // thinking-mode logic.
+        let (chat_template_kwargs, temperature_override) =
+            if config.model.is_mistral_small_4_family() {
+                let effort = if plan_set { "none" } else { "high" };
+                (serde_json::json!({"reasoning_effort": effort}), None)
+            } else if config.model.thinking {
+                (
+                    serde_json::json!({"enable_thinking": true}),
+                    Some(config.model.thinking_temperature),
+                )
+            } else {
+                (serde_json::json!({"enable_thinking": false}), None)
+            };
         // Bump output budget for Mistral 4 — see run.rs for rationale
         // (probe data: 8K truncates with empty content, 16K emits clean
         // correct output at ~6K tokens used).
@@ -1187,6 +1294,8 @@ async fn run_agent_loop(
             tool_choice: None,
             max_tokens_override,
             chat_template_kwargs: Some(chat_template_kwargs),
+            temperature_override,
+            cache_prompt: None,
         };
         log.llm_request(&request);
 
@@ -1239,16 +1348,80 @@ async fn run_agent_loop(
                                     // (primary path for compaction="lazy",
                                     // safety net for every other strategy).
                                     context_ceiling_hit = true;
+                                } else if is_tool_call_args_cap_error(&err_str) {
+                                    // Our streaming assembler aborted the
+                                    // generation: an anchor-only tool's
+                                    // arguments outgrew the cap. Nothing was
+                                    // persisted; hint and retry, or give up
+                                    // when the model keeps doing it.
+                                    truncated_call_errors_in_a_row += 1;
+                                    if truncated_call_errors_in_a_row
+                                        >= TRUNCATED_CALL_ABORT_AFTER
+                                    {
+                                        log.llm_error(&format!(
+                                            "{truncated_call_errors_in_a_row} consecutive oversized tool calls — aborting turn"
+                                        ));
+                                        // Falls through to `break None` below:
+                                        // no hint flag set, so the turn ends.
+                                        app.push_output(
+                                            "The model keeps emitting oversized tool-call arguments — giving up on this turn.",
+                                            LineStyle::Error,
+                                        );
+                                    } else {
+                                    log.llm_error(&format!(
+                                        "tool call aborted by the argument size cap: {err_str}"
+                                    ));
+                                    app.push_output(
+                                        "Tool call arguments exceeded the size cap — retrying with guidance.",
+                                        LineStyle::Status,
+                                    );
+                                    let hint = Message::user(&format!(
+                                        "{err_str}. Anchor-style tools take identifiers and short expressions only — \
+                                         never paste code bodies into their arguments. {}",
+                                        truncated_tool_call_hint(config.tools.edit_mode)
+                                    ));
+                                    messages.push(hint.clone());
+                                    conversation_history.push(hint);
+                                    truncated_tool_call_hint_pushed = true;
+                                    }
                                 } else if is_truncated_tool_call_error(&err_str) {
-                                    // Model hit max_tokens mid tool-call — the
-                                    // JSON couldn't be parsed server-side, so
-                                    // no tool_call_id was issued. When the
-                                    // prompt sits near the context window the
-                                    // truncation is really context exhaustion
-                                    // (the server clamps generation to the
-                                    // remaining room): a hint can't fix that,
-                                    // compaction can.
-                                    if context::compressor::estimated_context_tokens(
+                                    // The server's chat template could not
+                                    // parse some assistant tool call's
+                                    // arguments as JSON: either this
+                                    // response was cut off mid-call
+                                    // (nothing persisted), or a previously
+                                    // persisted call is broken and every
+                                    // request will fail until it is gone.
+                                    // Handle the second first — it is a
+                                    // zero-progress spin otherwise.
+                                    truncated_call_errors_in_a_row += 1;
+                                    let scrubbed = if truncated_call_errors_in_a_row >= 2 {
+                                        scrub_unparseable_tool_calls(messages)
+                                            + scrub_unparseable_tool_calls(conversation_history)
+                                    } else {
+                                        0
+                                    };
+                                    if scrubbed > 0 {
+                                        log.llm_error(&format!(
+                                            "scrubbed {scrubbed} unparseable tool call(s) from history after repeated parse failures — retrying"
+                                        ));
+                                        app.push_output(
+                                            "Repaired a truncated tool call left in history — retrying.",
+                                            LineStyle::Status,
+                                        );
+                                        truncated_tool_call_hint_pushed = true;
+                                    } else if truncated_call_errors_in_a_row
+                                        >= TRUNCATED_CALL_ABORT_AFTER
+                                    {
+                                        log.llm_error(&format!(
+                                            "{truncated_call_errors_in_a_row} consecutive tool-call parse failures with nothing left to repair — aborting turn"
+                                        ));
+                                        // Falls through to `break None`: turn ends.
+                                        app.push_output(
+                                            "The server keeps rejecting tool-call arguments — giving up on this turn.",
+                                            LineStyle::Error,
+                                        );
+                                    } else if context::compressor::estimated_context_tokens(
                                         messages,
                                         tool_def_tokens,
                                     ) > config.model.context_window * 3 / 4
@@ -1417,8 +1590,22 @@ async fn run_agent_loop(
         // A response made it through whole — any prior reactive-compaction
         // retries resolved this request; reset the budget for the next one.
         context_compact_retries = 0;
+        truncated_call_errors_in_a_row = 0;
 
-        let assistant_msg = &choice.message;
+        // Never persist an unparseable tool call (see run.rs): stub the
+        // cut-off arguments; the tool loop answers the stub with guidance.
+        let mut assistant_msg = choice.message.clone();
+        let truncated_calls = sanitize_truncated_tool_calls(&mut assistant_msg);
+        if truncated_calls > 0 {
+            log.llm_error(&format!(
+                "{truncated_calls} tool call(s) arrived with unparseable arguments (cut off by the output limit) — stubbed before persisting"
+            ));
+            app.push_output(
+                "A tool call was cut off by the output limit — it will not be executed.",
+                LineStyle::Status,
+            );
+        }
+        let assistant_msg = &assistant_msg;
 
         // Flush any remaining tokens
         app.flush_tokens();
@@ -1504,6 +1691,7 @@ async fn run_agent_loop(
                             // reset the context. Fires once per turn.
                             if config.tools.gate_restart && !restart_fired {
                                 restart_fired = true;
+                                plan_ever_set = false;
                                 *messages =
                                     scrap_restart(app, config, goal, mcp_summary, snapshots, false);
                                 conversation_history.clear();
@@ -1582,6 +1770,7 @@ async fn run_agent_loop(
                                 let msg = match verdict {
                                     debugger::DebuggerVerdict::Scrap if !restart_fired => {
                                         restart_fired = true;
+                                        plan_ever_set = false;
                                         *messages = scrap_restart(
                                             app,
                                             config,
@@ -1739,6 +1928,27 @@ async fn run_agent_loop(
                     continue;
                 }
             };
+            if let Some(info) = truncated_args_info(&args) {
+                // Stubbed by sanitize_truncated_tool_calls: nothing to run.
+                let result_msg = Message::tool_result(
+                    &tc.id,
+                    &format!(
+                        "{}\n\n{}",
+                        truncated_args_tool_result(&tc.function.name, &info),
+                        truncated_tool_call_hint(config.tools.edit_mode)
+                    ),
+                );
+                messages.push(result_msg.clone());
+                conversation_history.push(result_msg);
+                app.push_output(
+                    &format!(
+                        "  ✗ {}: arguments cut off by the output limit after {} chars — not executed",
+                        tc.function.name, info.original_chars
+                    ),
+                    LineStyle::ToolErr,
+                );
+                continue;
+            }
 
             let args_summary = summarize_args(&tc.function.name, &args);
 
@@ -1756,29 +1966,46 @@ async fn run_agent_loop(
             if recent_call_keys.len() > 12 {
                 recent_call_keys.remove(0);
             }
-            let period2 = is_period2_cycle(&recent_call_keys);
-            if same_call_streak >= 3 || period2 {
-                // Period-2-only detection (not also a plain streak).
-                let p2_only = period2 && same_call_streak < 3;
-                // A period-2 cycle is harmful if EITHER member mutates.
-                let mutating = if p2_only {
-                    let tail = &recent_call_keys[recent_call_keys.len().saturating_sub(2)..];
+            let cycle = cycle_period(&recent_call_keys);
+            if same_call_streak >= 3 || cycle.is_some() {
+                // Cycle-only detection (not also a plain streak).
+                let cycle_only = cycle.filter(|_| same_call_streak < 3);
+                // A cycle is harmful if ANY member mutates.
+                let mutating = if let Some(period) = cycle_only {
+                    let tail = &recent_call_keys[recent_call_keys.len().saturating_sub(period)..];
                     tail.iter().any(|k| key_is_mutating(k))
                 } else {
                     is_mutating_call(&tc.function.name, &args)
                 };
                 log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
 
-                // Read-only repetition: harmless, just wasted tokens.
-                // Surface a polite nudge inline and let processing continue.
+                // Read-only repetition: harmless per call, just wasted tokens.
+                // First detection: polite nudge, let processing continue.
+                // Re-detection: escalate — the nudge can't reach a
+                // cache-numerics rut, so force a compaction next round.
                 if !mutating {
-                    let result_msg = Message::tool_result(&tc.id, REPEATED_READ_NUDGE);
+                    read_nudges += 1;
+                    let escalate = read_nudges >= 2;
+                    let text = if escalate {
+                        read_nudges = 0;
+                        force_compact_next_round = true;
+                        REPEATED_READ_ESCALATION
+                    } else {
+                        REPEATED_READ_NUDGE
+                    };
+                    let result_msg = Message::tool_result(&tc.id, text);
                     messages.push(result_msg.clone());
                     conversation_history.push(result_msg);
                     app.push_output(
                         &format!(
-                            "  ⓘ Repeated read: {}({}) — nudge sent, continuing",
-                            tc.function.name, args_summary
+                            "  ⓘ Repeated read: {}({}) — {}, continuing",
+                            tc.function.name,
+                            args_summary,
+                            if escalate {
+                                "nudge failed, forcing compaction next round"
+                            } else {
+                                "nudge sent"
+                            }
                         ),
                         LineStyle::Status,
                     );
@@ -1788,12 +2015,12 @@ async fn run_agent_loop(
                     continue;
                 }
 
-                let hint = if p2_only {
-                    PERIOD2_LOOP_HINT
+                let hint = if let Some(period) = cycle_only {
+                    cycle_loop_hint(period)
                 } else {
-                    loop_detected_hint(config.tools.edit_mode)
+                    loop_detected_hint(config.tools.edit_mode).to_string()
                 };
-                let result_msg = Message::tool_result(&tc.id, hint);
+                let result_msg = Message::tool_result(&tc.id, &hint);
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
 
@@ -1809,10 +2036,10 @@ async fn run_agent_loop(
                             "  ⚠ Loop detected: {}({}) {} — surfacing a hint, giving the model one more round",
                             tc.function.name,
                             args_summary,
-                            if p2_only {
-                                "alternating with the same partner call (period-2 cycle)"
+                            if let Some(period) = cycle_only {
+                                format!("cycling through the same {period} calls (period-{period} cycle)")
                             } else {
-                                "repeated 3 times"
+                                "repeated 3 times".to_string()
                             }
                         ),
                         LineStyle::Status,
@@ -1882,6 +2109,7 @@ async fn run_agent_loop(
                             let msg = match verdict {
                                 debugger::DebuggerVerdict::Scrap if !restart_fired => {
                                     restart_fired = true;
+                                    plan_ever_set = false;
                                     *messages = scrap_restart(
                                         app,
                                         config,
@@ -2480,6 +2708,7 @@ async fn run_agent_loop(
                         let extra_msg = match verdict {
                             debugger::DebuggerVerdict::Scrap if !restart_fired => {
                                 restart_fired = true;
+                                plan_ever_set = false;
                                 *messages =
                                     scrap_restart(app, config, goal, mcp_summary, snapshots, true);
                                 conversation_history.clear();
@@ -2740,8 +2969,8 @@ fn scrap_restart(
     // Whole-tree revert touched many files outside the per-edit reindex path —
     // resync the symbol index / repo-map to the clean baseline.
     tools::reindex_project_incremental(config);
-    let _ = std::fs::remove_file(config.miniswe_path("plan.md"));
-    let _ = std::fs::remove_file(config.miniswe_path("scratchpad.md"));
+    let _ = std::fs::remove_file(config.session_path("plan.md"));
+    let _ = std::fs::remove_file(config.session_path("scratchpad.md"));
     let assembled = context::assemble(config, goal, &[], false, mcp_summary);
     app.push_output(done, LineStyle::Status);
     assembled.messages

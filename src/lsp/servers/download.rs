@@ -1,11 +1,92 @@
 //! HTTP downloaders for LSP binaries that ship as GitHub release
 //! artifacts (rust-analyzer, clangd, jdtls).
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use super::platform::{find_in_path, platform_triple};
+use super::verify::{VerifyResult, verify_binary_verbose};
+
+/// Attempts for a release-artifact download.
+///
+/// The failure this guards against was observed once in 38 benchmark runs: the
+/// rust-analyzer download threw, `ensure_binary` propagated the error, and the
+/// session then ran to completion with no LSP at all — which silently removes
+/// the `refactor` tools. The model fell back to `sed -i` across 14 callsites
+/// and scored 4/6, indistinguishable from an ordinary bad result.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// Per-attempt ceiling. `reqwest::get` applies no timeout whatsoever, so a
+/// stalled connection hangs session startup instead of failing it.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Run `f` up to [`DOWNLOAD_ATTEMPTS`] times with exponential backoff.
+///
+/// The whole install is retried, not just the HTTP GET: a truncated body
+/// surfaces as a gzip error and a corrupt artifact as a binary that won't
+/// exec, so retrying the transfer alone would miss both.
+async fn with_retry<T, F, Fut>(what: &str, mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        if attempt > 1 {
+            // Back off rather than hammer. These are unauthenticated GitHub
+            // release endpoints and a benchmark round hits them dozens of
+            // times from a single IP, so a tight retry loop would turn a
+            // transient rate-limit into a sustained one.
+            let wait = Duration::from_secs(1 << (attempt - 1));
+            eprintln!(
+                "[lsp] {what}: retrying in {}s ({attempt}/{DOWNLOAD_ATTEMPTS})",
+                wait.as_secs()
+            );
+            tokio::time::sleep(wait).await;
+        }
+
+        match f().await {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                eprintln!("[lsp] {what}: attempt {attempt}/{DOWNLOAD_ATTEMPTS} failed: {e:#}");
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("no attempts made")))
+        .with_context(|| format!("{what}: giving up after {DOWNLOAD_ATTEMPTS} attempts"))
+}
+
+/// GET `url` under [`DOWNLOAD_TIMEOUT`], returning the body only on 2xx.
+async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
+    let client = reqwest::Client::builder()
+        .timeout(DOWNLOAD_TIMEOUT)
+        .build()
+        .context("build http client")?;
+
+    let response = client
+        .get(url)
+        .header("User-Agent", "miniswe")
+        .send()
+        .await
+        .context("http request")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("HTTP {status}");
+    }
+
+    Ok(response
+        .bytes()
+        .await
+        .context("read response body")?
+        .to_vec())
+}
 
 /// Download rust-analyzer binary from GitHub releases.
 pub async fn download_rust_analyzer(cache_dir: &Path) -> Result<PathBuf> {
@@ -18,13 +99,15 @@ pub async fn download_rust_analyzer(cache_dir: &Path) -> Result<PathBuf> {
         "https://github.com/rust-lang/rust-analyzer/releases/latest/download/rust-analyzer-{triple}.gz"
     );
 
-    let response = reqwest::get(&url).await.context("download rust-analyzer")?;
+    let dest = with_retry("rust-analyzer", || install_rust_analyzer(&url, cache_dir)).await?;
 
-    if !response.status().is_success() {
-        anyhow::bail!("download failed: HTTP {}", response.status());
-    }
+    eprintln!("[lsp] rust-analyzer installed to {}", dest.display());
+    Ok(dest)
+}
 
-    let compressed = response.bytes().await?;
+/// One download → decompress → write → verify cycle, retried as a unit.
+async fn install_rust_analyzer(url: &str, cache_dir: &Path) -> Result<PathBuf> {
+    let compressed = fetch_bytes(url).await?;
 
     // Decompress gzip
     use std::io::Read;
@@ -35,16 +118,25 @@ pub async fn download_rust_analyzer(cache_dir: &Path) -> Result<PathBuf> {
         .context("decompress rust-analyzer")?;
 
     let dest = cache_dir.join("rust-analyzer");
-    std::fs::write(&dest, &binary)?;
+    std::fs::write(&dest, &binary).with_context(|| format!("write {}", dest.display()))?;
 
     // Make executable
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+            .context("chmod rust-analyzer")?;
     }
 
-    eprintln!("[lsp] rust-analyzer installed to {}", dest.display());
+    // Exec it once before declaring success. `ensure_binary` returns anything
+    // in the cache without re-verifying it, so a truncated or corrupt artifact
+    // written here would be trusted as known-good on every later startup —
+    // remove it and let the retry fetch a clean copy.
+    if let VerifyResult::Failed { reason } = verify_binary_verbose(&dest, &["--version"]) {
+        let _ = std::fs::remove_file(&dest);
+        anyhow::bail!("downloaded rust-analyzer does not run ({reason})");
+    }
+
     Ok(dest)
 }
 

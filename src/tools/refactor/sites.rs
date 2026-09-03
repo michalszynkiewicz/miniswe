@@ -397,6 +397,97 @@ pub struct Window {
 /// trailing lines (clamped to the file). The target line is always
 /// `lines[0]` of the snippet, so the model can be told unambiguously
 /// "edit the FIRST line of the snippet" without any line-number arithmetic.
+/// Radius, in lines, searched when an LSP-reported callsite line does not
+/// match the content we are about to edit.
+///
+/// Kept tight on purpose. Index lag is small — the agent edits a handful of
+/// lines between refactors — while callsites of the same function are often
+/// 15–20 lines apart in a test file. A wide search would confidently relocate
+/// onto a *different* call to the same function and rewrite the wrong one.
+const REANCHOR_RADIUS: u32 = 8;
+
+/// Re-anchor an LSP-reported callsite position against the source we are
+/// actually about to edit. Returns `(line, column)`, both 0-based.
+///
+/// Two things make the reported line go stale, and both were observed in
+/// benchmark runs:
+///
+///  * rust-analyzer's index lags the file on disk — the agent edits between
+///    refactors and `find_references` answers from the older snapshot. Seen
+///    live: a reported line pointing one line *below* the call opener, so the
+///    window handed to the model started mid-argument-list, the model could
+///    only guess at an OLD block, all three retries failed, and the refactor
+///    returned PARTIAL with the project left uncompilable.
+///  * within a single refactor the signature edit is staged before callsites
+///    are rewritten, so if it changed its own file's line count, every
+///    callsite below it in that file is off by that delta.
+///
+/// Anchoring on a stale line is not a cosmetic failure: `apply_rewrite`
+/// verifies OLD against the anchor, so the callsite is abandoned entirely.
+///
+/// This is NOT the fuzzy OLD-matching that `apply_rewrite` deliberately
+/// refuses. That would mean trusting model-authored text to find its own
+/// target. Here we relocate *our own* anchor by a deterministic criterion —
+/// the nearest line that actually mentions the callee — and return `None`
+/// rather than guess when the nearest match is ambiguous or absent.
+pub fn reanchor_callsite(source: &str, reported_line: u32, name: &str) -> Option<(u32, u32)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let col_of = |i: u32| lines.get(i as usize).and_then(|l| ident_column(l, name));
+
+    // Fast path: the reported line still names the callee.
+    if let Some(col) = col_of(reported_line) {
+        return Some((reported_line, col));
+    }
+
+    for delta in 1..=REANCHOR_RADIUS {
+        let above = reported_line
+            .checked_sub(delta)
+            .and_then(|l| col_of(l).map(|c| (l, c)));
+        let below = col_of(reported_line + delta).map(|c| (reported_line + delta, c));
+        match (above, below) {
+            // Equidistant candidates on both sides: no basis to choose, and
+            // picking wrong means editing an unrelated call.
+            (Some(_), Some(_)) => return None,
+            (Some(hit), None) | (None, Some(hit)) => return Some(hit),
+            (None, None) => continue,
+        }
+    }
+    None
+}
+
+/// Column (0-based, counted in chars) at which `name` appears in `line` as a
+/// whole identifier — `assemble` matches in `context::assemble(`, but not
+/// inside `reassemble` or `assemble_all`.
+fn ident_column(line: &str, name: &str) -> Option<u32> {
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = line.get(from..)?.find(name) {
+        let at = from + rel;
+        let end = at + name.len();
+        let before_ok = at == 0 || !is_ident_byte(bytes[at - 1]);
+        let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        if before_ok && after_ok {
+            return Some(line[..at].chars().count() as u32);
+        }
+        from = end;
+    }
+    None
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// The standard callsite context window, cut from `source` at `line`.
+/// Used when a re-anchor moved the position and the stored window — cut from
+/// the indexed content at the stale line — can no longer be trusted.
+pub fn callsite_window(source: &str, line: u32) -> String {
+    extract_window(source, line, TRAILING_LINES).text
+}
+
 pub fn extract_window(source: &str, line: u32, lines_after: u32) -> Window {
     let lines: Vec<&str> = source.lines().collect();
     let total = lines.len() as u32;
@@ -496,5 +587,97 @@ mod commit_staged_tests {
         let last = revs.last().expect("one revision recorded");
         assert!(last.ast_ok);
         assert!(last.ast_error.is_none());
+    }
+}
+
+#[cfg(test)]
+mod reanchor_tests {
+    use super::*;
+
+    /// Shape taken verbatim from the benchmark failure that motivated this:
+    /// the LSP reported the line one below the call opener, so the window the
+    /// model was shown started at `&config,` and every retry produced an OLD
+    /// that could not apply.
+    const CALL: &str = "\
+fn outer() {
+    if x {
+        let assembled = context::assemble(
+            &config,
+            &history,
+        );
+    }
+}
+";
+
+    #[test]
+    fn exact_line_is_kept() {
+        // Line 2 (0-based) is the opener; nothing should move.
+        assert_eq!(reanchor_callsite(CALL, 2, "assemble"), Some((2, 33)));
+    }
+
+    #[test]
+    fn stale_line_below_opener_is_pulled_back() {
+        // The observed failure: reported line points into the argument list.
+        assert_eq!(reanchor_callsite(CALL, 3, "assemble"), Some((2, 33)));
+    }
+
+    #[test]
+    fn stale_line_above_opener_is_pushed_forward() {
+        // The other direction — lines inserted above the call since indexing.
+        assert_eq!(reanchor_callsite(CALL, 0, "assemble"), Some((2, 33)));
+    }
+
+    #[test]
+    fn missing_callee_yields_none() {
+        // Callsite deleted since indexing: report it, never guess.
+        assert_eq!(reanchor_callsite(CALL, 3, "nonexistent_fn"), None);
+    }
+
+    #[test]
+    fn beyond_radius_yields_none() {
+        let mut src = String::new();
+        for _ in 0..40 {
+            src.push_str("    // filler\n");
+        }
+        src.push_str("    assemble(a);\n");
+        // The call is 40 lines away — far outside REANCHOR_RADIUS.
+        assert_eq!(reanchor_callsite(&src, 0, "assemble"), None);
+    }
+
+    #[test]
+    fn equidistant_candidates_yield_none() {
+        // Two calls the same distance either side: choosing would be a coin
+        // flip, and the wrong choice rewrites an unrelated call.
+        let src = "assemble(a);\n// middle\nassemble(b);\n";
+        assert_eq!(reanchor_callsite(src, 1, "assemble"), None);
+    }
+
+    #[test]
+    fn nearer_candidate_wins_over_farther() {
+        let src = "assemble(a);\n// x\n// y\n// z\nassemble(b);\n";
+        // Reported line 3: one below is line 4, three above is line 0.
+        assert_eq!(reanchor_callsite(src, 3, "assemble"), Some((4, 0)));
+    }
+
+    #[test]
+    fn substring_matches_are_not_identifiers() {
+        // `reassemble` / `assemble_all` must not satisfy the search, or a
+        // re-anchor could land on a similarly-named neighbour.
+        let src = "    reassemble(a);\n    // gap\n    assemble_all(b);\n";
+        assert_eq!(reanchor_callsite(src, 1, "assemble"), None);
+    }
+
+    #[test]
+    fn column_is_counted_in_chars_not_bytes() {
+        // A multibyte prefix must not shift the reported column: downstream
+        // consumers treat it as an LSP character offset.
+        let src = "// ✓ ok\nlet x = assemble(a);\n";
+        assert_eq!(reanchor_callsite(src, 1, "assemble"), Some((1, 8)));
+    }
+
+    #[test]
+    fn qualified_call_resolves_to_the_name_column() {
+        let src = "    let v = crate::context::assemble(a);\n";
+        assert_eq!(reanchor_callsite(src, 0, "assemble"), Some((0, 28)));
     }
 }

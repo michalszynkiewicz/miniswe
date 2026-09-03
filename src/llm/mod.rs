@@ -4,10 +4,16 @@
 //! Handles streaming responses and tool call parsing.
 
 pub mod router;
+pub mod tool_call_repair;
 mod types;
 mod xml_tool_calls;
 
 pub use router::ModelRouter;
+pub use tool_call_repair::{
+    TOOL_CALL_ARGS_CAP_MARKER, TRUNCATED_CALL_ABORT_AFTER, is_tool_call_args_cap_error,
+    sanitize_truncated_tool_calls, scrub_unparseable_tool_calls, tool_call_args_cap,
+    truncated_args_info, truncated_args_tool_result,
+};
 pub use types::*;
 
 use std::sync::Arc;
@@ -21,6 +27,62 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 use crate::config::{ModelConfig, ToolCallFormat};
+
+/// Idle-window floor (secs) for a forced cold prefill (`cache_prompt=false`).
+/// A cold prompt eval reprocesses the whole context and emits no token until
+/// prefill completes; on a slow / CPU-offloaded model that first-token latency
+/// can exceed the normal stream-idle guard, which would then kill a
+/// legitimately-progressing prefill (silence ≠ no progress). The absolute
+/// `request_deadline_secs` still backstops a truly wedged server.
+const COLD_PREFILL_IDLE_SECS: u64 = 60;
+
+/// Worst-case prompt-eval throughput (tokens/sec) assumed when sizing the idle
+/// window. A heavily CPU-offloaded MoE (`--n-cpu-moe 40`) was measured at a
+/// ~175 tok/s mean over 678 prefill reports, so this leaves ~4x headroom for
+/// the slow tail. Deliberately pessimistic: over-estimating the prefill cost
+/// only delays wedge detection, which `request_deadline_secs` backstops
+/// anyway, whereas under-estimating kills a healthy request outright.
+const MIN_PREFILL_TOKENS_PER_SEC: u64 = 40;
+
+/// Serialized-JSON bytes per token, for sizing the prefill allowance. The
+/// serialized form carries punctuation and escapes the tokenizer never sees,
+/// so this over-estimates the token count — again, the safe direction.
+const PROMPT_BYTES_PER_TOKEN: u64 = 4;
+
+/// Rough token count of the prompt this body will make the server evaluate.
+fn estimated_prompt_tokens(body: &Value) -> u64 {
+    let bytes = body
+        .get("messages")
+        .or_else(|| body.get("prompt"))
+        .map(|v| v.to_string().len())
+        .unwrap_or(0) as u64;
+    bytes / PROMPT_BYTES_PER_TOKEN
+}
+
+/// The idle timeout for one attempt.
+///
+/// Prefill emits no SSE token until it completes, so a long *legitimate* prompt
+/// eval is byte-for-byte indistinguishable from a wedged server to any purely
+/// idle-based guard. Keying the widened window on `cache_prompt=false` was
+/// therefore too narrow: a *warm* request whose cached prefix got evicted (one
+/// llama.cpp slot shared between 30k main-loop calls and 1-4k fast-role calls)
+/// re-prefills thousands of tokens while still advertising `cache_prompt=true`,
+/// and got killed by the flat configured window. Observed cost: 215 client-side
+/// cancels, every one at exactly the 30s mark, burning ~61% of a 2h56m run.
+///
+/// So the window is sized from the work the request actually implies —
+/// `configured_secs` as the floor, widened to cover the prompt at
+/// [`MIN_PREFILL_TOKENS_PER_SEC`], and capped at the absolute deadline, past
+/// which `request_deadline_secs` fires regardless and a longer window is a
+/// number that can never be reached.
+fn attempt_idle_timeout(body: &Value, configured_secs: u64, deadline_secs: u64) -> Duration {
+    let prefill_allowance = estimated_prompt_tokens(body) / MIN_PREFILL_TOKENS_PER_SEC;
+    let mut secs = configured_secs.max(prefill_allowance);
+    if body.get("cache_prompt") == Some(&Value::Bool(false)) {
+        secs = secs.max(COLD_PREFILL_IDLE_SECS);
+    }
+    Duration::from_secs(secs.min(deadline_secs.max(1)))
+}
 
 /// Counter for dumped request bodies. Atomic so multi-threaded callers
 /// don't collide on filenames.
@@ -163,7 +225,11 @@ impl LlmClient {
         // idle connections, even though the public API returns a single
         // ChatResponse to the caller.
         body["model"] = Value::String(self.config.model.clone());
-        body["temperature"] = Value::from(self.config.temperature);
+        body["temperature"] = Value::from(
+            request
+                .temperature_override
+                .unwrap_or(self.config.temperature),
+        );
         // Per-request override wins, otherwise the model's configured
         // default. Some callers (e.g. refactor's ask_rewrite) need more
         // budget for thinking-mode models that emit reasoning tokens
@@ -180,9 +246,14 @@ impl LlmClient {
         if let Some(kwargs) = &request.chat_template_kwargs {
             body["chat_template_kwargs"] = kwargs.clone();
         }
+        // Per-request cache_prompt override (e.g. force a cold prefill to break
+        // a q4-KV-cache loop). The tool-call-leak retry below may also flip
+        // this to false mid-loop.
+        if let Some(cp) = request.cache_prompt {
+            body["cache_prompt"] = Value::Bool(cp);
+        }
         maybe_dump_request(&body);
         let connect_timeout = Duration::from_secs(self.config.request_timeout_secs);
-        let idle_timeout = Duration::from_secs(self.config.stream_idle_timeout_secs);
 
         let mut attempt = 0usize;
         let mut cache_busted = false;
@@ -201,6 +272,14 @@ impl LlmClient {
                     self.config.request_deadline_secs
                 );
             }
+            // Recomputed per attempt: the tool-call-leak retry below may flip
+            // cache_prompt to false mid-loop, and a cold prefill needs the
+            // wider idle window.
+            let idle_timeout = attempt_idle_timeout(
+                &body,
+                self.config.stream_idle_timeout_secs,
+                self.config.request_deadline_secs,
+            );
             let result = self
                 .stream_once_assembled(
                     &url,
@@ -362,7 +441,7 @@ impl LlmClient {
                 Ok(Err(e)) => return Err(e),
                 Err(_) => bail!(
                     "LLM stream idle: no tokens received for {}s",
-                    self.config.stream_idle_timeout_secs
+                    idle_timeout.as_secs()
                 ),
             };
 
@@ -438,6 +517,24 @@ impl LlmClient {
                                     }
                                     if let Some(args) = &func.arguments {
                                         entry.2.push_str(args);
+                                        // Anchor-only tools never need more
+                                        // than a few hundred chars; a call
+                                        // growing past the cap is the model
+                                        // pasting code into an anchor field.
+                                        // Abort now (the server cancels the
+                                        // slot on disconnect) instead of
+                                        // burning minutes until the context
+                                        // ceiling truncates it anyway.
+                                        if let Some(cap) = tool_call_args_cap(&entry.1)
+                                            && entry.2.len() > cap
+                                        {
+                                            bail!(
+                                                "{TOOL_CALL_ARGS_CAP_MARKER}: `{}` arguments \
+                                                 reached {} chars (cap {cap}) — generation aborted",
+                                                entry.1,
+                                                entry.2.len()
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -526,7 +623,7 @@ impl LlmClient {
                 Ok(Err(e)) => return Err(e),
                 Err(_) => bail!(
                     "LLM stream idle: no tokens received for {}s",
-                    self.config.stream_idle_timeout_secs
+                    idle_timeout.as_secs()
                 ),
             };
 
@@ -577,7 +674,11 @@ impl LlmClient {
 
         let mut body = serde_json::to_value(request)?;
         body["model"] = Value::String(self.config.model.clone());
-        body["temperature"] = Value::from(self.config.temperature);
+        body["temperature"] = Value::from(
+            request
+                .temperature_override
+                .unwrap_or(self.config.temperature),
+        );
         let max_tokens = request
             .max_tokens_override
             .unwrap_or(self.config.max_output_tokens as u64);
@@ -589,9 +690,14 @@ impl LlmClient {
         if let Some(kwargs) = &request.chat_template_kwargs {
             body["chat_template_kwargs"] = kwargs.clone();
         }
+        // Per-request cache_prompt override (e.g. force a cold prefill to break
+        // a q4-KV-cache loop). The tool-call-leak retry below may also flip
+        // this to false mid-loop.
+        if let Some(cp) = request.cache_prompt {
+            body["cache_prompt"] = Value::Bool(cp);
+        }
         maybe_dump_request(&body);
         let connect_timeout = Duration::from_secs(self.config.request_timeout_secs);
-        let idle_timeout = Duration::from_secs(self.config.stream_idle_timeout_secs);
 
         let mut attempt = 0usize;
         // Absolute deadline across retries — see chat_with_cancel. The
@@ -607,6 +713,11 @@ impl LlmClient {
                 );
             }
             let mut had_progress = false;
+            let idle_timeout = attempt_idle_timeout(
+                &body,
+                self.config.stream_idle_timeout_secs,
+                self.config.request_deadline_secs,
+            );
             let result = {
                 let mut wrapped = |token: &str| {
                     had_progress = true;
@@ -908,6 +1019,84 @@ fn retryable_status_from_message(msg: &str) -> Option<StatusCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A body whose `messages` serialize to roughly `tokens` tokens.
+    fn body_of_size(tokens: u64, cache_prompt: Option<bool>) -> Value {
+        let content = "x".repeat((tokens * PROMPT_BYTES_PER_TOKEN) as usize);
+        let mut body = serde_json::json!({"messages": [{"role": "user", "content": content}]});
+        if let Some(cp) = cache_prompt {
+            body["cache_prompt"] = Value::Bool(cp);
+        }
+        body
+    }
+
+    #[test]
+    fn cold_prefill_widens_idle_window() {
+        // cache_prompt=false → widened to the cold-prefill floor.
+        let body = serde_json::json!({"cache_prompt": false});
+        assert_eq!(
+            attempt_idle_timeout(&body, 30, 600),
+            Duration::from_secs(COLD_PREFILL_IDLE_SECS)
+        );
+    }
+
+    #[test]
+    fn normal_request_keeps_configured_idle_window() {
+        // cache_prompt=true or absent, no prompt → configured value, untouched.
+        for body in [
+            serde_json::json!({"cache_prompt": true}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                attempt_idle_timeout(&body, 30, 600),
+                Duration::from_secs(30)
+            );
+        }
+    }
+
+    #[test]
+    fn warm_request_widens_for_a_large_prompt() {
+        // The regression this fix exists for: a *warm* request (cache_prompt
+        // absent/true) carrying a big prompt used to get the flat configured
+        // window and die mid-prefill. 12k tokens at MIN_PREFILL_TOKENS_PER_SEC
+        // needs 300s, well past a 120s floor.
+        let body = body_of_size(12_000, Some(true));
+        assert_eq!(
+            attempt_idle_timeout(&body, 120, 600),
+            Duration::from_secs(12_000 / MIN_PREFILL_TOKENS_PER_SEC)
+        );
+    }
+
+    #[test]
+    fn small_prompt_does_not_shrink_the_configured_window() {
+        // A fast-role helper call must not get a *tighter* window than configured.
+        let body = body_of_size(1_000, None);
+        assert_eq!(
+            attempt_idle_timeout(&body, 120, 600),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn idle_window_never_exceeds_the_absolute_deadline() {
+        // Past the deadline the request is dead anyway — a larger idle window
+        // would be a number that can never be reached.
+        let body = body_of_size(100_000, Some(true));
+        assert_eq!(
+            attempt_idle_timeout(&body, 120, 600),
+            Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn cold_prefill_never_shrinks_a_larger_configured_window() {
+        // A generous configured timeout wins over the floor (max, not set).
+        let body = serde_json::json!({"cache_prompt": false});
+        assert_eq!(
+            attempt_idle_timeout(&body, 120, 600),
+            Duration::from_secs(120)
+        );
+    }
 
     #[test]
     fn truncated_tool_call_error_detected() {

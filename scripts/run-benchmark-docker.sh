@@ -21,6 +21,16 @@
 #                -m $HOME/models/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf \
 #                --port 8464 -c 60000
 #   # then: ./scripts/run-benchmark-docker.sh --model gemma-4-26B-A4B-it
+#
+# Env knobs (all optional, defaults = the historical bench config):
+#   THINKING=true            model.thinking arm (main loop + debugger think)
+#   CTX_WINDOW=100000        model.context_window (default 60000)
+#   MAX_OUTPUT_TOKENS=10000  model.max_output_tokens (default 8000)
+#   STREAM_IDLE_SECS=90      model.stream_idle_timeout_secs floor (default 120)
+#   COMPACTION=unified       context.compaction (default lazy)
+#   GPU_SAMPLE_INTERVAL=10   seconds between nvidia-smi samples (0 = off)
+#   LLAMA_CONTAINER_FILTER   docker name filter for the server container
+#                            (default: llama-server-)
 
 set -euo pipefail
 
@@ -43,6 +53,9 @@ BASELINE_SHA="cc34d2626faf32c1b6dd1b8b33af693fb936b098"
 ACTIVE_CONTAINER_NAME=""
 ACTIVE_TMP_SCRIPT=""
 
+# GPU telemetry + llama-server provenance (docs/gpu-hardening.md items 2, 5)
+source "${REPO_DIR}/scripts/bench-gpu.sh"
+
 cleanup() {
     set +e
 
@@ -53,6 +66,8 @@ cleanup() {
     if [[ -n "${ACTIVE_TMP_SCRIPT}" ]]; then
         rm -f "${ACTIVE_TMP_SCRIPT}" >/dev/null 2>&1 || true
     fi
+
+    gpu_telemetry_stop
 
     docker image rm -f "${IMAGE_NAME}" >/dev/null 2>&1 || true
 }
@@ -127,6 +142,9 @@ if ! curl -fsS --max-time 5 "${LLAMA_ENDPOINT}/v1/models" > /dev/null 2>&1; then
     exit 1
 fi
 
+gpu_bench_start "${RESULTS_DIR}"
+echo ""
+
 # Build image
 echo "Building Docker image..."
 docker build -f "${REPO_DIR}/scripts/Dockerfile.benchmark" -t "${IMAGE_NAME}" "${REPO_DIR}" 2>&1 | tail -5
@@ -145,7 +163,14 @@ generate_config() {
     # size, but data showed that starves the model on multi-file changes
     # (Devstral regressed from 6/6 to 0/6). The leak is rare and now
     # has a retry-on-leak path; budget starvation is the bigger problem.
-    local CTX_WINDOW=60000
+    # CTX_WINDOW env overrides the 60K default (2026-08-22, for long-context
+    # models like Muse Glimmer). Everything downstream scales by fraction of
+    # context_window (compaction trigger, per-tool-result masking cap =
+    # ctx/10 chars, literal-replace line cap), so no code change is needed —
+    # but those caps DO move with it, so a larger window is its own arm, not
+    # a free change. Past ~60K also consider STREAM_IDLE_SECS: a post-
+    # compaction cold prefill is silent until the first token.
+    local CTX_WINDOW="${CTX_WINDOW:-60000}"
     local REPO_MAP_BUDGET=5000
 
     cat <<TOML
@@ -155,16 +180,33 @@ endpoint = "http://localhost:8464"
 model = "${MODEL}"
 context_window = ${CTX_WINDOW}
 temperature = ${TEMPERATURE}
-max_output_tokens = 8000
+# EXPERIMENTAL A/B knob. THINKING=true enables thinking-mode reasoning on the
+# main loop + debugger (at thinking_temperature 0.6); sub-roles stay instruct.
+thinking = ${THINKING:-false}
+# MAX_OUTPUT_TOKENS env: raise together with --reasoning-budget for heavier
+# thinking arms (default 8000 = every run through 2026-08-22).
+max_output_tokens = ${MAX_OUTPUT_TOKENS:-8000}
+# STREAM_IDLE_SECS env: idle-guard FLOOR between streamed chunks. Prefill emits
+# nothing until it finishes, so the harness widens this per request to cover the
+# prompt at MIN_PREFILL_TOKENS_PER_SEC (capped at request_deadline_secs) — this
+# value only sets the lower bound, which matters for the small fast-role calls
+# that carry no large prompt of their own. Keep it equal to the code default
+# (see default_stream_idle_timeout_secs); a stale literal here silently
+# overrides it. At the old flat 30 a warm request whose cached prefix had been
+# evicted died mid-prefill 215 times in one run, ~61% of its wall clock.
+stream_idle_timeout_secs = ${STREAM_IDLE_SECS:-120}
 
 [context]
 repo_map_budget = ${REPO_MAP_BUDGET}
 max_rounds = ${MAX_ROUNDS}
 pause_after_rounds = 99999
-# Conversation-compaction strategy A/B knob. Default unified = current
-# production behavior. COMPACTION=sliding_window|rolling_summary|observation_masking
+# Conversation-compaction strategy A/B knob. Default lazy = production default
+# (Config::default) and what the 2026-07-14 gemma 6/6 reference runs used.
+# NOTE: this defaulted to "unified" until 2026-08-22, so the 08-20..22 nemotron
+# runs and the 08-22 gemma thinking run ran unified.
+# COMPACTION=unified|sliding_window|rolling_summary|observation_masking|tiered...
 # ./scripts/run-benchmark-docker.sh ... to compare. See run-compaction-bench.sh.
-compaction = "${COMPACTION:-unified}"
+compaction = "${COMPACTION:-lazy}"
 
 [context.providers]
 profile = $(_dis profile)
@@ -195,22 +237,33 @@ diagnostic_timeout_ms = 2000
 web_tools = $(_dis web_tools)
 plan = $(_dis plan)
 scratchpad = $(_dis scratchpad)
-# EXPERIMENTAL A/B knob. Default false = pure fast-mode (baseline). Launch with
-# AUTO_REVERT=true ./scripts/run-benchmark-docker.sh ... to force-revert the
-# brace-cascade loop (3+ consecutive broken-AST edits → revert to last clean rev).
-auto_revert_ast_cascade = ${AUTO_REVERT:-false}
-# EXPERIMENTAL A/B knob (GitHub #40). Default false. Launch with
-# REACTIVE_DEBUGGER=true ./scripts/run-benchmark-docker.sh ... to spin up a
-# fresh-context debugger sub-agent after the done-gate blocks twice in a turn.
-reactive_debugger = ${REACTIVE_DEBUGGER:-false}
+# The three flags below default to the CODE defaults (src/config/mod.rs) so a
+# plain run benches what users get. Until 2026-08-23 they defaulted to the
+# June A/B-experiment values (false/false/true), which silently confounded
+# every 08-20..23 run: with the debugger off gemma went 6,5,6 @ 1090/3403/677s
+# vs 6,6,6 @ 550/279/1411s with the code defaults. Override for A/B runs, e.g.
+# REACTIVE_DEBUGGER=false ./scripts/run-benchmark-docker.sh ...
+#
+# Force-revert the brace-cascade loop (3+ consecutive broken-AST edits → revert
+# to the last clean rev).
+auto_revert_ast_cascade = ${AUTO_REVERT:-true}
+# GitHub #40: fresh-context debugger sub-agent (+ judge REWIND) after the
+# done-gate blocks twice in a turn. This is the flag that carries the
+# first-attempt rate.
+reactive_debugger = ${REACTIVE_DEBUGGER:-true}
 # EXPERIMENTAL A/B knob. Default false. Launch with SPIRAL_RESET=true to detect a
 # revert-loop (same file reverted 3+×/turn) and inject a reset + forced replan.
 spiral_reset = ${SPIRAL_RESET:-false}
-# EXPERIMENTAL. Default TRUE for this experiment: after the done-gate blocks twice
-# in a turn, drop the polluted history + re-assemble a clean context (fresh-attempt
-# in-session) instead of grinding. Override with GATE_CONTEXT_RESET=false for the
-# A/B baseline.
-gate_context_reset = ${GATE_CONTEXT_RESET:-true}
+# EXPERIMENTAL, opt-in (code default false): after the done-gate blocks twice in
+# a turn, drop the polluted history + re-assemble a clean context instead of
+# grinding. Benched 06-19 with no clean win; GATE_CONTEXT_RESET=true to try it.
+gate_context_reset = ${GATE_CONTEXT_RESET:-false}
+# T2c frozen-signature stuck check (default ON since 2026-08-24 after the live
+# A/B win — glimmer {6/6 @ 751s, 6/6 @ 800s} vs baseline {5/6 @ 3406s, 6/6 @
+# 2735s}; gemma + devstral no-regression): compiler/test signal unchanged 15
+# rounds AND 4+ min → append a stuck-note (red) or done-note (green + plan all
+# checked) to the round's last tool result. STUCK_CHECK=false to disable.
+stuck_check = ${STUCK_CHECK:-true}
 
 [logging]
 level = "trace"
@@ -225,7 +278,13 @@ enabled = true
 # because a brace error was reported as 'value not threaded'). TOKEN_XYZ is NOT
 # the grader's PONG_42 (grader stays independent); MINISWE_SKIP_VALIDATION=1
 # stops the gate recursing into the inner run. \$ is escaped for the heredoc.
-command = "out=\$(cargo build 2>&1) || { echo \"DOES NOT COMPILE:\"; echo \"\$out\" | tail -20; exit 1; }; run=\$(MINISWE_SKIP_VALIDATION=1 ./target/debug/miniswe --system-prompt-override 'Respond only with TOKEN_XYZ and nothing else' --yes hello 2>&1); echo \"\$run\" | grep -q TOKEN_XYZ || { echo \"COMPILES but override NOT consumed. Expected TOKEN_XYZ, GOT: \$run\"; exit 1; }"
+# The override names the greeting case explicitly: Muse Glimmer (harmony
+# template, tools present) answers a bare 'hello' with a canned greeting no
+# matter what the one-line override says (0/9), so every correct tree was
+# gate-blocked until the timeout. Naming the case fixes it (12/12 Glimmer,
+# 6/6 gemma, 6/6 Devstral); 'hello' stays so the check still proves the
+# override is consumed rather than merely echoed.
+command = "out=\$(cargo build 2>&1) || { echo \"DOES NOT COMPILE:\"; echo \"\$out\" | tail -20; exit 1; }; run=\$(MINISWE_SKIP_VALIDATION=1 ./target/debug/miniswe --system-prompt-override 'Respond only with TOKEN_XYZ and nothing else. Even if the user just greets you, do not greet back — reply only TOKEN_XYZ.' --yes hello 2>&1); echo \"\$run\" | grep -q TOKEN_XYZ || { echo \"COMPILES but override NOT consumed. Expected TOKEN_XYZ, GOT: \$run\"; exit 1; }"
 timeout_secs = 180
 max_retries = 3
 TOML
@@ -334,6 +393,21 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
         > /output/stdout_attempt${ATTEMPT}.txt \
         2> /output/stderr_attempt${ATTEMPT}.txt \
         || true
+
+    # Degradation scan. miniswe can lose its LSP — and with it the whole
+    # refactor toolset — and still run to completion, producing a score that
+    # looks like an ordinary result. One run in 38 did exactly that: the
+    # rust-analyzer download failed, add_param was unavailable for the entire
+    # session, the model fell back to sed, and the resulting 4/6 was nearly
+    # reported as a model regression. Surface it so it can never be averaged
+    # in silently.
+    if grep -q "LSP: DEGRADED" /output/stderr_attempt${ATTEMPT}.txt 2>/dev/null; then
+        echo "=== DEGRADED: attempt ${ATTEMPT} ran without LSP (refactor tools unavailable) ==="
+        {
+            echo "attempt ${ATTEMPT}: LSP unavailable"
+            grep -m1 "LSP: not available" /output/stderr_attempt${ATTEMPT}.txt || true
+        } >> /output/DEGRADED.txt 2>/dev/null || true
+    fi
 
     # Logs, scratchpad, tool_history, sessions, and index are all already on
     # the host volume via the .miniswe → /output/miniswe_state symlink.
@@ -582,6 +656,12 @@ SCRIPT
     echo "    ${final_line}"
     echo "    rounds=${rounds} attempts=${attempts} wall=${wall_s}s"
     grep -E "(compile|build|help|parse|test|smoke):(PASS|FAIL)" "${variant_dir}/container.log" | tail -6 | sed 's/^/    /'
+
+    # A run that lost its LSP is not comparable to one that had it — say so
+    # next to the score, not 300 lines deep in stderr.
+    if grep -q "=== DEGRADED:" "${variant_dir}/container.log" 2>/dev/null; then
+        grep "=== DEGRADED:" "${variant_dir}/container.log" | sort -u | sed 's/^/    !! /'
+    fi
     echo ""
 }
 
@@ -611,8 +691,12 @@ for d in "${RESULTS_DIR}"/*/; do
     wall=$(cat "$d/wall_s.txt" 2>/dev/null || echo "?")
     attempts=$(grep -c "=== ATTEMPT .* remaining" "$d/container.log" 2>/dev/null || echo "?")
     result=$(grep "=== FINAL:" "$d/container.log" 2>/dev/null | grep -oE "[0-9]+/[0-9]+" || echo "?/?")
-    printf "%-20s %8s %4s %7ss  %s\n" "$name" "$local_rounds" "$attempts" "$wall" "$result"
+    degraded=""
+    grep -q "=== DEGRADED:" "$d/container.log" 2>/dev/null && degraded="  !! DEGRADED (no LSP — result not comparable)"
+    printf "%-20s %8s %4s %7ss  %s%s\n" "$name" "$local_rounds" "$attempts" "$wall" "$result" "$degraded"
 done
 echo "================================================================="
+
+gpu_bench_finish "${RESULTS_DIR}"
 echo ""
 echo "Detailed results: ${RESULTS_DIR}/"

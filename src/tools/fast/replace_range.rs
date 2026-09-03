@@ -178,11 +178,16 @@ pub async fn execute(
     // Say so instead of recording a duplicate revision and implying success —
     // a small model that gets "applied" here will think the fix landed when it
     // didn't, and churn.
+    // The wording is load-bearing (warm-replay probe, 2026-07-15): the earlier
+    // "re-read the file" advice fed read loops, while this assertive text broke
+    // the resubmission loop 7/8. The "already match the content you provided"
+    // phrase is a compressor::GUARD_MARKERS entry — keep it if rewording.
     if new_content == original {
         return Ok(ToolResult::err(format!(
             "replace_range: lines L{start}-{end} of {path} already match the content you provided — \
-             nothing changed. The edit is already in place; re-read the file and look elsewhere if \
-             something still isn't right."
+             nothing changed. The file ALREADY contains exactly this text. Do NOT resubmit this \
+             edit and do NOT re-read this file. If the problem persists, its cause is elsewhere: \
+             pick a DIFFERENT file, line range, or approach."
         )));
     }
 
@@ -350,7 +355,10 @@ mod tests {
         .await
         .unwrap();
         assert!(!r.success, "no-op should be flagged: {}", r.content);
-        assert!(r.content.contains("already match"));
+        // "already match the content you provided" doubles as the
+        // compressor::GUARD_MARKERS exemption phrase — see is_guard_observation.
+        assert!(r.content.contains("already match the content you provided"));
+        assert!(r.content.contains("Do NOT resubmit"));
         // No revision recorded for a no-op.
         assert_eq!(store.current("f.rs"), None);
         // Disk unchanged.

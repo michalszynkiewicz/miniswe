@@ -28,15 +28,23 @@ pub enum CheckOutcome {
 /// `Skipped` (no command, spawn failure, or timeout) never blocks the agent —
 /// the gate is best-effort and must degrade to the prior behavior.
 pub async fn run_behavioral_check(config: &Config) -> CheckOutcome {
+    let Some(cmd) = config.validation.command() else {
+        return CheckOutcome::Skipped;
+    };
+    run_check_command(config, cmd).await
+}
+
+/// Run an explicit check command in the project root (shared by the
+/// configured task-level gate and the per-skill-step completion check —
+/// see `skill_cursor::current_check_command`). Same best-effort contract:
+/// spawn failure or timeout → `Skipped`, never a block.
+pub async fn run_check_command(config: &Config, cmd: &str) -> CheckOutcome {
     // Recursion guard: the check typically runs the project's own binary,
     // which may itself be a miniswe build that would re-enter this gate (and
     // re-build, and re-run …). Nested invocations set this env var to opt out.
     if std::env::var_os("MINISWE_SKIP_VALIDATION").is_some() {
         return CheckOutcome::Skipped;
     }
-    let Some(cmd) = config.validation.command() else {
-        return CheckOutcome::Skipped;
-    };
     let timeout = Duration::from_secs(config.validation.timeout_secs);
     let mut command = tokio::process::Command::new("sh");
     command

@@ -1,0 +1,831 @@
+//! Pre-turn skill router: a dedicated no-tools classifier call that maps a
+//! task onto exactly one installed skill (or none), then the caller rewrites
+//! the task to an imperative "read the skill and follow it".
+//!
+//! Motivation (pkg-mcp e2e, 2026-07-15, 6 runs across 2 sessions): the
+//! [SKILLS] listing was delivered with a near-verbatim description match
+//! and the model read ZERO SKILL.md files — advisory prose in the system
+//! prompt is inert. A focused classifier + task rewrite flips first-action
+//! skill adoption from 0/8 to 8/8 (tier1-skill-router-probe, stage 2), and
+//! the classifier itself was 30/30 (correct picks on matching tasks, NONE
+//! on non-matching) with zero salvage needed.
+//!
+//! Fail-safe by construction, mirroring the explore router: any parse
+//! failure, LLM error, or exhausted retry → None → the turn proceeds with
+//! the original task, i.e. today's behavior. The dangerous failure mode
+//! (grafting an irrelevant skill onto a task) requires a confident wrong
+//! pick twice in a row.
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use crate::config::ModelRole;
+use crate::llm::{ChatRequest, Message};
+use crate::runtime::{LlmWorkerEvent, LlmWorkerHandle};
+
+enum Pick {
+    Skill(String),
+    None,
+    Invalid,
+}
+
+/// Classify `task` against the installed skills. Returns the matched skill
+/// name, or None for "no skill / couldn't decide" (fail-safe).
+pub async fn route_task_to_skill(
+    llm_worker: &LlmWorkerHandle,
+    project_root: &std::path::Path,
+    task: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> Option<String> {
+    let entries = crate::skills::discover(project_root);
+    if entries.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut listing = String::new();
+    for entry in entries {
+        let Ok(skill) = crate::skills::load(&entry.path) else {
+            continue;
+        };
+        let desc: String = skill
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        listing.push_str(&format!(
+            "- {}: {}\n",
+            skill.name,
+            crate::truncate_chars(&desc, 800)
+        ));
+        names.push(skill.name);
+    }
+    if names.is_empty() {
+        return None;
+    }
+
+    let sys = format!(
+        "You route coding tasks to skills. Installed skills:\n{listing}\
+         If exactly one skill clearly applies to the user's task, reply with that \
+         skill's name and nothing else. If none clearly applies, reply NONE. \
+         Reply with a single word only."
+    );
+    let mut messages = vec![Message::system(&sys), Message::user(task)];
+
+    // One shot + one corrective retry, then fail-safe None.
+    for _ in 0..2 {
+        let out = ask(llm_worker, messages.clone(), cancelled).await;
+        match parse_pick(&out, &names) {
+            Pick::Skill(name) => return Some(name),
+            Pick::None => return None,
+            Pick::Invalid => {
+                messages.push(Message::assistant(&out));
+                messages.push(Message::user(&format!(
+                    "Answer with exactly one of: {} or NONE.",
+                    names.join(", ")
+                )));
+            }
+        }
+    }
+    None
+}
+
+/// The imperative rewrite. Full FILE path (a directory read errors) and an
+/// explicit "follow its instructions" — probe: 8/8 first-action skill reads
+/// vs 0/8 for the plain task.
+pub fn rewrite_task_for_skill(skill: &str, task: &str) -> String {
+    format!(
+        "Read .ai/skills/{skill}/SKILL.md and follow its instructions to handle \
+         this request: {task}"
+    )
+}
+
+async fn ask(
+    llm_worker: &LlmWorkerHandle,
+    messages: Vec<Message>,
+    cancelled: &Arc<AtomicBool>,
+) -> String {
+    // Skill names are short; thinking disabled like the explore router.
+    ask_with_budget(llm_worker, messages, cancelled, 24).await
+}
+
+async fn ask_with_budget(
+    llm_worker: &LlmWorkerHandle,
+    messages: Vec<Message>,
+    cancelled: &Arc<AtomicBool>,
+    max_tokens: u64,
+) -> String {
+    let request = ChatRequest {
+        messages,
+        tools: None,
+        tool_choice: None,
+        max_tokens_override: Some(max_tokens),
+        chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+        temperature_override: None,
+        cache_prompt: None,
+    };
+    let mut events = llm_worker.submit(ModelRole::Default, request, cancelled.clone());
+    let mut out = String::new();
+    while let Some(ev) = events.recv().await {
+        match ev {
+            LlmWorkerEvent::Completed(Ok(r)) => {
+                out = r
+                    .choices
+                    .first()
+                    .and_then(|c| c.message.content.clone())
+                    .unwrap_or_default();
+                break;
+            }
+            LlmWorkerEvent::Completed(Err(_)) => break, // fail-safe → empty
+            _ => {}
+        }
+    }
+    out
+}
+
+/// One actionable step extracted from a skill document, with a coarse
+/// anchor (heading or short verbatim quote) locating it in the source so
+/// the text can be re-read at execution time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SkillStep {
+    pub name: String,
+    pub anchor: String,
+}
+
+/// Turn a skill document into an ordered, anchored execution checklist.
+///
+/// LLM-driven on purpose — deterministic parsing is impossible: of the
+/// real PKG skills only 1 of 5 uses `### Step` headings, steps branch
+/// (conditionals, "IFF unavailable" fallbacks, mid-prose handoffs), and
+/// the actual content is spread across a doc tree that SKILL.md only
+/// indexes. Probe 2026-07-15: 10/10 recovered all 17 build-skill steps in
+/// order, every one anchored. Returns empty on any failure — the caller
+/// degrades to plain read-and-follow.
+pub async fn extract_skill_steps(
+    llm_worker: &LlmWorkerHandle,
+    skill_body: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> Vec<SkillStep> {
+    let sys = "You convert a skill document into an ordered execution checklist. \
+        Output ONLY a JSON array of objects, each {\"step\":\"<ShortName>\",\"anchor\":\"<the \
+        heading or a short verbatim quote locating this step in the document>\"}. One entry per \
+        actionable step, in execution order. Do not invent steps; do not include preamble or \
+        principles sections.";
+    let messages = vec![Message::system(sys), Message::user(skill_body)];
+    let out = ask_with_budget(llm_worker, messages, cancelled, 3000).await;
+    parse_steps(&out)
+}
+
+/// Decide whether a skill step HANDS OFF to another installed skill (control
+/// moves there) or merely REFERENCES one (the work stays here).
+///
+/// The deterministic token matcher that used to answer this on its own was
+/// never able to: it models "an installed skill is named in the last step's
+/// prose", and a *locative cross-reference to a section of another skill* has
+/// exactly that shape. Live 2026-08-30, `pkg-package-integrate`'s final
+/// `DeployReviewWorkspace` step says "following the Cluster Setup procedure in
+/// the `pkg-package` skill" — the matcher descended into `pkg-package`, a
+/// reference document with no phase steps at all, and 55 rounds (18% of the
+/// run) went into executing a five-step plan the extractor invented from it.
+/// The distinguishing signal is grammatical, not lexical, which is why this is
+/// a model call.
+///
+/// Scoped deliberately as a CLASSIFIER, not an escape hatch the model invokes:
+/// every proactive affordance this harness has offered has gone unused (the
+/// `[SKILLS]` listing, 0 reads / 6 runs; the saved shell-output pointer, 17
+/// writes / 0 reads on that same run), while narrow classifiers with a
+/// supplied candidate list have carried their probes (task router 30/30, step
+/// extraction 10/10, step checks 30/32).
+///
+/// Fail-safe to None, and asymmetrically so: a false negative keeps working in
+/// the current skill and is recoverable; a false positive tore down a phase.
+/// `candidates` comes from the token matcher, so the model picks a target it
+/// cannot invent.
+pub async fn classify_handoff(
+    llm_worker: &LlmWorkerHandle,
+    step_name: &str,
+    prose: &str,
+    candidates: &[String],
+    cancelled: &Arc<AtomicBool>,
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let sys = "You decide whether one step of a skill HANDS OFF to another skill.\n\
+        HANDOFF: after this step the work CONTINUES in the named skill — \"continue with the X \
+        skill\", \"invoke X\", \"proceed to the X phase\".\n\
+        REFERENCE: the work stays in the CURRENT skill and only cites another skill's content — \
+        \"following the Cluster Setup procedure in the X skill\", \"see X for the deploy rules\", \
+        \"as described in X\".\n\
+        Answer with exactly one candidate name, or NONE. Default to NONE: name a skill only if \
+        the step's own text says the work continues there. No explanation.";
+    let user = format!(
+        "Current step: {step_name}\n\nStep text:\n{prose}\n\nCandidates: {}\n\nHandoff target?",
+        candidates.join(", ")
+    );
+    let messages = vec![Message::system(sys), Message::user(&user)];
+    let out = ask(llm_worker, messages, cancelled).await;
+    parse_handoff_verdict(&out, candidates)
+}
+
+/// Distill ONE skill step into self-contained, verbatim-faithful
+/// instructions plus a completion criterion, from the skill material
+/// (SKILL.md + its sub-files). This is the just-in-time step-cursor
+/// mechanism — far more reliable than a file→anchor slice on the real
+/// skills (prose steps, distributed sub-file content). Probe 2026-07-16:
+/// 7/8 on the critical WritePackYaml step (kept the exact `.git@<ref>` tool
+/// args live runs kept botching), 8/8 on a cross-file step. Empty on
+/// failure (caller falls back to the raw step name).
+pub async fn distill_step(
+    llm_worker: &LlmWorkerHandle,
+    material: &str,
+    step_name: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> String {
+    let sys = "You are preparing focused, self-contained instructions for ONE step of a skill, \
+        to hand to an executor who will do only that step and nothing else. You are given the \
+        skill document and its referenced sub-files.\n\
+        Output exactly two sections:\n\
+        INSTRUCTIONS: the concrete actions for this step. COPY load-bearing specifics VERBATIM — \
+        tool names, exact argument names and formats, commands, URLs, file paths. Do NOT \
+        paraphrase them or leave them abstract. Inline anything from a referenced sub-file that \
+        this step needs. Omit other steps.\n\
+        DONE WHEN: a one-line, checkable completion criterion for this step.\n\
+        Output only those two sections.";
+    let user = format!("Skill material:\n\n{material}\n\nDistill the step: '{step_name}'.");
+    let messages = vec![Message::system(sys), Message::user(&user)];
+    ask_with_budget(llm_worker, messages, cancelled, 4000).await
+}
+
+/// Turn a step's `DONE WHEN` criterion into a cheap, READ-ONLY shell command
+/// that exits 0 iff the step is complete — the per-step completion check.
+/// While the step is active this becomes the effective validation command
+/// (see `skill_cursor::current_check_command`), which lights up the
+/// otherwise-dormant gate + debugger stack on projects with no configured
+/// task-level check. Returns None when the step isn't shell-checkable (the
+/// model answers NONE) or the command isn't provably read-only — the caller
+/// then just relies on the model's self-attested `skill(done)`.
+///
+/// Probe 2026-07-16 (tier1-step-check-generator, real skills + fixtures):
+/// 30/32 correct, ZERO false-passes, all read-only; the critical
+/// ConfigureIDP case was 8/8 (every check targeted the Package CR template,
+/// failing on the real `idp`-in-pack.yaml mistake). The lone risk — an
+/// over-specific check that false-FAILS (2/8 on one step, traceable to
+/// DONE WHEN wording) — is bounded by the one-retry override on skill(done).
+pub async fn generate_step_check(
+    llm_worker: &LlmWorkerHandle,
+    material: &str,
+    step_name: &str,
+    done_when: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> Option<String> {
+    let sys = "You write a completion CHECK for ONE step of a skill. Given the step's DONE WHEN \
+        criterion, output a SINGLE shell command that exits 0 if and only if the step is \
+        complete, and non-zero otherwise.\n\
+        HARD RULES:\n\
+        - READ-ONLY. Use only test / [ ] / grep / ls / find / cat / yq eval. NEVER modify, \
+        create, delete, build, or deploy anything. No redirects to files, no sed -i, no \
+        kubectl/helm/pack/git/docker, no package create or deploy.\n\
+        - Reference the EXACT file paths from the skill material.\n\
+        - Cheap and objective: filesystem/text checks only, no cluster access.\n\
+        - If the step's completion CANNOT be verified by such a command (it is investigative, \
+        or produces no on-disk artifact), output exactly: NONE\n\
+        Output ONLY the one-line command, or NONE. No explanation, no code fence.";
+    let user = format!(
+        "Skill material:\n\n{material}\n\nStep: '{step_name}'\nDONE WHEN: {done_when}\n\n\
+         Write the CHECK command."
+    );
+    let messages = vec![Message::system(sys), Message::user(&user)];
+    let out = ask_with_budget(llm_worker, messages, cancelled, 2000).await;
+    parse_check(&out).filter(|c| is_read_only_check(c))
+}
+
+/// Out-of-band completion judge: asked mid-step whether the CURRENT step is
+/// complete, given its definition and the model's recent activity. Drives
+/// cursor advancement — the model almost never calls skill(done) on its own
+/// (e2e 2026-07-16: 2 calls across 4 attempts), so a fixed safety valve was
+/// dragging every step 20 rounds. Neutral, skeptical framing so it doesn't
+/// rubber-stamp "done" for progress' sake.
+///
+/// Probe 2026-07-16 (tier1-ask-if-done, real states): 40/40 honest — 8/8
+/// NOT DONE on scaffold stubs, 8/8 on a half-filled step, 8/8 DONE on
+/// genuinely-complete, and it even flagged files written to the wrong
+/// directory. Returns false (not done) on any ambiguity — advancement is the
+/// side that must be earned.
+pub async fn judge_step_done(
+    llm_worker: &LlmWorkerHandle,
+    step_name: &str,
+    step_def: &str,
+    recent_activity: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> (bool, String) {
+    let sys = "You are mid-task, executing ONE step of a PKG packaging skill. A routine status \
+        check is running. Judge ONLY whether the CURRENT step is complete, based on the actual \
+        recent activity shown — do not assume, do not be optimistic, do not credit work that \
+        isn't evidenced. Reply with the first line EXACTLY 'DONE' or 'NOT DONE', then one line \
+        stating the specific remaining work (or why it is complete).";
+    let user = format!(
+        "Current step: {step_name}\n{step_def}\n\nYour recent activity:\n{recent_activity}\n\n\
+         Are you done with THIS step?"
+    );
+    let messages = vec![Message::system(sys), Message::user(&user)];
+    let out = ask_with_budget(llm_worker, messages, cancelled, 4000).await;
+    (parse_done_verdict(&out), extract_verdict_reason(&out))
+}
+
+/// The judge's one-line justification — the text after the DONE / NOT DONE
+/// verdict. On a NOT DONE this is the concrete remaining work (e.g. "write
+/// pack.yaml to the package root"), which the caller surfaces to the model:
+/// the judge's diagnosis was previously thrown away, and it's often the exact
+/// steer the model needs (e2e 2026-07-16: the judge correctly flagged the
+/// tmp_repo build, silently).
+/// Byte offset of the first ASCII-case-insensitive occurrence of `needle`
+/// in `hay`, safe for slicing `hay` directly: ASCII bytes never occur
+/// inside a multi-byte UTF-8 sequence, so a match of an ASCII needle always
+/// sits on char boundaries. (Replaces find-on-`to_uppercase()`: case
+/// mapping can CHANGE byte length — ﬁ→FI, ŉ→ʼN — so an index from the
+/// folded copy can land past the end or mid-char in the original and
+/// panic on raw model output.)
+fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
+    debug_assert!(needle.is_ascii() && !needle.is_empty());
+    let n = needle.as_bytes();
+    hay.as_bytes()
+        .windows(n.len())
+        .position(|w| w.eq_ignore_ascii_case(n))
+}
+
+fn extract_verdict_reason(raw: &str) -> String {
+    let t = raw.trim();
+    let rest = if let Some(i) = find_ascii_ci(t, "NOT DONE") {
+        &t[i + "NOT DONE".len()..]
+    } else if let Some(i) = find_ascii_ci(t, "DONE") {
+        &t[i + "DONE".len()..]
+    } else {
+        t
+    };
+    let rest = rest
+        .trim_start_matches([':', '.', '-', ' ', '\n', '\t', '—'])
+        .trim();
+    crate::truncate_chars(rest, 240)
+}
+
+/// Parse a completion-judge reply to `true` (done) only on an unambiguous
+/// DONE. "NOT DONE" and anything unclear → `false` (conservative — don't
+/// advance on ambiguity). "NOT DONE" must be tested before "DONE" (substring).
+fn parse_done_verdict(raw: &str) -> bool {
+    let t = raw.to_uppercase();
+    match (t.find("NOT DONE"), t.find("DONE")) {
+        (Some(_), _) => false,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+/// Extract the `DONE WHEN:` criterion from distilled step instructions.
+pub fn extract_done_when(distilled: &str) -> Option<String> {
+    let pos = find_ascii_ci(distilled, "done when")?;
+    let after = &distilled[pos + "done when".len()..];
+    let after = after.trim_start_matches([':', ' ', '\t']);
+    let crit = after.trim();
+    if crit.is_empty() {
+        None
+    } else {
+        Some(crate::truncate_chars(crit, 600))
+    }
+}
+
+/// Pull a single check command out of a possibly chatty/fenced response.
+/// Returns None for an explicit NONE (or empty) — meaning "no check".
+fn parse_check(raw: &str) -> Option<String> {
+    let mut t = raw.trim().to_string();
+    // Strip one ``` fence if present.
+    if let Some(start) = t.find("```") {
+        let rest = &t[start + 3..];
+        // drop an optional language tag on the fence's first line
+        let rest = rest
+            .strip_prefix("bash")
+            .or_else(|| rest.strip_prefix("sh"))
+            .unwrap_or(rest);
+        let rest = rest.trim_start_matches('\n');
+        if let Some(end) = rest.find("```") {
+            t = rest[..end].trim().to_string();
+        }
+    }
+    let line = t
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let bare = line.trim_matches(|c: char| c == '`' || c == '"' || c == '\'' || c == '*');
+    if bare.is_empty() || bare.trim_end_matches('.').eq_ignore_ascii_case("none") {
+        return None;
+    }
+    Some(bare.to_string())
+}
+
+/// A check is read-only unless a *command-position* token is a mutator, or it
+/// writes files (redirect / in-place edit). Command position = start of the
+/// string or right after a shell operator; this is what stops `pack.yaml` /
+/// `pkg-package.yaml` (mutators appearing only as PATH substrings) from being
+/// mis-flagged — a valid check legitimately names those files. Mirrors the
+/// probe's validated detector.
+fn is_read_only_check(cmd: &str) -> bool {
+    const MUTATORS: &[&str] = &[
+        "rm", "mv", "cp", "dd", "truncate", "tee", "chmod", "chown", "mkdir", "touch", "curl",
+        "wget", "kubectl", "helm", "pack", "pkg", "docker", "git", "ln", "install", "npm", "node",
+        "python", "python3", "make", "apt", "sh", "bash",
+    ];
+    // In-place edits: sed/yq/jq with a -i flag before the next operator.
+    for tool in ["sed", "yq", "jq"] {
+        let mut hay = cmd;
+        while let Some(i) = hay.find(tool) {
+            let seg = &hay[i + tool.len()..];
+            let seg = seg.split(['|', ';', '&']).next().unwrap_or(seg);
+            if seg.contains(" -i") {
+                return false;
+            }
+            hay = &hay[i + tool.len()..];
+        }
+    }
+    // File-writing redirects (but tolerate 2>/dev/null, 2>&1, &>/dev/null).
+    let bytes = cmd.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'>' {
+            if i > 0 && bytes[i - 1] == b'>' {
+                return false; // ">>"
+            }
+            if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+                continue; // first char of ">>", handled next iteration
+            }
+            let after = cmd[i + 1..].trim_start();
+            let after = after
+                .strip_prefix('&')
+                .map(str::trim_start)
+                .unwrap_or(after);
+            if !after.starts_with("/dev/null")
+                && !after.chars().next().is_some_and(|c| c.is_ascii_digit())
+            {
+                return false;
+            }
+        }
+    }
+    for seg in cmd.split(['|', ';', '&', '\n']) {
+        let seg = seg.trim().trim_start_matches(['!', '(']).trim();
+        let Some(tok) = seg.split_whitespace().next() else {
+            continue;
+        };
+        let tok = tok.trim_matches('(');
+        if MUTATORS.contains(&tok) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Extract the JSON array from a possibly chatty response and parse it into
+/// steps, dropping malformed entries. Returns empty (not an error) so the
+/// caller fails safe.
+fn parse_steps(raw: &str) -> Vec<SkillStep> {
+    let (Some(start), Some(end)) = (raw.find('['), raw.rfind(']')) else {
+        return Vec::new();
+    };
+    if end <= start {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw[start..=end]) else {
+        return Vec::new();
+    };
+    let Some(arr) = value.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| {
+            let name = v.get("step")?.as_str()?.trim().to_string();
+            let anchor = v.get("anchor")?.as_str()?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            Some(SkillStep { name, anchor })
+        })
+        .collect()
+}
+
+/// Salvage-then-validate: strip decoration (backticks, quotes, trailing
+/// period) before comparing case-insensitively; a unique containment match
+/// also counts (small models sometimes wrap the name in a phrase).
+fn parse_pick(raw: &str, names: &[String]) -> Pick {
+    let t = raw
+        .trim()
+        .trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == '*')
+        .trim()
+        .trim_end_matches('.')
+        .trim();
+    if t.is_empty() {
+        return Pick::Invalid;
+    }
+    if t.eq_ignore_ascii_case("none") {
+        return Pick::None;
+    }
+    for n in names {
+        if t.eq_ignore_ascii_case(n) {
+            return Pick::Skill(n.clone());
+        }
+    }
+    let contained: Vec<&String> = names
+        .iter()
+        .filter(|n| t.to_lowercase().contains(&n.to_lowercase()))
+        .collect();
+    if let [single] = contained.as_slice() {
+        return Pick::Skill((*single).clone());
+    }
+    Pick::Invalid
+}
+
+/// Parse a handoff verdict conservatively. An exact candidate name is the
+/// contract; anything else is salvaged only when unambiguous.
+///
+/// NONE is checked BEFORE the containment fallback on purpose: the natural
+/// chatty answer here is "NONE — the step only cites `pkg-package`", which
+/// names a candidate while explicitly declining it. `parse_pick`'s
+/// containment-first salvage would read that as a handoff, i.e. turn the
+/// single most likely stray reply into the exact failure this classifier
+/// exists to prevent.
+fn parse_handoff_verdict(raw: &str, candidates: &[String]) -> Option<String> {
+    let t = raw
+        .trim()
+        .trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == '*')
+        .trim()
+        .trim_end_matches('.')
+        .trim();
+    if t.is_empty() {
+        return None;
+    }
+    for n in candidates {
+        if t.eq_ignore_ascii_case(n) {
+            return Some(n.clone());
+        }
+    }
+    let lower = t.to_lowercase();
+    if super::skill_cursor::contains_token(&lower, "none") {
+        return None;
+    }
+    let hits: Vec<&String> = candidates
+        .iter()
+        .filter(|n| super::skill_cursor::contains_token(&lower, &n.to_lowercase()))
+        .collect();
+    match hits.as_slice() {
+        [one] => Some((*one).clone()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names() -> Vec<String> {
+        vec!["pkg-package".into(), "pkg-package-build".into()]
+    }
+
+    #[test]
+    fn parse_steps_extracts_ordered_anchored_steps() {
+        let raw = "Here you go:\n[\n \
+            {\"step\":\"ChartUrl\",\"anchor\":\"### Step ChartUrl: Identify Helm Chart URL\"},\n \
+            {\"step\":\"ScaffoldPack\",\"anchor\":\"Call `scaffold-feature` with targetDir\"}\n]";
+        let steps = parse_steps(raw);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].name, "ChartUrl");
+        assert_eq!(steps[1].name, "ScaffoldPack");
+        assert!(steps[1].anchor.contains("scaffold-feature"));
+    }
+
+    #[test]
+    fn parse_steps_drops_malformed_entries_and_fails_safe() {
+        // missing anchor / empty name entries are skipped, junk yields empty
+        let mixed =
+            "[{\"step\":\"A\",\"anchor\":\"x\"},{\"step\":\"\",\"anchor\":\"y\"},{\"step\":\"B\"}]";
+        let steps = parse_steps(mixed);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].name, "A");
+        assert!(parse_steps("no json here").is_empty());
+        assert!(parse_steps("").is_empty());
+    }
+
+    #[test]
+    fn exact_and_decorated_names_parse() {
+        assert!(
+            matches!(parse_pick("pkg-package-build", &names()), Pick::Skill(n) if n == "pkg-package-build")
+        );
+        assert!(
+            matches!(parse_pick("`pkg-package-build`", &names()), Pick::Skill(n) if n == "pkg-package-build")
+        );
+        assert!(
+            matches!(parse_pick("PKG-Package-Build.", &names()), Pick::Skill(n) if n == "pkg-package-build")
+        );
+    }
+
+    #[test]
+    fn none_variants_parse() {
+        assert!(matches!(parse_pick("NONE", &names()), Pick::None));
+        assert!(matches!(parse_pick(" none. ", &names()), Pick::None));
+    }
+
+    #[test]
+    fn ambiguous_containment_is_invalid() {
+        // "pkg-package-build" contains "pkg-package" too — a phrase matching
+        // BOTH names must not resolve to either.
+        assert!(matches!(
+            parse_pick("use pkg-package or pkg-package-build", &names()),
+            Pick::Invalid
+        ));
+        // But a phrase containing exactly one name salvages. Note
+        // "pkg-package-build" textually contains "pkg-package", so unique
+        // containment only works for the shorter name here when the longer
+        // is absent.
+        assert!(matches!(
+            parse_pick("I would use the pkg-package skill", &names()),
+            Pick::Skill(n) if n == "pkg-package"
+        ));
+    }
+
+    #[test]
+    fn junk_is_invalid() {
+        assert!(matches!(parse_pick("", &names()), Pick::Invalid));
+        assert!(matches!(parse_pick("who knows", &names()), Pick::Invalid));
+    }
+
+    #[test]
+    fn parse_check_strips_fence_and_detects_none() {
+        assert_eq!(
+            parse_check("```bash\ntest -f pack.yaml\n```").as_deref(),
+            Some("test -f pack.yaml")
+        );
+        assert_eq!(
+            parse_check("grep -q 'idp:' chart/templates/pkg-package.yaml").as_deref(),
+            Some("grep -q 'idp:' chart/templates/pkg-package.yaml")
+        );
+        assert_eq!(parse_check("NONE"), None);
+        assert_eq!(parse_check(" none. "), None);
+        assert_eq!(parse_check(""), None);
+    }
+
+    #[test]
+    fn read_only_check_allows_paths_named_like_mutators() {
+        // `pack`/`pkg` here are PATH substrings, not commands — must pass.
+        assert!(is_read_only_check(
+            "[ -f pack.yaml ] && yq eval '.kind' pack.yaml | grep -q PackPackageConfig"
+        ));
+        assert!(is_read_only_check(
+            "grep -q 'idp:' chart/templates/pkg-package.yaml"
+        ));
+        assert!(is_read_only_check(
+            "cat pack.yaml 2>/dev/null | grep -q kind"
+        ));
+        // real mutators in command position — must fail.
+        assert!(!is_read_only_check("rm -rf pack.yaml"));
+        assert!(!is_read_only_check("pack package create ."));
+        assert!(!is_read_only_check("grep idp x > out.txt"));
+        assert!(!is_read_only_check("sed -i s/a/b/ pack.yaml"));
+        assert!(!is_read_only_check("test -f x && kubectl apply -f y"));
+    }
+
+    #[test]
+    fn done_verdict_parses_conservatively() {
+        assert!(parse_done_verdict("DONE\nboth files are filled in"));
+        assert!(parse_done_verdict("done — looks complete"));
+        assert!(!parse_done_verdict(
+            "NOT DONE\ncommon/pack.yaml is still a stub"
+        ));
+        assert!(!parse_done_verdict("not done yet"));
+        assert!(!parse_done_verdict("hmm, hard to say")); // ambiguous → not done
+        // "NOT DONE" wins even if "DONE" also appears later
+        assert!(!parse_done_verdict("NOT DONE. it is not yet DONE."));
+    }
+
+    #[test]
+    fn verdict_reason_strips_the_verdict_token() {
+        assert_eq!(
+            extract_verdict_reason("NOT DONE\nwrite pack.yaml to the package root"),
+            "write pack.yaml to the package root"
+        );
+        assert_eq!(
+            extract_verdict_reason("NOT DONE: common/pack.yaml is still a stub"),
+            "common/pack.yaml is still a stub"
+        );
+        assert_eq!(
+            extract_verdict_reason("DONE — both files are filled in"),
+            "both files are filled in"
+        );
+    }
+
+    #[test]
+    fn extract_done_when_pulls_criterion() {
+        let d = "INSTRUCTIONS:\nDo the thing.\n\nDONE WHEN: pack.yaml exists and is valid.";
+        assert_eq!(
+            extract_done_when(d).as_deref(),
+            Some("pack.yaml exists and is valid.")
+        );
+        assert_eq!(extract_done_when("INSTRUCTIONS: no criterion here"), None);
+    }
+
+    #[test]
+    fn extraction_survives_multibyte_case_folding() {
+        // Both inputs are raw model output. Under the old fold-then-slice
+        // code, chars whose UTF-8 length changes under case mapping shifted
+        // the found index off the original string: 'ŉ' (2 bytes → "ʼN",
+        // 3 bytes) pushed the slice past the end (panic), 'ﬁ' (3 bytes →
+        // "FI", 2 bytes) pulled it mid-char.
+        assert_eq!(extract_verdict_reason("ŉ DONE"), "");
+        assert_eq!(
+            extract_verdict_reason("ﬁx applied — NOT DONE: finish the chart"),
+            "finish the chart"
+        );
+        assert_eq!(
+            extract_done_when("ﬁnal step notes\ndone when: pack.yaml exists").as_deref(),
+            Some("pack.yaml exists")
+        );
+        assert_eq!(extract_done_when("ŉ done when: x").as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn rewrite_shape() {
+        let r = rewrite_task_for_skill("pkg-package", "deploy the app");
+        assert!(r.starts_with("Read .ai/skills/pkg-package/SKILL.md"));
+        assert!(r.contains("follow its instructions"));
+        assert!(r.ends_with("deploy the app"));
+    }
+
+    #[test]
+    fn handoff_verdict_accepts_the_exact_contract_and_light_decoration() {
+        let cands = vec![
+            "pkg-package-integrate".to_string(),
+            "pkg-package-validate".to_string(),
+        ];
+        for raw in [
+            "pkg-package-integrate",
+            "  pkg-package-integrate  ",
+            "`pkg-package-integrate`",
+            "pkg-package-integrate.",
+            "**pkg-package-integrate**",
+            "PKG-Package-Integrate",
+        ] {
+            assert_eq!(
+                parse_handoff_verdict(raw, &cands).as_deref(),
+                Some("pkg-package-integrate"),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn handoff_verdict_declines_on_none_even_when_a_candidate_is_quoted() {
+        // The most likely stray reply names the skill it is REFUSING. Reading
+        // that as a handoff is the exact 2026-08-30 failure, so NONE has to
+        // beat containment.
+        let cands = vec!["pkg-package".to_string()];
+        for raw in [
+            "NONE",
+            "none",
+            "NONE.",
+            "NONE — the step only cites `pkg-package` for its cluster procedure",
+            "None: pkg-package is referenced, not invoked",
+        ] {
+            assert_eq!(parse_handoff_verdict(raw, &cands), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn handoff_verdict_fails_safe_on_ambiguity_and_junk() {
+        let cands = vec![
+            "pkg-package-integrate".to_string(),
+            "pkg-package-validate".to_string(),
+        ];
+        // Two candidates named with no NONE: undecidable, so stay put.
+        assert_eq!(
+            parse_handoff_verdict(
+                "either pkg-package-integrate or pkg-package-validate",
+                &cands
+            ),
+            None
+        );
+        assert_eq!(parse_handoff_verdict("", &cands), None);
+        assert_eq!(parse_handoff_verdict("¯\\_(ツ)_/¯", &cands), None);
+        // A skill that was never offered cannot be conjured.
+        assert_eq!(parse_handoff_verdict("pkg-package-publish", &cands), None);
+        // No candidates at all: nothing to pick.
+        assert_eq!(parse_handoff_verdict("pkg-package-integrate", &[]), None);
+    }
+
+    #[test]
+    fn handoff_verdict_salvages_a_single_unambiguous_name() {
+        let cands = vec!["pkg-package-integrate".to_string()];
+        assert_eq!(
+            parse_handoff_verdict("Handoff target: pkg-package-integrate", &cands).as_deref(),
+            Some("pkg-package-integrate")
+        );
+        // …but not one buried in a path.
+        assert_eq!(
+            parse_handoff_verdict("see chart/pkg-package-integrate.yaml", &cands),
+            None
+        );
+    }
+}

@@ -29,6 +29,9 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# GPU telemetry + llama-server provenance (docs/gpu-hardening.md items 2, 5)
+source "${REPO_DIR}/scripts/bench-gpu.sh"
 IMAGE_NAME="miniswe-bench"
 BASELINE_SHA="cc34d2626faf32c1b6dd1b8b33af693fb936b098"
 LLAMA_ENDPOINT="${LLAMA_ENDPOINT:-http://localhost:8464}"
@@ -74,6 +77,7 @@ ACTIVE_CONTAINER=""
 
 cleanup() {
     set +e
+    gpu_telemetry_stop
     [[ -n "${ACTIVE_CONTAINER}" ]] && docker rm -f "${ACTIVE_CONTAINER}" >/dev/null 2>&1
     # NOTE: deliberately do NOT remove the image here — it is built once and
     # reused across every run in this matrix.
@@ -81,6 +85,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "${RESULTS_DIR}"
+gpu_bench_start "${RESULTS_DIR}"
 
 echo "=== Conversation-compaction strategy benchmark ==="
 echo "Model:      ${MODEL}  (server: ${MODEL_TAG})"
@@ -451,6 +456,7 @@ for s in order:
     if max(strats[s]['compactions']) == 0:
         print(f"\n⚠️  {s}: compaction NEVER fired in any run — task too short to trigger; comparison is null for this arm.")
 PY
+gpu_bench_finish "${RESULTS_DIR}"
 echo ""
 echo "Detailed results: ${RESULTS_DIR}/"
 echo "  summary.md / summary.json / raw.csv"

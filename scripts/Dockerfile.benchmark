@@ -17,8 +17,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev git curl ca-certificates maven \
     && rm -rf /var/lib/apt/lists/*
 
-# Note: rust-analyzer is NOT installed here — miniswe auto-downloads
-# it to ~/.miniswe/lsp-servers/ if the rustup proxy doesn't work
+# Pre-install rust-analyzer into miniswe's own cache, using the EXACT artifact
+# miniswe would fetch at runtime (same GitHub releases/latest URL, same file).
+# ensure_binary() returns it at the cache check, so no benchmark run touches
+# the network for it. One run in 38 had this download fail at startup and spent
+# the whole session with no LSP and no refactor tools; nothing in the results
+# said so, and the 4/6 it produced was nearly reported as a model regression.
+#
+# Deliberately NOT `rustup component add rust-analyzer`: that installs the
+# toolchain's own build — a different binary from the one every prior run used,
+# which would quietly change LSP behaviour across the whole comparison set.
+# The trailing --version is the real check: a broken pipe or truncated body
+# would otherwise leave a corrupt file that looks like a valid cache entry.
+RUN mkdir -p /root/.miniswe/lsp-servers \
+    && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+        https://github.com/rust-lang/rust-analyzer/releases/latest/download/rust-analyzer-x86_64-unknown-linux-gnu.gz \
+      | gunzip > /root/.miniswe/lsp-servers/rust-analyzer \
+    && chmod +x /root/.miniswe/lsp-servers/rust-analyzer \
+    && /root/.miniswe/lsp-servers/rust-analyzer --version
 
 WORKDIR /build
 

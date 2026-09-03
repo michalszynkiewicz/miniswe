@@ -9,7 +9,7 @@ use serde_json::json;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use miniswe::config::Config;
@@ -45,6 +45,8 @@ async fn llm_client_chat_plain_text() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -52,6 +54,52 @@ async fn llm_client_chat_plain_text() {
     assert_eq!(
         response.choices[0].message.content.as_deref().unwrap(),
         "Hello!"
+    );
+}
+
+#[tokio::test]
+async fn llm_client_temperature_override_reaches_body() {
+    let mock_server = MockServer::start().await;
+
+    // Distinct responses keyed on the temperature actually sent, so the
+    // assertion fails if the override is dropped (or applied when absent).
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({"temperature": 0.6})))
+        .respond_with(helpers::mock_text_response("OVERRIDE"))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({"temperature": 0.15})))
+        .respond_with(helpers::mock_text_response("DEFAULT"))
+        .mount(&mock_server)
+        .await;
+
+    let (_tmp, mut config) = helpers::create_test_project();
+    helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
+
+    let client = LlmClient::new(config.model.clone());
+    let mut request = ChatRequest {
+        messages: vec![Message::user("hi")],
+        tools: None,
+        tool_choice: None,
+        max_tokens_override: None,
+        chat_template_kwargs: None,
+        temperature_override: Some(0.6),
+        cache_prompt: None,
+    };
+    let response = client.chat(&request).await.unwrap();
+    assert_eq!(
+        response.choices[0].message.content.as_deref().unwrap(),
+        "OVERRIDE"
+    );
+
+    request.temperature_override = None;
+    let response = client.chat(&request).await.unwrap();
+    assert_eq!(
+        response.choices[0].message.content.as_deref().unwrap(),
+        "DEFAULT"
     );
 }
 
@@ -78,6 +126,8 @@ async fn llm_client_chat_tool_call() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -114,6 +164,8 @@ async fn llm_client_stream_plain_text() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -160,6 +212,8 @@ async fn llm_client_stream_captures_length_finish_and_usage() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -197,6 +251,8 @@ async fn llm_client_stream_tool_call() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -310,6 +366,8 @@ async fn llm_client_stream_idle_timeout_fires_on_hung_connection() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let start = std::time::Instant::now();
@@ -355,6 +413,8 @@ async fn llm_client_stream_idle_timeout_retries_and_eventually_gives_up() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let result = client.chat(&request).await;
@@ -391,6 +451,8 @@ async fn llm_client_chat_stream_idle_timeout_fires_on_hung_connection() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -441,6 +503,8 @@ async fn llm_client_chat_stream_idle_timeout_retries_when_no_progress() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -521,6 +585,8 @@ async fn llm_client_chat_stream_no_retry_after_partial_progress() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -599,6 +665,8 @@ async fn single_tool_call_flow_reads_file() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -643,6 +711,8 @@ async fn write_file_flow_creates_file_on_disk() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -703,6 +773,8 @@ async fn invalid_json_args_from_llm() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -759,6 +831,8 @@ async fn llm_api_error_returns_error() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let result = client.chat(&request).await;
@@ -800,6 +874,8 @@ async fn llm_chat_does_not_retry_truncated_tool_call_500() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let err = client
@@ -852,6 +928,8 @@ async fn llm_chat_retries_transient_503_and_succeeds() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let response = client.chat(&request).await.unwrap();
@@ -873,6 +951,8 @@ async fn llm_connection_refused() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let result = client.chat(&request).await;
@@ -906,6 +986,8 @@ async fn llm_stream_retries_transient_503_and_succeeds() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -956,6 +1038,8 @@ async fn stream_cancellation_via_flag() {
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
+        temperature_override: None,
+        cache_prompt: None,
     };
 
     let cancelled = Arc::new(AtomicBool::new(true)); // pre-cancelled

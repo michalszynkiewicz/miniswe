@@ -49,8 +49,15 @@ pub fn is_file_write(tool_name: &str) -> bool {
 /// The runtime gate stays in place as defense-in-depth.
 ///
 /// Tools field is a per-request OpenAI parameter, so swapping mid-session
-/// is supported. The transition fires once (on first plan(action='set'))
-/// per session — that's a single prompt-cache miss, not per-turn churn.
+/// is supported, but it lives in the prompt prefix: every flip invalidates
+/// the KV cache from token zero. Callers therefore pass a *latched* flag —
+/// once a plan has existed in the current context segment, the wide tool
+/// list stays wide even if `plan.md` later goes away. Only a SCRAP, which
+/// throws the whole context out and reassembles it, restarts the ceremony.
+///
+/// (Before per-session state directories, a nested miniswe run deleting the
+/// parent's `plan.md` retracted these tools mid-run — 3-18% of rounds across
+/// three benchmark runs, each flip costing a full re-prefill.)
 pub fn visible_tool_defs(
     all: &[crate::llm::ToolDefinition],
     plan_exists: bool,
@@ -82,6 +89,16 @@ Stopping. Are you sure? Check the plan — if steps remain, continue.";
 pub const REPEATED_READ_NUDGE: &str = "\
 You just made this same read/inspection call 3 times in a row. The result hasn't changed. What specifically are you looking for? Try a narrower search, a different range, or move on to making an edit.";
 
+/// Escalation when the nudge failed: the model re-entered an identical read
+/// loop after a [`REPEATED_READ_NUDGE`]. Tail wording alone is inert here
+/// (warm-replay probe, 2026-07-15: 7-8/8 kept looping regardless of message
+/// — the rut lives in the cache-hot prompt prefix), so the agent loop also
+/// forces a context compaction before the next request, which broke the loop
+/// 8/8. Contains the "same read/inspection call" GUARD_MARKERS phrase so
+/// compaction never masks this message itself.
+pub const REPEATED_READ_ESCALATION: &str = "\
+You made this same read/inspection call 3 times in a row AGAIN — the result STILL has not changed, and the answer is not in this output. Older history has been compacted so you can re-approach. Re-orient from the plan and current state, then take a DIFFERENT action now: make an edit, run a check or validator, or consult the docs.";
+
 // ── Error-recovery hints ─────────────────────────────────────────────
 
 /// Injected as a user-role message after the model repeats the same
@@ -100,25 +117,31 @@ pub fn loop_detected_hint(edit_mode: EditMode) -> &'static str {
     }
 }
 
-/// Injected when the period-2 cycle detector fires: the model alternates
-/// between the SAME two calls (typically an edit that breaks the file and a
-/// revert that undoes it). Distinct from `loop_detected_hint` because the
-/// calls are not consecutive-identical — telling the model "this exact call
-/// repeated 3 times" would be false and confusing here.
-pub const PERIOD2_LOOP_HINT: &str = "\
-ERROR: You are in an edit↔revert loop — you have alternated between the SAME two tool calls \
-several times in a row. The edit you keep re-submitting is what breaks the file; submitting it \
-again UNCHANGED will break it the same way, and reverting just resets for another failure. \
-Stop this cycle now: re-read the exact lines, check the project-wide errors for the REAL \
-blocker (it may be in a different file), and write a DIFFERENT, smaller edit — do not re-issue \
-either of the two calls you have been alternating between.";
+/// Injected when the short-cycle detector fires: the model cycles through
+/// the SAME two to four calls (typically an edit that breaks the file, a
+/// revert that undoes it, and sometimes a `plan(check)` in between).
+/// Distinct from `loop_detected_hint` because the calls are not
+/// consecutive-identical — telling the model "this exact call repeated 3
+/// times" would be false and confusing here.
+pub fn cycle_loop_hint(period: usize) -> String {
+    format!(
+        "ERROR: You are in an edit↔revert loop — you have cycled through the SAME {period} tool \
+         calls several times in a row. The edit you keep re-submitting is what breaks the file; \
+         submitting it again UNCHANGED will break it the same way, and reverting just resets for \
+         another failure. Stop this cycle now: re-read the exact lines, check the project-wide \
+         errors for the REAL blocker (it may be in a different file), and write a DIFFERENT, \
+         smaller edit — do not re-issue any of the {period} calls you have been cycling through."
+    )
+}
 
-/// Injected after the server rejects the model's tool call with "Failed
-/// to parse tool call arguments as JSON" (see
-/// `crate::llm::TRUNCATED_TOOL_CALL_MARKER`). The previous assistant
-/// turn was streamed but never committed to history (the server dropped
-/// it), so we push this hint instead of a tool_result and let the agent
-/// try again with a smaller operation.
+/// Guidance for a tool call whose arguments were cut off by the output
+/// limit. Reaches the model two ways: as a user-role hint when the request
+/// itself failed (server-side "Failed to parse tool call arguments as
+/// JSON" — `crate::llm::TRUNCATED_TOOL_CALL_MARKER` — or our own streaming
+/// size cap), and appended to the tool_result of a call that arrived
+/// truncated and was stubbed by `crate::llm::sanitize_truncated_tool_calls`
+/// instead of being persisted (the server re-parses every historical
+/// call on every later request; one broken call failed them all).
 pub fn truncated_tool_call_hint(edit_mode: EditMode) -> &'static str {
     match edit_mode {
         EditMode::Smart => {

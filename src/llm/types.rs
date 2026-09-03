@@ -24,6 +24,27 @@ pub struct ChatRequest {
     /// into the body under the well-known `chat_template_kwargs` key.
     #[serde(skip)]
     pub chat_template_kwargs: Option<Value>,
+    /// Per-request override for `temperature`, used by thinking-mode
+    /// requests: reasoning traces need a higher temperature than code-task
+    /// sampling (see `ModelConfig::thinking_temperature`). `None` = the
+    /// model config's `temperature`. Merged into the body by the client,
+    /// like `max_tokens_override`.
+    #[serde(skip)]
+    pub temperature_override: Option<f64>,
+    /// Per-request `cache_prompt` override for llama.cpp. `Some(false)` forces
+    /// a fresh (cold) prompt eval instead of reusing the slot's KV cache.
+    /// `None` = server default (reuse). Merged into the body directly
+    /// (skipped from serde).
+    ///
+    /// Set by the tool-call-leak retry in `llm::mod` — a leaked call is
+    /// evidence the cached prefix itself is bad, so the resend must not reuse
+    /// it. The agent loop no longer forces cold prefills on loop detection: a
+    /// corpus audit of 680 forced prefills found no break-rate benefit and a
+    /// large cost (a ~40k-token re-prefill is ~58s, up to ~250s on
+    /// Mistral-Small-4). See the `window_edit_fires` comment in
+    /// `cli::commands::run`.
+    #[serde(skip)]
+    pub cache_prompt: Option<bool>,
 }
 
 /// A chat message (system, user, assistant, or tool).

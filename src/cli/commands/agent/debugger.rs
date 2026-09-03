@@ -154,6 +154,45 @@ FIX: <where and what must change, described conceptually — NOT verbatim code y
 PLAN: <the concrete remaining steps to finish the GOAL, including the step that makes the feature \
 actually work at runtime, not merely compile>";
 
+/// The STEP judge's prompt: fired on a `stuck_check` Red freeze while a
+/// skill step is active — the replacement for the removed fixed per-step
+/// round budget (rounds-only triggers: 3/3 false positives in the 08-24
+/// trigger eval; a fixed budget fires UNAVOIDABLY on a step whose
+/// instructions the environment cannot satisfy, e.g. the 2026-08-31
+/// ConfigureIDP abandonment). The satisfiability framing and the narrowed
+/// (a)/(b)/(c) choice (free-form 0/24 vs narrowed 13/24) are load-bearing.
+const STEP_JUDGE_PROMPT: &str = "\
+You are a READ-ONLY analyst with fresh eyes on a STUCK skill step. You have ONLY \
+read/search/inspect tools — you CANNOT edit files, run shell, set a plan, or use a scratchpad. \
+Do NOT plan and do NOT try to edit.\n\
+The main agent is executing one step of a skill (a step-by-step operating procedure) and its \
+observable state (files, checks, failures) has been frozen for many rounds. Investigate: read \
+the step's instructions below, the relevant files, and the changes so far. Pay particular \
+attention to whether the step is SATISFIABLE at all in this environment — distilled \
+instructions sometimes demand something the environment forbids or lacks (a config the app \
+does not support, a file that must not be modified, a secret with no consumer). An \
+unsatisfiable step can never be finished, no matter how many rounds are spent on it.\n\
+Choose EXACTLY ONE:\n\
+(a) CONTINUE — the step is doable and the work is close; a focused diagnosis will unstick it.\n\
+(b) RETRY — the step is doable but the agent's context is poisoned (grinding one dead-end \
+approach, looping on reads); the loop will compact the conversation and the agent will \
+re-approach the step carrying your diagnosis.\n\
+(c) ABANDON — the step as written cannot be satisfied in this environment, or its intent is \
+already effectively satisfied and the agent cannot see it; the loop will mark the step \
+abandoned (recorded as NOT done) and move on, revisiting it at the end of the skill if \
+possible.\n\
+Output your choice on the FIRST line, exactly one of:\n\
+CHOICE: (a)\n\
+CHOICE: (b)\n\
+CHOICE: (c)\n\
+Then one line — REASON: <the single most important reason>.\n\
+If (a) or (b): produce the report the main agent will use —\n\
+ROOT CAUSE: <the precise reason the step is not converging>\n\
+FIX: <where and what must change, described conceptually — NOT verbatim code you cannot \
+compile-check>\n\
+If (c): add one line — WHAT WAS MISSING: <what the environment lacks or forbids that the step \
+demands, or what already satisfies its intent> — and STOP.";
+
 /// What the debugger sub-agent decided the primary agent (or the loop)
 /// should do next.
 #[derive(Debug, Clone)]
@@ -168,6 +207,21 @@ pub enum DebuggerVerdict {
     /// Judge voted (b) REWIND: the loop reverts JUST this one file to the
     /// mechanically-computed candidate revision.
     Rewind(tools::RewindCandidate),
+}
+
+/// The step judge's verdict on a frozen skill step. Every variant carries
+/// the judge's report — the caller injects it in place of the generic stuck
+/// note, so even CONTINUE changes what the model sees next round.
+#[derive(Debug, Clone)]
+pub enum StepVerdict {
+    /// The step is doable and close — inject the diagnosis and keep going.
+    Continue(String),
+    /// The step is doable but the context is poisoned — the loop forces a
+    /// compaction and the agent re-approaches carrying the diagnosis.
+    Retry(String),
+    /// The step cannot be satisfied as written in this environment (or its
+    /// intent is already met) — the loop marks it abandoned, NOT done.
+    Abandon(String),
 }
 
 /// Run the read-only debugger sub-agent against a blocking check failure.
@@ -228,7 +282,152 @@ pub async fn run_debugger(
             c.path, c.rev, c.file_errors_then, c.file_errors_now
         ));
     }
-    let mut messages = vec![Message::system(system_prompt), Message::user(&user_prompt)];
+    let report = investigate(
+        system_prompt,
+        &user_prompt,
+        "You've finished investigating — no more reads. Write your final report now and \
+         nothing else: ROOT CAUSE (precise reason the check fails) and FIX (where and what \
+         must change, described conceptually — not verbatim code you cannot compile-check).",
+        &tool_defs,
+        config,
+        llm_worker,
+        perms,
+        lsp,
+        fast_revisions,
+        fast_baseline_errors,
+        cancelled,
+    )
+    .await;
+    if report.is_empty() {
+        return DebuggerVerdict::Report("(the debugger produced no diagnosis)".to_string());
+    }
+    parse_verdict(&report, candidate)
+}
+
+/// Judge a stuck skill step: either `stuck_check` fired Red while a skill
+/// cursor is active, or the model repeatedly tried to declare the whole
+/// task finished while steps remained (the stop-valve escalates instead of
+/// nudging forever). A fresh-context read-only sub-agent decides CONTINUE
+/// (inject a diagnosis), RETRY (compact + re-approach), or ABANDON (mark
+/// the step abandoned, NOT done). `trigger` is one preformatted sentence
+/// describing what tripped the escalation, so the judge sees the real
+/// signal for either path. `None` when the judge produced nothing
+/// (cancelled or LLM failure) — the caller falls back to its plain nudge.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_step_judge(
+    goal: &str,
+    skill_name: &str,
+    step_name: &str,
+    step_instructions: &str,
+    step_check: Option<&str>,
+    rounds_on_step: usize,
+    trigger: &str,
+    config: &Config,
+    llm_worker: &LlmWorkerHandle,
+    parent_tool_defs: &[ToolDefinition],
+    perms: &Arc<PermissionManager>,
+    lsp: &Option<Arc<LspClient>>,
+    fast_revisions: &Option<Arc<tools::RevisionStore>>,
+    fast_baseline_errors: usize,
+    cancelled: &Arc<AtomicBool>,
+) -> Option<StepVerdict> {
+    let tool_defs = readonly_tools(parent_tool_defs);
+    let changed = changed_files(config);
+    // Like the SCRAP/CONTINUE judge, this one needs the whole diff: whether
+    // a step is unsatisfiable or merely mid-flight only shows in what the
+    // work so far actually produced, not in the frozen signature.
+    let diff = changed_diff(config, 500);
+    let check_section = match step_check {
+        Some(cmd) => format!("The step's DONE WHEN check: `{cmd}`\n\n"),
+        None => String::new(),
+    };
+    let user_prompt = format!(
+        "GOAL (the overall task):\n\
+         {goal}\n\
+         \n\
+         The agent is executing skill '{skill_name}', step '{step_name}'. It has spent \
+         {rounds_on_step} rounds on this step. {trigger}\n\
+         \n\
+         THE STEP'S INSTRUCTIONS (exactly as given to the agent):\n\
+         ----------------------------------------\n\
+         {step_instructions}\n\
+         ----------------------------------------\n\
+         \n\
+         {check_section}\
+         Files changed so far this session:\n\
+         {files}\n\
+         {diff_section}\
+         \n\
+         Investigate, then act per your instructions.",
+        files = format_changed_files(&changed),
+        diff_section = format_diff_section(&diff),
+    );
+    let report = investigate(
+        STEP_JUDGE_PROMPT,
+        &user_prompt,
+        "You've finished investigating — no more reads. Write your final answer now and nothing \
+         else, per your instructions: first line CHOICE: (a), (b) or (c); then REASON:; then \
+         ROOT CAUSE and FIX for (a)/(b), or WHAT WAS MISSING for (c).",
+        &tool_defs,
+        config,
+        llm_worker,
+        perms,
+        lsp,
+        fast_revisions,
+        fast_baseline_errors,
+        cancelled,
+    )
+    .await;
+    if report.is_empty() {
+        return None;
+    }
+    Some(parse_step_verdict(&report))
+}
+
+/// Interpret the step judge's raw text. An unmarked report defaults to
+/// CONTINUE — the do-nothing verdict (inject text, change no state).
+fn parse_step_verdict(report: &str) -> StepVerdict {
+    let head = decision_head(report);
+    if head.contains("choice") && head.contains("(b)") {
+        return StepVerdict::Retry(report.to_string());
+    }
+    if head.contains("choice") && head.contains("(c)") {
+        return StepVerdict::Abandon(report.to_string());
+    }
+    StepVerdict::Continue(report.to_string())
+}
+
+/// The first few lines of a report, lowercased — where every judge flavor
+/// puts its decision marker.
+fn decision_head(report: &str) -> String {
+    report
+        .lines()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+/// Bounded read-only investigation shared by every debugger flavor: alternate
+/// LLM turns and read-only tool executions until the model concludes (a turn
+/// with no tool calls) or the round budget runs out; if no usable text was
+/// produced, force one text-only turn with `final_ask` so the deliverable
+/// always exists. Returns the trimmed report — empty on cancel/LLM failure.
+#[allow(clippy::too_many_arguments)]
+async fn investigate(
+    system_prompt: &str,
+    user_prompt: &str,
+    final_ask: &str,
+    tool_defs: &[ToolDefinition],
+    config: &Config,
+    llm_worker: &LlmWorkerHandle,
+    perms: &Arc<PermissionManager>,
+    lsp: &Option<Arc<LspClient>>,
+    fast_revisions: &Option<Arc<tools::RevisionStore>>,
+    fast_baseline_errors: usize,
+    cancelled: &Arc<AtomicBool>,
+) -> String {
+    let mut messages = vec![Message::system(system_prompt), Message::user(user_prompt)];
     let mut report = String::new();
 
     for _round in 0..MAX_DEBUGGER_ROUNDS {
@@ -236,12 +435,21 @@ pub async fn run_debugger(
             break;
         }
         context::sanitize_messages(&mut messages);
+        // Diagnosis benefits from reasoning: follow the main loop's
+        // `model.thinking` opt-in (mechanical sub-roles stay non-thinking).
         let request = ChatRequest {
             messages: messages.clone(),
-            tools: Some(tool_defs.clone()),
+            tools: Some(tool_defs.to_vec()),
             tool_choice: None,
             max_tokens_override: None,
-            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+            chat_template_kwargs: Some(
+                serde_json::json!({"enable_thinking": config.model.thinking}),
+            ),
+            temperature_override: config
+                .model
+                .thinking
+                .then_some(config.model.thinking_temperature),
+            cache_prompt: None,
         };
         let Some(resp) = drain(llm_worker, request, cancelled).await else {
             break;
@@ -284,17 +492,27 @@ pub async fn run_debugger(
     // Guarantee a report: if the investigation never emitted usable text,
     // ask once explicitly with no tools so the deliverable always exists.
     if report.trim().is_empty() && !cancelled.load(Ordering::Relaxed) {
-        messages.push(Message::user(
-            "You've finished investigating — no more reads. Write your final report now and \
-             nothing else: ROOT CAUSE (precise reason the check fails) and FIX (where and what \
-             must change, described conceptually — not verbatim code you cannot compile-check).",
-        ));
+        messages.push(Message::user(final_ask));
+        // The loop above sanitizes before every request; this one is built
+        // outside it and used to be sent raw. Its shape ends tool→user,
+        // which Mistral-family templates count as user→user (tool messages
+        // are invisible to the alternation check) → HTTP 500 on every
+        // attempt, and the diagnosis was lost after 7 retries (Devstral,
+        // 2026-08-23 bench). sanitize inserts the assistant bridge.
+        context::sanitize_messages(&mut messages);
         let request = ChatRequest {
             messages,
             tools: None,
             tool_choice: None,
             max_tokens_override: None,
-            chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+            chat_template_kwargs: Some(
+                serde_json::json!({"enable_thinking": config.model.thinking}),
+            ),
+            temperature_override: config
+                .model
+                .thinking
+                .then_some(config.model.thinking_temperature),
+            cache_prompt: None,
         };
         if let Some(resp) = drain(llm_worker, request, cancelled).await
             && let Some(c) = resp.choices.first().and_then(|c| c.message.content.clone())
@@ -303,23 +521,14 @@ pub async fn run_debugger(
         }
     }
 
-    let report = report.trim().to_string();
-    if report.is_empty() {
-        return DebuggerVerdict::Report("(the debugger produced no diagnosis)".to_string());
-    }
-    parse_verdict(&report, candidate)
+    report.trim().to_string()
 }
 
 /// Interpret the debugger's raw text into a structured verdict. Only the
 /// first few lines are inspected for the decision marker — the rest is the
 /// report body, injected verbatim by the caller when it's a `Report`.
 fn parse_verdict(report: &str, candidate: Option<tools::RewindCandidate>) -> DebuggerVerdict {
-    let head: String = report
-        .lines()
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
+    let head = decision_head(report);
     if let Some(cand) = candidate {
         if head.contains("choice") && head.contains("(a)") {
             return DebuggerVerdict::Scrap;
@@ -438,8 +647,9 @@ fn parse_porcelain(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-fn build_prompt(goal: &str, failure_output: &str, changed: &[String], diff: &str) -> String {
-    let files = if changed.is_empty() {
+/// The "files changed" prompt section, shared by every debugger flavor.
+fn format_changed_files(changed: &[String]) -> String {
+    if changed.is_empty() {
         "(could not list changed files — use file(action='search') to locate the relevant code)"
             .to_string()
     } else {
@@ -448,12 +658,16 @@ fn build_prompt(goal: &str, failure_output: &str, changed: &[String], diff: &str
             .map(|f| format!("  - {f}"))
             .collect::<Vec<_>>()
             .join("\n")
-    };
-    // The JUDGE needs the WHOLE diff to assess on-path-ness — investigating only
-    // the failing location makes it myopic (it sees a small local fix and votes
-    // CONTINUE even when the overall attempt is off-path). Empty for the plain
-    // diagnostician, which is deliberately failure-location-focused.
-    let diff_section = if diff.trim().is_empty() {
+    }
+}
+
+/// The full-diff prompt section; empty input yields an empty section. The
+/// JUDGE flavors need the WHOLE diff to assess on-path-ness — investigating
+/// only the failing location makes them myopic (a small local fix looks
+/// fixable even when the overall attempt is off-path). The plain
+/// diagnostician passes an empty diff, staying failure-location-focused.
+fn format_diff_section(diff: &str) -> String {
+    if diff.trim().is_empty() {
         String::new()
     } else {
         format!(
@@ -461,7 +675,12 @@ fn build_prompt(goal: &str, failure_output: &str, changed: &[String], diff: &str
              judge whether the work is on-path for the GOAL, not just the failing spot:\n\
              ```diff\n{diff}\n```\n"
         )
-    };
+    }
+}
+
+fn build_prompt(goal: &str, failure_output: &str, changed: &[String], diff: &str) -> String {
+    let files = format_changed_files(changed);
+    let diff_section = format_diff_section(diff);
 
     format!(
         "GOAL (the task the agent is trying to accomplish):\n\
@@ -666,5 +885,31 @@ mod tests {
         assert!(DEBUGGER_JUDGE_REWIND_PROMPT.contains("CHOICE: (a)"));
         assert!(DEBUGGER_JUDGE_REWIND_PROMPT.contains("CHOICE: (b)"));
         assert!(DEBUGGER_JUDGE_REWIND_PROMPT.contains("CHOICE: (c)"));
+    }
+
+    #[test]
+    fn parse_step_verdict_maps_choices_and_defaults_to_continue() {
+        use StepVerdict::*;
+        let v = parse_step_verdict("CHOICE: (a)\nREASON: close\nROOT CAUSE: x");
+        assert!(matches!(v, Continue(s) if s.contains("ROOT CAUSE")));
+        let v = parse_step_verdict("CHOICE: (b)\nREASON: poisoned context");
+        assert!(matches!(v, Retry(_)));
+        let v = parse_step_verdict("CHOICE: (c)\nREASON: no\nWHAT WAS MISSING: y");
+        assert!(matches!(v, Abandon(s) if s.contains("WHAT WAS MISSING")));
+        // No CHOICE marker → the do-nothing verdict: inject text, change no
+        // cursor or compaction state.
+        let v = parse_step_verdict("ROOT CAUSE: something\nFIX: somewhere");
+        assert!(matches!(v, Continue(_)));
+    }
+
+    #[test]
+    fn step_judge_prompt_offers_all_three_choices_and_forbids_edits() {
+        assert!(STEP_JUDGE_PROMPT.contains("READ-ONLY"));
+        assert!(STEP_JUDGE_PROMPT.contains("CANNOT edit"));
+        assert!(STEP_JUDGE_PROMPT.contains("CHOICE: (a)"));
+        assert!(STEP_JUDGE_PROMPT.contains("CHOICE: (b)"));
+        assert!(STEP_JUDGE_PROMPT.contains("CHOICE: (c)"));
+        // The satisfiability framing is the load-bearing part of the prompt.
+        assert!(STEP_JUDGE_PROMPT.contains("SATISFIABLE"));
     }
 }

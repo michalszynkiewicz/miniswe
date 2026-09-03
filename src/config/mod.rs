@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub mod session;
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -36,6 +38,20 @@ pub struct Config {
     /// Resolved project root directory (not serialized).
     #[serde(skip)]
     pub project_root: PathBuf,
+    /// Id of this process's session (not serialized). Session working
+    /// state — `plan.md`, `scratchpad.md` — lives under
+    /// `.miniswe/sessions/<session_id>/` so concurrent or nested miniswe
+    /// runs in one project can't clobber each other. See `config::session`.
+    #[serde(skip)]
+    pub session_id: String,
+    /// Whether current-state refresh injects the active skill-step block
+    /// (`[SKILL STEP]`). Runtime-only: set by the headless `run` surface,
+    /// which registers the `skill` tool the block tells the model to call.
+    /// The repl shares the same on-disk cursor (a killed run leaves one
+    /// behind) but has no `skill` tool, so injecting there would demand a
+    /// call the model cannot make — with no way to advance or clear it.
+    #[serde(skip)]
+    pub skill_step_injection: bool,
 }
 
 /// Which named model slot to use for each role.
@@ -98,7 +114,28 @@ pub struct ModelConfig {
     pub context_window: usize,
     /// Sampling temperature (low for code tasks)
     pub temperature: f64,
-    /// Maximum output tokens per response
+    /// Enable thinking-mode reasoning (`enable_thinking: true`) on the main
+    /// agent loop and the debugger. Mechanical sub-roles (edit apply,
+    /// summarizer, routers) always run without thinking — they don't benefit
+    /// and reasoning tokens would slow their tight loops.
+    pub thinking: bool,
+    /// Sampling temperature for thinking-mode requests. Reasoning traces
+    /// degenerate at code-task temperatures (Nemotron 3.5 whitespace-flood
+    /// probes; Unsloth recommends 0.6 for Nemotron thinking vs 0.2 instruct),
+    /// so thinking requests override `temperature` with this value.
+    pub thinking_temperature: f64,
+    /// Maximum output tokens per response. This is a runaway BRAKE, not a
+    /// capability budget: a real tool call is small (the 08-28 demo-e2e-task
+    /// run had a 93-token median generation, p90 289, and the largest output
+    /// the harness actually consumed was 1077 tokens), while a repetition
+    /// loop inside a tool argument runs to whatever ceiling this sets. At
+    /// 16384 that cost three requests 583s/571s/451s -- 26.7 min, 10% of all
+    /// server time -- and at least two were discarded outright ("arguments
+    /// were cut off by the output limit", "generation truncated by context
+    /// ceiling"). `tool_call_repair` already recovers from those; the cap
+    /// decides how long it waits first. Models that genuinely need more get
+    /// it explicitly (see the Mistral Small 4 reasoning override in `run.rs`)
+    /// or from a bench script's own config.
     pub max_output_tokens: usize,
     /// Ceiling on the connect phase of an LLM request — from send to
     /// receiving response headers (the start of the SSE stream), not the
@@ -115,11 +152,19 @@ pub struct ModelConfig {
     /// case of a legitimate prefill exceeding this just costs one extra
     /// retry cycle, safely bounded by `request_deadline_secs`.
     pub request_timeout_secs: u64,
-    /// Idle timeout (seconds) for streamed LLM responses. If no token
-    /// activity is observed for this many seconds the request is killed
-    /// and retried as a transient failure. Distinguishes "stuck
-    /// connection" from "model thinking hard" — a model that is
-    /// producing tokens steadily, even slowly, is *not* idle.
+    /// Idle-timeout FLOOR (seconds) for streamed LLM responses. If no token
+    /// activity is observed for this long the request is killed and retried
+    /// as a transient failure. Distinguishes "stuck connection" from "model
+    /// thinking hard" — a model that is producing tokens steadily, even
+    /// slowly, is *not* idle.
+    ///
+    /// A floor, not the whole story: prompt *prefill* emits no token at all,
+    /// so `attempt_idle_timeout` widens this per request to cover the prompt
+    /// the server has to evaluate (capped at `request_deadline_secs`). At the
+    /// old flat 30s a warm request whose cached prefix had been evicted was
+    /// killed mid-prefill — 215 times in one run, ~61% of its wall clock.
+    /// 120s covers a ~5k-token re-prefill on a CPU-offloaded MoE outright,
+    /// and the size-aware widening covers the rest.
     #[serde(default = "default_stream_idle_timeout_secs")]
     pub stream_idle_timeout_secs: u64,
     /// Absolute wall-clock deadline (seconds) for a single logical LLM
@@ -168,7 +213,7 @@ pub enum ToolCallFormat {
 }
 
 fn default_stream_idle_timeout_secs() -> u64 {
-    30
+    120
 }
 
 fn default_request_deadline_secs() -> u64 {
@@ -199,6 +244,48 @@ impl ModelConfig {
             }
             None => false,
         }
+    }
+
+    /// True if the served model's attention window is narrower than a typical
+    /// `[CURRENT STATE]` block, so re-anchoring that block every round throws
+    /// away the whole KV cache instead of trimming its tail.
+    ///
+    /// llama.cpp reuses a cached prompt only as a pure EXTENSION. A shorter
+    /// prefix is normally served by trimming the KV tail, but positions older
+    /// than a sliding-window model's window cannot be rolled back to at all,
+    /// so the sequence is cleared and re-prefilled from token zero. The
+    /// threshold is exactly that model's `attention.sliding_window` — measured
+    /// on Laguna XS at 512 tokens, where a 512-token rewind cost 496 tokens of
+    /// prefill and a 528-token rewind cost the full 21,491.
+    ///
+    /// Only two families we run sit below a real block (~600 bytes median,
+    /// ~2.3 KB on long plans): Laguna 2.1 at 512 tokens (~1.8 KB) and
+    /// gpt-oss-20b at 128 (~444 B). Gemma 4 (1024), Muse Glimmer (2048) and
+    /// North Mini Code (4096) are wide enough that re-anchoring never crosses
+    /// the cliff, and Devstral / Mistral Small 4 / Nemotron 3.5 / Qwen3 use
+    /// full attention and have no cliff at all.
+    ///
+    /// Unknown models answer `false`, which is both the safe default and the
+    /// empirically better one: replaying 223 benchmark runs, always
+    /// re-anchoring won or tied on every family except these two, and it never
+    /// leaves a superseded copy in history.
+    ///
+    /// Matched against the server-reported identity rather than the
+    /// user-supplied alias, same as [`Self::is_mistral_small_4_family`]. Every
+    /// llama-server we run reports the GGUF path, which carries the family
+    /// name.
+    pub fn has_narrow_attention_window(&self) -> bool {
+        // Unlike the reasoning_effort gate, this falls back to the configured
+        // alias when the probe failed. A silent `None` would disable the
+        // stickiness on exactly the models that need it, and the alias is a
+        // usable signal here: the benchmark harness writes the full GGUF path
+        // into `model`, and so does anyone pointing miniswe at a local file.
+        let name = self
+            .probed_model
+            .as_deref()
+            .unwrap_or(&self.model)
+            .to_ascii_lowercase();
+        name.contains("laguna") || name.contains("gpt-oss")
     }
 }
 
@@ -231,7 +318,6 @@ pub enum CompactionStrategy {
     /// miniswe production: rolling LLM summary anchored on the plan, keeping
     /// recent turns raw, with the full pre-compression text archived to
     /// `.miniswe/session_archive.md` (and a pointer to it in the summary).
-    #[default]
     Unified,
     /// Pure truncation: drop the oldest turns, keep the most-recent turns
     /// within budget. No summary, no LLM call, no archive.
@@ -268,6 +354,11 @@ pub enum CompactionStrategy {
     /// rarely. Trade-off: bigger per-round prompts (weaker KV-cache
     /// locality), and each compaction event is a large, expensive summary
     /// instead of many small ones.
+    ///
+    /// The DEFAULT since 2026-07-15: deepest-validated strategy of the
+    /// matrix (9x 6/6 across three bench batches + the jobs e2e), fires
+    /// rarely, and recovers cleanly at the ceiling.
+    #[default]
     Lazy,
 }
 
@@ -485,14 +576,17 @@ pub struct ToolsConfig {
     /// specific failing check output + the changed files and told to fix only
     /// that. The bet (see GitHub #40) is *attention reset / fresh eyes* on a
     /// "knows-it's-wrong-but-can't-recover" stall — not extra capability
-    /// (same weights). `false` (default) keeps the gate's plain retry-nudge
+    /// (same weights). `true` since 2026-07-15 (bench-unconditional since
+    /// 07-06: helps or no-ops, never hurt). `false` keeps the gate's plain retry-nudge
     /// loop. Requires a `[validation]` command to do anything. A/B only.
     pub reactive_debugger: bool,
     /// EXPERIMENTAL. Requires `reactive_debugger`. When `true`, the debugger may
     /// re-fire WITHIN a turn — but only when the gate's failure SIGNATURE changes
     /// (e.g. compile error fixed, now a runtime/smoke failure), so it walks the
     /// failure chain one fresh diagnosis per distinct failure instead of
-    /// re-diagnosing the same thing. `false` (default) keeps single-fire. The
+    /// re-diagnosing the same thing. `false` keeps single-fire; `true` since
+    /// 2026-07-15 (bench ran it unconditionally since 07-06: helps or no-ops,
+    /// never hurt). The
     /// blunt "fire ≤N×/turn" variant regressed before (scattered diagnoses the
     /// small model couldn't integrate); the distinct-signature gate is the
     /// difference. A/B only.
@@ -556,7 +650,7 @@ pub struct ToolsConfig {
     /// for the main agent to apply. Unifies the restart trigger, the debugger,
     /// and goal re-anchoring into ONE fresh-eyes decision the loop executes (the
     /// stuck agent never has to decide). Fires once per turn; needs a
-    /// `[validation]` command. `false` (default). A/B only.
+    /// `[validation]` command. `true` since 2026-07-15 (bench-unconditional).
     pub debugger_judge: bool,
     /// EXPERIMENTAL. Requires `debugger_judge`. Adds a third option next to
     /// SCRAP/CONTINUE: when a mechanical scan of the revision store finds one
@@ -566,7 +660,7 @@ pub struct ToolsConfig {
     /// untouched. A free-form version (ask the judge to notice AND name the
     /// file+revision itself) scored 0/24 in a tier-1 replay probe; computing
     /// the candidate mechanically and narrowing the ask to accept/reject it
-    /// raised that to 13/24. `false` (default). A/B only.
+    /// raised that to 13/24. `true` since 2026-07-15 (bench-unconditional).
     pub debugger_judge_rewind: bool,
     /// EXPERIMENTAL. Standalone — does NOT require `reactive_debugger` or
     /// `debugger_judge` (it fires the same underlying sub-agent, which already
@@ -588,8 +682,21 @@ pub struct ToolsConfig {
     /// `reactive_debugger` (initial A/B ran them coupled — sharing one fire
     /// budget meant the OTHER trigger's condition was hit first in 3 of 4
     /// runs, so the coupled config never actually tested this trigger cleanly)
-    /// so it can be A/B'd in isolation. `false` (default).
+    /// so it can be A/B'd in isolation. `true` since 2026-07-15 (bench-unconditional).
     pub plan_gate_debugger: bool,
+    /// EXPERIMENTAL. T2c frozen-signature stuck detection (gaps 9/10): when
+    /// the compiler/test signal (AST state, LSP project errors, failures,
+    /// check/gate/shell states) is unchanged for 15 rounds AND 4+ minutes,
+    /// append a note to the round's last tool result. Red signal → stuck-note
+    /// (broke glimmer's 110-round read loop 8/10 vs control 2/10); green +
+    /// every plan step checked → done-note teaching that a reply with no tool
+    /// call ends the task (finished the can't-stop dither 10/10 vs 1/10).
+    /// Offline trigger eval: 6/6 labeled stuck segments, 0 fires on all three
+    /// healthy Laguna runs (scripts/moments/trigger-eval.py, 2026-08-24).
+    /// `true` since 2026-08-24: live A/B win on glimmer ({6/6 @ 751s, 6/6 @
+    /// 800s} vs baseline {5/6 @ 3406s, 6/6 @ 2735s}), no regression on gemma
+    /// (6/6 @ 1000s, 0 fires) or devstral (6/6 @ 2463s, 1 correct Red fire).
+    pub stuck_check: bool,
 }
 
 /// Agent ceremony level — see `ToolsConfig::ceremony`.
@@ -640,8 +747,8 @@ impl Default for ToolsConfig {
             flat: false,
             edit_mode: EditMode::Fast,
             auto_revert_ast_cascade: true,
-            reactive_debugger: false,
-            debugger_multifire: false,
+            reactive_debugger: true,
+            debugger_multifire: true,
             spiral_reset: false,
             // Off: the controlled gemma A/B (2026-06-29) showed OFF is strictly
             // better (6.0 vs 5.67, ~1.6× faster) — the reset causes re-work churn
@@ -650,9 +757,10 @@ impl Default for ToolsConfig {
             revert_to_green: false,
             gate_replan: false,
             gate_restart: false,
-            debugger_judge: false,
-            debugger_judge_rewind: false,
-            plan_gate_debugger: false,
+            debugger_judge: true,
+            debugger_judge_rewind: true,
+            plan_gate_debugger: true,
+            stuck_check: true,
         }
     }
 }
@@ -684,6 +792,8 @@ impl Default for Config {
             tools: ToolsConfig::default(),
             validation: ValidationConfig::default(),
             project_root: PathBuf::from("."),
+            session_id: session::new_id(),
+            skill_step_injection: false,
         }
     }
 }
@@ -705,7 +815,9 @@ impl Default for ModelConfig {
             model: "devstral-small-2".into(),
             context_window: 50000,
             temperature: 0.15,
-            max_output_tokens: 16384,
+            thinking: false,
+            thinking_temperature: 0.6,
+            max_output_tokens: 4096,
             request_timeout_secs: 30,
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             request_deadline_secs: default_request_deadline_secs(),
@@ -829,6 +941,28 @@ impl Config {
         self.miniswe_dir().join(relative)
     }
 
+    /// Directory holding every session's state directory.
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.miniswe_dir().join("sessions")
+    }
+
+    /// This session's private state directory.
+    pub fn session_dir(&self) -> PathBuf {
+        self.sessions_dir().join(&self.session_id)
+    }
+
+    /// Path to a file within this session's state directory. Use this for
+    /// anything a concurrent or nested run must not see or overwrite.
+    pub fn session_path(&self, relative: &str) -> PathBuf {
+        self.session_dir().join(relative)
+    }
+
+    /// Create this session's state directory. Call before writing session
+    /// state; cheap and idempotent.
+    pub fn ensure_session_dir(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(self.session_dir())
+    }
+
     /// Check if this project has been initialized (`miniswe init` was run).
     pub fn is_initialized(&self) -> bool {
         self.miniswe_dir().is_dir()
@@ -870,10 +1004,11 @@ mod compaction_strategy_tests {
     use super::*;
 
     #[test]
-    fn defaults_to_unified() {
+    fn defaults_to_lazy() {
+        // Bench-validated default (3 batches of 6/6): reactive compaction.
         assert_eq!(
             ContextConfig::default().compaction,
-            CompactionStrategy::Unified
+            CompactionStrategy::Lazy
         );
     }
 
@@ -899,7 +1034,7 @@ mod compaction_strategy_tests {
     fn missing_field_keeps_default() {
         // Old configs with no `compaction` key still parse (struct-level serde default).
         let c: ContextConfig = toml::from_str("repo_map_budget = 1234").unwrap();
-        assert_eq!(c.compaction, CompactionStrategy::Unified);
+        assert_eq!(c.compaction, CompactionStrategy::Lazy);
         assert_eq!(c.repo_map_budget, 1234);
     }
 }

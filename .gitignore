@@ -5,6 +5,6 @@ models/
 .env
 **/benchmark_results
 tmp
-scripts/moments/.cache_*
+scripts/moments/
 __pycache__/
 / /

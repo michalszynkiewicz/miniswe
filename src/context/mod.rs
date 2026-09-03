@@ -249,6 +249,7 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
              Emit ONE tool call per response. Wait for its result before issuing the next one.\n\
              Tool contract: grouped tools require action plus action-specific params.\n\
              file read: {{\"action\":\"read\",\"path\":\"README.md\"}}\n\
+             shell run: {{\"action\":\"run\",\"command\":\"ls -la\"}}\n\
              {edit_contract}\n\
              If a tool says a parameter is missing, retry with the exact required parameter names.\n\
              Before finishing, verify your change actually works — run the FULL test suite, not just a compile check. A test failure in code you didn't mean to touch means your edit broke something; don't finish until it's fixed.\n\
@@ -283,6 +284,7 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
          Emit ONE tool call per response. Wait for its result before issuing the next one — chaining multiple tool calls in a single response can confuse the parser and you will lose work.\n\
          Tool contract: grouped tools require action plus action-specific params.\n\
          file read: {{\"action\":\"read\",\"path\":\"README.md\"}}\n\
+         shell run: {{\"action\":\"run\",\"command\":\"ls -la\"}}\n\
          {edit_contract}\n\
          If a tool says a parameter is missing, retry with the exact required parameter names.\n\
          Before finishing, verify your change actually works — run the FULL test suite, not just a compile check. A test failure in code you didn't mean to touch means your edit broke something; don't finish until it's fixed.\n\

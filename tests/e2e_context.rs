@@ -129,7 +129,7 @@ fn scratchpad_not_in_system_prompt() {
     let (_tmp, config) = helpers::create_test_project();
 
     fs::write(
-        config.miniswe_path("scratchpad.md"),
+        config.session_path("scratchpad.md"),
         "## Current Task\nImplement auth\n\n## Plan\n1. Add middleware\n",
     )
     .unwrap();
@@ -152,7 +152,7 @@ fn plan_not_in_system_prompt() {
     let (_tmp, config) = helpers::create_test_project();
 
     fs::write(
-        config.miniswe_path("plan.md"),
+        config.session_path("plan.md"),
         "1. Add the flag\n2. Wire it through\n",
     )
     .unwrap();
@@ -457,6 +457,75 @@ fn sanitize_drops_dangling_assistant_tool_calls_before_user() {
     assert!(content.contains("start server"));
     assert!(content.contains("another one"));
     assert!(!messages.iter().any(|m| m.tool_calls.is_some()));
+}
+
+/// Mirrors the alternation rule in Mistral/Devstral chat templates: only
+/// `user` messages and `assistant` messages WITHOUT tool_calls take part;
+/// `tool` messages and assistant+tool_calls are skipped. The participating
+/// messages must alternate starting with user, else the template raises
+/// and the server answers HTTP 500 ("roles must alternate").
+fn devstral_roles_alternate(messages: &[Message]) -> bool {
+    let mut expect_user = true;
+    for m in messages {
+        let counted = match m.role.as_str() {
+            "user" => true,
+            "assistant" => m.tool_calls.as_deref().is_none_or(|tc| tc.is_empty()),
+            _ => false,
+        };
+        if !counted {
+            continue;
+        }
+        if (m.role == "user") != expect_user {
+            return false;
+        }
+        expect_user = !expect_user;
+    }
+    true
+}
+
+#[test]
+fn sanitize_makes_debugger_final_report_shape_alternate() {
+    // The reactive debugger's final-report request: an investigation that
+    // ended on tool results, then a user nudge asking for the report.
+    // Sent raw, Devstral rejects it (tool→user == user→user to its
+    // template); after sanitize it must satisfy the alternation rule.
+    use miniswe::llm::{FunctionCall, ToolCall};
+    let tc = |id: &str| ToolCall {
+        id: id.into(),
+        r#type: "function".into(),
+        function: FunctionCall {
+            name: "read_file".into(),
+            arguments: r#"{"path":"src/main.rs"}"#.into(),
+        },
+    };
+    let mut messages = vec![
+        Message::system("you are the debugger"),
+        Message::user("the check fails; investigate"),
+        Message::assistant_tool_calls(vec![tc("c1"), tc("c2")]),
+        Message::tool_result("c1", "contents 1"),
+        Message::tool_result("c2", "contents 2"),
+        Message::user("You've finished investigating — write your final report now"),
+    ];
+    assert!(
+        !devstral_roles_alternate(&messages),
+        "precondition: the raw shape must be the one Devstral rejects"
+    );
+
+    context::sanitize_messages(&mut messages);
+
+    assert!(
+        devstral_roles_alternate(&messages),
+        "sanitized shape still violates alternation: {:?}",
+        messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+    );
+    // The tool results and the final nudge both survive.
+    assert_eq!(messages.iter().filter(|m| m.role == "tool").count(), 2);
+    assert!(
+        messages
+            .last()
+            .and_then(|m| m.content.as_deref())
+            .is_some_and(|c| c.contains("final report"))
+    );
 }
 
 #[test]

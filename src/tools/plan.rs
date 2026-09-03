@@ -6,8 +6,10 @@
 //! this by running `cargo check` (or the appropriate checker). If a
 //! step proves too coarse, the model can `refine` it into substeps.
 //!
-//! The plan persists in `.miniswe/plan.md` and is injected into context
-//! each round.
+//! The plan persists in `.miniswe/sessions/<id>/plan.md` and is injected
+//! into context each round. It is session-scoped, not project-scoped, so a
+//! concurrent or nested miniswe run in the same project can neither read
+//! nor clobber it — see `config::session`.
 
 mod actions;
 mod hints;
@@ -19,10 +21,12 @@ use std::fs;
 use crate::config::Config;
 
 pub use actions::execute;
+pub use step::{Step, parse_steps, steps_to_markdown};
+pub use validate::MAX_PLAN_STEPS;
 
 /// Check if a plan has been created.
 pub fn plan_exists(config: &Config) -> bool {
-    let plan_path = config.miniswe_dir().join("plan.md");
+    let plan_path = config.session_path("plan.md");
     plan_path.exists()
         && fs::read_to_string(&plan_path)
             .map(|c| !c.trim().is_empty())
@@ -55,7 +59,7 @@ pub fn parsed_steps(config: &Config) -> Vec<(bool, Option<usize>, String)> {
 
 /// Load the current plan for context injection.
 pub fn load_plan(config: &Config) -> Option<String> {
-    let plan_path = config.miniswe_dir().join("plan.md");
+    let plan_path = config.session_path("plan.md");
     let content = fs::read_to_string(plan_path).ok()?;
     if content.trim().is_empty() {
         None
@@ -117,9 +121,8 @@ mod tests {
     fn config_with_plan(tmp: &tempfile::TempDir, plan_md: &str) -> Config {
         let mut config = Config::default();
         config.project_root = tmp.path().to_path_buf();
-        let dir = config.miniswe_dir();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("plan.md"), plan_md).unwrap();
+        config.ensure_session_dir().unwrap();
+        std::fs::write(config.session_path("plan.md"), plan_md).unwrap();
         config
     }
 

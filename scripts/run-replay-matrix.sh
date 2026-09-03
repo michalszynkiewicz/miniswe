@@ -21,6 +21,9 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# GPU telemetry + llama-server provenance (docs/gpu-hardening.md items 2, 5)
+source "${REPO_DIR}/scripts/bench-gpu.sh"
 IMAGE_NAME="miniswe-bench"
 GEMMA_NAME="miniswe-bench-gemma"
 # The original task — passed to the replay as the message/goal so gate_replan can
@@ -58,8 +61,9 @@ MODEL_TAG="$( { curl -fsS --max-time 3 "${LLAMA_ENDPOINT}/v1/models" 2>/dev/null
     | sed -E 's/\.gguf$//; s/[^A-Za-z0-9._-]/_/g' | cut -c1-40; } || true)"
 RESULTS_DIR="${REPO_DIR}/benchmark_results/replaymatrix_$(date +%Y%m%d_%H%M%S)_${MODEL_TAG:-unknown}"
 mkdir -p "$RESULTS_DIR"
+gpu_bench_start "$RESULTS_DIR"
 ACTIVE_CONTAINER=""
-cleanup() { set +e; [[ -n "$ACTIVE_CONTAINER" ]] && docker rm -f "$ACTIVE_CONTAINER" >/dev/null 2>&1; }
+cleanup() { set +e; gpu_telemetry_stop; [[ -n "$ACTIVE_CONTAINER" ]] && docker rm -f "$ACTIVE_CONTAINER" >/dev/null 2>&1; }
 trap cleanup EXIT INT TERM
 
 echo "=== Replay recovery matrix ==="
@@ -248,4 +252,5 @@ for arm in arms:
     mean=f"{sum(nums)/len(nums):.2f}" if nums else "—"
     print(f"{arm:<14} {str(scores):<18} {mean:>5} {reverts:>8}")
 PY
+gpu_bench_finish "$RESULTS_DIR"
 echo "Detailed: $RESULTS_DIR/"
