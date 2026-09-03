@@ -24,6 +24,17 @@ pub(crate) enum ProgressKind {
 /// waiting (and, after `write_timeout`, erroring out).
 const WRITE_QUEUE_CAP: usize = 64;
 
+/// Grace period after spawn during which an empty progress map does NOT
+/// count as settled for servers that have never reported progress or
+/// server status. Between `initialize` and the first `$/progress begin`
+/// the map is empty while the server is actually ramping up its initial
+/// index — on a loaded CI runner that window is wide enough for
+/// `get_diagnostics` to read a premature empty publish and report
+/// "confirmed clean" (the 2026-09-02 `lsp_diagnostics_on_type_error` CI
+/// failure). Servers that never emit either signal (e.g.
+/// yaml-language-server) pay at most this once, right after spawn.
+const SETTLE_WARMUP: Duration = Duration::from_secs(10);
+
 /// JSON-RPC transport for LSP communication.
 pub struct LspTransport {
     /// Queue feeding the dedicated stdin writer thread. Bounded: when the
@@ -40,6 +51,21 @@ pub struct LspTransport {
     /// In-flight `$/progress` tokens. Inserted on `begin`, refreshed on
     /// `report`, removed on `end`. Emptiness == server is idle.
     pub(crate) progress: DashMap<String, ProgressKind>,
+    /// Whether at least one well-formed `$/progress` update has arrived.
+    /// Until then an empty `progress` map is ambiguous: "nothing to do"
+    /// vs "hasn't announced its initial indexing yet".
+    saw_progress: AtomicBool,
+    /// Latest `quiescent` flag from rust-analyzer's
+    /// `experimental/serverStatus` notification (sent only because we
+    /// advertise `serverStatusNotification` in the client capabilities).
+    /// Meaningless until `saw_server_status` is set.
+    quiescent: AtomicBool,
+    /// Whether the server has ever sent `experimental/serverStatus`.
+    /// When it has, `quiescent` is the authoritative settled signal and
+    /// the progress heuristic is demoted to a belt-and-braces AND.
+    saw_server_status: AtomicBool,
+    /// When this transport was created — anchors [`SETTLE_WARMUP`].
+    spawned_at: Instant,
     next_id: AtomicI64,
     /// Shared with the stdin writer thread (which sets it when the pipe
     /// breaks), hence `Arc` rather than a bare field.
@@ -86,6 +112,10 @@ impl LspTransport {
             pending: DashMap::new(),
             diagnostics: DashMap::new(),
             progress: DashMap::new(),
+            saw_progress: AtomicBool::new(false),
+            quiescent: AtomicBool::new(false),
+            saw_server_status: AtomicBool::new(false),
+            spawned_at: Instant::now(),
             next_id: AtomicI64::new(1),
             crashed,
         }
@@ -98,11 +128,45 @@ impl LspTransport {
         self.progress.is_empty()
     }
 
+    /// Returns `true` once the server has genuinely finished its initial
+    /// analysis — the signal that makes an *empty* diagnostics publish
+    /// trustworthy.
+    ///
+    /// - If the server sends `experimental/serverStatus` (rust-analyzer
+    ///   does, because we advertise `serverStatusNotification`), that
+    ///   `quiescent` flag is authoritative — ANDed with `is_idle` so an
+    ///   in-flight flycheck run still counts as busy.
+    /// - Otherwise fall back to the progress heuristic, hardened against
+    ///   the warm-up race: an empty progress map only counts once we've
+    ///   seen at least one progress update, or [`SETTLE_WARMUP`] has
+    ///   elapsed since spawn (for servers that never report progress).
+    pub(crate) fn is_settled(&self) -> bool {
+        if self.saw_server_status.load(Ordering::Acquire) {
+            return self.quiescent.load(Ordering::Acquire) && self.is_idle();
+        }
+        self.is_idle()
+            && (self.saw_progress.load(Ordering::Relaxed)
+                || self.spawned_at.elapsed() >= SETTLE_WARMUP)
+    }
+
     /// Apply a parsed `$/progress` notification to the in-flight token
     /// map. Pulled out of `reader_loop` so it can be unit-tested with
     /// synthetic JSON.
     pub(crate) fn apply_progress(&self, params: &Value) {
+        if parse_progress_params(params).is_some() {
+            self.saw_progress.store(true, Ordering::Relaxed);
+        }
         apply_progress_to_map(&self.progress, params);
+    }
+
+    /// Apply an `experimental/serverStatus` notification (rust-analyzer:
+    /// `{"health":"ok","quiescent":bool,"message":..}`). Pulled out of
+    /// `reader_loop` for unit tests.
+    pub(crate) fn apply_server_status(&self, params: &Value) {
+        if let Some(quiescent) = params.get("quiescent").and_then(Value::as_bool) {
+            self.quiescent.store(quiescent, Ordering::Release);
+            self.saw_server_status.store(true, Ordering::Release);
+        }
     }
 
     /// Send a JSON-RPC request. Returns a receiver for the response.
@@ -226,6 +290,11 @@ impl LspTransport {
                     "$/progress" => {
                         if let Some(params) = msg.get("params") {
                             transport.apply_progress(params);
+                        }
+                    }
+                    "experimental/serverStatus" => {
+                        if let Some(params) = msg.get("params") {
+                            transport.apply_server_status(params);
                         }
                     }
                     _ => {} // ignore other notifications
@@ -526,6 +595,106 @@ mod tests {
         assert!(
             err.contains("failed to write to lsp stdin"),
             "error must carry the HARD infra-failure wording, got: {err}"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Spawn a dummy child so a real `LspTransport` can be constructed
+    /// for driving `is_settled` with synthetic notifications.
+    fn dummy_transport() -> (std::process::Child, LspTransport) {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let stdin = child.stdin.take().expect("stdin");
+        let t = LspTransport::with_write_timeout(stdin, Duration::from_millis(200));
+        (child, t)
+    }
+
+    #[test]
+    fn fresh_transport_is_not_settled_despite_empty_progress() {
+        // The CI warm-up race: between `initialize` and the server's
+        // first `$/progress begin` the progress map is empty, but that
+        // must NOT read as "analysis finished".
+        let (mut child, t) = dummy_transport();
+        assert!(t.is_idle(), "no progress tokens yet");
+        assert!(
+            !t.is_settled(),
+            "empty progress map within the warm-up window must not count as settled"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn progress_end_settles_without_server_status() {
+        // Servers without serverStatus (gopls, pyright, …): once we have
+        // seen real progress traffic, empty-again means settled.
+        let (mut child, t) = dummy_transport();
+        t.apply_progress(&json!({
+            "token": "indexing",
+            "value": { "kind": "begin" }
+        }));
+        assert!(!t.is_settled(), "in-flight progress token = busy");
+        t.apply_progress(&json!({
+            "token": "indexing",
+            "value": { "kind": "end" }
+        }));
+        assert!(
+            t.is_settled(),
+            "progress seen and drained should count as settled"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn server_status_quiescent_is_authoritative() {
+        let (mut child, t) = dummy_transport();
+
+        // rust-analyzer's first status: still analyzing.
+        t.apply_server_status(&json!({
+            "health": "ok", "quiescent": false, "message": null
+        }));
+        assert!(!t.is_settled(), "quiescent=false must gate settled");
+
+        // Analysis done — settled even though no progress was ever seen
+        // and the warm-up window hasn't elapsed.
+        t.apply_server_status(&json!({
+            "health": "ok", "quiescent": true, "message": null
+        }));
+        assert!(t.is_settled(), "quiescent=true means settled");
+
+        // Belt and braces: an in-flight progress token (e.g. flycheck)
+        // still counts as busy even while quiescent.
+        t.apply_progress(&json!({
+            "token": "rustAnalyzer/Flycheck",
+            "value": { "kind": "begin" }
+        }));
+        assert!(!t.is_settled(), "quiescent + in-flight progress = busy");
+        t.apply_progress(&json!({
+            "token": "rustAnalyzer/Flycheck",
+            "value": { "kind": "end" }
+        }));
+        assert!(t.is_settled());
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn malformed_server_status_is_ignored() {
+        let (mut child, t) = dummy_transport();
+        t.apply_server_status(&json!({ "health": "ok" }));
+        t.apply_server_status(&json!(null));
+        t.apply_server_status(&json!({ "quiescent": "yes" }));
+        assert!(
+            !t.is_settled(),
+            "malformed status must not flip the transport into status mode"
         );
         let _ = child.kill();
         let _ = child.wait();

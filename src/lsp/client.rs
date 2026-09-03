@@ -319,19 +319,22 @@ impl LspClient {
         self.tx().crashed.load(Ordering::Relaxed)
     }
 
-    /// Wait until the LSP server has no in-flight `$/progress` work
-    /// (indexing, flycheck, cargo metadata, etc.), or until `timeout`
-    /// elapses. Returns `true` if the server reported idle in time,
+    /// Wait until the LSP server has *settled* — finished its in-flight
+    /// analysis (indexing, flycheck, cargo metadata, etc.) — or until
+    /// `timeout` elapses. Returns `true` if the server settled in time,
     /// `false` if we timed out with work still in flight.
     ///
-    /// Servers that don't emit progress at all (or that finished before
-    /// we asked) trip this immediately. The point is to remove the race
-    /// where `get_diagnostics` reads stale state because rust-analyzer
-    /// hadn't finished re-analyzing yet.
+    /// "Settled" is stronger than progress-map-empty: for rust-analyzer
+    /// it means `experimental/serverStatus` reported `quiescent`, and for
+    /// progress-only servers an empty map counts only after real progress
+    /// traffic (or a short post-spawn warm-up for servers that emit
+    /// neither). This closes the race where `get_diagnostics` read the
+    /// gap between `initialize` and the first `$/progress begin` as
+    /// "analysis finished".
     pub async fn wait_for_idle(&self, timeout: Duration) -> bool {
         let start = std::time::Instant::now();
         loop {
-            if self.tx().is_idle() {
+            if self.tx().is_settled() {
                 return true;
             }
             if start.elapsed() >= timeout {
@@ -428,24 +431,41 @@ impl LspClient {
         //    progress (e.g. typescript-language-server), `wait_for_idle`
         //    returns `true` immediately because the map is empty.
         //
-        //    We give idle a generous slice (up to half the timeout) so
+        //    We give settling a generous slice (up to half the timeout) so
         //    the legacy "wait for diagnostics" loop below can still soak
         //    up late-arriving messages on servers that don't use progress.
         let idle_budget = timeout / 2;
-        let idle = self.wait_for_idle(idle_budget).await;
+        let _ = self.wait_for_idle(idle_budget).await;
 
-        // 2) A publishDiagnostics for this file is authoritative — confirmed.
-        for entry in self.tx().diagnostics.iter() {
-            let key = entry.key();
+        // 2) A *non-empty* publishDiagnostics for this file is always
+        //    authoritative — real errors don't get published by accident.
+        //    An *empty* publish that arrived while the server was still
+        //    settling is NOT: rust-analyzer publishes empty diagnostics
+        //    for a file the moment it's opened, long before type
+        //    inference has run (the 2026-09-02 CI failure read exactly
+        //    that pre-analysis empty publish as "confirmed clean" ~9s
+        //    into initial indexing — and the same stale-empty stays in
+        //    the cache after quiescence, so "settled now" doesn't
+        //    launder it). Drop those stale empties; the wait loop below
+        //    then only sees publishes fresh enough to trust.
+        let mut found_non_empty = None;
+        self.tx().diagnostics.retain(|key, diags| {
             if key == &uri || key.ends_with(&path_str) {
-                return (entry.value().clone(), true);
+                if diags.is_empty() {
+                    return false;
+                }
+                found_non_empty = Some(diags.clone());
             }
+            true
+        });
+        if let Some(diags) = found_non_empty {
+            return (diags, true);
         }
 
         // 3) Fallback: legacy wait loop for servers that haven't emitted
-        //    a `publishDiagnostics` for this file *yet*, even though
-        //    they're idle. We poll for a brief window — most files
-        //    return immediately on the first iteration.
+        //    a definitive `publishDiagnostics` for this file *yet*. We
+        //    poll for a brief window — most files return immediately on
+        //    the first iteration.
         let mut saw_empty = false;
         while overall_start.elapsed() < timeout {
             for entry in self.tx().diagnostics.iter() {
@@ -459,17 +479,23 @@ impl LspClient {
                 }
             }
 
-            // An empty publish arrived → confirmed clean.
-            if saw_empty && overall_start.elapsed() > Duration::from_secs(3) {
+            // An empty publish arrived AND the server has settled →
+            // confirmed clean. Without the settled check a pre-analysis
+            // empty publish would confirm a clean bill 3s in.
+            if saw_empty
+                && overall_start.elapsed() > Duration::from_secs(3)
+                && self.tx().is_settled()
+            {
                 return (Vec::new(), true);
             }
 
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        // Timed out with no definitive publish. Trust idle: if the server
-        // reached idle, treat empty as clean; otherwise it's unknown/pending.
-        (Vec::new(), idle)
+        // Timed out with no definitive publish. Trust the settled signal:
+        // if the server has settled by now, treat empty as clean;
+        // otherwise it's unknown/pending.
+        (Vec::new(), self.tx().is_settled())
     }
 
     /// Go to definition of symbol at position.
@@ -811,6 +837,13 @@ async fn initialize(transport: &LspTransport, project_root: &Path) -> Result<()>
                         "willSave": false,
                         "willSaveWaitUntil": false
                     }
+                },
+                // Opt into rust-analyzer's `experimental/serverStatus`
+                // notifications — its `quiescent` flag is the only
+                // reliable "initial analysis actually finished" signal
+                // (progress-map emptiness is racy during warm-up).
+                "experimental": {
+                    "serverStatusNotification": true
                 }
             },
             "workspaceFolders": [{

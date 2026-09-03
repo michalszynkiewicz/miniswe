@@ -89,10 +89,13 @@ async fn lsp_diagnostics_on_type_error() {
     let main_rs = config.project_root.join("src/main.rs");
     fs::write(&main_rs, bad_code).unwrap();
 
-    // Notify LSP and get diagnostics
+    // Notify LSP and get diagnostics. 60s window: on a loaded CI runner
+    // rust-analyzer's initial index alone can eat most of 30s, and the
+    // settled gating now (correctly) waits for it instead of trusting
+    // the pre-analysis empty publish.
     client.notify_file_changed(&main_rs).expect("notify failed");
     let diags = client
-        .get_diagnostics(&main_rs, Duration::from_secs(30))
+        .get_diagnostics(&main_rs, Duration::from_secs(60))
         .await;
 
     // Should have at least one error diagnostic
@@ -147,11 +150,12 @@ async fn lsp_diagnostics_clear_on_fix() {
 
     let main_rs = config.project_root.join("src/main.rs");
 
-    // Write bad code
+    // Write bad code (60s windows for the same CI-warm-up reason as
+    // lsp_diagnostics_on_type_error above)
     fs::write(&main_rs, "fn main() {\n    let x: u32 = \"bad\";\n}\n").unwrap();
     client.notify_file_changed(&main_rs).unwrap();
     let diags = client
-        .get_diagnostics(&main_rs, Duration::from_secs(30))
+        .get_diagnostics(&main_rs, Duration::from_secs(60))
         .await;
     assert!(!diags.is_empty(), "should have errors for bad code");
 
@@ -163,7 +167,7 @@ async fn lsp_diagnostics_clear_on_fix() {
     .unwrap();
     client.notify_file_changed(&main_rs).unwrap();
     let diags = client
-        .get_diagnostics(&main_rs, Duration::from_secs(30))
+        .get_diagnostics(&main_rs, Duration::from_secs(60))
         .await;
 
     let errors: Vec<_> = diags
