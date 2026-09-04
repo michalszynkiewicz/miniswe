@@ -63,6 +63,20 @@ pub(crate) struct GreenState {
     pub(crate) red_streak: usize,
 }
 
+/// The message injected after an auto revert-to-green fired: names how long
+/// the tree stayed red, which round the tree was reverted to, and that the
+/// edits since then are gone (do NOT replay them).
+pub fn build_revert_to_green_message(red_streak: usize, last_green_round: usize) -> String {
+    format!(
+        "[auto-revert-to-green] The project has had compile errors for {red_streak} rounds \
+         straight and you are not converging — you are digging deeper, not recovering. I \
+         reverted the ENTIRE working tree to round {last_green_round}, the last state that \
+         compiled cleanly. Your edits since then are GONE; do not replay them. Start over \
+         from this clean base: re-read the relevant code, make ONE small complete change, \
+         and run a check before continuing."
+    )
+}
+
 /// Fresh-start user message for a gate-triggered context reset. The verbose
 /// turn-by-turn history is dropped on re-assemble, but the agent's *deliberate*
 /// memory — its PLAN (and scratchpad) — is re-injected from disk, so this isn't
@@ -124,6 +138,21 @@ pub fn build_reset_message(path: &str, revert_count: usize, tried: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Byte-pinned: both agent loops inject this builder and bench/moment
+    // tooling replays real transcripts — wording drift is a behavior change.
+    #[test]
+    fn revert_to_green_wording() {
+        assert_eq!(
+            build_revert_to_green_message(6, 4),
+            "[auto-revert-to-green] The project has had compile errors for 6 rounds \
+             straight and you are not converging — you are digging deeper, not recovering. \
+             I reverted the ENTIRE working tree to round 4, the last state that compiled \
+             cleanly. Your edits since then are GONE; do not replay them. Start over from \
+             this clean base: re-read the relevant code, make ONE small complete change, \
+             and run a check before continuing."
+        );
+    }
 
     #[test]
     fn reset_message_names_failure_forces_replan_and_redirects() {
