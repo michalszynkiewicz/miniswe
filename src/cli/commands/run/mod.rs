@@ -39,6 +39,7 @@ use crate::cli::commands::agent::prune_reads::prune_repeated_reads;
 use crate::cli::commands::agent::spiral;
 use crate::cli::commands::agent::stuck_check;
 use crate::cli::commands::agent::turn_state;
+use crate::cli::commands::agent::ui::{AgentUi, LlmOutcome, PauseDecision, UiEvent};
 use crate::cli::commands::agent::validation;
 use crate::config::{Config, EditMode, ModelRole};
 use crate::context;
