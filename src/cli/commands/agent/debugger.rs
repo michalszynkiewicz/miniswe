@@ -57,6 +57,18 @@ pub const DEBUGGER_TRIGGER_BLOCKS: usize = 2;
 /// flapping failure can't spawn unbounded sub-agents.
 pub const MAX_DEBUGGER_FIRES: usize = 3;
 
+/// Per-turn reactive-debugger state, shared by both agent loops.
+#[derive(Default)]
+pub(crate) struct DebuggerState {
+    /// Debugger fires so far this turn (bounded by `MAX_DEBUGGER_FIRES`).
+    pub(crate) fires: usize,
+    /// Signature of the last failure the debugger was handed. With
+    /// `debugger_multifire`, the debugger re-fires only when this CHANGES — so it
+    /// walks compile→smoke one diagnosis per distinct failure, never re-diagnosing
+    /// the same one (the blunt fire-≤N× variant regressed by doing exactly that).
+    pub(crate) last_failure: Option<String>,
+}
+
 /// Stable signature of a gate failure, used by `debugger_multifire` to decide
 /// whether the failure CHANGED since the last diagnosis (so the debugger walks
 /// compile→smoke rather than re-diagnosing the same failure). Using only the

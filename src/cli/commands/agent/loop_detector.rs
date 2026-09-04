@@ -6,6 +6,58 @@
 //! irrelevant JSON differences (object key ordering, insignificant
 //! whitespace), which is what `canonical_json` provides.
 
+/// Per-turn loop-detection state, shared by both agent loops. Plain fields
+/// (no accessors): call sites reset different subsets at different points
+/// (successful edit, recovery, escalation) and the split borrows must keep
+/// working.
+#[derive(Default)]
+pub(crate) struct LoopTracker {
+    /// Key of the previous tool call, for the consecutive-identical detector.
+    pub(crate) last_call_key: Option<String>,
+    pub(crate) same_call_streak: u32,
+    /// Short rolling history of call keys for period-2 cycle detection
+    /// (edit↔revert oscillation — invisible to the consecutive detector,
+    /// which resets its streak on every alternation).
+    pub(crate) recent_call_keys: Vec<String>,
+    /// Number of distinct loops the model has been pulled out of in this
+    /// turn. We give one recovery; a second loop ends the turn for real.
+    pub(crate) recoveries: u32,
+    /// Read-loop escalation ladder: first detection gets the polite
+    /// REPEATED_READ_NUDGE; if the model re-enters the same identical-read
+    /// loop, wording is proven inert (live 121347: 6 nudges, 0 effect) and the
+    /// next detection forces a context compaction before the following request
+    /// — breaking the cache-hot prefix is what actually ends the loop
+    /// (warm-replay probe 2026-07-15: nudge 0-1/8, forced compaction 8/8).
+    /// Resets after each escalation so a later, separate loop episode starts
+    /// back at the cheap nudge.
+    pub(crate) read_nudges: u32,
+    /// Window-detector fires this turn whose key was a FILE EDIT (headless
+    /// only). A single recurrence can still be a legitimate retry; a
+    /// byte-identical edit/revert recurring a SECOND time in the window is a
+    /// rut, and escalates to a forced compaction (the read-loop ladder's
+    /// proven breaker). Devstral `docker_20260823_114957`: the window detector
+    /// fired 16× on one edit<->revert<->plan(check) rut.
+    ///
+    /// Loop detection used to also force a cold prompt eval
+    /// (`cache_prompt=false`) here, on the theory that lossy q4-KV-cache
+    /// readback flips a decision into a repeat. A corpus audit of every bench
+    /// run 08-23..08-26 refuted it: 680 forced cold prefills, and the loop key
+    /// was gone from the next 6 calls only 9.1% of the time against 19.3% for
+    /// warm 2-streaks (a comparison biased in cold's FAVOUR would still have
+    /// to beat that). On the two models where it cost the most it did
+    /// essentially nothing -- Muse-Glimmer 2/117 breaks, North-Mini-Code
+    /// 1/210 -- while a re-prefill of a ~40k prompt costs ~58s (Glimmer, 48%
+    /// of one run's wall clock; North 75%; Mistral-Small-4 ~250s per fire).
+    /// The apparent "it changed the call" successes were the loop's own
+    /// periodicity: devstral cycled replace_range -> revert -> plan(check)
+    /// through 16 consecutive cold prefills. `ChatRequest::cache_prompt`
+    /// itself stays -- `llm/mod.rs` still uses it for the tool-call-leak
+    /// retry, which is a different mechanism with its own evidence.
+    pub(crate) window_edit_fires: u32,
+    /// jobs-status poll calls redirected to jobs(wait) this turn (headless only).
+    pub(crate) jobs_poll_redirects: u32,
+}
+
 pub fn loop_call_key(tool_name: &str, args: &serde_json::Value) -> String {
     format!("{tool_name}:{}", canonical_json(args))
 }

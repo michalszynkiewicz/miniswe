@@ -32,7 +32,7 @@ use crate::cli::commands::agent::hints::{
     visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{
-    cycle_period, is_mutating_call, key_is_file_edit, key_is_mutating, loop_call_key_tagged,
+    self, cycle_period, is_mutating_call, key_is_file_edit, key_is_mutating, loop_call_key_tagged,
 };
 use crate::cli::commands::agent::prune_reads::prune_repeated_reads;
 use crate::cli::commands::agent::spiral;
