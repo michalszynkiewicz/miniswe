@@ -394,22 +394,39 @@ impl LspClient {
     /// Get diagnostics for a file, waiting up to `timeout` for results.
     /// Returns diagnostics from the most recent publishDiagnostics notification.
     ///
-    /// First clears any cached diagnostics for the file, then waits for the
-    /// server to report idle via `$/progress` (so we don't read while
-    /// indexing/flycheck is still running), and finally reads whatever
-    /// `publishDiagnostics` left in the cache. Falls back to the older
-    /// "wait until a non-empty diagnostic arrives" heuristic for servers
-    /// that don't emit progress at all.
+    /// See [`Self::get_diagnostics_with_status`] for the wait model.
     pub async fn get_diagnostics(&self, path: &Path, timeout: Duration) -> Vec<Diagnostic> {
         self.get_diagnostics_with_status(path, timeout).await.0
     }
 
     /// Like [`Self::get_diagnostics`], but also reports whether the result is
-    /// *confirmed* — the server actually settled (reached idle or published
-    /// for this file) — versus *unconfirmed* (we timed out before analysis
-    /// finished). An empty `Vec` with `confirmed == false` means
-    /// "unknown / still pending", NOT "clean": callers must not claim the file
-    /// is OK on an unconfirmed-empty result.
+    /// *confirmed* — the server actually settled — versus *unconfirmed* (we
+    /// timed out before analysis finished). An empty `Vec` with
+    /// `confirmed == false` means "unknown / still pending", NOT "clean":
+    /// callers must not claim the file is OK on an unconfirmed-empty result.
+    ///
+    /// The wait model rests on two measured facts about rust-analyzer:
+    ///
+    /// - Servers do NOT re-publish unchanged diagnostics. rust-analyzer
+    ///   publishes natively once per didOpen, and after that only when a
+    ///   didSave-triggered flycheck (`cargo check`) produces or clears
+    ///   something. Waiting for a publish that will never come is what
+    ///   used to eat the entire timeout on every clean file.
+    /// - So the clean signal is *absence of publishes while settled*: once
+    ///   the server has been continuously settled (quiescent AND no
+    ///   in-flight `$/progress` token) for a short grace, any analysis our
+    ///   didSave triggered has started, run, and ended without publishing
+    ///   for this file — empty means clean. The grace only has to cover
+    ///   the didSave → flycheck-token-open dispatch gap (73ms measured
+    ///   locally; the token is visible because we advertise
+    ///   `window.workDoneProgress`), not the analysis itself.
+    ///
+    /// A *non-empty* publish short-circuits immediately: the cache is
+    /// cleared for this file on entry, so any errors read back arrived
+    /// after this call began and reflect the file's current contents.
+    /// Fresh *empty* publishes get no shortcut — on a loaded runner the
+    /// didOpen-time publish can be a pre-inference empty (the 2026-09-02
+    /// CI failure), so empties are only ever confirmed by the grace.
     pub async fn get_diagnostics_with_status(
         &self,
         path: &Path,
@@ -417,84 +434,50 @@ impl LspClient {
     ) -> (Vec<Diagnostic>, bool) {
         let uri = path_to_uri(path);
 
-        // Mark that we're waiting for fresh diagnostics
+        // Clear cached entries for this file (by exact URI and by path
+        // suffix) so anything read back below post-dates this call — a
+        // publish from before the caller's edit can neither acquit nor
+        // indict the current contents.
         self.tx().diagnostics.remove(&uri);
-        // Also remove by any URI that ends with our path
         let path_str = path.to_string_lossy().to_string();
         self.tx().diagnostics.retain(|k, _| !k.ends_with(&path_str));
 
+        // How long the server must hold "settled" before empty counts as
+        // clean. Must exceed the didSave → flycheck-begin dispatch gap
+        // (73ms measured on a fast machine) with plenty of slack for
+        // loaded CI runners; the expensive parts (indexing, cargo check)
+        // hold progress tokens and so extend the wait on their own.
+        const SETTLED_GRACE: Duration = Duration::from_secs(2);
+
         let overall_start = std::time::Instant::now();
-
-        // 1) Wait for the server to report idle. If the server emits
-        //    `$/progress`, this gives us a deterministic point-in-time
-        //    "the analysis pipeline is done". If the server never reports
-        //    progress (e.g. typescript-language-server), `wait_for_idle`
-        //    returns `true` immediately because the map is empty.
-        //
-        //    We give settling a generous slice (up to half the timeout) so
-        //    the legacy "wait for diagnostics" loop below can still soak
-        //    up late-arriving messages on servers that don't use progress.
-        let idle_budget = timeout / 2;
-        let _ = self.wait_for_idle(idle_budget).await;
-
-        // 2) A *non-empty* publishDiagnostics for this file is always
-        //    authoritative — real errors don't get published by accident.
-        //    An *empty* publish that arrived while the server was still
-        //    settling is NOT: rust-analyzer publishes empty diagnostics
-        //    for a file the moment it's opened, long before type
-        //    inference has run (the 2026-09-02 CI failure read exactly
-        //    that pre-analysis empty publish as "confirmed clean" ~9s
-        //    into initial indexing — and the same stale-empty stays in
-        //    the cache after quiescence, so "settled now" doesn't
-        //    launder it). Drop those stale empties; the wait loop below
-        //    then only sees publishes fresh enough to trust.
-        let mut found_non_empty = None;
-        self.tx().diagnostics.retain(|key, diags| {
-            if key == &uri || key.ends_with(&path_str) {
-                if diags.is_empty() {
-                    return false;
-                }
-                found_non_empty = Some(diags.clone());
-            }
-            true
-        });
-        if let Some(diags) = found_non_empty {
-            return (diags, true);
-        }
-
-        // 3) Fallback: legacy wait loop for servers that haven't emitted
-        //    a definitive `publishDiagnostics` for this file *yet*. We
-        //    poll for a brief window — most files return immediately on
-        //    the first iteration.
-        let mut saw_empty = false;
-        while overall_start.elapsed() < timeout {
+        let mut settled_since: Option<std::time::Instant> = None;
+        loop {
             for entry in self.tx().diagnostics.iter() {
                 let key = entry.key();
-                if key == &uri || key.ends_with(&path_str) {
-                    let diags = entry.value().clone();
-                    if !diags.is_empty() {
-                        return (diags, true);
-                    }
-                    saw_empty = true;
+                if (key == &uri || key.ends_with(&path_str)) && !entry.value().is_empty() {
+                    return (entry.value().clone(), true);
                 }
             }
 
-            // An empty publish arrived AND the server has settled →
-            // confirmed clean. Without the settled check a pre-analysis
-            // empty publish would confirm a clean bill 3s in.
-            if saw_empty
-                && overall_start.elapsed() > Duration::from_secs(3)
-                && self.tx().is_settled()
-            {
-                return (Vec::new(), true);
+            if self.tx().is_settled() {
+                let since = *settled_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= SETTLED_GRACE {
+                    return (Vec::new(), true);
+                }
+            } else {
+                settled_since = None;
             }
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            if overall_start.elapsed() >= timeout {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // Timed out with no definitive publish. Trust the settled signal:
-        // if the server has settled by now, treat empty as clean;
-        // otherwise it's unknown/pending.
+        // Timed out without holding settled for the grace. Trust the
+        // instantaneous settled signal for the confirmed flag: settled
+        // right now means empty is still the best answer; otherwise it's
+        // unknown/pending.
         (Vec::new(), self.tx().is_settled())
     }
 
@@ -837,6 +820,14 @@ async fn initialize(transport: &LspTransport, project_root: &Path) -> Result<()>
                         "willSave": false,
                         "willSaveWaitUntil": false
                     }
+                },
+                // Without this, spec-compliant servers send NO `$/progress`
+                // at all — the transport's progress-token map stays empty
+                // and `is_settled()` degrades to serverStatus-only, which
+                // is blind to flycheck: rust-analyzer stays `quiescent`
+                // while `cargo check` runs.
+                "window": {
+                    "workDoneProgress": true
                 },
                 // Opt into rust-analyzer's `experimental/serverStatus`
                 // notifications — its `quiescent` flag is the only
