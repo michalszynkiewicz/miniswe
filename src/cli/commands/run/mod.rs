@@ -27,8 +27,8 @@ use crate::cli::commands::agent::debugger;
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
     PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
-    PREMATURE_EXIT_NUDGE, REPEATED_READ_ESCALATION, REPEATED_READ_NUDGE, cycle_loop_hint,
-    is_file_write, is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint,
+    REPEATED_READ_ESCALATION, REPEATED_READ_NUDGE, cycle_loop_hint, is_file_write,
+    is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint,
 };
 use crate::cli::commands::agent::loop_detector::{
     cycle_period, is_mutating_call, key_is_file_edit, key_is_mutating, loop_call_key_tagged,

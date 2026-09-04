@@ -12,11 +12,15 @@ use crate::config::{Config, ModelRole};
 use crate::llm::{Message, ModelRouter, ToolDefinition};
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
-use crate::runtime::LlmWorkerHandle;
+use crate::mcp::McpRegistry;
+use crate::runtime::{LlmWorkerHandle, ToolWorkerPool};
 use crate::tools;
+use crate::tools::permissions::PermissionManager;
 
+pub(crate) mod done_gate;
 pub(crate) mod llm_call;
 pub(crate) mod preamble;
+pub(crate) mod restart;
 
 /// Borrowed per-turn view of the services both loops thread through every
 /// phase. `Copy` — call sites build it inline and pass it by value.
@@ -34,6 +38,17 @@ pub(crate) struct TurnCtx<'a> {
     pub fast_baseline_errors: usize,
     pub tool_def_tokens: usize,
     pub max_rounds: usize,
+    pub perms: &'a Arc<PermissionManager>,
+    pub tool_pool: &'a ToolWorkerPool,
+    pub mcp_registry: &'a Option<Arc<Mutex<McpRegistry>>>,
+    pub fast_revisions: &'a Option<Arc<tools::RevisionStore>>,
+    pub job_registry: &'a Arc<tools::jobs::JobRegistry>,
+    /// The original user message for this turn — the recovery goal used by the
+    /// done-gate re-anchor, the debugger sub-agent, and SCRAP re-assembly.
+    pub task: &'a str,
+    pub mcp_summary: Option<&'a str>,
+    /// `context::assemble`'s plan-only flag; the REPL always passes `false`.
+    pub plan_only: bool,
 }
 
 /// Explicit behavior deltas between the two loops — never silently
@@ -52,6 +67,13 @@ pub(crate) struct TurnOptions {
     pub worker_stopped_ends_turn: bool,
     /// Compact-retry UX in the LLM error ladder.
     pub compaction: CompactionUx,
+    /// REPL explore turns: skip the behavioral done-gate entirely. A read-only
+    /// Q&A turn makes no edits, so there is nothing to behaviorally verify and
+    /// blocking the answer would be nonsensical.
+    pub read_only: bool,
+    /// Headless: nudge once if background jobs are still running at finish time
+    /// (session end kills them). The REPL has no such gate.
+    pub live_jobs_gate: bool,
 }
 
 /// How the error ladder's compact-retry branches announce themselves and
