@@ -95,34 +95,9 @@ pub(super) async fn run_agent_loop(
 
     let mut round = 0;
     let mut had_error = false;
-    let mut user_continued = false;
-    // Per-turn loop-detection state (see `loop_detector::LoopTracker` field docs).
-    let mut loops = loop_detector::LoopTracker::default();
-    let mut force_compact_next_round = false;
-    let mut calls_since_last_edit = 0u32;
-    let mut successful_edits_since_plan_update = 0u32;
-    let mut plan_update_requested = false;
-    let mut nudged_premature_exit = false;
-    let mut nudged_no_plan = false;
-    // Consecutive reactive-compaction retries (context exhaustion signaled
-    // by the server — see compressor::force_compress). Reset whenever a
-    // response is successfully consumed; bounds futile retries of one
-    // failing request, not total compactions over a long turn.
-    let mut context_compact_retries: usize = 0;
-    // Consecutive LLM requests that died on a tool-call argument problem
-    // (server-side parse error or our streaming size cap) with no completed
-    // response in between. See run.rs for the escalation ladder.
-    let mut truncated_call_errors_in_a_row: usize = 0;
-    // Per-turn gate, debugger, spiral-reset, and revert-to-green state (see the
-    // field docs on `validation::GateState`, `debugger::DebuggerState`,
-    // `spiral::SpiralState`, `spiral::GreenState`).
-    let mut gate = validation::GateState::default();
-    let mut debugger_state = debugger::DebuggerState::default();
-    let mut spiral_state = spiral::SpiralState::default();
-    let mut green = spiral::GreenState::default();
-    // Ceremony-gate latch — see run.rs for the rationale. Reset on every
-    // SCRAP, which reassembles the context and restarts the ceremony.
-    let mut plan_ever_set = false;
+    // Per-turn agent-loop state shared with the headless loop (see the field
+    // docs on `turn_state::TurnState` and its sub-structs).
+    let mut state = turn_state::TurnState::default();
 
     'round: loop {
         if had_error {
@@ -153,21 +128,21 @@ pub(super) async fn run_agent_loop(
         {
             let errs = tools::fast::project_error_count(lsp.as_deref()).await;
             if errs <= fast_baseline_errors {
-                green.last_green_round = round;
-                green.red_streak = 0;
+                state.green.last_green_round = round;
+                state.green.red_streak = 0;
             } else {
-                green.red_streak += 1;
-                if green.red_streak >= spiral::REVERT_TO_GREEN_BLOCKS {
+                state.green.red_streak += 1;
+                if state.green.red_streak >= spiral::REVERT_TO_GREEN_BLOCKS {
                     let result = {
                         let guard = snap.lock();
-                        guard.revert_to_round(green.last_green_round)
+                        guard.revert_to_round(state.green.last_green_round)
                     };
                     match result {
                         Ok(m) => {
                             app.push_output(
                                 &format!(
                                     "[revert-to-green] stuck {} rounds; {m}",
-                                    green.red_streak
+                                    state.green.red_streak
                                 ),
                                 LineStyle::Status,
                             );
@@ -179,9 +154,9 @@ pub(super) async fn run_agent_loop(
                                  Your edits since then are GONE; do not replay them. Start over from \
                                  this clean base: re-read the relevant code, make ONE small complete \
                                  change, and run a check before continuing.",
-                                green.red_streak, green.last_green_round
+                                state.green.red_streak, state.green.last_green_round
                             )));
-                            green.red_streak = 0;
+                            state.green.red_streak = 0;
                         }
                         Err(e) => {
                             app.push_output(
@@ -200,7 +175,7 @@ pub(super) async fn run_agent_loop(
         }
 
         // Ask the user whether to continue after pause_after_rounds rounds.
-        if round == pause_at && !user_continued {
+        if round == pause_at && !state.user_continued {
             app.pending_permission = Some(format!(
                 "{pause_at} tool rounds used. Continue? [y]es / [n]o:"
             ));
@@ -209,7 +184,7 @@ pub(super) async fn run_agent_loop(
             let response = wait_for_modal_input(app, rx, terminal, &['y', 'n']).await;
             app.pending_permission = None;
             match response.as_str() {
-                "y" | "yes" | "" => user_continued = true,
+                "y" | "yes" | "" => state.user_continued = true,
                 _ => messages.push(Message::user("[Stop now. Summarize what you've done.]")),
             }
         }
@@ -252,8 +227,8 @@ pub(super) async fn run_agent_loop(
             // deliberately even though no budget pressure asks for it. Runs
             // before maybe_compress so refresh_current_state still lands on
             // the tail.
-            if force_compact_next_round {
-                force_compact_next_round = false;
+            if state.force_compact_next_round {
+                state.force_compact_next_round = false;
                 app.push_output(
                     "  ⚠ Read loop persisted — forcing context compaction",
                     LineStyle::Status,
@@ -277,7 +252,7 @@ pub(super) async fn run_agent_loop(
                     router,
                     llm_worker,
                     tool_def_tokens,
-                    &mut plan_update_requested,
+                    &mut state.plan_update_requested,
                 );
                 let mut compress_fut = std::pin::pin!(compress_fut);
                 let mut done = false;
@@ -301,11 +276,11 @@ pub(super) async fn run_agent_loop(
 
         // Hide edit tools until a plan exists; see visible_tool_defs.
         let plan_set = tools::plan::plan_exists(config);
-        plan_ever_set |= plan_set;
+        state.plan_ever_set |= plan_set;
         // Off: never hide edit tools (pass plan_exists=true). Strict: legacy
         // hide-until-plan behavior, latched so a plan that goes away mid-segment
         // cannot retract tools the model has already been shown.
-        let visible = visible_tool_defs(tool_defs, plan_ever_set || !strict);
+        let visible = visible_tool_defs(tool_defs, state.plan_ever_set || !strict);
         // Build request. See run.rs for the per-model reasoning_effort and
         // thinking-mode logic.
         let (chat_template_kwargs, temperature_override) =
@@ -380,7 +355,7 @@ pub(super) async fn run_agent_loop(
                                     cancelled.store(false, Ordering::Relaxed);
                                     app.push_output("Generation interrupted.", LineStyle::Status);
                                 } else if is_context_exceeded_error(&err_str)
-                                    && context_compact_retries
+                                    && state.context_compact_retries
                                         < context::compressor::FORCE_COMPRESS_MAX_RETRIES
                                 {
                                     // Prompt alone exceeds the context window
@@ -394,12 +369,13 @@ pub(super) async fn run_agent_loop(
                                     // arguments outgrew the cap. Nothing was
                                     // persisted; hint and retry, or give up
                                     // when the model keeps doing it.
-                                    truncated_call_errors_in_a_row += 1;
-                                    if truncated_call_errors_in_a_row
+                                    state.truncated_call_errors_in_a_row += 1;
+                                    if state.truncated_call_errors_in_a_row
                                         >= TRUNCATED_CALL_ABORT_AFTER
                                     {
                                         log.llm_error(&format!(
-                                            "{truncated_call_errors_in_a_row} consecutive oversized tool calls — aborting turn"
+                                            "{} consecutive oversized tool calls — aborting turn",
+                                            state.truncated_call_errors_in_a_row
                                         ));
                                         // Falls through to `break None` below:
                                         // no hint flag set, so the turn ends.
@@ -434,8 +410,8 @@ pub(super) async fn run_agent_loop(
                                     // request will fail until it is gone.
                                     // Handle the second first — it is a
                                     // zero-progress spin otherwise.
-                                    truncated_call_errors_in_a_row += 1;
-                                    let scrubbed = if truncated_call_errors_in_a_row >= 2 {
+                                    state.truncated_call_errors_in_a_row += 1;
+                                    let scrubbed = if state.truncated_call_errors_in_a_row >= 2 {
                                         scrub_unparseable_tool_calls(messages)
                                             + scrub_unparseable_tool_calls(conversation_history)
                                     } else {
@@ -450,11 +426,12 @@ pub(super) async fn run_agent_loop(
                                             LineStyle::Status,
                                         );
                                         truncated_tool_call_hint_pushed = true;
-                                    } else if truncated_call_errors_in_a_row
+                                    } else if state.truncated_call_errors_in_a_row
                                         >= TRUNCATED_CALL_ABORT_AFTER
                                     {
                                         log.llm_error(&format!(
-                                            "{truncated_call_errors_in_a_row} consecutive tool-call parse failures with nothing left to repair — aborting turn"
+                                            "{} consecutive tool-call parse failures with nothing left to repair — aborting turn",
+                                            state.truncated_call_errors_in_a_row
                                         ));
                                         // Falls through to `break None`: turn ends.
                                         app.push_output(
@@ -465,7 +442,7 @@ pub(super) async fn run_agent_loop(
                                         messages,
                                         tool_def_tokens,
                                     ) > config.model.context_window * 3 / 4
-                                        && context_compact_retries
+                                        && state.context_compact_retries
                                             < context::compressor::FORCE_COMPRESS_MAX_RETRIES
                                     {
                                         context_ceiling_hit = true;
@@ -552,7 +529,7 @@ pub(super) async fn run_agent_loop(
 
         let Some(response) = response else {
             if context_ceiling_hit {
-                context_compact_retries += 1;
+                state.context_compact_retries += 1;
                 app.push_output(
                     "Context window exceeded — compacting and retrying.",
                     LineStyle::Status,
@@ -597,9 +574,9 @@ pub(super) async fn run_agent_loop(
         if is_context_truncated_response(&response, effective_max_tokens)
             && context::compressor::estimated_context_tokens(messages, tool_def_tokens)
                 > config.model.context_window * 3 / 4
-            && context_compact_retries < context::compressor::FORCE_COMPRESS_MAX_RETRIES
+            && state.context_compact_retries < context::compressor::FORCE_COMPRESS_MAX_RETRIES
         {
-            context_compact_retries += 1;
+            state.context_compact_retries += 1;
             app.push_output(
                 "Generation truncated by context ceiling — compacting and regenerating.",
                 LineStyle::Status,
@@ -629,8 +606,8 @@ pub(super) async fn run_agent_loop(
         };
         // A response made it through whole — any prior reactive-compaction
         // retries resolved this request; reset the budget for the next one.
-        context_compact_retries = 0;
-        truncated_call_errors_in_a_row = 0;
+        state.context_compact_retries = 0;
+        state.truncated_call_errors_in_a_row = 0;
 
         // Never persist an unparseable tool call (see run.rs): stub the
         // cut-off arguments; the tool loop answers the stub with guidance.
@@ -671,11 +648,11 @@ pub(super) async fn run_agent_loop(
                 // and "no-plan exit" (the latter caught Mistral Small 4
                 // bailing during exploration before any meaningful work).
                 // Strict/legacy only.
-                if strict && !nudged_premature_exit && config.tools.plan {
+                if strict && !state.nudged_premature_exit && config.tools.plan {
                     let has_unchecked = tools::plan::has_unchecked_steps(config);
                     let plan_exists = tools::plan::plan_exists(config);
                     if has_unchecked || !plan_exists {
-                        nudged_premature_exit = true;
+                        state.nudged_premature_exit = true;
                         let nudge_text = if plan_exists {
                             PREMATURE_EXIT_NUDGE.to_string()
                         } else {
@@ -699,12 +676,12 @@ pub(super) async fn run_agent_loop(
                 // edits, so there is nothing to behaviorally verify and blocking
                 // the answer would be nonsensical.
                 if !read_only
-                    && gate.validation_blocks < config.validation.max_retries
+                    && state.gate.validation_blocks < config.validation.max_retries
                     && config.validation.command().is_some()
                 {
                     match validation::run_behavioral_check(config).await {
                         validation::CheckOutcome::Fail(output) => {
-                            gate.validation_blocks += 1;
+                            state.gate.validation_blocks += 1;
                             // Record the model's completion rationale (its
                             // no-tool-call exit content) — a bounded, auditable
                             // voice, not a silent free pass.
@@ -716,10 +693,10 @@ pub(super) async fn run_agent_loop(
                             {
                                 tracing::warn!(
                                     "[validation] blocked completion (attempt {}); model rationale: {}",
-                                    gate.validation_blocks,
+                                    state.gate.validation_blocks,
                                     crate::truncate_chars(rationale, 300)
                                 );
-                                gate.validation_disputes.push(rationale.to_string());
+                                state.gate.validation_disputes.push(rationale.to_string());
                             }
                             app.push_output(
                                 "Behavioral check failed — not done yet.",
@@ -730,14 +707,14 @@ pub(super) async fn run_agent_loop(
                             // gate block, abandon the possibly-poisoned attempt —
                             // revert the WHOLE tree to the clean baseline AND
                             // reset the context. Fires once per turn.
-                            if config.tools.gate_restart && !gate.restart_fired {
-                                gate.restart_fired = true;
-                                plan_ever_set = false;
+                            if config.tools.gate_restart && !state.gate.restart_fired {
+                                state.gate.restart_fired = true;
+                                state.plan_ever_set = false;
                                 *messages =
                                     scrap_restart(app, config, goal, mcp_summary, snapshots, false);
                                 conversation_history.clear();
-                                gate.validation_blocks = 0;
-                                gate.plan_step_failures.reset();
+                                state.gate.validation_blocks = 0;
+                                state.gate.plan_step_failures.reset();
                                 continue;
                             }
 
@@ -748,8 +725,11 @@ pub(super) async fn run_agent_loop(
                             let is_compile_fail = output.contains("DOES NOT COMPILE")
                                 || output.contains("could not compile")
                                 || output.contains("error[E");
-                            if config.tools.gate_replan && !gate.replan_fired && !is_compile_fail {
-                                gate.replan_fired = true;
+                            if config.tools.gate_replan
+                                && !state.gate.replan_fired
+                                && !is_compile_fail
+                            {
+                                state.gate.replan_fired = true;
                                 app.push_output(
                                     "Re-anchoring on the original goal — re-plan from the task…",
                                     LineStyle::Status,
@@ -776,17 +756,17 @@ pub(super) async fn run_agent_loop(
                             // primary agent has failed the gate a couple times.
                             let fkey = debugger::failure_key(&output);
                             let may_fire = if config.tools.debugger_multifire {
-                                debugger_state.fires < debugger::MAX_DEBUGGER_FIRES
-                                    && debugger_state.last_failure.as_deref() != Some(fkey.as_str())
+                                state.debugger.fires < debugger::MAX_DEBUGGER_FIRES
+                                    && state.debugger.last_failure.as_deref() != Some(fkey.as_str())
                             } else {
-                                debugger_state.fires == 0
+                                state.debugger.fires == 0
                             };
                             if (config.tools.reactive_debugger || config.tools.debugger_judge)
                                 && may_fire
-                                && gate.validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
+                                && state.gate.validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
                             {
-                                debugger_state.fires += 1;
-                                debugger_state.last_failure = Some(fkey);
+                                state.debugger.fires += 1;
+                                state.debugger.last_failure = Some(fkey);
                                 app.push_output(
                                     "Still failing — spinning up a fresh-context debugger sub-agent…",
                                     LineStyle::Status,
@@ -808,9 +788,11 @@ pub(super) async fn run_agent_loop(
                                 .await;
 
                                 let msg = match verdict {
-                                    debugger::DebuggerVerdict::Scrap if !gate.restart_fired => {
-                                        gate.restart_fired = true;
-                                        plan_ever_set = false;
+                                    debugger::DebuggerVerdict::Scrap
+                                        if !state.gate.restart_fired =>
+                                    {
+                                        state.gate.restart_fired = true;
+                                        state.plan_ever_set = false;
                                         *messages = scrap_restart(
                                             app,
                                             config,
@@ -820,8 +802,8 @@ pub(super) async fn run_agent_loop(
                                             true,
                                         );
                                         conversation_history.clear();
-                                        gate.validation_blocks = 0;
-                                        gate.plan_step_failures.reset();
+                                        state.gate.validation_blocks = 0;
+                                        state.gate.plan_step_failures.reset();
                                         continue;
                                     }
                                     debugger::DebuggerVerdict::Scrap => Message::user(
@@ -868,11 +850,11 @@ pub(super) async fn run_agent_loop(
                             // history and re-assemble a clean context (files
                             // persist on disk). Bounded per turn.
                             if config.tools.gate_context_reset
-                                && gate.context_resets < spiral::MAX_GATE_RESETS
-                                && gate.validation_blocks >= spiral::GATE_RESET_AFTER_BLOCKS
+                                && state.gate.context_resets < spiral::MAX_GATE_RESETS
+                                && state.gate.validation_blocks >= spiral::GATE_RESET_AFTER_BLOCKS
                             {
-                                gate.context_resets += 1;
-                                gate.validation_blocks = 0;
+                                state.gate.context_resets += 1;
+                                state.gate.validation_blocks = 0;
                                 let fresh = spiral::build_gate_reset_prompt(goal, &output);
                                 let assembled =
                                     context::assemble(config, &fresh, &[], false, mcp_summary);
@@ -905,18 +887,18 @@ pub(super) async fn run_agent_loop(
                     }
                 }
                 // Exiting now. Surface any recorded gate rationale(s) for audit.
-                if !gate.validation_disputes.is_empty() {
+                if !state.gate.validation_disputes.is_empty() {
                     app.push_output(
                         &format!(
                             "Completed after {} blocked verification(s); model's reasons recorded in the log.",
-                            gate.validation_disputes.len()
+                            state.gate.validation_disputes.len()
                         ),
                         LineStyle::Status,
                     );
                     tracing::warn!(
                         "[validation] turn completed over {} blocked check(s); model rationale(s): {}",
-                        gate.validation_disputes.len(),
-                        gate.validation_disputes.join(" | ")
+                        state.gate.validation_disputes.len(),
+                        state.gate.validation_disputes.join(" | ")
                     );
                 }
                 break;
@@ -993,24 +975,24 @@ pub(super) async fn run_agent_loop(
             // (period-1), or the SAME two calls alternating (period-2 — the
             // edit↔revert oscillation the streak counter is blind to).
             let call_key = loop_call_key(&tc.function.name, &args);
-            if loops.last_call_key.as_ref() == Some(&call_key) {
-                loops.same_call_streak += 1;
+            if state.loops.last_call_key.as_ref() == Some(&call_key) {
+                state.loops.same_call_streak += 1;
             } else {
-                loops.last_call_key = Some(call_key.clone());
-                loops.same_call_streak = 1;
+                state.loops.last_call_key = Some(call_key.clone());
+                state.loops.same_call_streak = 1;
             }
-            loops.recent_call_keys.push(call_key.clone());
-            if loops.recent_call_keys.len() > 12 {
-                loops.recent_call_keys.remove(0);
+            state.loops.recent_call_keys.push(call_key.clone());
+            if state.loops.recent_call_keys.len() > 12 {
+                state.loops.recent_call_keys.remove(0);
             }
-            let cycle = cycle_period(&loops.recent_call_keys);
-            if loops.same_call_streak >= 3 || cycle.is_some() {
+            let cycle = cycle_period(&state.loops.recent_call_keys);
+            if state.loops.same_call_streak >= 3 || cycle.is_some() {
                 // Cycle-only detection (not also a plain streak).
-                let cycle_only = cycle.filter(|_| loops.same_call_streak < 3);
+                let cycle_only = cycle.filter(|_| state.loops.same_call_streak < 3);
                 // A cycle is harmful if ANY member mutates.
                 let mutating = if let Some(period) = cycle_only {
-                    let tail = &loops.recent_call_keys
-                        [loops.recent_call_keys.len().saturating_sub(period)..];
+                    let tail = &state.loops.recent_call_keys
+                        [state.loops.recent_call_keys.len().saturating_sub(period)..];
                     tail.iter().any(|k| key_is_mutating(k))
                 } else {
                     is_mutating_call(&tc.function.name, &args)
@@ -1018,7 +1000,7 @@ pub(super) async fn run_agent_loop(
                 log.loop_detected(
                     &tc.function.name,
                     &args_summary,
-                    loops.same_call_streak as usize,
+                    state.loops.same_call_streak as usize,
                 );
 
                 // Read-only repetition: harmless per call, just wasted tokens.
@@ -1026,11 +1008,11 @@ pub(super) async fn run_agent_loop(
                 // Re-detection: escalate — the nudge can't reach a
                 // cache-numerics rut, so force a compaction next round.
                 if !mutating {
-                    loops.read_nudges += 1;
-                    let escalate = loops.read_nudges >= 2;
+                    state.loops.read_nudges += 1;
+                    let escalate = state.loops.read_nudges >= 2;
                     let text = if escalate {
-                        loops.read_nudges = 0;
-                        force_compact_next_round = true;
+                        state.loops.read_nudges = 0;
+                        state.force_compact_next_round = true;
                         REPEATED_READ_ESCALATION
                     } else {
                         REPEATED_READ_NUDGE
@@ -1051,9 +1033,9 @@ pub(super) async fn run_agent_loop(
                         ),
                         LineStyle::Status,
                     );
-                    loops.last_call_key = None;
-                    loops.same_call_streak = 0;
-                    loops.recent_call_keys.clear();
+                    state.loops.last_call_key = None;
+                    state.loops.same_call_streak = 0;
+                    state.loops.recent_call_keys.clear();
                     continue;
                 }
 
@@ -1068,11 +1050,11 @@ pub(super) async fn run_agent_loop(
 
                 // First mutating loop in this turn: surface the hint, reset
                 // the streak, and let the model try a different approach.
-                if loops.recoveries == 0 {
-                    loops.recoveries += 1;
-                    loops.last_call_key = None;
-                    loops.same_call_streak = 0;
-                    loops.recent_call_keys.clear();
+                if state.loops.recoveries == 0 {
+                    state.loops.recoveries += 1;
+                    state.loops.last_call_key = None;
+                    state.loops.same_call_streak = 0;
+                    state.loops.recent_call_keys.clear();
                     app.push_output(
                         &format!(
                             "  ⚠ Loop detected: {}({}) {} — surfacing a hint, giving the model one more round",
@@ -1096,7 +1078,7 @@ pub(super) async fn run_agent_loop(
                 // of dying with the whole recovery stack idle.
                 if !read_only
                     && config.validation.command().is_some()
-                    && gate.validation_blocks < config.validation.max_retries
+                    && state.gate.validation_blocks < config.validation.max_retries
                 {
                     app.push_output(
                         &format!(
@@ -1108,26 +1090,26 @@ pub(super) async fn run_agent_loop(
                     if let validation::CheckOutcome::Fail(output) =
                         validation::run_behavioral_check(config).await
                     {
-                        gate.validation_blocks += 1;
+                        state.gate.validation_blocks += 1;
                         // Fresh recovery budget for the rounds the gate grants.
-                        loops.recoveries = 0;
-                        loops.last_call_key = None;
-                        loops.same_call_streak = 0;
-                        loops.recent_call_keys.clear();
+                        state.loops.recoveries = 0;
+                        state.loops.last_call_key = None;
+                        state.loops.same_call_streak = 0;
+                        state.loops.recent_call_keys.clear();
 
                         let fkey = debugger::failure_key(&output);
                         let may_fire = if config.tools.debugger_multifire {
-                            debugger_state.fires < debugger::MAX_DEBUGGER_FIRES
-                                && debugger_state.last_failure.as_deref() != Some(fkey.as_str())
+                            state.debugger.fires < debugger::MAX_DEBUGGER_FIRES
+                                && state.debugger.last_failure.as_deref() != Some(fkey.as_str())
                         } else {
-                            debugger_state.fires == 0
+                            state.debugger.fires == 0
                         };
                         if (config.tools.reactive_debugger || config.tools.debugger_judge)
                             && may_fire
-                            && gate.validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
+                            && state.gate.validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
                         {
-                            debugger_state.fires += 1;
-                            debugger_state.last_failure = Some(fkey);
+                            state.debugger.fires += 1;
+                            state.debugger.last_failure = Some(fkey);
                             app.push_output(
                                 "Looping + failing gate — spinning up a fresh-context debugger sub-agent…",
                                 LineStyle::Status,
@@ -1149,9 +1131,9 @@ pub(super) async fn run_agent_loop(
                             .await;
 
                             let msg = match verdict {
-                                debugger::DebuggerVerdict::Scrap if !gate.restart_fired => {
-                                    gate.restart_fired = true;
-                                    plan_ever_set = false;
+                                debugger::DebuggerVerdict::Scrap if !state.gate.restart_fired => {
+                                    state.gate.restart_fired = true;
+                                    state.plan_ever_set = false;
                                     *messages = scrap_restart(
                                         app,
                                         config,
@@ -1161,8 +1143,8 @@ pub(super) async fn run_agent_loop(
                                         true,
                                     );
                                     conversation_history.clear();
-                                    gate.validation_blocks = 0;
-                                    gate.plan_step_failures.reset();
+                                    state.gate.validation_blocks = 0;
+                                    state.gate.plan_step_failures.reset();
                                     continue 'round;
                                 }
                                 debugger::DebuggerVerdict::Scrap => Message::user(
@@ -1663,27 +1645,27 @@ pub(super) async fn run_agent_loop(
             app.store_tool_result(&tc.function.name, &result.content);
 
             if result.success && tc.function.name == "plan" {
-                successful_edits_since_plan_update = 0;
+                state.successful_edits_since_plan_update = 0;
             }
 
             // Successful file write = code changed, reset loop/stall trackers.
             if result.success && is_file_write(tc.function.name.as_str()) {
-                loops.last_call_key = None;
-                loops.same_call_streak = 0;
-                calls_since_last_edit = 0;
+                state.loops.last_call_key = None;
+                state.loops.same_call_streak = 0;
+                state.calls_since_last_edit = 0;
                 if strict && config.tools.plan {
                     if tools::plan::plan_exists(config) {
                         result.content.push('\n');
                         result.content.push_str(PLAN_PROGRESS_NUDGE);
                     }
-                    successful_edits_since_plan_update += 1;
-                    if successful_edits_since_plan_update == PLAN_CHECKPOINT_AFTER_EDITS {
+                    state.successful_edits_since_plan_update += 1;
+                    if state.successful_edits_since_plan_update == PLAN_CHECKPOINT_AFTER_EDITS {
                         result.content.push('\n');
                         result.content.push_str(PLAN_CHECKPOINT_WARNING);
                     }
                 }
             } else {
-                calls_since_last_edit += 1;
+                state.calls_since_last_edit += 1;
             }
 
             if !is_prunable_refactor_failure(&result.content, result.success) {
@@ -1698,30 +1680,30 @@ pub(super) async fn run_agent_loop(
 
             // `plan_gate_debugger`: the plan tool's OWN compile gate repeatedly
             // blocking the SAME step is a distinct stall signature from the
-            // behavioral done-gate (`gate.validation_blocks`) — the primary agent is
+            // behavioral done-gate (`state.gate.validation_blocks`) — the primary agent is
             // re-litigating one step rather than making forward progress.
             if tc.function.name == "plan"
                 && args.get("action").and_then(|a| a.as_str()) == Some("check")
             {
                 if result.success {
-                    gate.plan_step_failures.reset();
+                    state.gate.plan_step_failures.reset();
                 } else if let Some(step) = args.get("step").and_then(|s| s.as_u64()) {
-                    gate.plan_step_failures.note(step);
+                    state.gate.plan_step_failures.note(step);
 
                     let fkey = debugger::failure_key(&result.content);
                     let may_fire = if config.tools.debugger_multifire {
-                        debugger_state.fires < debugger::MAX_DEBUGGER_FIRES
-                            && debugger_state.last_failure.as_deref() != Some(fkey.as_str())
+                        state.debugger.fires < debugger::MAX_DEBUGGER_FIRES
+                            && state.debugger.last_failure.as_deref() != Some(fkey.as_str())
                     } else {
-                        debugger_state.fires == 0
+                        state.debugger.fires == 0
                     };
                     if config.tools.plan_gate_debugger
                         && may_fire
-                        && gate.plan_step_failures.streak() as usize
+                        && state.gate.plan_step_failures.streak() as usize
                             >= debugger::DEBUGGER_TRIGGER_BLOCKS
                     {
-                        debugger_state.fires += 1;
-                        debugger_state.last_failure = Some(fkey);
+                        state.debugger.fires += 1;
+                        state.debugger.last_failure = Some(fkey);
                         app.push_output(
                             "Plan-check gate failing repeatedly on the same step — spinning up a fresh-context debugger sub-agent…",
                             LineStyle::Status,
@@ -1743,14 +1725,14 @@ pub(super) async fn run_agent_loop(
                         .await;
 
                         let extra_msg = match verdict {
-                            debugger::DebuggerVerdict::Scrap if !gate.restart_fired => {
-                                gate.restart_fired = true;
-                                plan_ever_set = false;
+                            debugger::DebuggerVerdict::Scrap if !state.gate.restart_fired => {
+                                state.gate.restart_fired = true;
+                                state.plan_ever_set = false;
                                 *messages =
                                     scrap_restart(app, config, goal, mcp_summary, snapshots, true);
                                 conversation_history.clear();
-                                gate.validation_blocks = 0;
-                                gate.plan_step_failures.reset();
+                                state.gate.validation_blocks = 0;
+                                state.gate.plan_step_failures.reset();
                                 continue 'round;
                             }
                             debugger::DebuggerVerdict::Scrap => Message::user(
@@ -1799,10 +1781,11 @@ pub(super) async fn run_agent_loop(
                 && result.success
                 && tc.function.name == "revert"
                 && config.tools.edit_mode == EditMode::Fast
-                && spiral_state.resets < spiral::MAX_RESETS_PER_TURN
+                && state.spiral.resets < spiral::MAX_RESETS_PER_TURN
                 && let Some(path) = args.get("path").and_then(|p| p.as_str())
             {
-                let count = spiral_state
+                let count = state
+                    .spiral
                     .revert_counts
                     .entry(path.to_string())
                     .or_insert(0);
@@ -1810,7 +1793,7 @@ pub(super) async fn run_agent_loop(
                 if *count >= spiral::SPIRAL_REVERT_THRESHOLD {
                     let n = *count;
                     *count = 0;
-                    spiral_state.resets += 1;
+                    state.spiral.resets += 1;
                     let tried = fast_revisions
                         .as_deref()
                         .map(|r| spiral::tried_edit_labels(r, path, 4))
@@ -1857,7 +1840,7 @@ pub(super) async fn run_agent_loop(
         // Early no-plan nudge (strict only): edit tools are hidden until
         // plan(action='set'). Nudge around round 12 so a model that ignores the
         // system prompt gets a course correction before it's deeply stuck.
-        if strict && round >= 12 && !nudged_no_plan && !tools::plan::plan_exists(config) {
+        if strict && round >= 12 && !state.nudged_no_plan && !tools::plan::plan_exists(config) {
             let unlock_tools = "refactor, replace_range, insert_at, write_file";
             messages.push(Message::user(&format!(
                 "[Reminder: you've explored for several rounds without a plan. \
@@ -1865,13 +1848,13 @@ pub(super) async fn run_agent_loop(
                  the edit tools ({unlock_tools}) are hidden until you do, and \
                  you'll need them to make changes.]"
             )));
-            nudged_no_plan = true;
+            state.nudged_no_plan = true;
         }
 
         // Stall detection: too many tool calls without any edits. Content is
         // plan-state aware — without a plan the edit tools are hidden, so
         // re-fire the plan nudge instead of pointing at hidden tools.
-        if calls_since_last_edit >= 20 && calls_since_last_edit.is_multiple_of(20) {
+        if state.calls_since_last_edit >= 20 && state.calls_since_last_edit.is_multiple_of(20) {
             let body = if strict && !tools::plan::plan_exists(config) {
                 "Still no plan set after 20+ exploration calls. \
                  Edit tools cannot appear in your tool list until plan(action='set') is called. \

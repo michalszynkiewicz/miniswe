@@ -32,11 +32,12 @@ use crate::cli::commands::agent::hints::{
     visible_tool_defs,
 };
 use crate::cli::commands::agent::loop_detector::{
-    self, cycle_period, is_mutating_call, key_is_file_edit, key_is_mutating, loop_call_key_tagged,
+    cycle_period, is_mutating_call, key_is_file_edit, key_is_mutating, loop_call_key_tagged,
 };
 use crate::cli::commands::agent::prune_reads::prune_repeated_reads;
 use crate::cli::commands::agent::spiral;
 use crate::cli::commands::agent::stuck_check;
+use crate::cli::commands::agent::turn_state;
 use crate::cli::commands::agent::validation;
 use crate::config::{Config, EditMode, ModelRole};
 use crate::context;
