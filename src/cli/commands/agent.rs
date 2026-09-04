@@ -9,6 +9,7 @@
 pub mod debugger;
 pub mod display;
 pub mod hints;
+pub mod job_banners;
 pub mod loop_detector;
 pub mod permissions;
 pub mod prune_reads;

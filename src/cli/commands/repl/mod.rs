@@ -28,15 +28,13 @@ use tokio::sync::mpsc;
 use crate::cli::commands::agent::debugger;
 use crate::cli::commands::agent::display::summarize_args;
 use crate::cli::commands::agent::hints::{
-    PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE,
     REPEATED_READ_ESCALATION, REPEATED_READ_NUDGE, cycle_loop_hint, is_file_write,
-    is_prunable_refactor_failure, loop_detected_hint, truncated_tool_call_hint,
+    loop_detected_hint, truncated_tool_call_hint,
 };
 use crate::cli::commands::agent::loop_detector::{
     cycle_period, is_mutating_call, key_is_mutating, loop_call_key,
 };
 use crate::cli::commands::agent::permissions::permission_action;
-use crate::cli::commands::agent::spiral;
 use crate::cli::commands::agent::turn;
 use crate::cli::commands::agent::turn_state;
 use crate::cli::commands::agent::ui::AgentUi;

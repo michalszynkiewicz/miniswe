@@ -81,6 +81,8 @@ pub(super) async fn run_agent_loop(
         compaction: turn::CompactionUx::Interactive,
         read_only,
         live_jobs_gate: false,
+        failure_tracking: false,
+        stuck_tracking: false,
     };
 
     'round: loop {
@@ -792,185 +794,27 @@ pub(super) async fn run_agent_loop(
                     .await
             };
 
-            if !result.success
-                && let Some(hint) = tools::plan::failure_hint(config)
+            match turn::dispatch::finish_call(
+                ctx,
+                opts,
+                &mut state,
+                &mut skill_state,
+                &mut ui,
+                messages,
+                conversation_history,
+                round,
+                tc,
+                &args,
+                &args_summary,
+                &call_key,
+                &mut result,
+                &mut all_prunable_failures,
+                &mut prunable_errors,
+            )
+            .await
             {
-                result.content.push('\n');
-                result.content.push_str(&hint);
-            }
-
-            // Append round number to every tool result.
-            result
-                .content
-                .push_str(&format!("\n[round {round}/{max_rounds}]"));
-
-            let first_line = result.content.lines().next().unwrap_or("(empty)");
-            log.tool_call(&tc.function.name, &args_summary, result.success, first_line);
-            log.tool_result_detail(&tc.function.name, result.success, &result.content);
-            ui.tool_result(&tc.function.name, result.success, first_line);
-            ui.store_tool_result(&tc.function.name, &result.content);
-
-            if result.success && tc.function.name == "plan" {
-                state.successful_edits_since_plan_update = 0;
-            }
-
-            // Successful file write = code changed, reset loop/stall trackers.
-            if result.success && is_file_write(tc.function.name.as_str()) {
-                state.loops.last_call_key = None;
-                state.loops.same_call_streak = 0;
-                state.calls_since_last_edit = 0;
-                if strict && config.tools.plan {
-                    if tools::plan::plan_exists(config) {
-                        result.content.push('\n');
-                        result.content.push_str(PLAN_PROGRESS_NUDGE);
-                    }
-                    state.successful_edits_since_plan_update += 1;
-                    if state.successful_edits_since_plan_update == PLAN_CHECKPOINT_AFTER_EDITS {
-                        result.content.push('\n');
-                        result.content.push_str(PLAN_CHECKPOINT_WARNING);
-                    }
-                }
-            } else {
-                state.calls_since_last_edit += 1;
-            }
-
-            if !is_prunable_refactor_failure(&result.content, result.success) {
-                all_prunable_failures = false;
-            } else {
-                prunable_errors.push(result.content.clone());
-            }
-
-            let result_msg = Message::tool_result(&tc.id, &result.content);
-            messages.push(result_msg.clone());
-            conversation_history.push(result_msg);
-
-            // `plan_gate_debugger`: the plan tool's OWN compile gate repeatedly
-            // blocking the SAME step is a distinct stall signature from the
-            // behavioral done-gate (`state.gate.validation_blocks`) — the primary agent is
-            // re-litigating one step rather than making forward progress.
-            if tc.function.name == "plan"
-                && args.get("action").and_then(|a| a.as_str()) == Some("check")
-            {
-                if result.success {
-                    state.gate.plan_step_failures.reset();
-                } else if let Some(step) = args.get("step").and_then(|s| s.as_u64()) {
-                    state.gate.plan_step_failures.note(step);
-
-                    let fkey = debugger::failure_key(&result.content);
-                    let may_fire = if config.tools.debugger_multifire {
-                        state.debugger.fires < debugger::MAX_DEBUGGER_FIRES
-                            && state.debugger.last_failure.as_deref() != Some(fkey.as_str())
-                    } else {
-                        state.debugger.fires == 0
-                    };
-                    if config.tools.plan_gate_debugger
-                        && may_fire
-                        && state.gate.plan_step_failures.streak() as usize
-                            >= debugger::DEBUGGER_TRIGGER_BLOCKS
-                    {
-                        state.debugger.fires += 1;
-                        state.debugger.last_failure = Some(fkey);
-                        ui.status(
-                            "Plan-check gate failing repeatedly on the same step — spinning up a fresh-context debugger sub-agent…",
-                        );
-                        let verdict = debugger::run_debugger(
-                            &result.content,
-                            goal,
-                            config,
-                            llm_worker,
-                            tool_pool,
-                            tool_defs,
-                            perms,
-                            mcp_registry,
-                            lsp,
-                            fast_revisions,
-                            fast_baseline_errors,
-                            cancelled,
-                        )
-                        .await;
-
-                        let extra_msg = match verdict {
-                            debugger::DebuggerVerdict::Scrap if !state.gate.restart_fired => {
-                                state.gate.restart_fired = true;
-                                state.plan_ever_set = false;
-                                *messages = turn::restart::scrap_restart(
-                                    &mut ui,
-                                    config,
-                                    goal,
-                                    mcp_summary,
-                                    snapshots,
-                                    false,
-                                    true,
-                                );
-                                conversation_history.clear();
-                                state.gate.validation_blocks = 0;
-                                state.gate.plan_step_failures.reset();
-                                continue 'round;
-                            }
-                            debugger::DebuggerVerdict::Scrap => {
-                                Message::user(debugger::SCRAP_ALREADY_RESET_MSG)
-                            }
-                            debugger::DebuggerVerdict::Rewind(candidate) => {
-                                turn::restart::rewind_message(
-                                    &mut ui,
-                                    &candidate,
-                                    config,
-                                    perms,
-                                    lsp,
-                                    fast_revisions,
-                                    fast_baseline_errors,
-                                    &result.content,
-                                )
-                                .await
-                            }
-                            debugger::DebuggerVerdict::Report(body) => {
-                                let output_note =
-                                    validation::gate_failure_note(config, &result.content);
-                                Message::user(&debugger::build_plan_step_report_message(
-                                    &body,
-                                    &output_note,
-                                ))
-                            }
-                        };
-                        messages.push(extra_msg.clone());
-                        conversation_history.push(extra_msg);
-                    }
-                }
-            }
-
-            // Spiral-reset: a revert-loop (same file reverted repeatedly) means
-            // the agent is cycling on the same failing edits. Inject a cognitive
-            // reset (names what failed + forces a replan + concrete redirection).
-            if config.tools.spiral_reset
-                && result.success
-                && tc.function.name == "revert"
-                && config.tools.edit_mode == EditMode::Fast
-                && state.spiral.resets < spiral::MAX_RESETS_PER_TURN
-                && let Some(path) = args.get("path").and_then(|p| p.as_str())
-            {
-                let count = state
-                    .spiral
-                    .revert_counts
-                    .entry(path.to_string())
-                    .or_insert(0);
-                *count += 1;
-                if *count >= spiral::SPIRAL_REVERT_THRESHOLD {
-                    let n = *count;
-                    *count = 0;
-                    state.spiral.resets += 1;
-                    let tried = fast_revisions
-                        .as_deref()
-                        .map(|r| spiral::tried_edit_labels(r, path, 4))
-                        .unwrap_or_default();
-                    let reset = Message::user(&spiral::build_reset_message(path, n, &tried));
-                    messages.push(reset.clone());
-                    conversation_history.push(reset);
-                    ui.status("Spiral detected (revert-loop) — reset + replan injected.");
-                    log.tool_debug(
-                        "agent",
-                        &format!("spiral-reset fired for {path} after {n} reverts"),
-                    );
-                }
+                turn::CallFlow::NextCall => {}
+                turn::CallFlow::RestartRound => continue 'round,
             }
 
             // Re-render after tool result
