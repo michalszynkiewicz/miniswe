@@ -39,6 +39,30 @@ pub const GATE_RESET_AFTER_BLOCKS: usize = 2;
 /// Max gate-triggered context-resets per turn (don't loop on resets).
 pub const MAX_GATE_RESETS: usize = 1;
 
+/// A stuck agent that keeps the tree red for this many consecutive rounds gets
+/// the whole tree reset to the last green snapshot (opt-in
+/// `tools.revert_to_green`).
+pub(crate) const REVERT_TO_GREEN_BLOCKS: usize = 6;
+
+/// Per-turn spiral-reset state, shared by both agent loops: per-file revert
+/// counts this turn + how many resets fired, to detect a revert-loop (agent
+/// cycling on the same failing edits).
+#[derive(Default)]
+pub(crate) struct SpiralState {
+    pub(crate) revert_counts: std::collections::HashMap<String, usize>,
+    pub(crate) resets: usize,
+}
+
+/// Per-turn revert-to-green state (opt-in `tools.revert_to_green`): the last
+/// round whose start-of-round snapshot was green (project errors ≤ baseline)
+/// and how many consecutive rounds the project has stayed broken (see
+/// [`REVERT_TO_GREEN_BLOCKS`]).
+#[derive(Default)]
+pub(crate) struct GreenState {
+    pub(crate) last_green_round: usize,
+    pub(crate) red_streak: usize,
+}
+
 /// Fresh-start user message for a gate-triggered context reset. The verbose
 /// turn-by-turn history is dropped on re-assemble, but the agent's *deliberate*
 /// memory — its PLAN (and scratchpad) — is re-injected from disk, so this isn't

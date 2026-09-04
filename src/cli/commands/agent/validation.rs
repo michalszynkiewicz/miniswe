@@ -98,6 +98,28 @@ pub(crate) fn write_gate_failure_output(config: &Config, output: &str) -> Option
     Some(format!(".miniswe/{rel}"))
 }
 
+/// Per-turn behavioral-gate state, shared by both agent loops. Plain
+/// `pub(crate)` fields (no accessors): call sites reset different subsets at
+/// different points and the split borrows must keep working.
+#[derive(Default)]
+pub(crate) struct GateState {
+    /// How many times the behavioral done-gate has blocked completion this turn.
+    pub(crate) validation_blocks: usize,
+    /// The model's stated rationale each time the gate blocked it — so a model
+    /// that believes the check is wrong has an auditable voice (bounded by
+    /// max_retries; never a silent free pass).
+    pub(crate) validation_disputes: Vec<String>,
+    /// The reactive replan/restart sub-agents fire at most once per turn.
+    pub(crate) replan_fired: bool,
+    pub(crate) restart_fired: bool,
+    /// Gate-triggered context resets fired this turn (bounded — don't loop).
+    pub(crate) context_resets: usize,
+    /// `tools.plan_gate_debugger`: consecutive plan(check) failures on the SAME
+    /// step. Distinct from `validation_blocks` (the behavioral done-gate) — this
+    /// is the plan tool's OWN compile gate repeatedly blocking one step.
+    pub(crate) plan_step_failures: PlanStepFailures,
+}
+
 /// Consecutive `plan(action='check')` failures on the SAME step
 /// (`tools.plan_gate_debugger`'s trigger). A failure on a step other than the
 /// last-failed one (or the first ever) resets the streak to 1 — only

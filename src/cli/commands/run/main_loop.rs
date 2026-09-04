@@ -207,16 +207,8 @@ pub async fn run(
     let mut had_error = false;
     let mut user_continued = false;
 
-    // Track consecutive identical tool calls for loop detection
-    let mut last_call_key: Option<String> = None;
-    let mut same_call_streak = 0u32;
-    // Short rolling history of call keys for period-2 cycle detection
-    // (edit↔revert oscillation — invisible to the consecutive detector,
-    // which resets its streak on every alternation).
-    let mut recent_call_keys: Vec<String> = Vec::new();
-    // Number of distinct loops the model has been pulled out of in this
-    // turn. We give one recovery; a second loop ends the turn for real.
-    let mut loop_recoveries = 0u32;
+    // Per-turn loop-detection state (see `loop_detector::LoopTracker` field docs).
+    let mut loops = loop_detector::LoopTracker::default();
     // (call_key, failure output) of the most recent FAILED tool call. When the
     // model loops on a call that keeps failing (e.g. `pack package create`
     // returning a lint error 10× — e2e 2026-07-17), this is the real error to
@@ -262,40 +254,7 @@ pub async fn run(
     // Running count of successful mutating edits (stuck_check::is_mutating_edit)
     // — the freshness clock for last_judge_block.
     let mut edits_total: usize = 0;
-    let mut jobs_poll_redirects = 0u32;
-    // Read-loop escalation ladder: first detection gets the polite
-    // REPEATED_READ_NUDGE; if the model re-enters the same identical-read
-    // loop, wording is proven inert (live 121347: 6 nudges, 0 effect) and the
-    // next detection forces a context compaction before the following request
-    // — breaking the cache-hot prefix is what actually ends the loop
-    // (warm-replay probe 2026-07-15: nudge 0-1/8, forced compaction 8/8).
-    // Resets after each escalation so a later, separate loop episode starts
-    // back at the cheap nudge.
-    let mut read_nudges = 0u32;
     let mut force_compact_next_round = false;
-    // Window-detector fires this turn whose key was a FILE EDIT. A single
-    // recurrence can still be a legitimate retry; a byte-identical
-    // edit/revert recurring a SECOND time in the window is a rut, and
-    // escalates to a forced compaction (the read-loop ladder's proven
-    // breaker). Devstral `docker_20260823_114957`: the window detector fired
-    // 16× on one edit<->revert<->plan(check) rut.
-    //
-    // Loop detection used to also force a cold prompt eval
-    // (`cache_prompt=false`) here, on the theory that lossy q4-KV-cache
-    // readback flips a decision into a repeat. A corpus audit of every bench
-    // run 08-23..08-26 refuted it: 680 forced cold prefills, and the loop key
-    // was gone from the next 6 calls only 9.1% of the time against 19.3% for
-    // warm 2-streaks (a comparison biased in cold's FAVOUR would still have
-    // to beat that). On the two models where it cost the most it did
-    // essentially nothing -- Muse-Glimmer 2/117 breaks, North-Mini-Code
-    // 1/210 -- while a re-prefill of a ~40k prompt costs ~58s (Glimmer, 48%
-    // of one run's wall clock; North 75%; Mistral-Small-4 ~250s per fire).
-    // The apparent "it changed the call" successes were the loop's own
-    // periodicity: devstral cycled replace_range -> revert -> plan(check)
-    // through 16 consecutive cold prefills. `ChatRequest::cache_prompt`
-    // itself stays -- `llm/mod.rs` still uses it for the tool-call-leak
-    // retry, which is a different mechanism with its own evidence.
-    let mut window_edit_fires: u32 = 0;
     let mut nudged_no_plan = false;
     // `tools.stuck_check`: T2c frozen-signature detector (see the module doc
     // in agent/stuck_check.rs and the config field doc). Fed unconditionally
@@ -314,32 +273,11 @@ pub async fn run(
     // seconds this way (2026-08-23 bench) once a truncated call sat in
     // history. Escalates: scrub history → compact → abort the turn.
     let mut truncated_call_errors_in_a_row: usize = 0;
-    // How many times the behavioral done-gate has blocked completion this turn.
-    let mut validation_blocks: usize = 0;
-    // The model's stated rationale each time the gate blocked it — so a model
-    // that believes the check is wrong has an auditable voice (bounded by
-    // max_retries; never a silent free pass).
-    let mut validation_disputes: Vec<String> = Vec::new();
-    // The reactive debugger sub-agent fires at most once per turn.
-    let mut replan_fired = false;
-    let mut restart_fired = false;
-    let mut debugger_fires = 0usize;
-    // Signature of the last failure the debugger was handed. With
-    // `debugger_multifire`, the debugger re-fires only when this CHANGES — so it
-    // walks compile→smoke one diagnosis per distinct failure, never re-diagnosing
-    // the same one (the blunt fire-≤N× variant regressed by doing exactly that).
-    let mut last_debugged_failure: Option<String> = None;
-    // `tools.plan_gate_debugger`: consecutive plan(check) failures on the SAME
-    // step. Distinct from validation_blocks (the behavioral done-gate) — this
-    // is the plan tool's OWN compile gate repeatedly blocking one step.
-    let mut plan_step_failures = validation::PlanStepFailures::default();
-    // Gate-triggered context resets fired this turn (bounded — don't loop).
-    let mut gate_resets: usize = 0;
-    // Spiral-reset: per-file revert counts this turn + how many resets fired,
-    // to detect a revert-loop (agent cycling on the same failing edits).
-    let mut revert_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut spiral_resets: usize = 0;
+    // Per-turn gate, debugger, and spiral-reset state (see the field docs on
+    // `validation::GateState`, `debugger::DebuggerState`, `spiral::SpiralState`).
+    let mut gate = validation::GateState::default();
+    let mut debugger_state = debugger::DebuggerState::default();
+    let mut spiral_state = spiral::SpiralState::default();
 
     // Ctrl+C cancellation flag. The handler fires once and exits — no
     // loop, because `ctrl_c().await` resolves immediately after the
@@ -543,14 +481,9 @@ pub async fn run(
         ));
     }
 
-    // revert-to-green state (opt-in `tools.revert_to_green`): the last round
-    // whose start-of-round snapshot was green (project errors ≤ baseline) and
-    // how many consecutive rounds the project has stayed broken. A stuck agent
-    // that keeps the tree red for REVERT_TO_GREEN_BLOCKS rounds gets the whole
-    // tree reset to that last green snapshot (see below).
-    const REVERT_TO_GREEN_BLOCKS: usize = 6;
-    let mut last_green_round: usize = 0;
-    let mut red_streak: usize = 0;
+    // revert-to-green state (opt-in `tools.revert_to_green`) — see
+    // `spiral::GreenState` and `spiral::REVERT_TO_GREEN_BLOCKS`.
+    let mut green = spiral::GreenState::default();
     // Ceremony-gate latch: whether this context segment has ever had a plan.
     // Tool *visibility* only ever widens within a segment — see
     // `visible_tool_defs`. Reset wherever the context is scrapped and
@@ -741,7 +674,7 @@ pub async fn run(
 
         // revert-to-green: this round STARTS from the state the previous round
         // left (just snapshotted above). If the project has been broken above
-        // baseline for REVERT_TO_GREEN_BLOCKS rounds, the agent is digging
+        // baseline for spiral::REVERT_TO_GREEN_BLOCKS rounds, the agent is digging
         // deeper, not recovering — reset the whole tree to the last green
         // snapshot and tell it to start over from a clean base.
         if config.tools.revert_to_green
@@ -751,30 +684,32 @@ pub async fn run(
             {
                 let errs = tools::fast::project_error_count(lsp_client.as_deref()).await;
                 if errs <= fast_baseline_errors {
-                    last_green_round = round;
-                    red_streak = 0;
+                    green.last_green_round = round;
+                    green.red_streak = 0;
                 } else {
-                    red_streak += 1;
-                    if red_streak >= REVERT_TO_GREEN_BLOCKS {
+                    green.red_streak += 1;
+                    if green.red_streak >= spiral::REVERT_TO_GREEN_BLOCKS {
                         let result = {
                             let guard = snap.lock();
-                            guard.revert_to_round(last_green_round)
+                            guard.revert_to_round(green.last_green_round)
                         };
                         match result {
                             Ok(m) => {
                                 tui::print_status(&format!(
-                                    "[revert-to-green] stuck {red_streak} rounds; {m}"
+                                    "[revert-to-green] stuck {} rounds; {m}",
+                                    green.red_streak
                                 ));
                                 messages.push(Message::user(&format!(
                                     "[auto-revert-to-green] The project has had compile errors for \
-                                     {red_streak} rounds straight and you are not converging — you are \
+                                     {} rounds straight and you are not converging — you are \
                                      digging deeper, not recovering. I reverted the ENTIRE working tree \
-                                     to round {last_green_round}, the last state that compiled cleanly. \
+                                     to round {}, the last state that compiled cleanly. \
                                      Your edits since then are GONE; do not replay them. Start over from \
                                      this clean base: re-read the relevant code, make ONE small complete \
-                                     change, and run a check before continuing."
+                                     change, and run a check before continuing.",
+                                    green.red_streak, green.last_green_round
                                 )));
-                                red_streak = 0;
+                                green.red_streak = 0;
                             }
                             Err(e) => {
                                 tui::print_status(&format!("[revert-to-green] revert failed: {e}"));
@@ -944,7 +879,7 @@ pub async fn run(
             max_tokens_override,
             chat_template_kwargs: Some(chat_template_kwargs),
             temperature_override,
-            // Never forced from the agent loop; see `window_edit_fires`.
+            // Never forced from the agent loop; see `loops.window_edit_fires`.
             cache_prompt: None,
         };
         log.llm_request(&request);
@@ -1389,12 +1324,12 @@ pub async fn run(
                 // + the debugger per-step). See docs/success-validation-design.md.
                 let effective_check = skill_cursor::current_check_command(&config)
                     .or_else(|| config.validation.command().map(str::to_string));
-                if validation_blocks < config.validation.max_retries
+                if gate.validation_blocks < config.validation.max_retries
                     && let Some(check_cmd) = effective_check.as_deref()
                 {
                     match validation::run_check_command(&config, check_cmd).await {
                         validation::CheckOutcome::Fail(output) => {
-                            validation_blocks += 1;
+                            gate.validation_blocks += 1;
                             // Record the model's completion rationale (its
                             // no-tool-call exit content). If it believes the
                             // check is wrong, this is its bounded, auditable
@@ -1406,10 +1341,11 @@ pub async fn run(
                                 .filter(|c| !c.is_empty())
                             {
                                 tracing::warn!(
-                                    "[validation] blocked completion (attempt {validation_blocks}); model rationale: {}",
+                                    "[validation] blocked completion (attempt {}); model rationale: {}",
+                                    gate.validation_blocks,
                                     crate::truncate_chars(rationale, 300)
                                 );
-                                validation_disputes.push(rationale.to_string());
+                                gate.validation_disputes.push(rationale.to_string());
                             }
                             tui::print_status("Behavioral check failed — not done yet.");
 
@@ -1420,8 +1356,8 @@ pub async fn run(
                             // attempt at the task, clearing the degraded plan. Tests
                             // detect-and-restart: a stuck/off-path state is worse than
                             // a clean start (run2), so scrap it. Fires once per turn.
-                            if config.tools.gate_restart && !restart_fired {
-                                restart_fired = true;
+                            if config.tools.gate_restart && !gate.restart_fired {
+                                gate.restart_fired = true;
                                 if let Some(ref snap) = snapshots {
                                     let guard = snap.lock();
                                     match guard.revert_to_round(0) {
@@ -1448,8 +1384,8 @@ pub async fn run(
                                 );
                                 messages = assembled.messages;
                                 conversation_history.clear();
-                                validation_blocks = 0;
-                                plan_step_failures.reset();
+                                gate.validation_blocks = 0;
+                                gate.plan_step_failures.reset();
                                 tui::print_status(
                                     "[gate-restart] scrapped the stuck state — tree at clean baseline + fresh context; restarting from scratch.",
                                 );
@@ -1470,8 +1406,8 @@ pub async fn run(
                             let is_compile_fail = output.contains("DOES NOT COMPILE")
                                 || output.contains("could not compile")
                                 || output.contains("error[E");
-                            if config.tools.gate_replan && !replan_fired && !is_compile_fail {
-                                replan_fired = true;
+                            if config.tools.gate_replan && !gate.replan_fired && !is_compile_fail {
+                                gate.replan_fired = true;
                                 tui::print_status(
                                     "Re-anchoring on the original goal — re-plan from the task…",
                                 );
@@ -1502,17 +1438,17 @@ pub async fn run(
                             // failure signature (walk compile→smoke).
                             let fkey = debugger::failure_key(&output);
                             let may_fire = if config.tools.debugger_multifire {
-                                debugger_fires < debugger::MAX_DEBUGGER_FIRES
-                                    && last_debugged_failure.as_deref() != Some(fkey.as_str())
+                                debugger_state.fires < debugger::MAX_DEBUGGER_FIRES
+                                    && debugger_state.last_failure.as_deref() != Some(fkey.as_str())
                             } else {
-                                debugger_fires == 0
+                                debugger_state.fires == 0
                             };
                             if (config.tools.reactive_debugger || config.tools.debugger_judge)
                                 && may_fire
-                                && validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
+                                && gate.validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
                             {
-                                debugger_fires += 1;
-                                last_debugged_failure = Some(fkey);
+                                debugger_state.fires += 1;
+                                debugger_state.last_failure = Some(fkey);
                                 tui::print_status(
                                     "Still failing — spinning up a fresh-context debugger sub-agent…",
                                 );
@@ -1537,8 +1473,8 @@ pub async fn run(
                                 // Rewind → the loop reverts JUST the one flagged file;
                                 // Report → inject the diagnosis for the main agent.
                                 let msg = match verdict {
-                                    debugger::DebuggerVerdict::Scrap if !restart_fired => {
-                                        restart_fired = true;
+                                    debugger::DebuggerVerdict::Scrap if !gate.restart_fired => {
+                                        gate.restart_fired = true;
                                         if let Some(ref snap) = snapshots {
                                             let guard = snap.lock();
                                             match guard.revert_to_round(0) {
@@ -1569,8 +1505,8 @@ pub async fn run(
                                         );
                                         messages = assembled.messages;
                                         conversation_history.clear();
-                                        validation_blocks = 0;
-                                        plan_step_failures.reset();
+                                        gate.validation_blocks = 0;
+                                        gate.plan_step_failures.reset();
                                         tui::print_status(
                                             "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                         );
@@ -1628,11 +1564,11 @@ pub async fn run(
                             // the in-session equivalent of a best-of-3 fresh
                             // attempt (files persist on disk). Bounded per turn.
                             if config.tools.gate_context_reset
-                                && gate_resets < spiral::MAX_GATE_RESETS
-                                && validation_blocks >= spiral::GATE_RESET_AFTER_BLOCKS
+                                && gate.context_resets < spiral::MAX_GATE_RESETS
+                                && gate.validation_blocks >= spiral::GATE_RESET_AFTER_BLOCKS
                             {
-                                gate_resets += 1;
-                                validation_blocks = 0; // fresh gate budget for the clean restart
+                                gate.context_resets += 1;
+                                gate.validation_blocks = 0; // fresh gate budget for the clean restart
                                 let fresh = spiral::build_gate_reset_prompt(message, &output);
                                 let assembled = context::assemble(
                                     &config,
@@ -1671,15 +1607,15 @@ pub async fn run(
                 // Exiting now. If the gate blocked the model along the way,
                 // surface its recorded rationale(s) for audit — whether it
                 // ultimately fixed the change or exhausted the retry budget.
-                if !validation_disputes.is_empty() {
+                if !gate.validation_disputes.is_empty() {
                     tui::print_status(&format!(
                         "Completed after {} blocked verification(s); model's reasons recorded in the log.",
-                        validation_disputes.len()
+                        gate.validation_disputes.len()
                     ));
                     tracing::warn!(
                         "[validation] turn completed over {} blocked check(s); model rationale(s): {}",
-                        validation_disputes.len(),
-                        validation_disputes.join(" | ")
+                        gate.validation_disputes.len(),
+                        gate.validation_disputes.join(" | ")
                     );
                 }
                 break;
@@ -1769,15 +1705,15 @@ pub async fn run(
             // because every alternation resets it).
             let call_key =
                 loop_call_key_tagged(&tc.function.name, &args, active_step_tag.as_deref());
-            if last_call_key.as_ref() == Some(&call_key) {
-                same_call_streak += 1;
+            if loops.last_call_key.as_ref() == Some(&call_key) {
+                loops.same_call_streak += 1;
             } else {
-                last_call_key = Some(call_key.clone());
-                same_call_streak = 1;
+                loops.last_call_key = Some(call_key.clone());
+                loops.same_call_streak = 1;
             }
-            recent_call_keys.push(call_key.clone());
-            if recent_call_keys.len() > 12 {
-                recent_call_keys.remove(0);
+            loops.recent_call_keys.push(call_key.clone());
+            if loops.recent_call_keys.len() > 12 {
+                loops.recent_call_keys.remove(0);
             }
             // Soft loop-breaker for the "wandering grind": a call that recurs
             // FREQUENTLY in the window even when INTERSPERSED (so it never
@@ -1789,19 +1725,25 @@ pub async fn run(
             // each element at exactly 12/3=4, so 4 catches period-2 AND
             // period-3 wandering; 5 would miss period-3.
             const WINDOW_REPEAT_FREQ: usize = 4;
-            if recent_call_keys.iter().filter(|k| **k == call_key).count() >= WINDOW_REPEAT_FREQ {
-                recent_call_keys.clear();
+            if loops
+                .recent_call_keys
+                .iter()
+                .filter(|k| **k == call_key)
+                .count()
+                >= WINDOW_REPEAT_FREQ
+            {
+                loops.recent_call_keys.clear();
                 // Escalate on a RECURRING file edit: one recurrence can be a
                 // legitimate retry, a second is a rut, so break the cache-hot
                 // prefix for real. Reads/checks/tests are exempt — repeating
                 // those between different edits is a normal rhythm.
                 let escalate = key_is_file_edit(&call_key) && {
-                    window_edit_fires += 1;
-                    window_edit_fires >= 2
+                    loops.window_edit_fires += 1;
+                    loops.window_edit_fires >= 2
                 };
                 if escalate {
                     force_compact_next_round = true;
-                    window_edit_fires = 0;
+                    loops.window_edit_fires = 0;
                 }
                 tui::print_status(&format!(
                     "[loop] '{args_summary}' recurred {WINDOW_REPEAT_FREQ}x in the window{}",
@@ -1812,21 +1754,26 @@ pub async fn run(
                     }
                 ));
             }
-            let cycle = cycle_period(&recent_call_keys);
-            if same_call_streak >= 3 || cycle.is_some() {
+            let cycle = cycle_period(&loops.recent_call_keys);
+            if loops.same_call_streak >= 3 || cycle.is_some() {
                 // Cycle-only detection (not also a plain streak). Captured
                 // before any state resets below so messaging stays accurate.
-                let cycle_only = cycle.filter(|_| same_call_streak < 3);
+                let cycle_only = cycle.filter(|_| loops.same_call_streak < 3);
                 // A cycle is harmful if ANY member mutates (the classic case
                 // is edit↔revert — both mutate; edit↔read still re-applies
                 // the same broken edit).
                 let mutating = if let Some(period) = cycle_only {
-                    let tail = &recent_call_keys[recent_call_keys.len().saturating_sub(period)..];
+                    let tail = &loops.recent_call_keys
+                        [loops.recent_call_keys.len().saturating_sub(period)..];
                     tail.iter().any(|k| key_is_mutating(k))
                 } else {
                     is_mutating_call(&tc.function.name, &args)
                 };
-                log.loop_detected(&tc.function.name, &args_summary, same_call_streak as usize);
+                log.loop_detected(
+                    &tc.function.name,
+                    &args_summary,
+                    loops.same_call_streak as usize,
+                );
 
                 // Polling a status command while a background job runs is
                 // the unpaced form of monitoring — redirect to the paced one,
@@ -1839,9 +1786,9 @@ pub async fn run(
                 if ((tc.function.name == "shell" && args["action"].as_str() == Some("run"))
                     || (tc.function.name == "file" && args["action"].as_str() == Some("shell")))
                     && !job_registry.is_empty()
-                    && jobs_poll_redirects < 2
+                    && loops.jobs_poll_redirects < 2
                 {
-                    jobs_poll_redirects += 1;
+                    loops.jobs_poll_redirects += 1;
                     let polled = args["command"].as_str().unwrap_or("<status command>");
                     let result_msg = Message::tool_result(
                         &tc.id,
@@ -1857,9 +1804,9 @@ pub async fn run(
                         "Job-poll loop: {}({}) — redirected to jobs(wait), continuing",
                         tc.function.name, args_summary
                     ));
-                    last_call_key = None;
-                    same_call_streak = 0;
-                    recent_call_keys.clear();
+                    loops.last_call_key = None;
+                    loops.same_call_streak = 0;
+                    loops.recent_call_keys.clear();
                     continue;
                 }
 
@@ -1868,10 +1815,10 @@ pub async fn run(
                 // continue. Re-detection: escalate — the nudge can't reach a
                 // cache-numerics rut, so force a compaction next round.
                 if !mutating {
-                    read_nudges += 1;
-                    let escalate = read_nudges >= 2;
+                    loops.read_nudges += 1;
+                    let escalate = loops.read_nudges >= 2;
                     let text = if escalate {
-                        read_nudges = 0;
+                        loops.read_nudges = 0;
                         force_compact_next_round = true;
                         REPEATED_READ_ESCALATION
                     } else {
@@ -1890,9 +1837,9 @@ pub async fn run(
                             "nudge sent"
                         }
                     ));
-                    last_call_key = None;
-                    same_call_streak = 0;
-                    recent_call_keys.clear();
+                    loops.last_call_key = None;
+                    loops.same_call_streak = 0;
+                    loops.recent_call_keys.clear();
                     continue;
                 }
 
@@ -1909,11 +1856,11 @@ pub async fn run(
                 // the streak, and let the model try a different approach.
                 // Subsequent loops mean the recovery itself spiraled —
                 // abort for real.
-                if loop_recoveries == 0 {
-                    loop_recoveries += 1;
-                    last_call_key = None;
-                    same_call_streak = 0;
-                    recent_call_keys.clear();
+                if loops.recoveries == 0 {
+                    loops.recoveries += 1;
+                    loops.last_call_key = None;
+                    loops.same_call_streak = 0;
+                    loops.recent_call_keys.clear();
                     tui::print_error(&format!(
                         "Loop detected: {}({}) {} — surfacing a hint, giving the model one more round",
                         tc.function.name,
@@ -2003,33 +1950,33 @@ pub async fn run(
                     })
                 };
                 if let Some(output) = recover_output
-                    && validation_blocks < config.validation.max_retries
+                    && gate.validation_blocks < config.validation.max_retries
                 {
                     tui::print_error(&format!(
                         "Loop detected again ({}({})) — routing through the recovery ladder instead of stopping",
                         tc.function.name, args_summary
                     ));
                     {
-                        validation_blocks += 1;
+                        gate.validation_blocks += 1;
                         // Fresh recovery budget for the rounds the ladder grants.
-                        loop_recoveries = 0;
-                        last_call_key = None;
-                        same_call_streak = 0;
-                        recent_call_keys.clear();
+                        loops.recoveries = 0;
+                        loops.last_call_key = None;
+                        loops.same_call_streak = 0;
+                        loops.recent_call_keys.clear();
 
                         let fkey = debugger::failure_key(&output);
                         let may_fire = if config.tools.debugger_multifire {
-                            debugger_fires < debugger::MAX_DEBUGGER_FIRES
-                                && last_debugged_failure.as_deref() != Some(fkey.as_str())
+                            debugger_state.fires < debugger::MAX_DEBUGGER_FIRES
+                                && debugger_state.last_failure.as_deref() != Some(fkey.as_str())
                         } else {
-                            debugger_fires == 0
+                            debugger_state.fires == 0
                         };
                         if (config.tools.reactive_debugger || config.tools.debugger_judge)
                             && may_fire
-                            && validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
+                            && gate.validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
                         {
-                            debugger_fires += 1;
-                            last_debugged_failure = Some(fkey);
+                            debugger_state.fires += 1;
+                            debugger_state.last_failure = Some(fkey);
                             tui::print_status(
                                 "Looping + failing gate — spinning up a fresh-context debugger sub-agent…",
                             );
@@ -2050,8 +1997,8 @@ pub async fn run(
                             .await;
 
                             let msg = match verdict {
-                                debugger::DebuggerVerdict::Scrap if !restart_fired => {
-                                    restart_fired = true;
+                                debugger::DebuggerVerdict::Scrap if !gate.restart_fired => {
+                                    gate.restart_fired = true;
                                     if let Some(ref snap) = snapshots {
                                         let guard = snap.lock();
                                         match guard.revert_to_round(0) {
@@ -2077,8 +2024,8 @@ pub async fn run(
                                     );
                                     messages = assembled.messages;
                                     conversation_history.clear();
-                                    validation_blocks = 0;
-                                    plan_step_failures.reset();
+                                    gate.validation_blocks = 0;
+                                    gate.plan_step_failures.reset();
                                     tui::print_status(
                                         "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                     );
@@ -2668,8 +2615,8 @@ pub async fn run(
 
             // A successful file write means code changed — reset trackers.
             if result.success && is_file_write(tc.function.name.as_str()) {
-                last_call_key = None;
-                same_call_streak = 0;
+                loops.last_call_key = None;
+                loops.same_call_streak = 0;
                 calls_since_last_edit = 0;
                 if strict && config.tools.plan {
                     if tools::plan::plan_exists(&config) {
@@ -2708,7 +2655,7 @@ pub async fn run(
 
             // `tools.plan_gate_debugger`: the plan tool's OWN compile gate
             // repeatedly blocking the SAME step is a distinct stall signature
-            // from the behavioral done-gate (`validation_blocks` above) — the
+            // from the behavioral done-gate (`gate.validation_blocks` above) — the
             // primary agent is re-litigating one step in its own accumulated
             // context rather than making forward progress. See the field doc
             // in config/mod.rs for the forensic evidence motivating this.
@@ -2716,23 +2663,24 @@ pub async fn run(
                 && args.get("action").and_then(|a| a.as_str()) == Some("check")
             {
                 if result.success {
-                    plan_step_failures.reset();
+                    gate.plan_step_failures.reset();
                 } else if let Some(step) = args.get("step").and_then(|s| s.as_u64()) {
-                    plan_step_failures.note(step);
+                    gate.plan_step_failures.note(step);
 
                     let fkey = debugger::failure_key(&result.content);
                     let may_fire = if config.tools.debugger_multifire {
-                        debugger_fires < debugger::MAX_DEBUGGER_FIRES
-                            && last_debugged_failure.as_deref() != Some(fkey.as_str())
+                        debugger_state.fires < debugger::MAX_DEBUGGER_FIRES
+                            && debugger_state.last_failure.as_deref() != Some(fkey.as_str())
                     } else {
-                        debugger_fires == 0
+                        debugger_state.fires == 0
                     };
                     if config.tools.plan_gate_debugger
                         && may_fire
-                        && plan_step_failures.streak() as usize >= debugger::DEBUGGER_TRIGGER_BLOCKS
+                        && gate.plan_step_failures.streak() as usize
+                            >= debugger::DEBUGGER_TRIGGER_BLOCKS
                     {
-                        debugger_fires += 1;
-                        last_debugged_failure = Some(fkey);
+                        debugger_state.fires += 1;
+                        debugger_state.last_failure = Some(fkey);
                         tui::print_status(
                             "Plan-check gate failing repeatedly on the same step — spinning up a fresh-context debugger sub-agent…",
                         );
@@ -2753,8 +2701,8 @@ pub async fn run(
                         .await;
 
                         let extra_msg = match verdict {
-                            debugger::DebuggerVerdict::Scrap if !restart_fired => {
-                                restart_fired = true;
+                            debugger::DebuggerVerdict::Scrap if !gate.restart_fired => {
+                                gate.restart_fired = true;
                                 if let Some(ref snap) = snapshots {
                                     let guard = snap.lock();
                                     match guard.revert_to_round(0) {
@@ -2779,8 +2727,8 @@ pub async fn run(
                                 );
                                 messages = assembled.messages;
                                 conversation_history.clear();
-                                validation_blocks = 0;
-                                plan_step_failures.reset();
+                                gate.validation_blocks = 0;
+                                gate.plan_step_failures.reset();
                                 tui::print_status(
                                     "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                 );
@@ -2833,15 +2781,18 @@ pub async fn run(
                 && result.success
                 && tc.function.name == "revert"
                 && config.tools.edit_mode == EditMode::Fast
-                && spiral_resets < spiral::MAX_RESETS_PER_TURN
+                && spiral_state.resets < spiral::MAX_RESETS_PER_TURN
                 && let Some(path) = args.get("path").and_then(|p| p.as_str())
             {
-                let count = revert_counts.entry(path.to_string()).or_insert(0);
+                let count = spiral_state
+                    .revert_counts
+                    .entry(path.to_string())
+                    .or_insert(0);
                 *count += 1;
                 if *count >= spiral::SPIRAL_REVERT_THRESHOLD {
                     let n = *count;
                     *count = 0;
-                    spiral_resets += 1;
+                    spiral_state.resets += 1;
                     let tried = fast_revisions
                         .as_deref()
                         .map(|r| spiral::tried_edit_labels(r, path, 4))

@@ -41,8 +41,8 @@ pub struct ChatRequest {
     /// it. The agent loop no longer forces cold prefills on loop detection: a
     /// corpus audit of 680 forced prefills found no break-rate benefit and a
     /// large cost (a ~40k-token re-prefill is ~58s, up to ~250s on
-    /// Mistral-Small-4). See the `window_edit_fires` comment in
-    /// `cli::commands::run`.
+    /// Mistral-Small-4). See the `window_edit_fires` field doc on
+    /// `cli::commands::agent::loop_detector::LoopTracker`.
     #[serde(skip)]
     pub cache_prompt: Option<bool>,
 }
