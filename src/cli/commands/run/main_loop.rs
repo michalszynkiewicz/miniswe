@@ -435,6 +435,8 @@ pub async fn run(
         ));
     }
 
+    let mut ui = HeadlessUi { headless };
+
     'round: loop {
         if had_error {
             break;
@@ -485,12 +487,12 @@ pub async fn run(
                         // that will not resolve, so holding on the step would
                         // retry it forever instead of grinding on real work.
                         cursor.mark_abandoned();
-                        tui::print_status(&format!(
+                        ui.status(&format!(
                             "[skills] handoff '{next}' yielded no steps {n}x; skipping (sub-skill NOT run)"
                         ));
                         report_cursor_gaps(&cursor);
                     } else {
-                        tui::print_status(&format!(
+                        ui.status(&format!(
                             "[skills] handoff '{next}' yielded no steps (attempt {n}); will retry"
                         ));
                     }
@@ -538,7 +540,7 @@ pub async fn run(
                                     None => validation::CheckOutcome::Skipped,
                                 };
                                 if let validation::CheckOutcome::Fail(out) = verdict {
-                                    tui::print_status(&format!(
+                                    ui.status(&format!(
                                         "[skills] '{step_name}' judged done but its check failed — holding"
                                     ));
                                     let msg = Message::user(&format!(
@@ -552,11 +554,11 @@ pub async fn run(
                                     cursor.mark_done();
                                     skill_state.last_judge_block = None;
                                     match cursor.current() {
-                                        Some((_, next)) => tui::print_status(&format!(
+                                        Some((_, next)) => ui.status(&format!(
                                             "[skills] '{step_name}' judged done → advancing to '{}'",
                                             next.name
                                         )),
-                                        None => tui::print_status(&format!(
+                                        None => ui.status(&format!(
                                             "[skills] '{step_name}' judged done → {skill_name} skill complete"
                                         )),
                                     }
@@ -582,7 +584,7 @@ pub async fn run(
                                 // discarding (e2e: it flagged the tmp_repo build).
                                 // Dedup so an identical reason isn't re-nudged every
                                 // cycle (repeats feed loops).
-                                tui::print_status(&format!(
+                                ui.status(&format!(
                                     "[skills] '{step_name}' judged not done: {reason}"
                                 ));
                                 // Record the standing verdict for the log-only
@@ -641,7 +643,7 @@ pub async fn run(
                         };
                         match result {
                             Ok(m) => {
-                                tui::print_status(&format!(
+                                ui.status(&format!(
                                     "[revert-to-green] stuck {} rounds; {m}",
                                     state.green.red_streak
                                 ));
@@ -654,7 +656,9 @@ pub async fn run(
                                 state.green.red_streak = 0;
                             }
                             Err(e) => {
-                                tui::print_status(&format!("[revert-to-green] revert failed: {e}"));
+                                ui.event(UiEvent::RevertToGreenFailed {
+                                    error: e.to_string(),
+                                });
                             }
                         }
                     }
@@ -662,32 +666,23 @@ pub async fn run(
             }
         }
         if round > max_rounds {
-            tui::print_error("Maximum tool rounds reached. Stopping.");
+            ui.event(UiEvent::MaxRoundsReached);
             break;
         }
 
         // Ask user if they want to continue after pause_after_rounds.
-        // Headless runs have nobody to answer — blocking on stdin hung real
-        // e2e harness runs for their full timeout (pkg-mcp 2026-07-13: two
-        // of three attempts died waiting at exactly this prompt). Continue
-        // with a logged notice instead; max_rounds stays the hard stop.
+        // The headless auto-continue notice lives in HeadlessUi (blocking on
+        // stdin hung real e2e harness runs for their full timeout — pkg-mcp
+        // 2026-07-13: two of three attempts died waiting at exactly this
+        // prompt); max_rounds stays the hard stop.
         if round == pause_at && !state.user_continued {
-            if headless {
-                tui::print_status(&format!(
-                    "{pause_at} tool rounds used — headless, continuing without prompt."
-                ));
-                state.user_continued = true;
-            } else {
-                tui::print_status(&format!("{pause_at} tool rounds used."));
-                let response = tui::read_input("Continue? [y]es / [n]o:");
-                match response.as_deref() {
-                    Some("y") | Some("yes") | Some("") => {
-                        state.user_continued = true;
-                    }
-                    _ => {
-                        // Tell the LLM to wrap up
-                        messages.push(Message::user("[Stop now. Summarize what you've done.]"));
-                    }
+            match ui.confirm_continue(pause_at).await {
+                PauseDecision::Continue => {
+                    state.user_continued = true;
+                }
+                PauseDecision::WrapUp => {
+                    // Tell the LLM to wrap up
+                    messages.push(Message::user("[Stop now. Summarize what you've done.]"));
                 }
             }
         }
@@ -711,16 +706,11 @@ pub async fn run(
                 pruned.keys,
                 pruned.deepest.as_deref().unwrap_or("?"),
             );
-            tui::print_status(&format!(
-                "[prune] dropped {} repeated {} from context{}",
-                pruned.removed / 2,
-                if pruned.keys == 1 { "call" } else { "calls" },
-                pruned
-                    .deepest
-                    .as_deref()
-                    .map(|d| format!(" (deepest: {d})"))
-                    .unwrap_or_default()
-            ));
+            ui.event(UiEvent::ReadsPruned {
+                pairs: pruned.removed / 2,
+                keys: pruned.keys,
+                deepest: pruned.deepest,
+            });
         }
 
         // Unified context compression — handles both tool results and conversation
@@ -731,24 +721,24 @@ pub async fn run(
         // maybe_compress so refresh_current_state still lands on the tail.
         if state.force_compact_next_round {
             state.force_compact_next_round = false;
-            tui::print_status("Loop persisted past the nudge — forcing context compaction.");
-            context::compressor::force_compress(
+            ui.event(UiEvent::ForcingCompaction);
+            ui.pump(context::compressor::force_compress(
                 &mut messages,
                 &config,
                 &router,
                 &llm_worker,
                 tool_def_tokens,
-            )
+            ))
             .await;
         }
-        context::compressor::maybe_compress(
+        ui.pump(context::compressor::maybe_compress(
             &mut messages,
             &config,
             &router,
             &llm_worker,
             tool_def_tokens,
             &mut state.plan_update_requested,
-        )
+        ))
         .await;
         log.masking_applied(pre_mask.saturating_sub(messages.len()), pre_mask);
 
@@ -826,43 +816,25 @@ pub async fn run(
         };
         log.llm_request(&request);
 
-        tui::print_separator();
+        ui.separator();
 
         // Reset cancel flag for this round
         cancelled.store(false, Ordering::Relaxed);
 
-        eprint!("\x1b[2m⠋ thinking...\x1b[0m");
-        std::io::stderr().flush().ok();
-        let thinking = Arc::new(AtomicBool::new(true));
-
-        let mut llm_events = llm_worker.submit(model_role, request.clone(), cancelled.clone());
-        let response = match loop {
-            match llm_events.recv().await {
-                Some(LlmWorkerEvent::Token(token)) => {
-                    if thinking.load(Ordering::Relaxed) {
-                        thinking.store(false, Ordering::Relaxed);
-                        eprint!("\r\x1b[2K");
-                        std::io::stderr().flush().ok();
-                    }
-                    tui::print_token(&token);
-                }
-                Some(LlmWorkerEvent::Completed(Ok(r))) => break Ok(r),
-                Some(LlmWorkerEvent::Completed(Err(e))) => break Err(e),
-                None => break Err("LLM worker stopped unexpectedly".to_string()),
-            }
-        } {
-            Ok(r) => {
-                if thinking.load(Ordering::Relaxed) {
-                    eprint!("\r\x1b[2K");
-                    std::io::stderr().flush().ok();
-                }
-                r
-            }
-            Err(err_str) => {
-                eprint!("\r\x1b[2K");
-                std::io::stderr().flush().ok();
+        let response = match ui
+            .stream_llm(&llm_worker, model_role, request, &cancelled)
+            .await
+        {
+            LlmOutcome::Response(r) => r,
+            outcome => {
+                let err_str = match outcome {
+                    LlmOutcome::Error(e) => e,
+                    // WorkerStopped (UiClosed never occurs headless) routes
+                    // through the generic error ladder below.
+                    _ => "LLM worker stopped unexpectedly".to_string(),
+                };
                 if err_str.contains("Interrupted") {
-                    tui::print_status("Generation interrupted.");
+                    ui.status("Generation interrupted.");
                     break;
                 }
                 // The server rejected the request outright: prompt alone
@@ -875,17 +847,18 @@ pub async fn run(
                         < context::compressor::FORCE_COMPRESS_MAX_RETRIES
                 {
                     state.context_compact_retries += 1;
-                    if context::compressor::force_compress(
-                        &mut messages,
-                        &config,
-                        &router,
-                        &llm_worker,
-                        tool_def_tokens,
-                    )
-                    .await
+                    if ui
+                        .pump(context::compressor::force_compress(
+                            &mut messages,
+                            &config,
+                            &router,
+                            &llm_worker,
+                            tool_def_tokens,
+                        ))
+                        .await
                     {
                         log.llm_error("context window exceeded — compacted history, retrying");
-                        tui::print_status("Context window exceeded — compacting and retrying.");
+                        ui.status("Context window exceeded — compacting and retrying.");
                         continue;
                     }
                     // Nothing could be freed — fall through to the normal
@@ -902,7 +875,7 @@ pub async fn run(
                             "{} consecutive oversized tool calls — aborting turn",
                             state.truncated_call_errors_in_a_row
                         ));
-                        tui::print_error(
+                        ui.error(
                             "The model keeps emitting oversized tool-call arguments — giving up on this turn.",
                         );
                         had_error = true;
@@ -911,7 +884,7 @@ pub async fn run(
                     log.llm_error(&format!(
                         "tool call aborted by the argument size cap: {err_str}"
                     ));
-                    tui::print_status(
+                    ui.status(
                         "Tool call arguments exceeded the size cap — retrying with guidance.",
                     );
                     let hint = Message::user(&format!(
@@ -940,9 +913,7 @@ pub async fn run(
                             log.llm_error(&format!(
                                 "scrubbed {scrubbed} unparseable tool call(s) from history after repeated parse failures — retrying"
                             ));
-                            tui::print_status(
-                                "Repaired a truncated tool call left in history — retrying.",
-                            );
+                            ui.status("Repaired a truncated tool call left in history — retrying.");
                             continue;
                         }
                     }
@@ -951,7 +922,7 @@ pub async fn run(
                             "{} consecutive tool-call parse failures with nothing left to repair — aborting turn",
                             state.truncated_call_errors_in_a_row
                         ));
-                        tui::print_error(
+                        ui.error(
                             "The server keeps rejecting tool-call arguments — giving up on this turn.",
                         );
                         had_error = true;
@@ -967,19 +938,20 @@ pub async fn run(
                             < context::compressor::FORCE_COMPRESS_MAX_RETRIES
                     {
                         state.context_compact_retries += 1;
-                        if context::compressor::force_compress(
-                            &mut messages,
-                            &config,
-                            &router,
-                            &llm_worker,
-                            tool_def_tokens,
-                        )
-                        .await
+                        if ui
+                            .pump(context::compressor::force_compress(
+                                &mut messages,
+                                &config,
+                                &router,
+                                &llm_worker,
+                                tool_def_tokens,
+                            ))
+                            .await
                         {
                             log.llm_error(
                                 "tool call truncated near context ceiling — compacted history, retrying",
                             );
-                            tui::print_status(
+                            ui.status(
                                 "Tool call truncated near context ceiling — compacting and retrying.",
                             );
                             continue;
@@ -990,7 +962,7 @@ pub async fn run(
                     log.llm_error(
                         "tool call JSON truncated (max_tokens) — injecting hint and continuing",
                     );
-                    tui::print_status("Previous tool call truncated — retrying with guidance.");
+                    ui.status("Previous tool call truncated — retrying with guidance.");
                     let hint = Message::user(truncated_tool_call_hint(config.tools.edit_mode));
                     messages.push(hint.clone());
                     conversation_history.push(hint);
@@ -1007,8 +979,8 @@ pub async fn run(
                     err_str
                 };
                 log.llm_error(&clean);
-                tui::print_error(&format!("LLM error: {clean}"));
-                tui::print_status(&format!(
+                ui.error(&format!("LLM error: {clean}"));
+                ui.status(&format!(
                     "Check that your LLM server is running at {}",
                     config.model.endpoint
                 ));
@@ -1033,21 +1005,20 @@ pub async fn run(
             && state.context_compact_retries < context::compressor::FORCE_COMPRESS_MAX_RETRIES
         {
             state.context_compact_retries += 1;
-            if context::compressor::force_compress(
-                &mut messages,
-                &config,
-                &router,
-                &llm_worker,
-                tool_def_tokens,
-            )
-            .await
+            if ui
+                .pump(context::compressor::force_compress(
+                    &mut messages,
+                    &config,
+                    &router,
+                    &llm_worker,
+                    tool_def_tokens,
+                ))
+                .await
             {
                 log.llm_error(
                     "generation truncated by context ceiling — compacted history, regenerating",
                 );
-                tui::print_status(
-                    "Generation truncated by context ceiling — compacting and regenerating.",
-                );
+                ui.status("Generation truncated by context ceiling — compacting and regenerating.");
                 continue;
             }
         }
@@ -1056,7 +1027,7 @@ pub async fn run(
         let choice = match response.choices.first() {
             Some(c) => c,
             None => {
-                tui::print_error("Empty response from LLM");
+                ui.event(UiEvent::EmptyLlmResponse);
                 break;
             }
         };
@@ -1077,16 +1048,11 @@ pub async fn run(
             log.llm_error(&format!(
                 "{truncated_calls} tool call(s) arrived with unparseable arguments (cut off by the output limit) — stubbed before persisting"
             ));
-            tui::print_status(
-                "A tool call was cut off by the output limit — it will not be executed.",
-            );
+            ui.status("A tool call was cut off by the output limit — it will not be executed.");
         }
         let assistant_msg = &assistant_msg;
 
-        // Print newline after streaming content
-        if assistant_msg.content.is_some() {
-            println!();
-        }
+        ui.finish_assistant_text(assistant_msg.content.as_deref());
 
         // Log and add assistant message to history
         if let Some(content) = &assistant_msg.content {
@@ -1182,7 +1148,7 @@ pub async fn run(
                             let m = Message::user(&msg);
                             messages.push(m.clone());
                             conversation_history.push(m);
-                            tui::print_status(&format!(
+                            ui.status(&format!(
                                 "[skills] model kept stopping on '{step}' — abandoning it (NOT done)"
                             ));
                             report_cursor_gaps(&cursor);
@@ -1239,7 +1205,7 @@ pub async fn run(
                         ));
                         messages.push(nudge.clone());
                         conversation_history.push(nudge);
-                        tui::print_status(&format!(
+                        ui.status(&format!(
                             "[skills] blocked premature finish on '{step}' (stop #{})",
                             skill_state.exit_stops
                         ));
@@ -1297,7 +1263,7 @@ pub async fn run(
                                 );
                                 state.gate.validation_disputes.push(rationale.to_string());
                             }
-                            tui::print_status("Behavioral check failed — not done yet.");
+                            ui.status("Behavioral check failed — not done yet.");
 
                             // Full restart (opt-in `tools.gate_restart`): on the
                             // FIRST gate block, ABANDON the (possibly poisoned)
@@ -1311,8 +1277,8 @@ pub async fn run(
                                 if let Some(ref snap) = snapshots {
                                     let guard = snap.lock();
                                     match guard.revert_to_round(0) {
-                                        Ok(m) => tui::print_status(&format!("[gate-restart] {m}")),
-                                        Err(e) => tui::print_status(&format!(
+                                        Ok(m) => ui.status(&format!("[gate-restart] {m}")),
+                                        Err(e) => ui.status(&format!(
                                             "[gate-restart] tree revert failed: {e}"
                                         )),
                                     }
@@ -1336,7 +1302,7 @@ pub async fn run(
                                 conversation_history.clear();
                                 state.gate.validation_blocks = 0;
                                 state.gate.plan_step_failures.reset();
-                                tui::print_status(
+                                ui.status(
                                     "[gate-restart] scrapped the stuck state — tree at clean baseline + fresh context; restarting from scratch.",
                                 );
                                 continue;
@@ -1361,7 +1327,7 @@ pub async fn run(
                                 && !is_compile_fail
                             {
                                 state.gate.replan_fired = true;
-                                tui::print_status(
+                                ui.status(
                                     "Re-anchoring on the original goal — re-plan from the task…",
                                 );
                                 let msg = Message::user(&format!(
@@ -1402,7 +1368,7 @@ pub async fn run(
                             {
                                 state.debugger.fires += 1;
                                 state.debugger.last_failure = Some(fkey);
-                                tui::print_status(
+                                ui.status(
                                     "Still failing — spinning up a fresh-context debugger sub-agent…",
                                 );
                                 let verdict = debugger::run_debugger(
@@ -1433,10 +1399,10 @@ pub async fn run(
                                         if let Some(ref snap) = snapshots {
                                             let guard = snap.lock();
                                             match guard.revert_to_round(0) {
-                                                Ok(m) => tui::print_status(&format!(
+                                                Ok(m) => ui.status(&format!(
                                                     "[debugger-judge] SCRAP — {m}"
                                                 )),
-                                                Err(e) => tui::print_status(&format!(
+                                                Err(e) => ui.status(&format!(
                                                     "[debugger-judge] SCRAP — tree revert failed: {e}"
                                                 )),
                                             }
@@ -1462,7 +1428,7 @@ pub async fn run(
                                         conversation_history.clear();
                                         state.gate.validation_blocks = 0;
                                         state.gate.plan_step_failures.reset();
-                                        tui::print_status(
+                                        ui.status(
                                             "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                         );
                                         continue;
@@ -1516,7 +1482,7 @@ pub async fn run(
                                     mcp_summary.as_deref(),
                                 );
                                 messages = assembled.messages;
-                                tui::print_status(
+                                ui.status(
                                     "Gate context-reset — fresh start (history cleared, files kept).",
                                 );
                                 log.tool_debug(
@@ -1540,7 +1506,7 @@ pub async fn run(
                 // surface its recorded rationale(s) for audit — whether it
                 // ultimately fixed the change or exhausted the retry budget.
                 if !state.gate.validation_disputes.is_empty() {
-                    tui::print_status(&format!(
+                    ui.status(&format!(
                         "Completed after {} blocked verification(s); model's reasons recorded in the log.",
                         state.gate.validation_disputes.len()
                     ));
@@ -1596,7 +1562,7 @@ pub async fn run(
                     );
                     messages.push(result_msg.clone());
                     conversation_history.push(result_msg);
-                    tui::print_tool_result(&tc.function.name, false, "invalid JSON args");
+                    ui.tool_result(&tc.function.name, false, "invalid JSON args");
                     continue;
                 }
             };
@@ -1621,7 +1587,7 @@ pub async fn run(
                         tc.function.name, info.original_chars
                     ),
                 );
-                tui::print_tool_result(
+                ui.tool_result(
                     &tc.function.name,
                     false,
                     "arguments cut off by the output limit — not executed",
@@ -1678,7 +1644,7 @@ pub async fn run(
                     state.force_compact_next_round = true;
                     state.loops.window_edit_fires = 0;
                 }
-                tui::print_status(&format!(
+                ui.status(&format!(
                     "[loop] '{args_summary}' recurred {WINDOW_REPEAT_FREQ}x in the window{}",
                     if escalate {
                         " — forcing context compaction next round"
@@ -1733,7 +1699,7 @@ pub async fn run(
                     );
                     messages.push(result_msg.clone());
                     conversation_history.push(result_msg);
-                    tui::print_status(&format!(
+                    ui.status(&format!(
                         "Job-poll loop: {}({}) — redirected to jobs(wait), continuing",
                         tc.function.name, args_summary
                     ));
@@ -1760,7 +1726,7 @@ pub async fn run(
                     let result_msg = Message::tool_result(&tc.id, text);
                     messages.push(result_msg.clone());
                     conversation_history.push(result_msg);
-                    tui::print_status(&format!(
+                    ui.status(&format!(
                         "Repeated read: {}({}) — {}, continuing",
                         tc.function.name,
                         args_summary,
@@ -1794,7 +1760,7 @@ pub async fn run(
                     state.loops.last_call_key = None;
                     state.loops.same_call_streak = 0;
                     state.loops.recent_call_keys.clear();
-                    tui::print_error(&format!(
+                    ui.error(&format!(
                         "Loop detected: {}({}) {} — surfacing a hint, giving the model one more round",
                         tc.function.name,
                         args_summary,
@@ -1885,7 +1851,7 @@ pub async fn run(
                 if let Some(output) = recover_output
                     && state.gate.validation_blocks < config.validation.max_retries
                 {
-                    tui::print_error(&format!(
+                    ui.error(&format!(
                         "Loop detected again ({}({})) — routing through the recovery ladder instead of stopping",
                         tc.function.name, args_summary
                     ));
@@ -1910,7 +1876,7 @@ pub async fn run(
                         {
                             state.debugger.fires += 1;
                             state.debugger.last_failure = Some(fkey);
-                            tui::print_status(
+                            ui.status(
                                 "Looping + failing gate — spinning up a fresh-context debugger sub-agent…",
                             );
                             let verdict = debugger::run_debugger(
@@ -1935,10 +1901,10 @@ pub async fn run(
                                     if let Some(ref snap) = snapshots {
                                         let guard = snap.lock();
                                         match guard.revert_to_round(0) {
-                                            Ok(m) => tui::print_status(&format!(
-                                                "[debugger-judge] SCRAP — {m}"
-                                            )),
-                                            Err(e) => tui::print_status(&format!(
+                                            Ok(m) => {
+                                                ui.status(&format!("[debugger-judge] SCRAP — {m}"))
+                                            }
+                                            Err(e) => ui.status(&format!(
                                                 "[debugger-judge] SCRAP — tree revert failed: {e}"
                                             )),
                                         }
@@ -1959,7 +1925,7 @@ pub async fn run(
                                     conversation_history.clear();
                                     state.gate.validation_blocks = 0;
                                     state.gate.plan_step_failures.reset();
-                                    tui::print_status(
+                                    ui.status(
                                         "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                     );
                                     continue 'round;
@@ -2001,7 +1967,7 @@ pub async fn run(
                 }
                 // No check failed and no skill cursor is active — the loop is
                 // on something the recovery ladder can't act on; stop the turn.
-                tui::print_error(&format!(
+                ui.error(&format!(
                     "Loop detected again ({}({})) after the recovery hint — stopping this turn",
                     tc.function.name, args_summary
                 ));
@@ -2010,7 +1976,7 @@ pub async fn run(
             }
 
             log.tool_call_detail(&tc.function.name, &args);
-            tui::print_tool_call(&tc.function.name, &args_summary);
+            ui.tool_call_started(&tc.function.name, &args_summary);
 
             // Block write tools in plan-only mode
             let file_action = args["action"].as_str().unwrap_or("");
@@ -2027,7 +1993,7 @@ pub async fn run(
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
-                tui::print_tool_result(&tc.function.name, false, "blocked in plan mode");
+                ui.tool_result(&tc.function.name, false, "blocked in plan mode");
                 continue;
             }
 
@@ -2041,7 +2007,7 @@ pub async fn run(
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
-                tui::print_tool_result(&tc.function.name, false, "blocked: no plan");
+                ui.tool_result(&tc.function.name, false, "blocked: no plan");
                 continue;
             }
             // (Plan-checkpoint used to hard-block writes after N edits without
@@ -2110,9 +2076,9 @@ pub async fn run(
                 let perms = perms.clone();
                 let router = router.clone();
                 let lsp = lsp_client.clone();
-                let cancelled = cancelled.clone();
+                let cancelled_for_job = cancelled.clone();
                 let log = log.clone();
-                await_tool_job(
+                ui.await_tool_job(
                     tool_pool.submit(move || {
                         let runtime = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
@@ -2126,7 +2092,7 @@ pub async fn run(
                                     perms.as_ref(),
                                     router.as_ref(),
                                     lsp.as_deref(),
-                                    Some(cancelled.as_ref()),
+                                    Some(cancelled_for_job.as_ref()),
                                     Some(log.as_ref()),
                                 )
                                 .await
@@ -2134,6 +2100,7 @@ pub async fn run(
                             .map_err(|e| format!("edit_file error: {e}"))
                     }),
                     "edit_file",
+                    &cancelled,
                 )
                 .await
             } else if tc.function.name == "refactor"
@@ -2151,8 +2118,8 @@ pub async fn run(
                 let lsp = lsp_client.clone();
                 let log_for_job = log.clone();
                 let revisions_for_job = fast_revisions.clone();
-                let cancelled = cancelled.clone();
-                await_tool_job(
+                let cancelled_for_job = cancelled.clone();
+                ui.await_tool_job(
                     tool_pool.submit(move || {
                         let runtime = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
@@ -2167,13 +2134,14 @@ pub async fn run(
                                     lsp.as_deref(),
                                     Some(log_for_job.as_ref()),
                                     revisions_for_job.as_deref(),
-                                    Some(cancelled.as_ref()),
+                                    Some(cancelled_for_job.as_ref()),
                                 )
                                 .await
                             })
                             .map_err(|e| format!("refactor error: {e}"))
                     }),
                     "refactor",
+                    &cancelled,
                 )
                 .await
             } else if (tc.function.name == "shell" && args["action"].as_str() == Some("run"))
@@ -2185,9 +2153,9 @@ pub async fn run(
                     // output-captured, managed via the jobs tool.
                     tools::jobs::start_background(&args, &config, job_registry.as_ref())
                 } else {
-                    await_shell_job_run(
+                    ui.await_shell_job(
                         tool_pool.submit_shell(args.clone(), config.clone(), cancelled.clone()),
-                        cancelled.as_ref(),
+                        &cancelled,
                         headless.then_some(job_registry.as_ref()),
                     )
                     .await
@@ -2213,7 +2181,7 @@ pub async fn run(
                 let lsp = lsp_client.clone();
                 let revisions = fast_revisions.clone();
                 let baseline = fast_baseline_errors;
-                await_tool_job(
+                ui.await_tool_job(
                     tool_pool.submit(move || {
                         let runtime = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
@@ -2240,6 +2208,7 @@ pub async fn run(
                             .map_err(|e| format!("fast tool error: {e}"))
                     }),
                     &tc.function.name,
+                    &cancelled,
                 )
                 .await
             } else if tc.function.name == "mcp_use" {
@@ -2288,22 +2257,22 @@ pub async fn run(
                             .into(),
                     )
                 } else {
-                    tui::print_status(&format!("spawning {} subagents...", tasks.len()));
-                    let outputs = crate::cli::commands::agent::subagent::run_subagents(
-                        tasks,
-                        &config,
-                        &llm_worker,
-                        &tool_pool,
-                        &tool_defs,
-                        &perms,
-                        &mcp_registry,
-                        &lsp_client,
-                        &fast_revisions,
-                        fast_baseline_errors,
-                        &cancelled,
-                        None,
-                    )
-                    .await;
+                    ui.status(&format!("spawning {} subagents...", tasks.len()));
+                    let outputs = ui
+                        .drive_subagents(
+                            tasks,
+                            &config,
+                            &llm_worker,
+                            &tool_pool,
+                            &tool_defs,
+                            &perms,
+                            &mcp_registry,
+                            &lsp_client,
+                            &fast_revisions,
+                            fast_baseline_errors,
+                            &cancelled,
+                        )
+                        .await;
                     let combined = crate::cli::commands::agent::subagent::format_outputs(outputs);
                     crate::tools::ToolResult::ok(combined)
                 }
@@ -2366,7 +2335,7 @@ pub async fn run(
                                     && *key == format!("{skill}::{finished}")
                                     && *at_edits == skill_state.edits_total
                                 {
-                                    tui::print_status(&format!(
+                                    ui.status(&format!(
                                         "[skills] judge-veto (log-only) on '{finished}': {reason}"
                                     ));
                                 }
@@ -2380,7 +2349,7 @@ pub async fn run(
                                 // silently, as it did before the loop in
                                 // prepare_step closed that window.
                                 if cursor.cached().is_none() {
-                                    tui::print_status(&format!(
+                                    ui.status(&format!(
                                         "[skills] warning: done on '{finished}' while undistilled \
                                          — the step was never shown"
                                     ));
@@ -2468,7 +2437,7 @@ pub async fn run(
                 let config = config.clone();
                 let perms = perms.clone();
                 let lsp = lsp_client.clone();
-                await_tool_job(
+                ui.await_tool_job(
                     tool_pool.submit(move || {
                         let runtime = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
@@ -2488,6 +2457,7 @@ pub async fn run(
                             .map_err(|e| format!("Tool error: {e}"))
                     }),
                     &tc.function.name,
+                    &cancelled,
                 )
                 .await
             };
@@ -2507,7 +2477,8 @@ pub async fn run(
             let first_line = result.content.lines().next().unwrap_or("(empty)");
             log.tool_call(&tc.function.name, &args_summary, result.success, first_line);
             log.tool_result_detail(&tc.function.name, result.success, &result.content);
-            tui::print_tool_result(&tc.function.name, result.success, first_line);
+            ui.tool_result(&tc.function.name, result.success, first_line);
+            ui.store_tool_result(&tc.function.name, &result.content);
 
             // Remember the last failing tool call keyed by its loop key, so a
             // loop on a *failing* command can hand the real error to the
@@ -2599,7 +2570,7 @@ pub async fn run(
                     {
                         state.debugger.fires += 1;
                         state.debugger.last_failure = Some(fkey);
-                        tui::print_status(
+                        ui.status(
                             "Plan-check gate failing repeatedly on the same step — spinning up a fresh-context debugger sub-agent…",
                         );
                         let verdict = debugger::run_debugger(
@@ -2624,10 +2595,10 @@ pub async fn run(
                                 if let Some(ref snap) = snapshots {
                                     let guard = snap.lock();
                                     match guard.revert_to_round(0) {
-                                        Ok(m) => tui::print_status(&format!(
-                                            "[debugger-judge] SCRAP — {m}"
-                                        )),
-                                        Err(e) => tui::print_status(&format!(
+                                        Ok(m) => {
+                                            ui.status(&format!("[debugger-judge] SCRAP — {m}"))
+                                        }
+                                        Err(e) => ui.status(&format!(
                                             "[debugger-judge] SCRAP — tree revert failed: {e}"
                                         )),
                                     }
@@ -2647,7 +2618,7 @@ pub async fn run(
                                 conversation_history.clear();
                                 state.gate.validation_blocks = 0;
                                 state.gate.plan_step_failures.reset();
-                                tui::print_status(
+                                ui.status(
                                     "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                 );
                                 continue 'round;
@@ -2711,7 +2682,7 @@ pub async fn run(
                     let reset = Message::user(&spiral::build_reset_message(path, n, &tried));
                     messages.push(reset.clone());
                     conversation_history.push(reset);
-                    tui::print_status("Spiral detected (revert-loop) — reset + replan injected.");
+                    ui.status("Spiral detected (revert-loop) — reset + replan injected.");
                     log.tool_debug(
                         "agent",
                         &format!("spiral-reset fired for {path} after {n} reverts"),
@@ -2820,7 +2791,7 @@ pub async fn run(
                 messages.push(msg.clone());
                 conversation_history.push(msg);
             }
-            tui::print_status(&format!(
+            ui.status(&format!(
                 "[stuck-check] fired ({}) after {} frozen rounds",
                 if kind == stuck_check::StuckKind::Green {
                     "green"
