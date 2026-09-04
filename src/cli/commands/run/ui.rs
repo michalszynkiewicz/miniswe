@@ -57,6 +57,11 @@ impl AgentUi for HeadlessUi {
             UiEvent::ForcingCompaction => {
                 tui::print_status("Loop persisted past the nudge — forcing context compaction.");
             }
+            UiEvent::LlmErrorEndpointHint { endpoint } => {
+                tui::print_status(&format!(
+                    "Check that your LLM server is running at {endpoint}"
+                ));
+            }
         }
     }
 

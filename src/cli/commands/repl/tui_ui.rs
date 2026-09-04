@@ -96,6 +96,8 @@ impl AgentUi for TuiUi<'_> {
                     LineStyle::Status,
                 );
             }
+            // The REPL's stream_llm/error lines already said everything.
+            UiEvent::LlmErrorEndpointHint { .. } => {}
         }
     }
 
