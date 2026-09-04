@@ -146,15 +146,9 @@ pub(super) async fn run_agent_loop(
                                 ),
                                 LineStyle::Status,
                             );
-                            messages.push(Message::user(&format!(
-                                "[auto-revert-to-green] The project has had compile errors for \
-                                 {} rounds straight and you are not converging — you are \
-                                 digging deeper, not recovering. I reverted the ENTIRE working tree \
-                                 to round {}, the last state that compiled cleanly. \
-                                 Your edits since then are GONE; do not replay them. Start over from \
-                                 this clean base: re-read the relevant code, make ONE small complete \
-                                 change, and run a check before continuing.",
-                                state.green.red_streak, state.green.last_green_round
+                            messages.push(Message::user(&spiral::build_revert_to_green_message(
+                                state.green.red_streak,
+                                state.green.last_green_round,
                             )));
                             state.green.red_streak = 0;
                         }
@@ -806,11 +800,9 @@ pub(super) async fn run_agent_loop(
                                         state.gate.plan_step_failures.reset();
                                         continue;
                                     }
-                                    debugger::DebuggerVerdict::Scrap => Message::user(
-                                        "[A fresh-context review voted to reset again, but the \
-                                         tree was already reset once this turn. Keep going: read \
-                                         the current failure carefully and fix it directly.]",
-                                    ),
+                                    debugger::DebuggerVerdict::Scrap => {
+                                        Message::user(debugger::SCRAP_ALREADY_RESET_MSG)
+                                    }
                                     debugger::DebuggerVerdict::Rewind(candidate) => {
                                         rewind_message_repl(
                                             app,
@@ -826,18 +818,10 @@ pub(super) async fn run_agent_loop(
                                     }
                                     debugger::DebuggerVerdict::Report(body) => {
                                         let output_note =
-                                            validation::write_gate_failure_output(config, &output)
-                                                .map(|path| {
-                                                    format!(
-                                                        "\nFull raw check output: read(\"{path}\")."
-                                                    )
-                                                })
-                                                .unwrap_or_default();
-                                        Message::user(&format!(
-                                            "[A read-only debugger with fresh eyes investigated the failing \
-                                         check and produced this DIAGNOSIS. It did not edit anything — \
-                                         YOU must apply the fix and finish the plan it lays out:\n{body}\n\
-                                         Make the change(s), then finish; the verification will re-run.{output_note}]"
+                                            validation::gate_failure_note(config, &output);
+                                        Message::user(&debugger::build_gate_report_message(
+                                            &body,
+                                            &output_note,
                                         ))
                                     }
                                 };
@@ -870,15 +854,9 @@ pub(super) async fn run_agent_loop(
                                 continue;
                             }
 
-                            let msg = Message::user(&format!(
-                                "[Verification failed — do NOT finish yet. A check that exercises \
-                                 the change end-to-end exited non-zero; the output below shows what \
-                                 is actually wrong. Read it carefully and fix the SPECIFIC problem \
-                                 it reports (it may be a compile error, not a logic error), then \
-                                 continue. (If you are certain the check itself is wrong, finish \
-                                 anyway and state the specific reason — it will be recorded.)\n\
-                                 Check output:\n{output}]"
-                            ));
+                            let msg = Message::user(
+                                &validation::build_verification_failed_message(&output),
+                            );
                             messages.push(msg.clone());
                             conversation_history.push(msg);
                             continue;
@@ -1147,11 +1125,9 @@ pub(super) async fn run_agent_loop(
                                     state.gate.plan_step_failures.reset();
                                     continue 'round;
                                 }
-                                debugger::DebuggerVerdict::Scrap => Message::user(
-                                    "[A fresh-context review voted to reset again, but the tree \
-                                     was already reset once this turn. Keep going: read the \
-                                     current failure carefully and fix it directly.]",
-                                ),
+                                debugger::DebuggerVerdict::Scrap => {
+                                    Message::user(debugger::SCRAP_ALREADY_RESET_MSG)
+                                }
                                 debugger::DebuggerVerdict::Rewind(candidate) => {
                                     rewind_message_repl(
                                         app,
@@ -1167,18 +1143,10 @@ pub(super) async fn run_agent_loop(
                                 }
                                 debugger::DebuggerVerdict::Report(body) => {
                                     let output_note =
-                                        validation::write_gate_failure_output(config, &output)
-                                            .map(|path| {
-                                                format!(
-                                                    "\nFull raw check output: read(\"{path}\")."
-                                                )
-                                            })
-                                            .unwrap_or_default();
-                                    Message::user(&format!(
-                                        "[A read-only debugger with fresh eyes investigated the failing \
-                                     check and produced this DIAGNOSIS. It did not edit anything — \
-                                     YOU must apply the fix and finish the plan it lays out:\n{body}\n\
-                                     Make the change(s), then finish; the verification will re-run.{output_note}]"
+                                        validation::gate_failure_note(config, &output);
+                                    Message::user(&debugger::build_gate_report_message(
+                                        &body,
+                                        &output_note,
                                     ))
                                 }
                             };
@@ -1187,13 +1155,7 @@ pub(super) async fn run_agent_loop(
                             continue 'round;
                         }
 
-                        let msg = Message::user(&format!(
-                            "[Your repeated failing tool call was aborted, and the task is NOT \
-                             done — the verification check failed:\n{output}\nRead the check \
-                             output and your tool errors carefully, fix the SPECIFIC problem, \
-                             and use a correctly-formed call (include every required parameter) \
-                             or a different tool.]"
-                        ));
+                        let msg = Message::user(&validation::build_loop_abort_message(&output));
                         messages.push(msg.clone());
                         conversation_history.push(msg);
                         continue 'round;
@@ -1735,11 +1697,9 @@ pub(super) async fn run_agent_loop(
                                 state.gate.plan_step_failures.reset();
                                 continue 'round;
                             }
-                            debugger::DebuggerVerdict::Scrap => Message::user(
-                                "[A fresh-context review voted to reset again, but the tree \
-                                 was already reset once this turn. Keep going: read the \
-                                 current failure carefully and fix it directly.]",
-                            ),
+                            debugger::DebuggerVerdict::Scrap => {
+                                Message::user(debugger::SCRAP_ALREADY_RESET_MSG)
+                            }
                             debugger::DebuggerVerdict::Rewind(candidate) => {
                                 rewind_message_repl(
                                     app,
@@ -1755,16 +1715,10 @@ pub(super) async fn run_agent_loop(
                             }
                             debugger::DebuggerVerdict::Report(body) => {
                                 let output_note =
-                                    validation::write_gate_failure_output(config, &result.content)
-                                        .map(|path| {
-                                            format!("\nFull raw check output: read(\"{path}\").")
-                                        })
-                                        .unwrap_or_default();
-                                Message::user(&format!(
-                                    "[A read-only debugger with fresh eyes investigated the failing \
-                                 plan-check step and produced this DIAGNOSIS. It did not edit \
-                                 anything — YOU must apply the fix and finish the step it lays \
-                                 out:\n{body}\nMake the change(s), then re-check the step.{output_note}]"
+                                    validation::gate_failure_note(config, &result.content);
+                                Message::user(&debugger::build_plan_step_report_message(
+                                    &body,
+                                    &output_note,
                                 ))
                             }
                         };

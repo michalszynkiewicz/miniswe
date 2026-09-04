@@ -265,6 +265,76 @@ pub enum DebuggerVerdict {
     Rewind(tools::RewindCandidate),
 }
 
+/// Injected for a `Scrap` verdict when the tree was ALREADY reset once this
+/// turn — the whole-tree restart fires at most once, so a second vote
+/// degrades to marching orders instead of another reset.
+pub(crate) const SCRAP_ALREADY_RESET_MSG: &str = "[A fresh-context review voted to reset again, but the tree was already reset once this \
+     turn. Keep going: read the current failure carefully and fix it directly.]";
+
+/// The `Report` verdict message on the behavioral done-gate path: the
+/// debugger's diagnosis plus marching orders to apply the fix and finish.
+/// `output_note` is `validation::gate_failure_note` output (or empty).
+pub(crate) fn build_gate_report_message(body: &str, output_note: &str) -> String {
+    format!(
+        "[A read-only debugger with fresh eyes investigated the failing check and produced \
+         this DIAGNOSIS. It did not edit anything — YOU must apply the fix and finish the \
+         plan it lays out:\n{body}\n\
+         Make the change(s), then finish; the verification will re-run.{output_note}]"
+    )
+}
+
+/// The `Report` verdict message on the plan-check-step path
+/// (`tools.plan_gate_debugger`): same shape as [`build_gate_report_message`]
+/// but aimed at the failing plan step rather than the done-gate.
+pub(crate) fn build_plan_step_report_message(body: &str, output_note: &str) -> String {
+    format!(
+        "[A read-only debugger with fresh eyes investigated the failing plan-check step and \
+         produced this DIAGNOSIS. It did not edit anything — YOU must apply the fix and \
+         finish the step it lays out:\n{body}\n\
+         Make the change(s), then re-check the step.{output_note}]"
+    )
+}
+
+#[cfg(test)]
+mod verdict_message_tests {
+    use super::*;
+
+    // These pin the exact bytes the model sees — both agent loops inject the
+    // same builders, and bench/moment tooling replays real transcripts, so a
+    // wording drift is a behavior change even when the code "just" moved.
+    #[test]
+    fn scrap_already_reset_wording() {
+        assert_eq!(
+            SCRAP_ALREADY_RESET_MSG,
+            "[A fresh-context review voted to reset again, but the tree was already reset \
+             once this turn. Keep going: read the current failure carefully and fix it \
+             directly.]"
+        );
+    }
+
+    #[test]
+    fn gate_report_wording() {
+        assert_eq!(
+            build_gate_report_message("BODY", "NOTE"),
+            "[A read-only debugger with fresh eyes investigated the failing check and \
+             produced this DIAGNOSIS. It did not edit anything — YOU must apply the fix and \
+             finish the plan it lays out:\nBODY\nMake the change(s), then finish; the \
+             verification will re-run.NOTE]"
+        );
+    }
+
+    #[test]
+    fn plan_step_report_wording() {
+        assert_eq!(
+            build_plan_step_report_message("BODY", "NOTE"),
+            "[A read-only debugger with fresh eyes investigated the failing plan-check step \
+             and produced this DIAGNOSIS. It did not edit anything — YOU must apply the fix \
+             and finish the step it lays out:\nBODY\nMake the change(s), then re-check the \
+             step.NOTE]"
+        );
+    }
+}
+
 /// The step judge's verdict on a frozen skill step. Every variant carries
 /// the judge's report — the caller injects it in place of the generic stuck
 /// note, so even CONTINUE changes what the model sees next round.

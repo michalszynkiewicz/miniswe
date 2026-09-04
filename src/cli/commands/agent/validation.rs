@@ -98,6 +98,88 @@ pub(crate) fn write_gate_failure_output(config: &Config, output: &str) -> Option
     Some(format!(".miniswe/{rel}"))
 }
 
+/// The "read the raw output yourself" pointer appended to a debugger Report
+/// verdict: [`write_gate_failure_output`] plus the pointer sentence (see its
+/// doc for why the raw text rides alongside the diagnosis). Empty when the
+/// write failed — the diagnosis then stands alone.
+pub(crate) fn gate_failure_note(config: &Config, output: &str) -> String {
+    write_gate_failure_output(config, output)
+        .map(|path| raw_output_note(&path))
+        .unwrap_or_default()
+}
+
+/// Pure formatting half of [`gate_failure_note`], split out so the wording
+/// test needs no filesystem.
+fn raw_output_note(path: &str) -> String {
+    format!("\nFull raw check output: read(\"{path}\").")
+}
+
+/// Corrective injected when the behavioral done-gate blocks completion and
+/// the escalation ladder (restart / replan / debugger / context-reset)
+/// declined to fire: re-read the check output, fix the SPECIFIC problem —
+/// or dispute the check with a stated reason (recorded, never a free pass).
+pub(crate) fn build_verification_failed_message(output: &str) -> String {
+    format!(
+        "[Verification failed — do NOT finish yet. A check that exercises the change \
+         end-to-end exited non-zero; the output below shows what is actually wrong. Read it \
+         carefully and fix the SPECIFIC problem it reports (it may be a compile error, not a \
+         logic error), then continue. (If you are certain the check itself is wrong, finish \
+         anyway and state the specific reason — it will be recorded.)\n\
+         Check output:\n{output}]"
+    )
+}
+
+/// Corrective injected when a repeated failing tool call was aborted by loop
+/// detection while the verification check is failing: the task is NOT done —
+/// fix the call itself, not just the loop.
+pub(crate) fn build_loop_abort_message(output: &str) -> String {
+    format!(
+        "[Your repeated failing tool call was aborted, and the task is NOT done — the \
+         verification check failed:\n{output}\nRead the check output and your tool errors \
+         carefully, fix the SPECIFIC problem, and use a correctly-formed call (include every \
+         required parameter) or a different tool.]"
+    )
+}
+
+#[cfg(test)]
+mod gate_message_tests {
+    use super::*;
+
+    // Byte-pinned: both agent loops inject these builders and bench/moment
+    // tooling replays real transcripts — wording drift is a behavior change.
+    #[test]
+    fn raw_output_note_wording() {
+        assert_eq!(
+            raw_output_note(".miniswe/last_gate_failure.txt"),
+            "\nFull raw check output: read(\".miniswe/last_gate_failure.txt\")."
+        );
+    }
+
+    #[test]
+    fn verification_failed_wording() {
+        assert_eq!(
+            build_verification_failed_message("OUTPUT"),
+            "[Verification failed — do NOT finish yet. A check that exercises the change \
+             end-to-end exited non-zero; the output below shows what is actually wrong. \
+             Read it carefully and fix the SPECIFIC problem it reports (it may be a compile \
+             error, not a logic error), then continue. (If you are certain the check itself \
+             is wrong, finish anyway and state the specific reason — it will be \
+             recorded.)\nCheck output:\nOUTPUT]"
+        );
+    }
+
+    #[test]
+    fn loop_abort_wording() {
+        assert_eq!(
+            build_loop_abort_message("OUTPUT"),
+            "[Your repeated failing tool call was aborted, and the task is NOT done — the \
+             verification check failed:\nOUTPUT\nRead the check output and your tool errors \
+             carefully, fix the SPECIFIC problem, and use a correctly-formed call (include \
+             every required parameter) or a different tool.]"
+        );
+    }
+}
+
 /// Per-turn behavioral-gate state, shared by both agent loops. Plain
 /// `pub(crate)` fields (no accessors): call sites reset different subsets at
 /// different points and the split borrows must keep working.
