@@ -68,6 +68,15 @@ pub(super) async fn run_agent_loop(
     let mut state = turn_state::TurnState::default();
     let mut ui = TuiUi::new(app, rx, terminal);
 
+    // Explicit behavior deltas for the shared turn phases — see
+    // `turn::TurnOptions` field docs.
+    let opts = turn::TurnOptions {
+        skill_steps: false,
+        clear_cancel_on_interrupt: true,
+        worker_stopped_ends_turn: true,
+        compaction: turn::CompactionUx::Interactive,
+    };
+
     'round: loop {
         if had_error {
             break;
@@ -88,6 +97,9 @@ pub(super) async fn run_agent_loop(
             lsp,
             snapshots,
             log: &log,
+            tool_defs,
+            cancelled,
+            model_role: ModelRole::Default,
             fast_baseline_errors,
             tool_def_tokens,
             max_rounds,
@@ -97,265 +109,21 @@ pub(super) async fn run_agent_loop(
             turn::RoundFlow::EndTurn { .. } => break,
         }
 
-        // Hide edit tools until a plan exists; see visible_tool_defs.
-        let plan_set = tools::plan::plan_exists(config);
-        state.plan_ever_set |= plan_set;
-        // Off: never hide edit tools (pass plan_exists=true). Strict: legacy
-        // hide-until-plan behavior, latched so a plan that goes away mid-segment
-        // cannot retract tools the model has already been shown.
-        let visible = visible_tool_defs(tool_defs, state.plan_ever_set || !strict);
-        // Build request. See run.rs for the per-model reasoning_effort and
-        // thinking-mode logic.
-        let (chat_template_kwargs, temperature_override) =
-            if config.model.is_mistral_small_4_family() {
-                let effort = if plan_set { "none" } else { "high" };
-                (serde_json::json!({"reasoning_effort": effort}), None)
-            } else if config.model.thinking {
-                (
-                    serde_json::json!({"enable_thinking": true}),
-                    Some(config.model.thinking_temperature),
-                )
-            } else {
-                (serde_json::json!({"enable_thinking": false}), None)
-            };
-        // Bump output budget for Mistral 4 — see run.rs for rationale
-        // (probe data: 8K truncates with empty content, 16K emits clean
-        // correct output at ~6K tokens used).
-        let max_tokens_override = if config.model.is_mistral_small_4_family() {
-            Some(16384)
-        } else {
-            None
-        };
-        let request = ChatRequest {
-            messages: messages.clone(),
-            tools: Some(visible),
-            tool_choice: None,
-            max_tokens_override,
-            chat_template_kwargs: Some(chat_template_kwargs),
-            temperature_override,
-            cache_prompt: None,
-        };
-        log.llm_request(&request);
-
-        cancelled.store(false, Ordering::Relaxed);
-
-        let response = match ui
-            .stream_llm(llm_worker, ModelRole::Default, request, cancelled)
-            .await
+        let assistant_msg = match turn::llm_call::generate(
+            ctx,
+            opts,
+            &mut state,
+            &mut ui,
+            messages,
+            conversation_history,
+        )
+        .await
         {
-            LlmOutcome::Response(r) => r,
-            // stream_llm already surfaced the error line for both.
-            LlmOutcome::WorkerStopped | LlmOutcome::UiClosed => break,
-            LlmOutcome::Error(err_str) => {
-                if err_str.contains("Interrupted") {
-                    cancelled.store(false, Ordering::Relaxed);
-                    ui.status("Generation interrupted.");
-                    break;
-                }
-                if is_context_exceeded_error(&err_str)
-                    && state.context_compact_retries
-                        < context::compressor::FORCE_COMPRESS_MAX_RETRIES
-                {
-                    // Prompt alone exceeds the context window — recoverable by
-                    // compacting + resending (primary path for
-                    // compaction="lazy", safety net for every other strategy).
-                    state.context_compact_retries += 1;
-                    ui.status("Context window exceeded — compacting and retrying.");
-                    if ui
-                        .pump(context::compressor::force_compress(
-                            messages,
-                            config,
-                            router,
-                            llm_worker,
-                            tool_def_tokens,
-                        ))
-                        .await
-                    {
-                        log.llm_error("context window exceeded — compacted history, retrying");
-                        continue;
-                    }
-                    // Nothing could be freed — retrying would fail identically.
-                    ui.error("Compaction could not free any context — stopping this turn.");
-                    break;
-                }
-                if is_tool_call_args_cap_error(&err_str) {
-                    // Our streaming assembler aborted the generation: an
-                    // anchor-only tool's arguments outgrew the cap. Nothing
-                    // was persisted; hint and retry, or give up when the
-                    // model keeps doing it.
-                    state.truncated_call_errors_in_a_row += 1;
-                    if state.truncated_call_errors_in_a_row >= TRUNCATED_CALL_ABORT_AFTER {
-                        log.llm_error(&format!(
-                            "{} consecutive oversized tool calls — aborting turn",
-                            state.truncated_call_errors_in_a_row
-                        ));
-                        ui.error(
-                            "The model keeps emitting oversized tool-call arguments — giving up on this turn.",
-                        );
-                        break;
-                    }
-                    log.llm_error(&format!(
-                        "tool call aborted by the argument size cap: {err_str}"
-                    ));
-                    ui.status(
-                        "Tool call arguments exceeded the size cap — retrying with guidance.",
-                    );
-                    let hint = Message::user(&format!(
-                        "{err_str}. Anchor-style tools take identifiers and short expressions only — \
-                         never paste code bodies into their arguments. {}",
-                        truncated_tool_call_hint(config.tools.edit_mode)
-                    ));
-                    messages.push(hint.clone());
-                    conversation_history.push(hint);
-                    continue;
-                }
-                if is_truncated_tool_call_error(&err_str) {
-                    // The server's chat template could not parse some
-                    // assistant tool call's arguments as JSON: either this
-                    // response was cut off mid-call (nothing persisted), or a
-                    // previously persisted call is broken and every request
-                    // will fail until it is gone. Handle the second first —
-                    // it is a zero-progress spin otherwise.
-                    state.truncated_call_errors_in_a_row += 1;
-                    if state.truncated_call_errors_in_a_row >= 2 {
-                        let scrubbed = scrub_unparseable_tool_calls(messages)
-                            + scrub_unparseable_tool_calls(conversation_history);
-                        if scrubbed > 0 {
-                            log.llm_error(&format!(
-                                "scrubbed {scrubbed} unparseable tool call(s) from history after repeated parse failures — retrying"
-                            ));
-                            ui.status("Repaired a truncated tool call left in history — retrying.");
-                            continue;
-                        }
-                    }
-                    if state.truncated_call_errors_in_a_row >= TRUNCATED_CALL_ABORT_AFTER {
-                        log.llm_error(&format!(
-                            "{} consecutive tool-call parse failures with nothing left to repair — aborting turn",
-                            state.truncated_call_errors_in_a_row
-                        ));
-                        ui.error(
-                            "The server keeps rejecting tool-call arguments — giving up on this turn.",
-                        );
-                        break;
-                    }
-                    // When the prompt sits near the context window the
-                    // truncation is really context exhaustion — compact and
-                    // resend instead of hinting.
-                    if context::compressor::estimated_context_tokens(messages, tool_def_tokens)
-                        > config.model.context_window * 3 / 4
-                        && state.context_compact_retries
-                            < context::compressor::FORCE_COMPRESS_MAX_RETRIES
-                    {
-                        state.context_compact_retries += 1;
-                        ui.status("Context window exceeded — compacting and retrying.");
-                        if ui
-                            .pump(context::compressor::force_compress(
-                                messages,
-                                config,
-                                router,
-                                llm_worker,
-                                tool_def_tokens,
-                            ))
-                            .await
-                        {
-                            log.llm_error("context window exceeded — compacted history, retrying");
-                            continue;
-                        }
-                        ui.error("Compaction could not free any context — stopping this turn.");
-                        break;
-                    }
-                    // Push a user-role hint so the agent retries with a
-                    // smaller operation.
-                    log.llm_error(
-                        "tool call JSON truncated (max_tokens) — \
-                         injecting hint and continuing",
-                    );
-                    ui.status("Previous tool call truncated — retrying with guidance.");
-                    let hint = Message::user(truncated_tool_call_hint(config.tools.edit_mode));
-                    messages.push(hint.clone());
-                    conversation_history.push(hint);
-                    continue;
-                }
-                let clean = if err_str.contains('<') {
-                    err_str
-                        .split('<')
-                        .next()
-                        .unwrap_or(&err_str)
-                        .trim()
-                        .to_string()
-                } else {
-                    err_str
-                };
-                log.llm_error(&clean);
-                ui.error(&format!("LLM error: {clean}"));
-                break;
-            }
+            turn::LlmFlow::Ready(msg) => msg,
+            turn::LlmFlow::Retry => continue,
+            turn::LlmFlow::EndTurn { .. } => break,
         };
-
-        // A 200 response can still be a context-exhaustion casualty:
-        // finish_reason="length" with the completion well under the
-        // requested cap means the server clipped generation at n_ctx (see
-        // run.rs / is_context_truncated_response). Discard the partial
-        // output, compact, regenerate.
-        let effective_max_tokens =
-            max_tokens_override.unwrap_or(config.model.max_output_tokens as u64) as usize;
-        if is_context_truncated_response(&response, effective_max_tokens)
-            && context::compressor::estimated_context_tokens(messages, tool_def_tokens)
-                > config.model.context_window * 3 / 4
-            && state.context_compact_retries < context::compressor::FORCE_COMPRESS_MAX_RETRIES
-        {
-            state.context_compact_retries += 1;
-            ui.status("Generation truncated by context ceiling — compacting and regenerating.");
-            if ui
-                .pump(context::compressor::force_compress(
-                    messages,
-                    config,
-                    router,
-                    llm_worker,
-                    tool_def_tokens,
-                ))
-                .await
-            {
-                log.llm_error(
-                    "generation truncated by context ceiling — compacted history, regenerating",
-                );
-                continue;
-            }
-        }
-
-        let choice = match response.choices.first() {
-            Some(c) => c,
-            None => {
-                ui.event(UiEvent::EmptyLlmResponse);
-                break;
-            }
-        };
-        // A response made it through whole — any prior reactive-compaction
-        // retries resolved this request; reset the budget for the next one.
-        state.context_compact_retries = 0;
-        state.truncated_call_errors_in_a_row = 0;
-
-        // Never persist an unparseable tool call (see run.rs): stub the
-        // cut-off arguments; the tool loop answers the stub with guidance.
-        let mut assistant_msg = choice.message.clone();
-        let truncated_calls = sanitize_truncated_tool_calls(&mut assistant_msg);
-        if truncated_calls > 0 {
-            log.llm_error(&format!(
-                "{truncated_calls} tool call(s) arrived with unparseable arguments (cut off by the output limit) — stubbed before persisting"
-            ));
-            ui.status("A tool call was cut off by the output limit — it will not be executed.");
-        }
         let assistant_msg = &assistant_msg;
-
-        // Flush any remaining tokens and reconcile the streamed text against
-        // the final message content.
-        ui.finish_assistant_text(assistant_msg.content.as_deref());
-        if let Some(content) = &assistant_msg.content {
-            log.llm_response(content);
-        }
-        if assistant_msg.is_meaningful() {
-            conversation_history.push(assistant_msg.clone());
-        }
 
         let tool_calls = match &assistant_msg.tool_calls {
             Some(tc) if !tc.is_empty() => tc.clone(),

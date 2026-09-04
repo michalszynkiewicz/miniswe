@@ -84,6 +84,9 @@ pub(crate) enum UiEvent {
     },
     /// Read-loop escalation is forcing a context compaction this round.
     ForcingCompaction,
+    /// A fatal LLM error was just surfaced (headless adds a check-your-
+    /// server hint; the REPL shows nothing extra).
+    LlmErrorEndpointHint { endpoint: String },
 }
 
 /// Everything an agent round loop needs from its frontend: line output,
