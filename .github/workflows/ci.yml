@@ -57,6 +57,9 @@ jobs:
       # its stderr verbatim via `[lsp:stderr] …` lines, so this surfaces
       # in the cargo test output and makes any LSP hang diagnosable.
       RA_LOG: "info"
+      # Line-tables-only debug info is enough for the backtraces above and
+      # is much cheaper to emit than full debuginfo across every test binary.
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@v7
 
@@ -68,6 +71,9 @@ jobs:
           # in degraded mode where type-checking is unreliable — the root
           # cause of the lsp_auto_check_integration flake.
           components: rust-src
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Cache cargo registry, index, and target/
         uses: Swatinem/rust-cache@v2
@@ -90,16 +96,15 @@ jobs:
           restore-keys: |
             lsp-servers-${{ runner.os }}-
 
-      - name: cargo build
-        run: cargo build --locked --all-targets
+      # Test-group caps and the wedge-killing slow-timeout live in
+      # .config/nextest.toml (ci profile).
+      - name: cargo nextest run
+        run: cargo nextest run --locked --profile ci
 
-      - name: cargo test
-        # `--nocapture` surfaces eprintln! breadcrumbs (e.g. `[trace]` lines
-        # in tests/e2e_lsp.rs) in-flight, so hangs are diagnosable from the
-        # workflow log rather than only on failure.
-        # (`--report-time` would also be handy here but is nightly-only —
-        # available via cargo-nextest if we want per-test timing later.)
-        run: cargo test --locked -- --nocapture
+      # nextest doesn't run doctests. We have none today, but this is cheap
+      # insurance if one gets added later.
+      - name: cargo test --doc
+        run: cargo test --locked --doc
 
   check-all-languages:
     name: cargo check --features all-languages

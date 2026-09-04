@@ -1,0 +1,25 @@
+[store]
+dir = "target/nextest"
+
+[profile.default]
+retries = 0
+
+[profile.ci]
+retries = 0
+fail-fast = false
+success-output = "never"
+failure-output = "immediate-final"
+status-level = "fail"
+# Internal LSP budgets can legitimately chain to ~240s per test on a
+# slow runner (e2e_refactor_replay: 180s diagnostics + 60s idle), so
+# this keeps ~2x headroom and only kills a genuinely wedged test.
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# rust-analyzer instances are heavy; cap the 4 LSP e2e binaries to a
+# shared pool so a small runner doesn't spawn 4 at once.
+[test-groups]
+lsp = { max-threads = 2 }
+
+[[profile.ci.overrides]]
+filter = 'binary_id(miniswe::e2e_lsp) + binary_id(miniswe::e2e_refactor) + binary_id(miniswe::e2e_refactor_replay) + binary_id(miniswe::e2e_edit_file)'
+test-group = 'lsp'
