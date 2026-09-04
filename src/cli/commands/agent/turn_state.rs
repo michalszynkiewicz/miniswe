@@ -27,6 +27,9 @@ pub(crate) struct TurnState {
     pub(crate) plan_update_requested: bool,
     pub(crate) nudged_premature_exit: bool,
     pub(crate) nudged_no_plan: bool,
+    /// Headless: whether the live-jobs finish-gate has already nudged this
+    /// turn (see `TurnOptions::live_jobs_gate`) — one nudge only.
+    pub(crate) nudged_live_jobs: bool,
     /// Force a context compaction before the next LLM request (the read-loop
     /// ladder's escalation — see `LoopTracker::read_nudges`).
     pub(crate) force_compact_next_round: bool,

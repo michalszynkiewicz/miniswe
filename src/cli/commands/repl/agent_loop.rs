@@ -66,6 +66,10 @@ pub(super) async fn run_agent_loop(
     // Per-turn agent-loop state shared with the headless loop (see the field
     // docs on `turn_state::TurnState` and its sub-structs).
     let mut state = turn_state::TurnState::default();
+    // Unused in the REPL (`opts.skill_steps` is false, which short-circuits every
+    // read of it); the shared phases take it by reference and Stage 4's driver
+    // will own both state structs.
+    let mut skill_state = turn_state::SkillTurnState::default();
     let mut ui = TuiUi::new(app, rx, terminal);
 
     // Explicit behavior deltas for the shared turn phases — see
@@ -75,6 +79,8 @@ pub(super) async fn run_agent_loop(
         clear_cancel_on_interrupt: true,
         worker_stopped_ends_turn: true,
         compaction: turn::CompactionUx::Interactive,
+        read_only,
+        live_jobs_gate: false,
     };
 
     'round: loop {
@@ -103,6 +109,14 @@ pub(super) async fn run_agent_loop(
             fast_baseline_errors,
             tool_def_tokens,
             max_rounds,
+            perms,
+            tool_pool,
+            mcp_registry,
+            fast_revisions,
+            job_registry,
+            task: goal,
+            mcp_summary,
+            plan_only: false,
         };
         match turn::preamble::begin_round(ctx, &mut state, &mut ui, messages, round).await {
             turn::RoundFlow::Continue => {}
@@ -127,247 +141,21 @@ pub(super) async fn run_agent_loop(
 
         let tool_calls = match &assistant_msg.tool_calls {
             Some(tc) if !tc.is_empty() => tc.clone(),
-            _ => {
-                // See run.rs for rationale — nudge on both "mid-plan exit"
-                // and "no-plan exit" (the latter caught Mistral Small 4
-                // bailing during exploration before any meaningful work).
-                // Strict/legacy only.
-                if strict && !state.nudged_premature_exit && config.tools.plan {
-                    let has_unchecked = tools::plan::has_unchecked_steps(config);
-                    let plan_exists = tools::plan::plan_exists(config);
-                    if has_unchecked || !plan_exists {
-                        state.nudged_premature_exit = true;
-                        let nudge_text = if plan_exists {
-                            PREMATURE_EXIT_NUDGE.to_string()
-                        } else {
-                            "[You returned no tool call before setting a plan. \
-                             Don't exit yet — call plan(action='set') with your \
-                             step-by-step approach (or file/code if you need more \
-                             exploration). The task isn't done.]"
-                                .to_string()
-                        };
-                        let nudge = Message::user(&nudge_text);
-                        messages.push(nudge.clone());
-                        conversation_history.push(nudge);
-                        continue;
-                    }
-                }
-
-                // Behavioral done-gate: before accepting completion, verify the
-                // change actually works at runtime. Default config has no
-                // command → no-op. See docs/success-validation-design.md.
-                // Skipped for read-only (explore) turns — a Q&A turn makes no
-                // edits, so there is nothing to behaviorally verify and blocking
-                // the answer would be nonsensical.
-                if !read_only
-                    && state.gate.validation_blocks < config.validation.max_retries
-                    && config.validation.command().is_some()
-                {
-                    match validation::run_behavioral_check(config).await {
-                        validation::CheckOutcome::Fail(output) => {
-                            state.gate.validation_blocks += 1;
-                            // Record the model's completion rationale (its
-                            // no-tool-call exit content) — a bounded, auditable
-                            // voice, not a silent free pass.
-                            if let Some(rationale) = assistant_msg
-                                .content
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|c| !c.is_empty())
-                            {
-                                tracing::warn!(
-                                    "[validation] blocked completion (attempt {}); model rationale: {}",
-                                    state.gate.validation_blocks,
-                                    crate::truncate_chars(rationale, 300)
-                                );
-                                state.gate.validation_disputes.push(rationale.to_string());
-                            }
-                            ui.status("Behavioral check failed — not done yet.");
-
-                            // Full restart (opt-in `gate_restart`): on the FIRST
-                            // gate block, abandon the possibly-poisoned attempt —
-                            // revert the WHOLE tree to the clean baseline AND
-                            // reset the context. Fires once per turn.
-                            if config.tools.gate_restart && !state.gate.restart_fired {
-                                state.gate.restart_fired = true;
-                                state.plan_ever_set = false;
-                                *messages = scrap_restart(
-                                    ui.app,
-                                    config,
-                                    goal,
-                                    mcp_summary,
-                                    snapshots,
-                                    false,
-                                );
-                                conversation_history.clear();
-                                state.gate.validation_blocks = 0;
-                                state.gate.plan_step_failures.reset();
-                                continue;
-                            }
-
-                            // Goal re-anchor (opt-in `gate_replan`): re-anchor on
-                            // the ORIGINAL goal and force a fresh plan — but skip
-                            // when the block is a COMPILE failure (re-anchoring on
-                            // a broken tree just digs deeper).
-                            let is_compile_fail = output.contains("DOES NOT COMPILE")
-                                || output.contains("could not compile")
-                                || output.contains("error[E");
-                            if config.tools.gate_replan
-                                && !state.gate.replan_fired
-                                && !is_compile_fail
-                            {
-                                state.gate.replan_fired = true;
-                                ui.status(
-                                    "Re-anchoring on the original goal — re-plan from the task…",
-                                );
-                                let msg = Message::user(&format!(
-                                    "[A check that exercises the change end-to-end FAILED — it \
-                                     COMPILES but does not yet BEHAVE as required. After fixing \
-                                     errors it is easy to lose the original goal and stop at \"it \
-                                     compiles\". Re-anchor on the task: \"{goal}\". Use \
-                                     plan(action='set') to re-derive the FULL plan from that goal — \
-                                     list every step the feature needs end-to-end, INCLUDING the \
-                                     code that actually USES the new input to change behavior (not \
-                                     just declaring or plumbing it). For each step, confirm it is \
-                                     DONE in the code, not merely compiling — then implement \
-                                     whatever is missing before finishing.\nCheck output:\n{output}]"
-                                ));
-                                messages.push(msg.clone());
-                                conversation_history.push(msg);
-                                continue;
-                            }
-
-                            // Reactive debugger (opt-in): hand the SPECIFIC
-                            // failure to a fresh-context sub-agent once the
-                            // primary agent has failed the gate a couple times.
-                            let fkey = debugger::failure_key(&output);
-                            let may_fire = if config.tools.debugger_multifire {
-                                state.debugger.fires < debugger::MAX_DEBUGGER_FIRES
-                                    && state.debugger.last_failure.as_deref() != Some(fkey.as_str())
-                            } else {
-                                state.debugger.fires == 0
-                            };
-                            if (config.tools.reactive_debugger || config.tools.debugger_judge)
-                                && may_fire
-                                && state.gate.validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
-                            {
-                                state.debugger.fires += 1;
-                                state.debugger.last_failure = Some(fkey);
-                                ui.status(
-                                    "Still failing — spinning up a fresh-context debugger sub-agent…",
-                                );
-                                let verdict = debugger::run_debugger(
-                                    &output,
-                                    goal,
-                                    config,
-                                    llm_worker,
-                                    tool_pool,
-                                    tool_defs,
-                                    perms,
-                                    mcp_registry,
-                                    lsp,
-                                    fast_revisions,
-                                    fast_baseline_errors,
-                                    cancelled,
-                                )
-                                .await;
-
-                                let msg = match verdict {
-                                    debugger::DebuggerVerdict::Scrap
-                                        if !state.gate.restart_fired =>
-                                    {
-                                        state.gate.restart_fired = true;
-                                        state.plan_ever_set = false;
-                                        *messages = scrap_restart(
-                                            ui.app,
-                                            config,
-                                            goal,
-                                            mcp_summary,
-                                            snapshots,
-                                            true,
-                                        );
-                                        conversation_history.clear();
-                                        state.gate.validation_blocks = 0;
-                                        state.gate.plan_step_failures.reset();
-                                        continue;
-                                    }
-                                    debugger::DebuggerVerdict::Scrap => {
-                                        Message::user(debugger::SCRAP_ALREADY_RESET_MSG)
-                                    }
-                                    debugger::DebuggerVerdict::Rewind(candidate) => {
-                                        rewind_message_repl(
-                                            ui.app,
-                                            &candidate,
-                                            config,
-                                            perms,
-                                            lsp,
-                                            fast_revisions,
-                                            fast_baseline_errors,
-                                            &output,
-                                        )
-                                        .await
-                                    }
-                                    debugger::DebuggerVerdict::Report(body) => {
-                                        let output_note =
-                                            validation::gate_failure_note(config, &output);
-                                        Message::user(&debugger::build_gate_report_message(
-                                            &body,
-                                            &output_note,
-                                        ))
-                                    }
-                                };
-                                messages.push(msg.clone());
-                                conversation_history.push(msg);
-                                continue;
-                            }
-
-                            // Gate context-reset (opt-in): drop the polluted
-                            // history and re-assemble a clean context (files
-                            // persist on disk). Bounded per turn.
-                            if config.tools.gate_context_reset
-                                && state.gate.context_resets < spiral::MAX_GATE_RESETS
-                                && state.gate.validation_blocks >= spiral::GATE_RESET_AFTER_BLOCKS
-                            {
-                                state.gate.context_resets += 1;
-                                state.gate.validation_blocks = 0;
-                                let fresh = spiral::build_gate_reset_prompt(goal, &output);
-                                let assembled =
-                                    context::assemble(config, &fresh, &[], false, mcp_summary);
-                                *messages = assembled.messages;
-                                ui.status(
-                                    "Gate context-reset — fresh start (history cleared, files kept).",
-                                );
-                                log.tool_debug(
-                                    "agent",
-                                    "gate context-reset: re-assembled clean context after repeated gate blocks",
-                                );
-                                continue;
-                            }
-
-                            let msg = Message::user(
-                                &validation::build_verification_failed_message(&output),
-                            );
-                            messages.push(msg.clone());
-                            conversation_history.push(msg);
-                            continue;
-                        }
-                        validation::CheckOutcome::Pass | validation::CheckOutcome::Skipped => {}
-                    }
-                }
-                // Exiting now. Surface any recorded gate rationale(s) for audit.
-                if !state.gate.validation_disputes.is_empty() {
-                    ui.status(&format!(
-                        "Completed after {} blocked verification(s); model's reasons recorded in the log.",
-                        state.gate.validation_disputes.len()
-                    ));
-                    tracing::warn!(
-                        "[validation] turn completed over {} blocked check(s); model rationale(s): {}",
-                        state.gate.validation_disputes.len(),
-                        state.gate.validation_disputes.join(" | ")
-                    );
-                }
-                break;
-            }
+            _ => match turn::done_gate::check(
+                ctx,
+                opts,
+                &mut state,
+                &mut skill_state,
+                &mut ui,
+                messages,
+                conversation_history,
+                assistant_msg,
+            )
+            .await
+            {
+                turn::RoundFlow::Continue => continue,
+                turn::RoundFlow::EndTurn { .. } => break,
+            },
         };
 
         messages.push(assistant_msg.clone());
@@ -589,12 +377,13 @@ pub(super) async fn run_agent_loop(
                                 debugger::DebuggerVerdict::Scrap if !state.gate.restart_fired => {
                                     state.gate.restart_fired = true;
                                     state.plan_ever_set = false;
-                                    *messages = scrap_restart(
-                                        ui.app,
+                                    *messages = turn::restart::scrap_restart(
+                                        &mut ui,
                                         config,
                                         goal,
                                         mcp_summary,
                                         snapshots,
+                                        false,
                                         true,
                                     );
                                     conversation_history.clear();
@@ -606,8 +395,8 @@ pub(super) async fn run_agent_loop(
                                     Message::user(debugger::SCRAP_ALREADY_RESET_MSG)
                                 }
                                 debugger::DebuggerVerdict::Rewind(candidate) => {
-                                    rewind_message_repl(
-                                        ui.app,
+                                    turn::restart::rewind_message(
+                                        &mut ui,
                                         &candidate,
                                         config,
                                         perms,
@@ -1104,12 +893,13 @@ pub(super) async fn run_agent_loop(
                             debugger::DebuggerVerdict::Scrap if !state.gate.restart_fired => {
                                 state.gate.restart_fired = true;
                                 state.plan_ever_set = false;
-                                *messages = scrap_restart(
-                                    ui.app,
+                                *messages = turn::restart::scrap_restart(
+                                    &mut ui,
                                     config,
                                     goal,
                                     mcp_summary,
                                     snapshots,
+                                    false,
                                     true,
                                 );
                                 conversation_history.clear();
@@ -1121,8 +911,8 @@ pub(super) async fn run_agent_loop(
                                 Message::user(debugger::SCRAP_ALREADY_RESET_MSG)
                             }
                             debugger::DebuggerVerdict::Rewind(candidate) => {
-                                rewind_message_repl(
-                                    ui.app,
+                                turn::restart::rewind_message(
+                                    &mut ui,
                                     &candidate,
                                     config,
                                     perms,
