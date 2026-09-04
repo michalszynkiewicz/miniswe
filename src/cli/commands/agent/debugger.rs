@@ -57,6 +57,50 @@ pub const DEBUGGER_TRIGGER_BLOCKS: usize = 2;
 /// flapping failure can't spawn unbounded sub-agents.
 pub const MAX_DEBUGGER_FIRES: usize = 3;
 
+/// Stable signature of a gate failure, used by `debugger_multifire` to decide
+/// whether the failure CHANGED since the last diagnosis (so the debugger walks
+/// compile→smoke rather than re-diagnosing the same failure). Using only the
+/// first line breaks this for commands that wrap every failure in a constant
+/// banner (e.g. `echo "DOES NOT COMPILE:"; echo "$out" | tail -20`) — every
+/// compile error then hashes to the identical string, so multifire silently
+/// refuses to refire when the underlying error actually changed. Join enough
+/// of the (non-empty) output to reach past such banners into the real detail.
+pub(crate) fn failure_key(output: &str) -> String {
+    let joined = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    joined.to_ascii_lowercase().chars().take(400).collect()
+}
+
+#[cfg(test)]
+mod failure_key_tests {
+    use super::failure_key;
+
+    #[test]
+    fn distinguishes_different_errors_behind_the_same_banner() {
+        let a = "DOES NOT COMPILE:\nerror[E0599]: no method named `call_chat`\n --> src/cli/commands/run.rs:222:41";
+        let b = "DOES NOT COMPILE:\nerror[E0382]: borrow of partially moved value: `system_prompt_override`\n --> src/context/mod.rs:306:8";
+        assert_ne!(failure_key(a), failure_key(b));
+    }
+
+    #[test]
+    fn treats_the_same_error_as_the_same_key() {
+        let a = "DOES NOT COMPILE:\nerror[E0382]: borrow of partially moved value: `x`\n --> src/context/mod.rs:306:8";
+        let b = "DOES NOT COMPILE:\nerror[E0382]: borrow of partially moved value: `x`\n --> src/context/mod.rs:306:8";
+        assert_eq!(failure_key(a), failure_key(b));
+    }
+
+    #[test]
+    fn ignores_blank_lines_and_case() {
+        let a = "\n\nDOES NOT COMPILE:\n\nError[E0308]\n";
+        let b = "DOES NOT COMPILE:\nerror[e0308]";
+        assert_eq!(failure_key(a), failure_key(b));
+    }
+}
+
 /// Read-only investigation budget. Diagnosis doesn't need many rounds; a
 /// final forced report turn happens after this regardless.
 const MAX_DEBUGGER_ROUNDS: usize = 8;

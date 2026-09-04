@@ -51,7 +51,7 @@ pub(super) async fn rewind_message_repl(
         // mean the gate's original failure is fully resolved. Point at the raw
         // check output so the model isn't left guessing what "the remaining
         // problem" actually is from the rewind summary alone.
-        let output_note = crate::cli::commands::run::write_gate_failure_output(config, output)
+        let output_note = validation::write_gate_failure_output(config, output)
             .map(|path| format!(" Full check output that triggered this: read(\"{path}\")."))
             .unwrap_or_default();
         Message::user(&format!(

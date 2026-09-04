@@ -141,7 +141,7 @@ pub(super) async fn rewind_message(
         // check may still be failing for an unrelated reason elsewhere). Point
         // at the raw check output so the model isn't left guessing what
         // "the remaining problem" actually is from the rewind summary alone.
-        let output_note = write_gate_failure_output(config, output)
+        let output_note = validation::write_gate_failure_output(config, output)
             .map(|path| format!(" Full check output that triggered this: read(\"{path}\")."))
             .unwrap_or_default();
         Message::user(&format!(
@@ -160,5 +160,70 @@ pub(super) async fn rewind_message(
         Message::user(&format!(
             "[Verification failed — do NOT finish yet. Check output:\n{output}]"
         ))
+    }
+}
+
+#[cfg(test)]
+mod job_failure_tests {
+    use super::{failing_job_output, job_banner_command, normalize_command, note_job_banners};
+
+    #[test]
+    fn normalize_strips_cd_prefix_and_whitespace() {
+        assert_eq!(
+            normalize_command("cd demo-e2e-task-package &&  pkg   run dev"),
+            "pkg run dev"
+        );
+        assert_eq!(normalize_command("pkg run dev"), "pkg run dev");
+    }
+
+    #[test]
+    fn job_banner_command_extracts_normalized_command() {
+        assert_eq!(
+            job_banner_command("[job 1 FAILED]  $ cd pkg && pkg run dev").as_deref(),
+            Some("pkg run dev")
+        );
+        assert_eq!(job_banner_command("just some output"), None);
+    }
+
+    #[test]
+    fn failed_banner_records_and_clean_finish_clears() {
+        let mut failed = std::collections::HashMap::new();
+        note_job_banners(
+            "[job 1 FAILED]  $ cd pkg && pkg run dev\n[shell: exit 1]\nunable to pull chart",
+            &mut failed,
+        );
+        assert!(failed["pkg run dev"].contains("unable to pull chart"));
+        // Same command later finishes cleanly → stale failure cleared.
+        note_job_banners("[job 2 FINISHED]  $ pkg run dev\nok", &mut failed);
+        assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn aggregate_result_with_mixed_banners_attributes_per_job() {
+        // One result carrying two banners (aggregate status): only the FAILED
+        // job's command must be recorded, regardless of result-level success.
+        let mut failed = std::collections::HashMap::new();
+        note_job_banners(
+            "[job 1 FINISHED]  $ ls\nok\n[job 2 FAILED]  $ pkg run dev\n[shell: exit 128]",
+            &mut failed,
+        );
+        assert!(!failed.contains_key("ls"));
+        assert!(failed.contains_key("pkg run dev"));
+    }
+
+    #[test]
+    fn failing_job_output_matches_normalized_shell_command() {
+        let mut failed = std::collections::HashMap::new();
+        failed.insert(
+            "pkg run dev".to_string(),
+            "exit 128: bad chart ref".to_string(),
+        );
+        let args = serde_json::json!({"action": "run", "command": "cd pkg && pkg run dev"});
+        let hit = failing_job_output("shell", &args, &failed);
+        assert_eq!(hit.map(|(c, _)| c), Some("pkg run dev".to_string()));
+        // non-shell tool, or unrecorded command → no match
+        assert!(failing_job_output("file", &args, &failed).is_none());
+        let other = serde_json::json!({"action": "run", "command": "ls"});
+        assert!(failing_job_output("shell", &other, &failed).is_none());
     }
 }
