@@ -60,7 +60,6 @@ pub(super) async fn run_agent_loop(
     // plan/no-plan nudges, hide-edit-tools-until-plan). Derived from the
     // per-turn config, which already has ceremony forced Off for explore turns.
     let strict = config.tools.ceremony == CeremonyMode::Strict;
-    let pause_at = config.context.pause_after_rounds;
 
     let mut round = 0;
     let mut had_error = false;
@@ -82,130 +81,21 @@ pub(super) async fn run_agent_loop(
         round += 1;
         log.round_start(round);
 
-        // Snapshot at the start of each round for revert support (SCRAP /
-        // revert-to-green rely on these per-round commits in the shadow repo).
-        if let Some(snap) = snapshots {
-            let mut guard = snap.lock();
-            let _ = guard.begin_round(round);
+        let ctx = turn::TurnCtx {
+            config,
+            router,
+            llm_worker,
+            lsp,
+            snapshots,
+            log: &log,
+            fast_baseline_errors,
+            tool_def_tokens,
+            max_rounds,
+        };
+        match turn::preamble::begin_round(ctx, &mut state, &mut ui, messages, round).await {
+            turn::RoundFlow::Continue => {}
+            turn::RoundFlow::EndTurn { .. } => break,
         }
-
-        // revert-to-green: if the project has been broken above baseline for
-        // spiral::REVERT_TO_GREEN_BLOCKS rounds, the agent is digging deeper, not
-        // recovering — reset the whole tree to the last green snapshot.
-        if config.tools.revert_to_green
-            && config.tools.edit_mode == EditMode::Fast
-            && let Some(snap) = snapshots
-        {
-            let errs = tools::fast::project_error_count(lsp.as_deref()).await;
-            if errs <= fast_baseline_errors {
-                state.green.last_green_round = round;
-                state.green.red_streak = 0;
-            } else {
-                state.green.red_streak += 1;
-                if state.green.red_streak >= spiral::REVERT_TO_GREEN_BLOCKS {
-                    let result = {
-                        let guard = snap.lock();
-                        guard.revert_to_round(state.green.last_green_round)
-                    };
-                    match result {
-                        Ok(m) => {
-                            ui.status(&format!(
-                                "[revert-to-green] stuck {} rounds; {m}",
-                                state.green.red_streak
-                            ));
-                            messages.push(Message::user(&spiral::build_revert_to_green_message(
-                                state.green.red_streak,
-                                state.green.last_green_round,
-                            )));
-                            state.green.red_streak = 0;
-                        }
-                        Err(e) => {
-                            ui.event(UiEvent::RevertToGreenFailed {
-                                error: e.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        if round > max_rounds {
-            ui.event(UiEvent::MaxRoundsReached);
-            break;
-        }
-
-        // Ask the user whether to continue after pause_after_rounds rounds.
-        if round == pause_at && !state.user_continued {
-            match ui.confirm_continue(pause_at).await {
-                PauseDecision::Continue => state.user_continued = true,
-                PauseDecision::WrapUp => {
-                    messages.push(Message::user("[Stop now. Summarize what you've done.]"))
-                }
-            }
-        }
-
-        // Warn the LLM when approaching the hard limit.
-        if round == max_rounds.saturating_sub(5) {
-            messages.push(Message::user(
-                "[Approaching tool limit. Wrap up and summarize.]",
-            ));
-        }
-
-        // Refresh the live plan panel from plan.md (single source of truth).
-        ui.refresh_plan(config, round);
-
-        // Unified context compression — handles both tool results and
-        // conversation, every round (matching run.rs). Driven through a
-        // select! so a long LLM-based summarization keeps the TUI responsive.
-        {
-            // See `agent::prune_reads` — surgically drop the middle of a deep
-            // run of identical reads, which compaction structurally cannot
-            // reach (it summarizes the oldest end; the loop is in the newest).
-            let pruned = prune_repeated_reads(messages);
-            if !pruned.is_empty() {
-                log.reads_pruned(
-                    pruned.removed / 2,
-                    pruned.keys,
-                    pruned.deepest.as_deref().unwrap_or("?"),
-                );
-                ui.event(UiEvent::ReadsPruned {
-                    pairs: pruned.removed / 2,
-                    keys: pruned.keys,
-                    deepest: pruned.deepest,
-                });
-            }
-            let pre = messages.len();
-            // Read-loop escalation (see REPEATED_READ_ESCALATION): the loop
-            // is sustained by the cache-hot prompt prefix, so break it
-            // deliberately even though no budget pressure asks for it. Runs
-            // before maybe_compress so refresh_current_state still lands on
-            // the tail.
-            if state.force_compact_next_round {
-                state.force_compact_next_round = false;
-                ui.event(UiEvent::ForcingCompaction);
-                ui.pump(context::compressor::force_compress(
-                    messages,
-                    config,
-                    router,
-                    llm_worker,
-                    tool_def_tokens,
-                ))
-                .await;
-            }
-            ui.pump(context::compressor::maybe_compress(
-                messages,
-                config,
-                router,
-                llm_worker,
-                tool_def_tokens,
-                &mut state.plan_update_requested,
-            ))
-            .await;
-            log.masking_applied(pre.saturating_sub(messages.len()), pre);
-        }
-
-        // Sanitize messages
-        context::sanitize_messages(messages);
 
         // Hide edit tools until a plan exists; see visible_tool_defs.
         let plan_set = tools::plan::plan_exists(config);

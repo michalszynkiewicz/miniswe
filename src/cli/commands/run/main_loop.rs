@@ -195,7 +195,6 @@ pub async fn run(
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(config.context.max_rounds);
-    let pause_at = config.context.pause_after_rounds;
     // Ceremony=Off (default, evidence-distilled): no plan gate, no
     // plan/no-plan nudges, all edit tools always visible, no phase
     // rebuild. `strict` re-enables the legacy plan-first machinery.
@@ -614,136 +613,24 @@ pub async fn run(
             }
         }
 
-        // Snapshot at start of each round for revert support
-        if let Some(ref snap) = snapshots {
-            let mut guard = snap.lock();
-            let _ = guard.begin_round(round);
-        }
-
-        // revert-to-green: this round STARTS from the state the previous round
-        // left (just snapshotted above). If the project has been broken above
-        // baseline for spiral::REVERT_TO_GREEN_BLOCKS rounds, the agent is digging
-        // deeper, not recovering — reset the whole tree to the last green
-        // snapshot and tell it to start over from a clean base.
-        if config.tools.revert_to_green
-            && config.tools.edit_mode == EditMode::Fast
-            && let Some(ref snap) = snapshots
-        {
-            {
-                let errs = tools::fast::project_error_count(lsp_client.as_deref()).await;
-                if errs <= fast_baseline_errors {
-                    state.green.last_green_round = round;
-                    state.green.red_streak = 0;
-                } else {
-                    state.green.red_streak += 1;
-                    if state.green.red_streak >= spiral::REVERT_TO_GREEN_BLOCKS {
-                        let result = {
-                            let guard = snap.lock();
-                            guard.revert_to_round(state.green.last_green_round)
-                        };
-                        match result {
-                            Ok(m) => {
-                                ui.status(&format!(
-                                    "[revert-to-green] stuck {} rounds; {m}",
-                                    state.green.red_streak
-                                ));
-                                messages.push(Message::user(
-                                    &spiral::build_revert_to_green_message(
-                                        state.green.red_streak,
-                                        state.green.last_green_round,
-                                    ),
-                                ));
-                                state.green.red_streak = 0;
-                            }
-                            Err(e) => {
-                                ui.event(UiEvent::RevertToGreenFailed {
-                                    error: e.to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if round > max_rounds {
-            ui.event(UiEvent::MaxRoundsReached);
-            break;
-        }
-
-        // Ask user if they want to continue after pause_after_rounds.
-        // The headless auto-continue notice lives in HeadlessUi (blocking on
-        // stdin hung real e2e harness runs for their full timeout — pkg-mcp
-        // 2026-07-13: two of three attempts died waiting at exactly this
-        // prompt); max_rounds stays the hard stop.
-        if round == pause_at && !state.user_continued {
-            match ui.confirm_continue(pause_at).await {
-                PauseDecision::Continue => {
-                    state.user_continued = true;
-                }
-                PauseDecision::WrapUp => {
-                    // Tell the LLM to wrap up
-                    messages.push(Message::user("[Stop now. Summarize what you've done.]"));
-                }
-            }
-        }
-
-        // Warn the LLM when approaching the hard limit
-        if round == max_rounds.saturating_sub(5) {
-            messages.push(Message::user(
-                "[Approaching tool limit. Wrap up and summarize.]",
-            ));
-        }
-
-        // Drop the middle of any deep run of identical read/inspection pairs
-        // BEFORE compaction: compaction only ever summarizes the oldest end,
-        // and a read loop lives in the newest messages, so every forced
-        // compaction used to leave the repeats untouched and raise their
-        // share of the prompt. See `agent::prune_reads`.
-        let pruned = prune_repeated_reads(&mut messages);
-        if !pruned.is_empty() {
-            log.reads_pruned(
-                pruned.removed / 2,
-                pruned.keys,
-                pruned.deepest.as_deref().unwrap_or("?"),
-            );
-            ui.event(UiEvent::ReadsPruned {
-                pairs: pruned.removed / 2,
-                keys: pruned.keys,
-                deepest: pruned.deepest,
-            });
-        }
-
-        // Unified context compression — handles both tool results and conversation
-        let pre_mask = messages.len();
-        // Read-loop escalation (see REPEATED_READ_ESCALATION): the loop is
-        // sustained by the cache-hot prompt prefix, so break it deliberately
-        // even though no budget pressure asks for it. Runs before
-        // maybe_compress so refresh_current_state still lands on the tail.
-        if state.force_compact_next_round {
-            state.force_compact_next_round = false;
-            ui.event(UiEvent::ForcingCompaction);
-            ui.pump(context::compressor::force_compress(
-                &mut messages,
-                &config,
-                &router,
-                &llm_worker,
-                tool_def_tokens,
-            ))
-            .await;
-        }
-        ui.pump(context::compressor::maybe_compress(
-            &mut messages,
-            &config,
-            &router,
-            &llm_worker,
+        let ctx = turn::TurnCtx {
+            config: &config,
+            router: &router,
+            llm_worker: &llm_worker,
+            lsp: &lsp_client,
+            snapshots: &snapshots,
+            log: &log,
+            fast_baseline_errors,
             tool_def_tokens,
-            &mut state.plan_update_requested,
-        ))
-        .await;
-        log.masking_applied(pre_mask.saturating_sub(messages.len()), pre_mask);
-
-        // Sanitize message roles before sending (strict chat template compat)
-        context::sanitize_messages(&mut messages);
+            max_rounds,
+        };
+        match turn::preamble::begin_round(ctx, &mut state, &mut ui, &mut messages, round).await {
+            turn::RoundFlow::Continue => {}
+            turn::RoundFlow::EndTurn { error } => {
+                had_error |= error;
+                break;
+            }
+        }
 
         // Call LLM with streaming.
         //

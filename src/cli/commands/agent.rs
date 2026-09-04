@@ -17,6 +17,7 @@ pub mod skill_router;
 pub mod spiral;
 pub mod stuck_check;
 pub mod subagent;
+pub mod turn;
 pub mod turn_state;
 pub mod ui;
 pub mod validation;
