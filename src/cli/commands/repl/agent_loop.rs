@@ -23,37 +23,6 @@ pub(super) fn refresh_plan_panel(app: &mut App, config: &Config, round: usize) {
     app.round = round;
 }
 
-/// `compressor::force_compress` driven through the same select!-with-redraw
-/// pattern the round loop uses for `maybe_compress`, so a long LLM-based
-/// summarization during reactive context-exhaustion recovery keeps the TUI
-/// responsive. Returns force_compress's "did anything shrink" result.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn force_compress_responsive(
-    app: &mut App,
-    rx: &mut mpsc::UnboundedReceiver<AppEvent>,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    messages: &mut Vec<Message>,
-    config: &Config,
-    router: &ModelRouter,
-    llm_worker: &LlmWorkerHandle,
-    tool_def_tokens: usize,
-) -> bool {
-    let fut =
-        context::compressor::force_compress(messages, config, router, llm_worker, tool_def_tokens);
-    let mut fut = std::pin::pin!(fut);
-    loop {
-        tokio::select! {
-            biased;
-            freed = &mut fut => break freed,
-            evt = rx.recv() => {
-                if matches!(evt, Some(AppEvent::Tick)) {
-                    let _ = terminal.draw(|frame| ui::draw(frame, app));
-                }
-            }
-        }
-    }
-}
-
 /// This runs inline in the main loop, processing events between rounds.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_agent_loop(
@@ -98,6 +67,7 @@ pub(super) async fn run_agent_loop(
     // Per-turn agent-loop state shared with the headless loop (see the field
     // docs on `turn_state::TurnState` and its sub-structs).
     let mut state = turn_state::TurnState::default();
+    let mut ui = TuiUi::new(app, rx, terminal);
 
     'round: loop {
         if had_error {
@@ -105,7 +75,7 @@ pub(super) async fn run_agent_loop(
         }
         // Check cancellation at the top of every round
         if consume_interrupt(cancelled) {
-            app.push_output("(interrupted)", LineStyle::Status);
+            ui.notify_interrupted();
             break;
         }
 
@@ -139,13 +109,10 @@ pub(super) async fn run_agent_loop(
                     };
                     match result {
                         Ok(m) => {
-                            app.push_output(
-                                &format!(
-                                    "[revert-to-green] stuck {} rounds; {m}",
-                                    state.green.red_streak
-                                ),
-                                LineStyle::Status,
-                            );
+                            ui.status(&format!(
+                                "[revert-to-green] stuck {} rounds; {m}",
+                                state.green.red_streak
+                            ));
                             messages.push(Message::user(&spiral::build_revert_to_green_message(
                                 state.green.red_streak,
                                 state.green.last_green_round,
@@ -153,10 +120,9 @@ pub(super) async fn run_agent_loop(
                             state.green.red_streak = 0;
                         }
                         Err(e) => {
-                            app.push_output(
-                                &format!("[revert-to-green] revert failed: {e}"),
-                                LineStyle::Error,
-                            );
+                            ui.event(UiEvent::RevertToGreenFailed {
+                                error: e.to_string(),
+                            });
                         }
                     }
                 }
@@ -164,22 +130,17 @@ pub(super) async fn run_agent_loop(
         }
 
         if round > max_rounds {
-            app.push_output("Maximum tool rounds reached.", LineStyle::Error);
+            ui.event(UiEvent::MaxRoundsReached);
             break;
         }
 
         // Ask the user whether to continue after pause_after_rounds rounds.
         if round == pause_at && !state.user_continued {
-            app.pending_permission = Some(format!(
-                "{pause_at} tool rounds used. Continue? [y]es / [n]o:"
-            ));
-            app.input.clear();
-            app.cursor = 0;
-            let response = wait_for_modal_input(app, rx, terminal, &['y', 'n']).await;
-            app.pending_permission = None;
-            match response.as_str() {
-                "y" | "yes" | "" => state.user_continued = true,
-                _ => messages.push(Message::user("[Stop now. Summarize what you've done.]")),
+            match ui.confirm_continue(pause_at).await {
+                PauseDecision::Continue => state.user_continued = true,
+                PauseDecision::WrapUp => {
+                    messages.push(Message::user("[Stop now. Summarize what you've done.]"))
+                }
             }
         }
 
@@ -191,7 +152,7 @@ pub(super) async fn run_agent_loop(
         }
 
         // Refresh the live plan panel from plan.md (single source of truth).
-        refresh_plan_panel(app, config, round);
+        ui.refresh_plan(config, round);
 
         // Unified context compression — handles both tool results and
         // conversation, every round (matching run.rs). Driven through a
@@ -207,13 +168,11 @@ pub(super) async fn run_agent_loop(
                     pruned.keys,
                     pruned.deepest.as_deref().unwrap_or("?"),
                 );
-                app.push_output(
-                    &format!(
-                        "  ⋯ pruned {} repeated calls from context",
-                        pruned.removed / 2
-                    ),
-                    LineStyle::Status,
-                );
+                ui.event(UiEvent::ReadsPruned {
+                    pairs: pruned.removed / 2,
+                    keys: pruned.keys,
+                    deepest: pruned.deepest,
+                });
             }
             let pre = messages.len();
             // Read-loop escalation (see REPEATED_READ_ESCALATION): the loop
@@ -223,45 +182,25 @@ pub(super) async fn run_agent_loop(
             // the tail.
             if state.force_compact_next_round {
                 state.force_compact_next_round = false;
-                app.push_output(
-                    "  ⚠ Read loop persisted — forcing context compaction",
-                    LineStyle::Status,
-                );
-                force_compress_responsive(
-                    app,
-                    rx,
-                    terminal,
+                ui.event(UiEvent::ForcingCompaction);
+                ui.pump(context::compressor::force_compress(
                     messages,
                     config,
                     router,
                     llm_worker,
                     tool_def_tokens,
-                )
+                ))
                 .await;
             }
-            {
-                let compress_fut = context::compressor::maybe_compress(
-                    messages,
-                    config,
-                    router,
-                    llm_worker,
-                    tool_def_tokens,
-                    &mut state.plan_update_requested,
-                );
-                let mut compress_fut = std::pin::pin!(compress_fut);
-                let mut done = false;
-                while !done {
-                    tokio::select! {
-                        biased;
-                        () = &mut compress_fut, if !done => { done = true; }
-                        evt = rx.recv() => {
-                            if matches!(evt, Some(AppEvent::Tick)) {
-                                let _ = terminal.draw(|frame| ui::draw(frame, app));
-                            }
-                        }
-                    }
-                }
-            }
+            ui.pump(context::compressor::maybe_compress(
+                messages,
+                config,
+                router,
+                llm_worker,
+                tool_def_tokens,
+                &mut state.plan_update_requested,
+            ))
+            .await;
             log.masking_applied(pre.saturating_sub(messages.len()), pre);
         }
 
@@ -309,253 +248,158 @@ pub(super) async fn run_agent_loop(
         log.llm_request(&request);
 
         cancelled.store(false, Ordering::Relaxed);
-        app.is_thinking = true;
-        app.set_active_job("llm");
 
-        // Render before LLM call so spinner is visible immediately
-        let _ = terminal.draw(|frame| ui::draw(frame, app));
-
-        // Call LLM with streaming — render on each token
-        let mut rendered_assistant_text = String::new();
-        // Set when the server rejected the model's tool call as
-        // truncated JSON. In that case we inject a synthetic user-role
-        // hint and continue the outer loop so the agent can recover
-        // with a smaller operation, instead of aborting the session.
-        let mut truncated_tool_call_hint_pushed = false;
-        // Set when the failure is really CONTEXT EXHAUSTION (the server
-        // rejected an over-size request, or clipped a tool call because the
-        // prompt sits near the window). Handled after the select loop —
-        // force_compress is a long await that must not run inside it.
-        let mut context_ceiling_hit = false;
-        let response = {
-            let mut token_count = 0u32;
-            let mut llm_events =
-                llm_worker.submit(ModelRole::Default, request.clone(), cancelled.clone());
-            loop {
-                tokio::select! {
-                    evt = llm_events.recv() => {
-                        match evt {
-                            Some(LlmWorkerEvent::Token(token)) => {
-                                app.push_token(&token);
-                                rendered_assistant_text.push_str(&token);
-                                token_count += 1;
-                                if token_count.is_multiple_of(3) {
-                                    let _ = terminal.draw(|frame| ui::draw(frame, app));
-                                }
-                            }
-                            Some(LlmWorkerEvent::Completed(Ok(r))) => break Some(r),
-                            Some(LlmWorkerEvent::Completed(Err(err_str))) => {
-                                if err_str.contains("Interrupted") {
-                                    cancelled.store(false, Ordering::Relaxed);
-                                    app.push_output("Generation interrupted.", LineStyle::Status);
-                                } else if is_context_exceeded_error(&err_str)
-                                    && state.context_compact_retries
-                                        < context::compressor::FORCE_COMPRESS_MAX_RETRIES
-                                {
-                                    // Prompt alone exceeds the context window
-                                    // — recoverable by compacting + resending
-                                    // (primary path for compaction="lazy",
-                                    // safety net for every other strategy).
-                                    context_ceiling_hit = true;
-                                } else if is_tool_call_args_cap_error(&err_str) {
-                                    // Our streaming assembler aborted the
-                                    // generation: an anchor-only tool's
-                                    // arguments outgrew the cap. Nothing was
-                                    // persisted; hint and retry, or give up
-                                    // when the model keeps doing it.
-                                    state.truncated_call_errors_in_a_row += 1;
-                                    if state.truncated_call_errors_in_a_row
-                                        >= TRUNCATED_CALL_ABORT_AFTER
-                                    {
-                                        log.llm_error(&format!(
-                                            "{} consecutive oversized tool calls — aborting turn",
-                                            state.truncated_call_errors_in_a_row
-                                        ));
-                                        // Falls through to `break None` below:
-                                        // no hint flag set, so the turn ends.
-                                        app.push_output(
-                                            "The model keeps emitting oversized tool-call arguments — giving up on this turn.",
-                                            LineStyle::Error,
-                                        );
-                                    } else {
-                                    log.llm_error(&format!(
-                                        "tool call aborted by the argument size cap: {err_str}"
-                                    ));
-                                    app.push_output(
-                                        "Tool call arguments exceeded the size cap — retrying with guidance.",
-                                        LineStyle::Status,
-                                    );
-                                    let hint = Message::user(&format!(
-                                        "{err_str}. Anchor-style tools take identifiers and short expressions only — \
-                                         never paste code bodies into their arguments. {}",
-                                        truncated_tool_call_hint(config.tools.edit_mode)
-                                    ));
-                                    messages.push(hint.clone());
-                                    conversation_history.push(hint);
-                                    truncated_tool_call_hint_pushed = true;
-                                    }
-                                } else if is_truncated_tool_call_error(&err_str) {
-                                    // The server's chat template could not
-                                    // parse some assistant tool call's
-                                    // arguments as JSON: either this
-                                    // response was cut off mid-call
-                                    // (nothing persisted), or a previously
-                                    // persisted call is broken and every
-                                    // request will fail until it is gone.
-                                    // Handle the second first — it is a
-                                    // zero-progress spin otherwise.
-                                    state.truncated_call_errors_in_a_row += 1;
-                                    let scrubbed = if state.truncated_call_errors_in_a_row >= 2 {
-                                        scrub_unparseable_tool_calls(messages)
-                                            + scrub_unparseable_tool_calls(conversation_history)
-                                    } else {
-                                        0
-                                    };
-                                    if scrubbed > 0 {
-                                        log.llm_error(&format!(
-                                            "scrubbed {scrubbed} unparseable tool call(s) from history after repeated parse failures — retrying"
-                                        ));
-                                        app.push_output(
-                                            "Repaired a truncated tool call left in history — retrying.",
-                                            LineStyle::Status,
-                                        );
-                                        truncated_tool_call_hint_pushed = true;
-                                    } else if state.truncated_call_errors_in_a_row
-                                        >= TRUNCATED_CALL_ABORT_AFTER
-                                    {
-                                        log.llm_error(&format!(
-                                            "{} consecutive tool-call parse failures with nothing left to repair — aborting turn",
-                                            state.truncated_call_errors_in_a_row
-                                        ));
-                                        // Falls through to `break None`: turn ends.
-                                        app.push_output(
-                                            "The server keeps rejecting tool-call arguments — giving up on this turn.",
-                                            LineStyle::Error,
-                                        );
-                                    } else if context::compressor::estimated_context_tokens(
-                                        messages,
-                                        tool_def_tokens,
-                                    ) > config.model.context_window * 3 / 4
-                                        && state.context_compact_retries
-                                            < context::compressor::FORCE_COMPRESS_MAX_RETRIES
-                                    {
-                                        context_ceiling_hit = true;
-                                    } else {
-                                        // Clear the partial UI text (don't
-                                        // persist the half-streamed output)
-                                        // and push a user-role hint so the
-                                        // agent retries with a smaller
-                                        // operation.
-                                        log.llm_error(
-                                            "tool call JSON truncated (max_tokens) — \
-                                             injecting hint and continuing",
-                                        );
-                                        app.push_output(
-                                            "Previous tool call truncated — retrying with guidance.",
-                                            LineStyle::Status,
-                                        );
-                                        let hint = Message::user(truncated_tool_call_hint(
-                                            config.tools.edit_mode,
-                                        ));
-                                        messages.push(hint.clone());
-                                        conversation_history.push(hint);
-                                        truncated_tool_call_hint_pushed = true;
-                                    }
-                                } else {
-                                    let clean = if err_str.contains('<') {
-                                        err_str
-                                            .split('<')
-                                            .next()
-                                            .unwrap_or(&err_str)
-                                            .trim()
-                                            .to_string()
-                                    } else {
-                                        err_str
-                                    };
-                                    log.llm_error(&clean);
-                                    app.push_output(&format!("LLM error: {clean}"), LineStyle::Error);
-                                }
-                                app.clear_active_job();
-                                break None;
-                            }
-                            None => {
-                                app.push_output("LLM worker stopped unexpectedly.", LineStyle::Error);
-                                app.clear_active_job();
-                                break None;
-                            }
-                        }
-                    }
-                    app_evt = rx.recv() => {
-                        match app_evt {
-                            Some(AppEvent::Tick) => {
-                                let _ = terminal.draw(|frame| ui::draw(frame, app));
-                            }
-                            Some(AppEvent::Key(key)) if handle_background_key(app, &key) => {
-                                let _ = terminal.draw(|frame| ui::draw(frame, app));
-                            }
-                            Some(AppEvent::Key(key)) if event::is_ctrl_c(&key) => {
-                                cancelled.store(true, Ordering::Relaxed);
-                                app.push_output("(interrupted)", LineStyle::Status);
-                                let _ = terminal.draw(|frame| ui::draw(frame, app));
-                            }
-                            Some(AppEvent::Mouse(_)) => {}
-                            Some(AppEvent::PermissionRequest(prompt, response_tx)) => {
-                                let response =
-                                    fulfill_permission_request(app, rx, terminal, prompt).await;
-                                let _ = response_tx.send(response);
-                            }
-                            Some(_) => {}
-                            None => {
-                                app.push_output("Event stream closed.", LineStyle::Error);
-                                app.clear_active_job();
-                                break None;
-                            }
-                        }
-                    }
+        let response = match ui
+            .stream_llm(llm_worker, ModelRole::Default, request, cancelled)
+            .await
+        {
+            LlmOutcome::Response(r) => r,
+            // stream_llm already surfaced the error line for both.
+            LlmOutcome::WorkerStopped | LlmOutcome::UiClosed => break,
+            LlmOutcome::Error(err_str) => {
+                if err_str.contains("Interrupted") {
+                    cancelled.store(false, Ordering::Relaxed);
+                    ui.status("Generation interrupted.");
+                    break;
                 }
-            }
-        };
-
-        app.clear_active_job();
-
-        // Re-render after LLM response
-        let _ = terminal.draw(|frame| ui::draw(frame, app));
-
-        let Some(response) = response else {
-            if context_ceiling_hit {
-                state.context_compact_retries += 1;
-                app.push_output(
-                    "Context window exceeded — compacting and retrying.",
-                    LineStyle::Status,
-                );
-                if force_compress_responsive(
-                    app,
-                    rx,
-                    terminal,
-                    messages,
-                    config,
-                    router,
-                    llm_worker,
-                    tool_def_tokens,
-                )
-                .await
+                if is_context_exceeded_error(&err_str)
+                    && state.context_compact_retries
+                        < context::compressor::FORCE_COMPRESS_MAX_RETRIES
                 {
-                    log.llm_error("context window exceeded — compacted history, retrying");
+                    // Prompt alone exceeds the context window — recoverable by
+                    // compacting + resending (primary path for
+                    // compaction="lazy", safety net for every other strategy).
+                    state.context_compact_retries += 1;
+                    ui.status("Context window exceeded — compacting and retrying.");
+                    if ui
+                        .pump(context::compressor::force_compress(
+                            messages,
+                            config,
+                            router,
+                            llm_worker,
+                            tool_def_tokens,
+                        ))
+                        .await
+                    {
+                        log.llm_error("context window exceeded — compacted history, retrying");
+                        continue;
+                    }
+                    // Nothing could be freed — retrying would fail identically.
+                    ui.error("Compaction could not free any context — stopping this turn.");
+                    break;
+                }
+                if is_tool_call_args_cap_error(&err_str) {
+                    // Our streaming assembler aborted the generation: an
+                    // anchor-only tool's arguments outgrew the cap. Nothing
+                    // was persisted; hint and retry, or give up when the
+                    // model keeps doing it.
+                    state.truncated_call_errors_in_a_row += 1;
+                    if state.truncated_call_errors_in_a_row >= TRUNCATED_CALL_ABORT_AFTER {
+                        log.llm_error(&format!(
+                            "{} consecutive oversized tool calls — aborting turn",
+                            state.truncated_call_errors_in_a_row
+                        ));
+                        ui.error(
+                            "The model keeps emitting oversized tool-call arguments — giving up on this turn.",
+                        );
+                        break;
+                    }
+                    log.llm_error(&format!(
+                        "tool call aborted by the argument size cap: {err_str}"
+                    ));
+                    ui.status(
+                        "Tool call arguments exceeded the size cap — retrying with guidance.",
+                    );
+                    let hint = Message::user(&format!(
+                        "{err_str}. Anchor-style tools take identifiers and short expressions only — \
+                         never paste code bodies into their arguments. {}",
+                        truncated_tool_call_hint(config.tools.edit_mode)
+                    ));
+                    messages.push(hint.clone());
+                    conversation_history.push(hint);
                     continue;
                 }
-                // Nothing could be freed — retrying would fail identically.
-                app.push_output(
-                    "Compaction could not free any context — stopping this turn.",
-                    LineStyle::Error,
-                );
+                if is_truncated_tool_call_error(&err_str) {
+                    // The server's chat template could not parse some
+                    // assistant tool call's arguments as JSON: either this
+                    // response was cut off mid-call (nothing persisted), or a
+                    // previously persisted call is broken and every request
+                    // will fail until it is gone. Handle the second first —
+                    // it is a zero-progress spin otherwise.
+                    state.truncated_call_errors_in_a_row += 1;
+                    if state.truncated_call_errors_in_a_row >= 2 {
+                        let scrubbed = scrub_unparseable_tool_calls(messages)
+                            + scrub_unparseable_tool_calls(conversation_history);
+                        if scrubbed > 0 {
+                            log.llm_error(&format!(
+                                "scrubbed {scrubbed} unparseable tool call(s) from history after repeated parse failures — retrying"
+                            ));
+                            ui.status("Repaired a truncated tool call left in history — retrying.");
+                            continue;
+                        }
+                    }
+                    if state.truncated_call_errors_in_a_row >= TRUNCATED_CALL_ABORT_AFTER {
+                        log.llm_error(&format!(
+                            "{} consecutive tool-call parse failures with nothing left to repair — aborting turn",
+                            state.truncated_call_errors_in_a_row
+                        ));
+                        ui.error(
+                            "The server keeps rejecting tool-call arguments — giving up on this turn.",
+                        );
+                        break;
+                    }
+                    // When the prompt sits near the context window the
+                    // truncation is really context exhaustion — compact and
+                    // resend instead of hinting.
+                    if context::compressor::estimated_context_tokens(messages, tool_def_tokens)
+                        > config.model.context_window * 3 / 4
+                        && state.context_compact_retries
+                            < context::compressor::FORCE_COMPRESS_MAX_RETRIES
+                    {
+                        state.context_compact_retries += 1;
+                        ui.status("Context window exceeded — compacting and retrying.");
+                        if ui
+                            .pump(context::compressor::force_compress(
+                                messages,
+                                config,
+                                router,
+                                llm_worker,
+                                tool_def_tokens,
+                            ))
+                            .await
+                        {
+                            log.llm_error("context window exceeded — compacted history, retrying");
+                            continue;
+                        }
+                        ui.error("Compaction could not free any context — stopping this turn.");
+                        break;
+                    }
+                    // Push a user-role hint so the agent retries with a
+                    // smaller operation.
+                    log.llm_error(
+                        "tool call JSON truncated (max_tokens) — \
+                         injecting hint and continuing",
+                    );
+                    ui.status("Previous tool call truncated — retrying with guidance.");
+                    let hint = Message::user(truncated_tool_call_hint(config.tools.edit_mode));
+                    messages.push(hint.clone());
+                    conversation_history.push(hint);
+                    continue;
+                }
+                let clean = if err_str.contains('<') {
+                    err_str
+                        .split('<')
+                        .next()
+                        .unwrap_or(&err_str)
+                        .trim()
+                        .to_string()
+                } else {
+                    err_str
+                };
+                log.llm_error(&clean);
+                ui.error(&format!("LLM error: {clean}"));
                 break;
             }
-            if truncated_tool_call_hint_pushed {
-                // Hint was injected into `messages`; loop back and let
-                // the agent try again with smaller operations.
-                continue;
-            }
-            break;
         };
 
         // A 200 response can still be a context-exhaustion casualty:
@@ -571,21 +415,16 @@ pub(super) async fn run_agent_loop(
             && state.context_compact_retries < context::compressor::FORCE_COMPRESS_MAX_RETRIES
         {
             state.context_compact_retries += 1;
-            app.push_output(
-                "Generation truncated by context ceiling — compacting and regenerating.",
-                LineStyle::Status,
-            );
-            if force_compress_responsive(
-                app,
-                rx,
-                terminal,
-                messages,
-                config,
-                router,
-                llm_worker,
-                tool_def_tokens,
-            )
-            .await
+            ui.status("Generation truncated by context ceiling — compacting and regenerating.");
+            if ui
+                .pump(context::compressor::force_compress(
+                    messages,
+                    config,
+                    router,
+                    llm_worker,
+                    tool_def_tokens,
+                ))
+                .await
             {
                 log.llm_error(
                     "generation truncated by context ceiling — compacted history, regenerating",
@@ -596,7 +435,10 @@ pub(super) async fn run_agent_loop(
 
         let choice = match response.choices.first() {
             Some(c) => c,
-            None => break,
+            None => {
+                ui.event(UiEvent::EmptyLlmResponse);
+                break;
+            }
         };
         // A response made it through whole — any prior reactive-compaction
         // retries resolved this request; reset the budget for the next one.
@@ -611,25 +453,15 @@ pub(super) async fn run_agent_loop(
             log.llm_error(&format!(
                 "{truncated_calls} tool call(s) arrived with unparseable arguments (cut off by the output limit) — stubbed before persisting"
             ));
-            app.push_output(
-                "A tool call was cut off by the output limit — it will not be executed.",
-                LineStyle::Status,
-            );
+            ui.status("A tool call was cut off by the output limit — it will not be executed.");
         }
         let assistant_msg = &assistant_msg;
 
-        // Flush any remaining tokens
-        app.flush_tokens();
-
+        // Flush any remaining tokens and reconcile the streamed text against
+        // the final message content.
+        ui.finish_assistant_text(assistant_msg.content.as_deref());
         if let Some(content) = &assistant_msg.content {
             log.llm_response(content);
-            if let Some(missing) =
-                reconcile_streamed_assistant_content(&rendered_assistant_text, content)
-            {
-                app.push_token(&missing);
-                app.flush_tokens();
-                let _ = terminal.draw(|frame| ui::draw(frame, app));
-            }
         }
         if assistant_msg.is_meaningful() {
             conversation_history.push(assistant_msg.clone());
@@ -692,10 +524,7 @@ pub(super) async fn run_agent_loop(
                                 );
                                 state.gate.validation_disputes.push(rationale.to_string());
                             }
-                            app.push_output(
-                                "Behavioral check failed — not done yet.",
-                                LineStyle::Status,
-                            );
+                            ui.status("Behavioral check failed — not done yet.");
 
                             // Full restart (opt-in `gate_restart`): on the FIRST
                             // gate block, abandon the possibly-poisoned attempt —
@@ -704,8 +533,14 @@ pub(super) async fn run_agent_loop(
                             if config.tools.gate_restart && !state.gate.restart_fired {
                                 state.gate.restart_fired = true;
                                 state.plan_ever_set = false;
-                                *messages =
-                                    scrap_restart(app, config, goal, mcp_summary, snapshots, false);
+                                *messages = scrap_restart(
+                                    ui.app,
+                                    config,
+                                    goal,
+                                    mcp_summary,
+                                    snapshots,
+                                    false,
+                                );
                                 conversation_history.clear();
                                 state.gate.validation_blocks = 0;
                                 state.gate.plan_step_failures.reset();
@@ -724,9 +559,8 @@ pub(super) async fn run_agent_loop(
                                 && !is_compile_fail
                             {
                                 state.gate.replan_fired = true;
-                                app.push_output(
+                                ui.status(
                                     "Re-anchoring on the original goal — re-plan from the task…",
-                                    LineStyle::Status,
                                 );
                                 let msg = Message::user(&format!(
                                     "[A check that exercises the change end-to-end FAILED — it \
@@ -761,9 +595,8 @@ pub(super) async fn run_agent_loop(
                             {
                                 state.debugger.fires += 1;
                                 state.debugger.last_failure = Some(fkey);
-                                app.push_output(
+                                ui.status(
                                     "Still failing — spinning up a fresh-context debugger sub-agent…",
-                                    LineStyle::Status,
                                 );
                                 let verdict = debugger::run_debugger(
                                     &output,
@@ -788,7 +621,7 @@ pub(super) async fn run_agent_loop(
                                         state.gate.restart_fired = true;
                                         state.plan_ever_set = false;
                                         *messages = scrap_restart(
-                                            app,
+                                            ui.app,
                                             config,
                                             goal,
                                             mcp_summary,
@@ -805,7 +638,7 @@ pub(super) async fn run_agent_loop(
                                     }
                                     debugger::DebuggerVerdict::Rewind(candidate) => {
                                         rewind_message_repl(
-                                            app,
+                                            ui.app,
                                             &candidate,
                                             config,
                                             perms,
@@ -843,9 +676,8 @@ pub(super) async fn run_agent_loop(
                                 let assembled =
                                     context::assemble(config, &fresh, &[], false, mcp_summary);
                                 *messages = assembled.messages;
-                                app.push_output(
+                                ui.status(
                                     "Gate context-reset — fresh start (history cleared, files kept).",
-                                    LineStyle::Status,
                                 );
                                 log.tool_debug(
                                     "agent",
@@ -866,13 +698,10 @@ pub(super) async fn run_agent_loop(
                 }
                 // Exiting now. Surface any recorded gate rationale(s) for audit.
                 if !state.gate.validation_disputes.is_empty() {
-                    app.push_output(
-                        &format!(
-                            "Completed after {} blocked verification(s); model's reasons recorded in the log.",
-                            state.gate.validation_disputes.len()
-                        ),
-                        LineStyle::Status,
-                    );
+                    ui.status(&format!(
+                        "Completed after {} blocked verification(s); model's reasons recorded in the log.",
+                        state.gate.validation_disputes.len()
+                    ));
                     tracing::warn!(
                         "[validation] turn completed over {} blocked check(s); model rationale(s): {}",
                         state.gate.validation_disputes.len(),
@@ -906,7 +735,7 @@ pub(super) async fn run_agent_loop(
         for tc in &tool_calls {
             // Check cancellation between tool calls
             if consume_interrupt(cancelled) {
-                app.push_output("(interrupted)", LineStyle::Status);
+                ui.notify_interrupted();
                 break 'round;
             }
             let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
@@ -918,7 +747,7 @@ pub(super) async fn run_agent_loop(
                     );
                     messages.push(result_msg.clone());
                     conversation_history.push(result_msg);
-                    app.push_output(
+                    ui.app.push_output(
                         &format!("  ✗ {}: invalid JSON args", tc.function.name),
                         LineStyle::ToolErr,
                     );
@@ -937,7 +766,7 @@ pub(super) async fn run_agent_loop(
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
-                app.push_output(
+                ui.app.push_output(
                     &format!(
                         "  ✗ {}: arguments cut off by the output limit after {} chars — not executed",
                         tc.function.name, info.original_chars
@@ -998,19 +827,16 @@ pub(super) async fn run_agent_loop(
                     let result_msg = Message::tool_result(&tc.id, text);
                     messages.push(result_msg.clone());
                     conversation_history.push(result_msg);
-                    app.push_output(
-                        &format!(
-                            "  ⓘ Repeated read: {}({}) — {}, continuing",
-                            tc.function.name,
-                            args_summary,
-                            if escalate {
-                                "nudge failed, forcing compaction next round"
-                            } else {
-                                "nudge sent"
-                            }
-                        ),
-                        LineStyle::Status,
-                    );
+                    ui.status(&format!(
+                        "  ⓘ Repeated read: {}({}) — {}, continuing",
+                        tc.function.name,
+                        args_summary,
+                        if escalate {
+                            "nudge failed, forcing compaction next round"
+                        } else {
+                            "nudge sent"
+                        }
+                    ));
                     state.loops.last_call_key = None;
                     state.loops.same_call_streak = 0;
                     state.loops.recent_call_keys.clear();
@@ -1033,19 +859,16 @@ pub(super) async fn run_agent_loop(
                     state.loops.last_call_key = None;
                     state.loops.same_call_streak = 0;
                     state.loops.recent_call_keys.clear();
-                    app.push_output(
-                        &format!(
-                            "  ⚠ Loop detected: {}({}) {} — surfacing a hint, giving the model one more round",
-                            tc.function.name,
-                            args_summary,
-                            if let Some(period) = cycle_only {
-                                format!("cycling through the same {period} calls (period-{period} cycle)")
-                            } else {
-                                "repeated 3 times".to_string()
-                            }
-                        ),
-                        LineStyle::Status,
-                    );
+                    ui.status(&format!(
+                        "  ⚠ Loop detected: {}({}) {} — surfacing a hint, giving the model one more round",
+                        tc.function.name,
+                        args_summary,
+                        if let Some(period) = cycle_only {
+                            format!("cycling through the same {period} calls (period-{period} cycle)")
+                        } else {
+                            "repeated 3 times".to_string()
+                        }
+                    ));
                     break;
                 }
 
@@ -1058,13 +881,10 @@ pub(super) async fn run_agent_loop(
                     && config.validation.command().is_some()
                     && state.gate.validation_blocks < config.validation.max_retries
                 {
-                    app.push_output(
-                        &format!(
-                            "  Loop detected again ({}({})) — routing through the done-gate instead of stopping",
-                            tc.function.name, args_summary
-                        ),
-                        LineStyle::Status,
-                    );
+                    ui.status(&format!(
+                        "  Loop detected again ({}({})) — routing through the done-gate instead of stopping",
+                        tc.function.name, args_summary
+                    ));
                     if let validation::CheckOutcome::Fail(output) =
                         validation::run_behavioral_check(config).await
                     {
@@ -1088,9 +908,8 @@ pub(super) async fn run_agent_loop(
                         {
                             state.debugger.fires += 1;
                             state.debugger.last_failure = Some(fkey);
-                            app.push_output(
+                            ui.status(
                                 "Looping + failing gate — spinning up a fresh-context debugger sub-agent…",
-                                LineStyle::Status,
                             );
                             let verdict = debugger::run_debugger(
                                 &output,
@@ -1113,7 +932,7 @@ pub(super) async fn run_agent_loop(
                                     state.gate.restart_fired = true;
                                     state.plan_ever_set = false;
                                     *messages = scrap_restart(
-                                        app,
+                                        ui.app,
                                         config,
                                         goal,
                                         mcp_summary,
@@ -1130,7 +949,7 @@ pub(super) async fn run_agent_loop(
                                 }
                                 debugger::DebuggerVerdict::Rewind(candidate) => {
                                     rewind_message_repl(
-                                        app,
+                                        ui.app,
                                         &candidate,
                                         config,
                                         perms,
@@ -1163,25 +982,16 @@ pub(super) async fn run_agent_loop(
                     // Gate passed (or skipped): the loop was on something the
                     // check doesn't care about — fall through to the stop.
                 }
-                app.push_output(
-                    &format!(
-                        "  ✗ Loop detected again ({}({})) after the recovery hint — stopping this turn",
-                        tc.function.name, args_summary
-                    ),
-                    LineStyle::Error,
-                );
+                ui.error(&format!(
+                    "  ✗ Loop detected again ({}({})) after the recovery hint — stopping this turn",
+                    tc.function.name, args_summary
+                ));
                 had_error = true;
                 break;
             }
 
             log.tool_call_detail(&tc.function.name, &args);
-            app.push_output(
-                &format!("  → {}({})", tc.function.name, args_summary),
-                LineStyle::ToolCall,
-            );
-
-            // Re-render to show tool call
-            let _ = terminal.draw(|frame| ui::draw(frame, app));
+            ui.tool_call_started(&tc.function.name, &args_summary);
 
             // Read-only investigation (explore) mode: hard-block any mutating
             // tool call at runtime, BEFORE any permission prompt. The def filter
@@ -1200,7 +1010,7 @@ pub(super) async fn run_agent_loop(
                     );
                     messages.push(msg.clone());
                     conversation_history.push(msg);
-                    app.push_output(
+                    ui.app.push_output(
                         &format!("  ⛔ {}: blocked — read-only mode", tc.function.name),
                         LineStyle::ToolErr,
                     );
@@ -1222,7 +1032,7 @@ pub(super) async fn run_agent_loop(
                         let result_msg = Message::tool_result(&tc.id, &e);
                         messages.push(result_msg.clone());
                         conversation_history.push(result_msg);
-                        app.push_output(
+                        ui.app.push_output(
                             &format!("  ✗ {}: {e}", tc.function.name),
                             LineStyle::ToolErr,
                         );
@@ -1230,37 +1040,31 @@ pub(super) async fn run_agent_loop(
                     }
                     Ok(Some(prompt)) => {
                         // Needs user approval — show prompt in TUI
-                        app.pending_permission = Some(prompt);
-                        app.input.clear();
-                        app.cursor = 0;
-                        let _ = terminal.draw(|frame| ui::draw(frame, app));
+                        ui.app.pending_permission = Some(prompt);
+                        ui.app.input.clear();
+                        ui.app.cursor = 0;
+                        let _ = ui.terminal.draw(|frame| ui::draw(frame, ui.app));
 
                         // Wait for user input (y/n/a)
-                        let response = wait_for_permission_input(app, rx, terminal).await;
-                        app.pending_permission = None;
+                        let response = wait_for_permission_input(ui.app, ui.rx, ui.terminal).await;
+                        ui.app.pending_permission = None;
 
                         match response.as_str() {
                             "y" | "yes" => {
                                 perms.approve(action, false);
-                                app.push_output(
-                                    "  · Permission granted, running tool...",
-                                    LineStyle::Status,
-                                );
+                                ui.status("  · Permission granted, running tool...");
                             }
                             "a" | "always" => {
                                 perms.approve(action, true);
-                                app.push_output(
-                                    "  · Permission granted and saved, running tool...",
-                                    LineStyle::Status,
-                                );
+                                ui.status("  · Permission granted and saved, running tool...");
                             }
                             _ => {
                                 perm_denied = true;
-                                app.push_output("  · Permission denied.", LineStyle::Status);
+                                ui.status("  · Permission denied.");
                             }
                         }
 
-                        let _ = terminal.draw(|frame| ui::draw(frame, app));
+                        let _ = ui.terminal.draw(|frame| ui::draw(frame, ui.app));
                     }
                     Ok(None) => {} // No prompt needed
                 }
@@ -1271,7 +1075,7 @@ pub(super) async fn run_agent_loop(
                     Message::tool_result(&tc.id, &format!("{} denied by user", tc.function.name));
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
-                app.push_output(
+                ui.app.push_output(
                     &format!("  ✗ {}: denied", tc.function.name),
                     LineStyle::ToolErr,
                 );
@@ -1289,7 +1093,7 @@ pub(super) async fn run_agent_loop(
                 );
                 messages.push(result_msg.clone());
                 conversation_history.push(result_msg);
-                app.push_output(
+                ui.app.push_output(
                     &format!("  ✗ {}: blocked — no plan", tc.function.name),
                     LineStyle::ToolErr,
                 );
@@ -1315,7 +1119,7 @@ pub(super) async fn run_agent_loop(
                 let lsp = lsp.clone();
                 let revisions = fast_revisions.clone();
                 let baseline = fast_baseline_errors;
-                let mut result_rx = tool_pool.submit(move || {
+                let result_rx = tool_pool.submit(move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -1340,15 +1144,8 @@ pub(super) async fn run_agent_loop(
                         })
                         .map_err(|e| format!("fast tool error: {e}"))
                 });
-                await_tool_job_ui(
-                    rx,
-                    terminal,
-                    app,
-                    &tc.function.name,
-                    &mut result_rx,
-                    cancelled,
-                )
-                .await
+                ui.await_tool_job(result_rx, &tc.function.name, cancelled)
+                    .await
             } else if tc.function.name == "mcp_use" {
                 let server = args["server"].as_str().unwrap_or("").to_string();
                 let tool = args["tool"].as_str().unwrap_or("").to_string();
@@ -1360,7 +1157,7 @@ pub(super) async fn run_agent_loop(
                     )
                 } else {
                     let registry = mcp_registry.clone();
-                    let mut result_rx = tool_pool.submit(move || match registry {
+                    let result_rx = tool_pool.submit(move || match registry {
                         Some(registry) => {
                             let mut guard = registry.lock();
                             guard
@@ -1372,7 +1169,7 @@ pub(super) async fn run_agent_loop(
                             "No MCP servers connected".into(),
                         )),
                     });
-                    await_tool_job_ui(rx, terminal, app, "mcp_use", &mut result_rx, cancelled).await
+                    ui.await_tool_job(result_rx, "mcp_use", cancelled).await
                 }
             } else if tc.function.name == "spawn_agents" {
                 let tasks = crate::cli::commands::agent::subagent::parse_tasks(&args);
@@ -1382,43 +1179,22 @@ pub(super) async fn run_agent_loop(
                             .into(),
                     )
                 } else {
-                    let (out_tx, mut out_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<(String, LineStyle)>();
-                    let subagents_fut = crate::cli::commands::agent::subagent::run_subagents(
-                        tasks,
-                        config,
-                        llm_worker,
-                        tool_pool,
-                        tool_defs,
-                        perms,
-                        mcp_registry,
-                        lsp,
-                        fast_revisions,
-                        fast_baseline_errors,
-                        cancelled,
-                        Some(out_tx),
-                    );
-                    let mut subagents_fut = std::pin::pin!(subagents_fut);
-                    let mut outputs = None;
-                    while outputs.is_none() {
-                        tokio::select! {
-                            biased;
-                            r = &mut subagents_fut, if outputs.is_none() => { outputs = Some(r); }
-                            line = out_rx.recv() => {
-                                if let Some((text, style)) = line {
-                                    app.push_output(&text, style);
-                                    let _ = terminal.draw(|frame| ui::draw(frame, app));
-                                }
-                            }
-                            evt = rx.recv() => {
-                                if matches!(evt, Some(AppEvent::Tick)) {
-                                    let _ = terminal.draw(|frame| ui::draw(frame, app));
-                                }
-                            }
-                        }
-                    }
-                    let combined =
-                        crate::cli::commands::agent::subagent::format_outputs(outputs.unwrap());
+                    let outputs = ui
+                        .drive_subagents(
+                            tasks,
+                            config,
+                            llm_worker,
+                            tool_pool,
+                            tool_defs,
+                            perms,
+                            mcp_registry,
+                            lsp,
+                            fast_revisions,
+                            fast_baseline_errors,
+                            cancelled,
+                        )
+                        .await;
+                    let combined = crate::cli::commands::agent::subagent::format_outputs(outputs);
                     crate::tools::ToolResult::ok(combined)
                 }
             } else if tc.function.name == "edit_file" {
@@ -1429,7 +1205,7 @@ pub(super) async fn run_agent_loop(
                 let lsp = lsp.clone();
                 let cancelled_for_job = cancelled.clone();
                 let log_for_job = log.clone();
-                let mut result_rx = tool_pool.submit(move || {
+                let result_rx = tool_pool.submit(move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -1449,11 +1225,11 @@ pub(super) async fn run_agent_loop(
                         })
                         .map_err(|e| format!("edit_file error: {e}"))
                 });
-                await_tool_job_ui(rx, terminal, app, "edit_file", &mut result_rx, cancelled).await
+                ui.await_tool_job(result_rx, "edit_file", cancelled).await
             } else if tc.function.name == "plan" {
                 let args = args.clone();
                 let config_for_job = config.clone();
-                let mut result_rx = tool_pool.submit(move || {
+                let result_rx = tool_pool.submit(move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -1464,13 +1240,12 @@ pub(super) async fn run_agent_loop(
                         })
                         .map_err(|e| format!("plan error: {e}"))
                 });
-                let r =
-                    await_tool_job_ui(rx, terminal, app, "plan", &mut result_rx, cancelled).await;
+                let r = ui.await_tool_job(result_rx, "plan", cancelled).await;
                 // The plan tool just mutated plan.md mid-round — refresh the
                 // panel and redraw now so a checked/added/refined step appears
                 // immediately instead of lagging to the next round's refresh.
-                refresh_plan_panel(app, config, round);
-                let _ = terminal.draw(|frame| ui::draw(frame, app));
+                ui.refresh_plan(config, round);
+                let _ = ui.terminal.draw(|frame| ui::draw(frame, ui.app));
                 r
             } else if tc.function.name == "refactor" {
                 let args = args.clone();
@@ -1480,7 +1255,7 @@ pub(super) async fn run_agent_loop(
                 let log_for_job = log.clone();
                 let revisions_for_job = fast_revisions.clone();
                 let cancelled_for_job = cancelled.clone();
-                let mut result_rx = tool_pool.submit(move || {
+                let result_rx = tool_pool.submit(move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -1500,7 +1275,7 @@ pub(super) async fn run_agent_loop(
                         })
                         .map_err(|e| format!("refactor error: {e}"))
                 });
-                await_tool_job_ui(rx, terminal, app, "refactor", &mut result_rx, cancelled).await
+                ui.await_tool_job(result_rx, "refactor", cancelled).await
             } else if (tc.function.name == "shell" && args["action"].as_str() == Some("run"))
                 || (tc.function.name == "file" && file_action == "shell")
             {
@@ -1510,12 +1285,10 @@ pub(super) async fn run_agent_loop(
                     // the jobs tool in this or any later turn.
                     tools::jobs::start_background(&args, config, job_registry.as_ref())
                 } else {
-                    await_shell_job_repl(
+                    ui.await_shell_job(
                         tool_pool.submit_shell(args.clone(), config.clone(), cancelled.clone()),
-                        app,
-                        rx,
-                        terminal,
                         cancelled,
+                        None,
                     )
                     .await
                 }
@@ -1527,7 +1300,7 @@ pub(super) async fn run_agent_loop(
                 let perms_for_job = perms.clone();
                 let registry_for_job = job_registry.clone();
                 let cancelled_for_job = cancelled.clone();
-                let mut result_rx = tool_pool.submit(move || {
+                let result_rx = tool_pool.submit(move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -1543,14 +1316,14 @@ pub(super) async fn run_agent_loop(
                         .await
                     }))
                 });
-                await_tool_job_ui(rx, terminal, app, "jobs", &mut result_rx, cancelled).await
+                ui.await_tool_job(result_rx, "jobs", cancelled).await
             } else {
                 let tool_name = tc.function.name.clone();
                 let args = args.clone();
                 let config = config.clone();
                 let perms = perms.clone();
                 let lsp = lsp.clone();
-                let mut result_rx = tool_pool.submit(move || {
+                let result_rx = tool_pool.submit(move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -1568,15 +1341,8 @@ pub(super) async fn run_agent_loop(
                         })
                         .map_err(|e| format!("Tool error: {e}"))
                 });
-                await_tool_job_ui(
-                    rx,
-                    terminal,
-                    app,
-                    &tc.function.name,
-                    &mut result_rx,
-                    cancelled,
-                )
-                .await
+                ui.await_tool_job(result_rx, &tc.function.name, cancelled)
+                    .await
             };
 
             if !result.success
@@ -1594,17 +1360,8 @@ pub(super) async fn run_agent_loop(
             let first_line = result.content.lines().next().unwrap_or("(empty)");
             log.tool_call(&tc.function.name, &args_summary, result.success, first_line);
             log.tool_result_detail(&tc.function.name, result.success, &result.content);
-            let style = if result.success {
-                LineStyle::ToolOk
-            } else {
-                LineStyle::ToolErr
-            };
-            let icon = if result.success { "✓" } else { "✗" };
-            app.push_output(
-                &format!("  {icon} {}: {first_line}", tc.function.name),
-                style,
-            );
-            app.store_tool_result(&tc.function.name, &result.content);
+            ui.tool_result(&tc.function.name, result.success, first_line);
+            ui.store_tool_result(&tc.function.name, &result.content);
 
             if result.success && tc.function.name == "plan" {
                 state.successful_edits_since_plan_update = 0;
@@ -1666,9 +1423,8 @@ pub(super) async fn run_agent_loop(
                     {
                         state.debugger.fires += 1;
                         state.debugger.last_failure = Some(fkey);
-                        app.push_output(
+                        ui.status(
                             "Plan-check gate failing repeatedly on the same step — spinning up a fresh-context debugger sub-agent…",
-                            LineStyle::Status,
                         );
                         let verdict = debugger::run_debugger(
                             &result.content,
@@ -1690,8 +1446,14 @@ pub(super) async fn run_agent_loop(
                             debugger::DebuggerVerdict::Scrap if !state.gate.restart_fired => {
                                 state.gate.restart_fired = true;
                                 state.plan_ever_set = false;
-                                *messages =
-                                    scrap_restart(app, config, goal, mcp_summary, snapshots, true);
+                                *messages = scrap_restart(
+                                    ui.app,
+                                    config,
+                                    goal,
+                                    mcp_summary,
+                                    snapshots,
+                                    true,
+                                );
                                 conversation_history.clear();
                                 state.gate.validation_blocks = 0;
                                 state.gate.plan_step_failures.reset();
@@ -1702,7 +1464,7 @@ pub(super) async fn run_agent_loop(
                             }
                             debugger::DebuggerVerdict::Rewind(candidate) => {
                                 rewind_message_repl(
-                                    app,
+                                    ui.app,
                                     &candidate,
                                     config,
                                     perms,
@@ -1755,10 +1517,7 @@ pub(super) async fn run_agent_loop(
                     let reset = Message::user(&spiral::build_reset_message(path, n, &tried));
                     messages.push(reset.clone());
                     conversation_history.push(reset);
-                    app.push_output(
-                        "Spiral detected (revert-loop) — reset + replan injected.",
-                        LineStyle::Status,
-                    );
+                    ui.status("Spiral detected (revert-loop) — reset + replan injected.");
                     log.tool_debug(
                         "agent",
                         &format!("spiral-reset fired for {path} after {n} reverts"),
@@ -1767,7 +1526,7 @@ pub(super) async fn run_agent_loop(
             }
 
             // Re-render after tool result
-            let _ = terminal.draw(|frame| ui::draw(frame, app));
+            let _ = ui.terminal.draw(|frame| ui::draw(frame, ui.app));
         }
 
         // History pruning — see run.rs for rationale.
