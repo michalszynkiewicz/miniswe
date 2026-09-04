@@ -3,7 +3,7 @@
 //! different subsets at different points and the split borrows must keep
 //! working.
 
-use super::{debugger, loop_detector, spiral, validation};
+use super::{debugger, loop_detector, spiral, stuck_check, validation};
 
 /// The mutable per-turn state both agent loops thread through a turn. The
 /// round counter and `had_error` stay loop-locals — they belong to the round
@@ -30,6 +30,28 @@ pub(crate) struct TurnState {
     /// Headless: whether the live-jobs finish-gate has already nudged this
     /// turn (see `TurnOptions::live_jobs_gate`) — one nudge only.
     pub(crate) nudged_live_jobs: bool,
+    /// Headless (see `TurnOptions::failure_tracking`): (call_key, truncated
+    /// failure output) of the most recent FAILED tool call. When the model
+    /// loops on a call that keeps failing (e.g. `pack package create`
+    /// returning a lint error 10× — e2e 2026-07-17), this is the real error
+    /// to hand the debugger — the per-step check can't surface it, since
+    /// it's a read-only existence proxy that PASSES while the command
+    /// fails. Keyed by the SAME tagged `call_key` the loop-recovery ladder
+    /// compares against.
+    pub(crate) last_tool_failure: Option<(String, String)>,
+    /// Headless (see `TurnOptions::failure_tracking`): background-job
+    /// failures keyed by their (normalized) COMMAND. A detached deploy
+    /// (`pkg run dev`) fails in a later status/wait result, not on the
+    /// launch, and each re-launch is a new job id — so the identical-call
+    /// loop detector never sees the failing deploy. Keyed by command, a
+    /// repeated failing deploy still routes to the debugger via the
+    /// loop-recovery ladder.
+    pub(crate) failed_job_commands: std::collections::HashMap<String, String>,
+    /// Headless (see `TurnOptions::stuck_tracking`): `tools.stuck_check`
+    /// T2c frozen-signature detector (see the module doc in
+    /// `agent/stuck_check.rs`). Fed unconditionally by every tool call;
+    /// fires only when the flag is on.
+    pub(crate) stuck_tracker: stuck_check::StuckTracker,
     /// Force a context compaction before the next LLM request (the read-loop
     /// ladder's escalation — see `LoopTracker::read_nudges`).
     pub(crate) force_compact_next_round: bool,

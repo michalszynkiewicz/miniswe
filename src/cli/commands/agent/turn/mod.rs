@@ -17,6 +17,7 @@ use crate::runtime::{LlmWorkerHandle, ToolWorkerPool};
 use crate::tools;
 use crate::tools::permissions::PermissionManager;
 
+pub(crate) mod dispatch;
 pub(crate) mod done_gate;
 pub(crate) mod llm_call;
 pub(crate) mod preamble;
@@ -74,6 +75,13 @@ pub(crate) struct TurnOptions {
     /// Headless: nudge once if background jobs are still running at finish time
     /// (session end kills them). The REPL has no such gate.
     pub live_jobs_gate: bool,
+    /// Headless: record the last failing tool call and background-job failure
+    /// banners. Both feed the loop-recovery ladder's `recover_output` chain,
+    /// which only the headless loop has.
+    pub failure_tracking: bool,
+    /// Headless: feed the stuck-signature tracker, read by the
+    /// `tools.stuck_check` fire in the headless postamble.
+    pub stuck_tracking: bool,
 }
 
 /// How the error ladder's compact-retry branches announce themselves and
@@ -97,6 +105,15 @@ pub(crate) enum RoundFlow {
     EndTurn {
         error: bool,
     },
+}
+
+/// What the round does after finishing one tool call in the batch.
+pub(crate) enum CallFlow {
+    /// Move on to the next tool call in this round's batch.
+    NextCall,
+    /// Abandon the rest of the batch and restart the round loop — the
+    /// context was re-assembled underneath us (debugger SCRAP).
+    RestartRound,
 }
 
 /// Outcome of the LLM-call phase.

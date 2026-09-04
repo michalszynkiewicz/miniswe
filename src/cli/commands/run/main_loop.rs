@@ -207,21 +207,6 @@ pub async fn run(
     // Per-turn agent-loop state shared with the REPL loop (see the field docs
     // on `turn_state::TurnState` and its sub-structs).
     let mut state = turn_state::TurnState::default();
-    // (call_key, failure output) of the most recent FAILED tool call. When the
-    // model loops on a call that keeps failing (e.g. `pack package create`
-    // returning a lint error 10× — e2e 2026-07-17), this is the real error to
-    // hand the debugger. The per-step check can't surface it: it's a read-only
-    // existence proxy that PASSES while the command fails, so nothing else
-    // triggers recovery on a failing command's own exit code.
-    let mut last_tool_failure: Option<(String, String)> = None;
-    // Background-job failures keyed by their COMMAND. A detached deploy
-    // (`pkg run dev`) fails in a later status/wait result, not on the launch,
-    // and each re-launch is a new job id — so the identical-call loop detector
-    // never sees the failing DEPLOY. Keyed by command, a repeated failing
-    // deploy still routes to the debugger via the recovery ladder (e2e
-    // 2026-07-17: the run never deployed because a bad chart git-ref made
-    // `pkg run dev` fail, and nothing surfaced it to the debugger).
-    let mut failed_job_commands: std::collections::HashMap<String, String> = Default::default();
     // Skill-cursor finish-gate state (headless-only — see the field docs on
     // `turn_state::SkillTurnState`).
     let mut skill_state = turn_state::SkillTurnState::default();
@@ -229,7 +214,6 @@ pub async fn run(
     // in agent/stuck_check.rs and the config field doc). Fed unconditionally
     // (cheap string scans); fires only when the flag is on.
     let session_start = std::time::Instant::now();
-    let mut stuck_tracker = stuck_check::StuckTracker::new();
 
     // Ctrl+C cancellation flag. The handler fires once and exits — no
     // loop, because `ctrl_c().await` resolves immediately after the
@@ -444,6 +428,8 @@ pub async fn run(
         compaction: turn::CompactionUx::Batch,
         read_only: false,
         live_jobs_gate: true,
+        failure_tracking: true,
+        stuck_tracking: true,
     };
 
     'round: loop {
@@ -452,7 +438,9 @@ pub async fn run(
         }
         round += 1;
         log.round_start(round);
-        stuck_tracker.on_round(round, session_start.elapsed().as_secs_f64());
+        state
+            .stuck_tracker
+            .on_round(round, session_start.elapsed().as_secs_f64());
 
         // Skill step-cursor maintenance (harness-owned; runs before the LLM
         // call so the [SKILL STEP] re-injection is current):
@@ -969,7 +957,8 @@ pub async fn run(
                 //    stuck state so a non-checkable (or check-passing but
                 //    still looping) step reaches the debugger instead of the
                 //    hard stop below, which assumes no cursor.
-                let recover_output: Option<String> = if let Some((k, out)) = &last_tool_failure
+                let recover_output: Option<String> = if let Some((k, out)) =
+                    &state.last_tool_failure
                     && *k == call_key
                 {
                     Some(format!(
@@ -980,7 +969,7 @@ pub async fn run(
                         tc.function.name, args_summary
                     ))
                 } else if let Some((cmd, out)) =
-                    failing_job_output(&tc.function.name, &args, &failed_job_commands)
+                    failing_job_output(&tc.function.name, &args, &state.failed_job_commands)
                 {
                     // The looping command launches a BACKGROUND job (e.g. the
                     // detached `pkg run dev` deploy) that keeps FAILING — its
@@ -1618,217 +1607,27 @@ pub async fn run(
                 .await
             };
 
-            if !result.success
-                && let Some(hint) = tools::plan::failure_hint(&config)
+            match turn::dispatch::finish_call(
+                ctx,
+                opts,
+                &mut state,
+                &mut skill_state,
+                &mut ui,
+                &mut messages,
+                &mut conversation_history,
+                round,
+                tc,
+                &args,
+                &args_summary,
+                &call_key,
+                &mut result,
+                &mut all_prunable_failures,
+                &mut prunable_errors,
+            )
+            .await
             {
-                result.content.push('\n');
-                result.content.push_str(&hint);
-            }
-
-            // Append round number to every tool result
-            result
-                .content
-                .push_str(&format!("\n[round {round}/{max_rounds}]"));
-
-            let first_line = result.content.lines().next().unwrap_or("(empty)");
-            log.tool_call(&tc.function.name, &args_summary, result.success, first_line);
-            log.tool_result_detail(&tc.function.name, result.success, &result.content);
-            ui.tool_result(&tc.function.name, result.success, first_line);
-            ui.store_tool_result(&tc.function.name, &result.content);
-
-            // Remember the last failing tool call keyed by its loop key, so a
-            // loop on a *failing* command can hand the real error to the
-            // debugger (see the loop-recovery ladder). Shell exit≠0 sets
-            // success=false, so this catches the `pack package create` case.
-            // Keyed by the SAME tagged `call_key` the ladder compares against
-            // — an untagged key here never matches during skill runs.
-            if !result.success {
-                last_tool_failure = Some((
-                    call_key.clone(),
-                    crate::truncate_chars(result.content.trim(), 2000),
-                ));
-            }
-            // Background-job bookkeeping is per BANNER, not per result: a
-            // FAILED deploy surfaces later in a wait/status result (possibly
-            // aggregated with other jobs' banners), so the wrapper's ok/err
-            // can't attribute verdicts to commands.
-            note_job_banners(&result.content, &mut failed_job_commands);
-
-            if result.success && tc.function.name == "plan" {
-                state.successful_edits_since_plan_update = 0;
-            }
-
-            // A successful file write means code changed — reset trackers.
-            if result.success && is_file_write(tc.function.name.as_str()) {
-                state.loops.last_call_key = None;
-                state.loops.same_call_streak = 0;
-                state.calls_since_last_edit = 0;
-                if strict && config.tools.plan {
-                    if tools::plan::plan_exists(&config) {
-                        result.content.push('\n');
-                        result.content.push_str(PLAN_PROGRESS_NUDGE);
-                    }
-                    state.successful_edits_since_plan_update += 1;
-                    if state.successful_edits_since_plan_update == PLAN_CHECKPOINT_AFTER_EDITS {
-                        result.content.push('\n');
-                        result.content.push_str(PLAN_CHECKPOINT_WARNING);
-                    }
-                }
-            } else {
-                state.calls_since_last_edit += 1;
-            }
-
-            if !is_prunable_refactor_failure(&result.content, result.success) {
-                all_prunable_failures = false;
-            } else {
-                prunable_errors.push(result.content.clone());
-            }
-
-            stuck_tracker.on_tool(&tc.function.name, &args, result.success, &result.content);
-            if result.success
-                && stuck_check::is_mutating_edit(
-                    &tc.function.name,
-                    args.get("action").and_then(|a| a.as_str()).unwrap_or(""),
-                )
-            {
-                skill_state.edits_total += 1;
-            }
-
-            let result_msg = Message::tool_result(&tc.id, &result.content);
-            messages.push(result_msg.clone());
-            conversation_history.push(result_msg);
-
-            // `tools.plan_gate_debugger`: the plan tool's OWN compile gate
-            // repeatedly blocking the SAME step is a distinct stall signature
-            // from the behavioral done-gate (`state.gate.validation_blocks` above) — the
-            // primary agent is re-litigating one step in its own accumulated
-            // context rather than making forward progress. See the field doc
-            // in config/mod.rs for the forensic evidence motivating this.
-            if tc.function.name == "plan"
-                && args.get("action").and_then(|a| a.as_str()) == Some("check")
-            {
-                if result.success {
-                    state.gate.plan_step_failures.reset();
-                } else if let Some(step) = args.get("step").and_then(|s| s.as_u64()) {
-                    state.gate.plan_step_failures.note(step);
-
-                    let fkey = debugger::failure_key(&result.content);
-                    let may_fire = if config.tools.debugger_multifire {
-                        state.debugger.fires < debugger::MAX_DEBUGGER_FIRES
-                            && state.debugger.last_failure.as_deref() != Some(fkey.as_str())
-                    } else {
-                        state.debugger.fires == 0
-                    };
-                    if config.tools.plan_gate_debugger
-                        && may_fire
-                        && state.gate.plan_step_failures.streak() as usize
-                            >= debugger::DEBUGGER_TRIGGER_BLOCKS
-                    {
-                        state.debugger.fires += 1;
-                        state.debugger.last_failure = Some(fkey);
-                        ui.status(
-                            "Plan-check gate failing repeatedly on the same step — spinning up a fresh-context debugger sub-agent…",
-                        );
-                        let verdict = debugger::run_debugger(
-                            &result.content,
-                            message,
-                            &config,
-                            &llm_worker,
-                            &tool_pool,
-                            &tool_defs,
-                            &perms,
-                            &mcp_registry,
-                            &lsp_client,
-                            &fast_revisions,
-                            fast_baseline_errors,
-                            &cancelled,
-                        )
-                        .await;
-
-                        let extra_msg = match verdict {
-                            debugger::DebuggerVerdict::Scrap if !state.gate.restart_fired => {
-                                state.gate.restart_fired = true;
-                                state.plan_ever_set = false;
-                                messages = turn::restart::scrap_restart(
-                                    &mut ui,
-                                    &config,
-                                    message,
-                                    mcp_summary.as_deref(),
-                                    &snapshots,
-                                    plan_only,
-                                    true,
-                                );
-                                conversation_history.clear();
-                                state.gate.validation_blocks = 0;
-                                state.gate.plan_step_failures.reset();
-                                continue 'round;
-                            }
-                            debugger::DebuggerVerdict::Scrap => {
-                                Message::user(debugger::SCRAP_ALREADY_RESET_MSG)
-                            }
-                            debugger::DebuggerVerdict::Rewind(candidate) => {
-                                turn::restart::rewind_message(
-                                    &mut ui,
-                                    &candidate,
-                                    &config,
-                                    &perms,
-                                    &lsp_client,
-                                    &fast_revisions,
-                                    fast_baseline_errors,
-                                    &result.content,
-                                )
-                                .await
-                            }
-                            debugger::DebuggerVerdict::Report(body) => {
-                                let output_note =
-                                    validation::gate_failure_note(&config, &result.content);
-                                Message::user(&debugger::build_plan_step_report_message(
-                                    &body,
-                                    &output_note,
-                                ))
-                            }
-                        };
-                        messages.push(extra_msg.clone());
-                        conversation_history.push(extra_msg);
-                    }
-                }
-            }
-
-            // Spiral-reset: a revert-loop (same file reverted repeatedly) means
-            // the agent is cycling on the same failing edits. A bare revert
-            // won't break it — its context keeps dragging it back. Inject a
-            // cognitive reset (names what failed + forces a replan + concrete
-            // redirection). API-probe-validated framing; see agent::spiral.
-            if config.tools.spiral_reset
-                && result.success
-                && tc.function.name == "revert"
-                && config.tools.edit_mode == EditMode::Fast
-                && state.spiral.resets < spiral::MAX_RESETS_PER_TURN
-                && let Some(path) = args.get("path").and_then(|p| p.as_str())
-            {
-                let count = state
-                    .spiral
-                    .revert_counts
-                    .entry(path.to_string())
-                    .or_insert(0);
-                *count += 1;
-                if *count >= spiral::SPIRAL_REVERT_THRESHOLD {
-                    let n = *count;
-                    *count = 0;
-                    state.spiral.resets += 1;
-                    let tried = fast_revisions
-                        .as_deref()
-                        .map(|r| spiral::tried_edit_labels(r, path, 4))
-                        .unwrap_or_default();
-                    let reset = Message::user(&spiral::build_reset_message(path, n, &tried));
-                    messages.push(reset.clone());
-                    conversation_history.push(reset);
-                    ui.status("Spiral detected (revert-loop) — reset + replan injected.");
-                    log.tool_debug(
-                        "agent",
-                        &format!("spiral-reset fired for {path} after {n} reverts"),
-                    );
-                }
+                turn::CallFlow::NextCall => {}
+                turn::CallFlow::RestartRound => continue 'round,
             }
         }
 
@@ -1864,8 +1663,9 @@ pub async fn run(
         // was tested). Runs AFTER history pruning so the note can't land on
         // a tool result that was just truncated away.
         if config.tools.stuck_check
-            && let Some(kind) =
-                stuck_tracker.check_fire(round, session_start.elapsed().as_secs_f64())
+            && let Some(kind) = state
+                .stuck_tracker
+                .check_fire(round, session_start.elapsed().as_secs_f64())
         {
             // Red fire while a skill step is active → the fresh-context step
             // judge decides instead of the generic note (the removed
@@ -1878,7 +1678,7 @@ pub async fn run(
                 let trigger = format!(
                     "Its observable state (compiler/test/check signals) has been frozen for the \
                      last {} rounds.",
-                    stuck_tracker.frozen_rounds()
+                    state.stuck_tracker.frozen_rounds()
                 );
                 step_judge_escalation(
                     message,
@@ -1909,9 +1709,9 @@ pub async fn run(
                     .find(|(checked, _, _)| !checked)
                     .and_then(|(_, n, _)| *n);
                 stuck_check::stuck_note(
-                    stuck_tracker.frozen_rounds(),
-                    stuck_tracker.frozen_minutes(),
-                    stuck_tracker.looping_read_path(),
+                    state.stuck_tracker.frozen_rounds(),
+                    state.stuck_tracker.frozen_minutes(),
+                    state.stuck_tracker.looping_read_path(),
                     first_unchecked,
                 )
             };
@@ -1939,13 +1739,13 @@ pub async fn run(
                 } else {
                     "red"
                 },
-                stuck_tracker.frozen_rounds(),
+                state.stuck_tracker.frozen_rounds(),
             ));
             log.tool_debug(
                 "agent",
                 &format!(
                     "stuck-check fired: kind={kind:?} plan_done={plan_done} frozen_rounds={} note={}",
-                    stuck_tracker.frozen_rounds(),
+                    state.stuck_tracker.frozen_rounds(),
                     crate::truncate_chars(&note, 120),
                 ),
             );
