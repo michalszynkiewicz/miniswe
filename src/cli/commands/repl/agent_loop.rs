@@ -136,8 +136,7 @@ pub(super) async fn run_agent_loop(
     let mut debugger_fires = 0usize;
     let mut last_debugged_failure: Option<String> = None;
     // `plan_gate_debugger`: consecutive plan(check) failures on the SAME step.
-    let mut same_plan_step_failures: u32 = 0;
-    let mut last_failed_plan_step: Option<u64> = None;
+    let mut plan_step_failures = validation::PlanStepFailures::default();
     // Gate-triggered context resets fired this turn (bounded — don't loop).
     let mut gate_resets: usize = 0;
     // Spiral-reset: per-file revert counts + how many resets fired this turn.
@@ -762,8 +761,7 @@ pub(super) async fn run_agent_loop(
                                     scrap_restart(app, config, goal, mcp_summary, snapshots, false);
                                 conversation_history.clear();
                                 validation_blocks = 0;
-                                same_plan_step_failures = 0;
-                                last_failed_plan_step = None;
+                                plan_step_failures.reset();
                                 continue;
                             }
 
@@ -800,7 +798,7 @@ pub(super) async fn run_agent_loop(
                             // Reactive debugger (opt-in): hand the SPECIFIC
                             // failure to a fresh-context sub-agent once the
                             // primary agent has failed the gate a couple times.
-                            let fkey = crate::cli::commands::run::failure_key(&output);
+                            let fkey = debugger::failure_key(&output);
                             let may_fire = if config.tools.debugger_multifire {
                                 debugger_fires < debugger::MAX_DEBUGGER_FIRES
                                     && last_debugged_failure.as_deref() != Some(fkey.as_str())
@@ -847,8 +845,7 @@ pub(super) async fn run_agent_loop(
                                         );
                                         conversation_history.clear();
                                         validation_blocks = 0;
-                                        same_plan_step_failures = 0;
-                                        last_failed_plan_step = None;
+                                        plan_step_failures.reset();
                                         continue;
                                     }
                                     debugger::DebuggerVerdict::Scrap => Message::user(
@@ -871,15 +868,13 @@ pub(super) async fn run_agent_loop(
                                     }
                                     debugger::DebuggerVerdict::Report(body) => {
                                         let output_note =
-                                            crate::cli::commands::run::write_gate_failure_output(
-                                                config, &output,
-                                            )
-                                            .map(|path| {
-                                                format!(
-                                                    "\nFull raw check output: read(\"{path}\")."
-                                                )
-                                            })
-                                            .unwrap_or_default();
+                                            validation::write_gate_failure_output(config, &output)
+                                                .map(|path| {
+                                                    format!(
+                                                        "\nFull raw check output: read(\"{path}\")."
+                                                    )
+                                                })
+                                                .unwrap_or_default();
                                         Message::user(&format!(
                                             "[A read-only debugger with fresh eyes investigated the failing \
                                          check and produced this DIAGNOSIS. It did not edit anything — \
@@ -1139,7 +1134,7 @@ pub(super) async fn run_agent_loop(
                         same_call_streak = 0;
                         recent_call_keys.clear();
 
-                        let fkey = crate::cli::commands::run::failure_key(&output);
+                        let fkey = debugger::failure_key(&output);
                         let may_fire = if config.tools.debugger_multifire {
                             debugger_fires < debugger::MAX_DEBUGGER_FIRES
                                 && last_debugged_failure.as_deref() != Some(fkey.as_str())
@@ -1186,8 +1181,7 @@ pub(super) async fn run_agent_loop(
                                     );
                                     conversation_history.clear();
                                     validation_blocks = 0;
-                                    same_plan_step_failures = 0;
-                                    last_failed_plan_step = None;
+                                    plan_step_failures.reset();
                                     continue 'round;
                                 }
                                 debugger::DebuggerVerdict::Scrap => Message::user(
@@ -1210,13 +1204,13 @@ pub(super) async fn run_agent_loop(
                                 }
                                 debugger::DebuggerVerdict::Report(body) => {
                                     let output_note =
-                                        crate::cli::commands::run::write_gate_failure_output(
-                                            config, &output,
-                                        )
-                                        .map(|path| {
-                                            format!("\nFull raw check output: read(\"{path}\").")
-                                        })
-                                        .unwrap_or_default();
+                                        validation::write_gate_failure_output(config, &output)
+                                            .map(|path| {
+                                                format!(
+                                                    "\nFull raw check output: read(\"{path}\")."
+                                                )
+                                            })
+                                            .unwrap_or_default();
                                     Message::user(&format!(
                                         "[A read-only debugger with fresh eyes investigated the failing \
                                      check and produced this DIAGNOSIS. It did not edit anything — \
@@ -1729,16 +1723,11 @@ pub(super) async fn run_agent_loop(
                 && args.get("action").and_then(|a| a.as_str()) == Some("check")
             {
                 if result.success {
-                    same_plan_step_failures = 0;
-                    last_failed_plan_step = None;
+                    plan_step_failures.reset();
                 } else if let Some(step) = args.get("step").and_then(|s| s.as_u64()) {
-                    crate::cli::commands::run::track_plan_step_failure(
-                        &mut last_failed_plan_step,
-                        &mut same_plan_step_failures,
-                        step,
-                    );
+                    plan_step_failures.note(step);
 
-                    let fkey = crate::cli::commands::run::failure_key(&result.content);
+                    let fkey = debugger::failure_key(&result.content);
                     let may_fire = if config.tools.debugger_multifire {
                         debugger_fires < debugger::MAX_DEBUGGER_FIRES
                             && last_debugged_failure.as_deref() != Some(fkey.as_str())
@@ -1747,7 +1736,7 @@ pub(super) async fn run_agent_loop(
                     };
                     if config.tools.plan_gate_debugger
                         && may_fire
-                        && same_plan_step_failures as usize >= debugger::DEBUGGER_TRIGGER_BLOCKS
+                        && plan_step_failures.streak() as usize >= debugger::DEBUGGER_TRIGGER_BLOCKS
                     {
                         debugger_fires += 1;
                         last_debugged_failure = Some(fkey);
@@ -1779,8 +1768,7 @@ pub(super) async fn run_agent_loop(
                                     scrap_restart(app, config, goal, mcp_summary, snapshots, true);
                                 conversation_history.clear();
                                 validation_blocks = 0;
-                                same_plan_step_failures = 0;
-                                last_failed_plan_step = None;
+                                plan_step_failures.reset();
                                 continue 'round;
                             }
                             debugger::DebuggerVerdict::Scrap => Message::user(
@@ -1803,14 +1791,11 @@ pub(super) async fn run_agent_loop(
                             }
                             debugger::DebuggerVerdict::Report(body) => {
                                 let output_note =
-                                    crate::cli::commands::run::write_gate_failure_output(
-                                        config,
-                                        &result.content,
-                                    )
-                                    .map(|path| {
-                                        format!("\nFull raw check output: read(\"{path}\").")
-                                    })
-                                    .unwrap_or_default();
+                                    validation::write_gate_failure_output(config, &result.content)
+                                        .map(|path| {
+                                            format!("\nFull raw check output: read(\"{path}\").")
+                                        })
+                                        .unwrap_or_default();
                                 Message::user(&format!(
                                     "[A read-only debugger with fresh eyes investigated the failing \
                                  plan-check step and produced this DIAGNOSIS. It did not edit \

@@ -83,6 +83,99 @@ pub async fn run_check_command(config: &Config, cmd: &str) -> CheckOutcome {
     }
 }
 
+/// Persist the behavioral gate's raw failure output (stdout+stderr from the
+/// configured validation command) to a file the model can `read` directly.
+/// The reactive debugger's Report/Rewind verdicts summarize this output in
+/// their own words before handing it to the primary agent — a paraphrase
+/// that can lose precision the raw text had (e.g. the exact "GOT: <value>"
+/// line pointing at which callsite is actually broken). Writing the raw
+/// text alongside the summary, rather than instead of it, lets the model
+/// fall back to ground truth when the summary steers it wrong. Best-effort:
+/// a write failure just means no pointer gets appended, never a hard error.
+pub(crate) fn write_gate_failure_output(config: &Config, output: &str) -> Option<String> {
+    let rel = "last_gate_failure.txt";
+    std::fs::write(config.miniswe_path(rel), output).ok()?;
+    Some(format!(".miniswe/{rel}"))
+}
+
+/// Consecutive `plan(action='check')` failures on the SAME step
+/// (`tools.plan_gate_debugger`'s trigger). A failure on a step other than the
+/// last-failed one (or the first ever) resets the streak to 1 — only
+/// *repeated* blocking on one step signals a stall worth escalating.
+#[derive(Default)]
+pub(crate) struct PlanStepFailures {
+    last_failed_step: Option<u64>,
+    streak: u32,
+}
+
+impl PlanStepFailures {
+    /// Record a plan-check failure on `step`.
+    pub(crate) fn note(&mut self, step: u64) {
+        if self.last_failed_step == Some(step) {
+            self.streak += 1;
+        } else {
+            self.last_failed_step = Some(step);
+            self.streak = 1;
+        }
+    }
+
+    /// Consecutive failures on the current step.
+    pub(crate) fn streak(&self) -> u32 {
+        self.streak
+    }
+
+    /// Clear the streak (plan-check success, or a tree/context reset).
+    pub(crate) fn reset(&mut self) {
+        self.last_failed_step = None;
+        self.streak = 0;
+    }
+}
+
+#[cfg(test)]
+mod plan_step_failures_tests {
+    use super::PlanStepFailures;
+
+    #[test]
+    fn same_step_repeated_increments_streak() {
+        let mut f = PlanStepFailures::default();
+        f.note(1);
+        assert_eq!(f.streak(), 1);
+        f.note(1);
+        assert_eq!(f.streak(), 2);
+        f.note(1);
+        assert_eq!(f.streak(), 3);
+    }
+
+    #[test]
+    fn different_step_resets_streak_to_one() {
+        let mut f = PlanStepFailures::default();
+        f.note(1);
+        f.note(1);
+        assert_eq!(f.streak(), 2);
+        f.note(2);
+        assert_eq!(f.streak(), 1);
+    }
+
+    #[test]
+    fn first_failure_ever_sets_streak_to_one() {
+        let mut f = PlanStepFailures::default();
+        f.note(7);
+        assert_eq!(f.streak(), 1);
+    }
+
+    #[test]
+    fn reset_clears_streak_and_step_memory() {
+        let mut f = PlanStepFailures::default();
+        f.note(3);
+        f.note(3);
+        f.reset();
+        assert_eq!(f.streak(), 0);
+        // After a reset the next failure on the same step starts a NEW streak.
+        f.note(3);
+        assert_eq!(f.streak(), 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

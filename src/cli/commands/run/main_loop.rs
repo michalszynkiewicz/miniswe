@@ -332,8 +332,7 @@ pub async fn run(
     // `tools.plan_gate_debugger`: consecutive plan(check) failures on the SAME
     // step. Distinct from validation_blocks (the behavioral done-gate) — this
     // is the plan tool's OWN compile gate repeatedly blocking one step.
-    let mut same_plan_step_failures: u32 = 0;
-    let mut last_failed_plan_step: Option<u64> = None;
+    let mut plan_step_failures = validation::PlanStepFailures::default();
     // Gate-triggered context resets fired this turn (bounded — don't loop).
     let mut gate_resets: usize = 0;
     // Spiral-reset: per-file revert counts this turn + how many resets fired,
@@ -1450,8 +1449,7 @@ pub async fn run(
                                 messages = assembled.messages;
                                 conversation_history.clear();
                                 validation_blocks = 0;
-                                same_plan_step_failures = 0;
-                                last_failed_plan_step = None;
+                                plan_step_failures.reset();
                                 tui::print_status(
                                     "[gate-restart] scrapped the stuck state — tree at clean baseline + fresh context; restarting from scratch.",
                                 );
@@ -1502,7 +1500,7 @@ pub async fn run(
                             // validates it. Single-fire by default; with
                             // `debugger_multifire` it re-fires only on a CHANGED
                             // failure signature (walk compile→smoke).
-                            let fkey = failure_key(&output);
+                            let fkey = debugger::failure_key(&output);
                             let may_fire = if config.tools.debugger_multifire {
                                 debugger_fires < debugger::MAX_DEBUGGER_FIRES
                                     && last_debugged_failure.as_deref() != Some(fkey.as_str())
@@ -1572,8 +1570,7 @@ pub async fn run(
                                         messages = assembled.messages;
                                         conversation_history.clear();
                                         validation_blocks = 0;
-                                        same_plan_step_failures = 0;
-                                        last_failed_plan_step = None;
+                                        plan_step_failures.reset();
                                         tui::print_status(
                                             "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                         );
@@ -1605,7 +1602,7 @@ pub async fn run(
                                         // the model can fall back to ground truth if the
                                         // summary steers it wrong.
                                         let output_note =
-                                            write_gate_failure_output(&config, &output)
+                                            validation::write_gate_failure_output(&config, &output)
                                                 .map(|path| {
                                                     format!(
                                                         "\nFull raw check output: read(\"{path}\")."
@@ -2020,7 +2017,7 @@ pub async fn run(
                         same_call_streak = 0;
                         recent_call_keys.clear();
 
-                        let fkey = failure_key(&output);
+                        let fkey = debugger::failure_key(&output);
                         let may_fire = if config.tools.debugger_multifire {
                             debugger_fires < debugger::MAX_DEBUGGER_FIRES
                                 && last_debugged_failure.as_deref() != Some(fkey.as_str())
@@ -2081,8 +2078,7 @@ pub async fn run(
                                     messages = assembled.messages;
                                     conversation_history.clear();
                                     validation_blocks = 0;
-                                    same_plan_step_failures = 0;
-                                    last_failed_plan_step = None;
+                                    plan_step_failures.reset();
                                     tui::print_status(
                                         "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                     );
@@ -2106,11 +2102,14 @@ pub async fn run(
                                     .await
                                 }
                                 debugger::DebuggerVerdict::Report(body) => {
-                                    let output_note = write_gate_failure_output(&config, &output)
-                                        .map(|path| {
-                                            format!("\nFull raw check output: read(\"{path}\").")
-                                        })
-                                        .unwrap_or_default();
+                                    let output_note =
+                                        validation::write_gate_failure_output(&config, &output)
+                                            .map(|path| {
+                                                format!(
+                                                    "\nFull raw check output: read(\"{path}\")."
+                                                )
+                                            })
+                                            .unwrap_or_default();
                                     Message::user(&format!(
                                         "[A read-only debugger with fresh eyes investigated the failing \
                                      check and produced this DIAGNOSIS. It did not edit anything — \
@@ -2717,16 +2716,11 @@ pub async fn run(
                 && args.get("action").and_then(|a| a.as_str()) == Some("check")
             {
                 if result.success {
-                    same_plan_step_failures = 0;
-                    last_failed_plan_step = None;
+                    plan_step_failures.reset();
                 } else if let Some(step) = args.get("step").and_then(|s| s.as_u64()) {
-                    track_plan_step_failure(
-                        &mut last_failed_plan_step,
-                        &mut same_plan_step_failures,
-                        step,
-                    );
+                    plan_step_failures.note(step);
 
-                    let fkey = failure_key(&result.content);
+                    let fkey = debugger::failure_key(&result.content);
                     let may_fire = if config.tools.debugger_multifire {
                         debugger_fires < debugger::MAX_DEBUGGER_FIRES
                             && last_debugged_failure.as_deref() != Some(fkey.as_str())
@@ -2735,7 +2729,7 @@ pub async fn run(
                     };
                     if config.tools.plan_gate_debugger
                         && may_fire
-                        && same_plan_step_failures as usize >= debugger::DEBUGGER_TRIGGER_BLOCKS
+                        && plan_step_failures.streak() as usize >= debugger::DEBUGGER_TRIGGER_BLOCKS
                     {
                         debugger_fires += 1;
                         last_debugged_failure = Some(fkey);
@@ -2786,8 +2780,7 @@ pub async fn run(
                                 messages = assembled.messages;
                                 conversation_history.clear();
                                 validation_blocks = 0;
-                                same_plan_step_failures = 0;
-                                last_failed_plan_step = None;
+                                plan_step_failures.reset();
                                 tui::print_status(
                                     "[debugger-judge] scrapped the stuck state — clean baseline + fresh context; restarting from scratch.",
                                 );
@@ -2812,7 +2805,7 @@ pub async fn run(
                             }
                             debugger::DebuggerVerdict::Report(body) => {
                                 let output_note =
-                                    write_gate_failure_output(&config, &result.content)
+                                    validation::write_gate_failure_output(&config, &result.content)
                                         .map(|path| {
                                             format!("\nFull raw check output: read(\"{path}\").")
                                         })

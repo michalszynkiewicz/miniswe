@@ -8,12 +8,10 @@
 //! 5. Apply observation masking (compress old tool results)
 //! 6. Feed results back and repeat
 
-mod gate;
 mod main_loop;
 mod skill_step;
 mod support;
 
-pub(crate) use gate::{failure_key, track_plan_step_failure, write_gate_failure_output};
 pub use main_loop::run;
 
 use std::io::Write;
