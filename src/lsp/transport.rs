@@ -269,13 +269,15 @@ impl LspTransport {
                 Err(_) => continue,
             };
 
-            // Dispatch: response (has "id") or notification (no "id")
-            if let Some(id) = msg.get("id").and_then(|v| v.as_i64()) {
-                // Response — find pending request
-                if let Some((_, tx)) = transport.pending.remove(&id) {
-                    let _ = tx.send(msg);
-                }
-            } else if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
+            // Dispatch on shape, method first: a message WITH "method" is
+            // server-initiated (a request when it also has "id", else a
+            // notification); only a message with "id" and no "method" is a
+            // response to one of ours. Testing "id" first would misroute
+            // server-initiated requests (workspace/configuration,
+            // window/workDoneProgress/create, ...) into `pending` — their
+            // ids come from the server's own counter and can collide with
+            // ours, resolving an unrelated in-flight request with garbage.
+            if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
                 match method {
                     "textDocument/publishDiagnostics" => {
                         if let Some(params) = msg.get("params")
@@ -297,7 +299,25 @@ impl LspTransport {
                             transport.apply_server_status(params);
                         }
                     }
-                    _ => {} // ignore other notifications
+                    "window/workDoneProgress/create" => {
+                        // The server asks to open a progress token (sent
+                        // because we advertise `window.workDoneProgress`).
+                        // Acknowledge so it doesn't accumulate pending
+                        // requests; the updates arrive as `$/progress`.
+                        if let Some(id) = msg.get("id") {
+                            let _ = transport.write_message(&serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": null,
+                            }));
+                        }
+                    }
+                    _ => {} // other notifications/requests ignored
+                }
+            } else if let Some(id) = msg.get("id").and_then(|v| v.as_i64()) {
+                // Response — find pending request
+                if let Some((_, tx)) = transport.pending.remove(&id) {
+                    let _ = tx.send(msg);
                 }
             }
         }
@@ -684,6 +704,87 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn reader_loop_routes_server_requests_by_method_not_id() {
+        // A server→client REQUEST (has BOTH "method" and "id") whose id
+        // collides with one of our in-flight client requests. Before the
+        // method-first dispatch fix, reader_loop matched on "id" alone and
+        // resolved our pending request with the server's request — this
+        // pins down that it must be routed as a request instead: the
+        // `window/workDoneProgress/create` gets a null-result reply and
+        // the pending entry stays untouched.
+        let out = tempfile::NamedTempFile::new().expect("tmp file");
+        let out_path = out.path().to_str().expect("utf8 path").to_string();
+        // Child: emit one create request and one publishDiagnostics
+        // notification as LSP frames, then copy everything we send IT
+        // into $OUT (so the test can observe our reply) until we exit.
+        let script = format!(
+            r#"m1='{{"jsonrpc":"2.0","id":1,"method":"window/workDoneProgress/create","params":{{"token":"t1"}}}}'
+m2='{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"uri":"file:///w/src/lib.rs","diagnostics":[]}}}}'
+printf 'Content-Length: %s\r\n\r\n%s' "${{#m1}}" "$m1"
+printf 'Content-Length: %s\r\n\r\n%s' "${{#m2}}" "$m2"
+cat > {out_path}"#
+        );
+        let mut child = std::process::Command::new("bash")
+            .args(["-c", &script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn bash");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+
+        let t = Arc::new(LspTransport::with_write_timeout(
+            stdin,
+            Duration::from_millis(500),
+        ));
+        // Simulate an in-flight client request whose id collides with the
+        // server request's id.
+        let (tx, mut rx) = oneshot::channel();
+        t.pending.insert(1, tx);
+
+        let reader_t = Arc::clone(&t);
+        let reader = std::thread::spawn(move || LspTransport::reader_loop(reader_t, stdout));
+
+        // Wait until our reply reached the child (it copies it to $OUT).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let reply = loop {
+            let content = std::fs::read_to_string(out.path()).unwrap_or_default();
+            if content.contains("\"id\":1") {
+                break content;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no reply to window/workDoneProgress/create reached the server; got: {content:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            reply.contains("\"result\":null"),
+            "create request must be answered with a null result, got: {reply:?}"
+        );
+        // The colliding pending request must be untouched: still registered,
+        // nothing sent on its channel.
+        assert!(
+            t.pending.contains_key(&1),
+            "server request id must not resolve an unrelated pending client request"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "pending channel must not have received the server's request"
+        );
+        // The notification path still works after the dispatch reorder.
+        assert!(
+            t.diagnostics.contains_key("file:///w/src/lib.rs"),
+            "publishDiagnostics must still be cached"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
     }
 
     #[test]
