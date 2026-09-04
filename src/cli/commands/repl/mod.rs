@@ -6,6 +6,7 @@ mod session;
 mod support;
 #[cfg(test)]
 mod tests;
+mod tui_ui;
 
 pub use session::run;
 
