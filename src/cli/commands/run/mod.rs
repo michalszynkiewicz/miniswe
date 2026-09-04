@@ -11,6 +11,7 @@
 mod main_loop;
 mod skill_step;
 mod support;
+mod ui;
 
 pub use main_loop::run;
 
@@ -59,3 +60,4 @@ use crate::tui;
 
 use skill_step::*;
 use support::*;
+use ui::*;
