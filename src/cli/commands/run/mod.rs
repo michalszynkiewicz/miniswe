@@ -9,7 +9,6 @@
 //! 6. Feed results back and repeat
 
 mod main_loop;
-mod skill_step;
 mod support;
 mod ui;
 
@@ -53,6 +52,6 @@ use crate::tools;
 use crate::tools::permissions::{Action, PermissionManager};
 use crate::tui;
 
-use skill_step::*;
+use crate::cli::commands::agent::skill_step::*;
 use support::*;
 use ui::*;

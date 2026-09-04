@@ -14,6 +14,7 @@ pub mod permissions;
 pub mod prune_reads;
 pub mod skill_cursor;
 pub mod skill_router;
+pub mod skill_step;
 pub mod spiral;
 pub mod stuck_check;
 pub mod subagent;

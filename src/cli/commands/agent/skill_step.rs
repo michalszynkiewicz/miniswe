@@ -1,13 +1,22 @@
 //! Skill-step machinery: descending into handoff skills, distilling step
 //! instructions, preparing the active step, and the step-judge escalation.
 
-use super::*;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use crate::cli::commands::agent::debugger;
+use crate::config::Config;
+use crate::lsp::LspClient;
+use crate::runtime::LlmWorkerHandle;
+use crate::tools;
+use crate::tools::permissions::PermissionManager;
+use crate::tui;
 
 /// Fetch, extract, and descend into `next` (a skill named by a handoff step).
 /// Returns true on success. `descend` consumes the invoking step, so on a
 /// failed extraction the cursor is left untouched and the caller decides what
 /// to do. Shared by name-based and body-based handoff detection.
-pub(super) async fn descend_into_skill(
+pub(crate) async fn descend_into_skill(
     cursor: &mut crate::cli::commands::agent::skill_cursor::SkillCursor,
     next: &str,
     config: &Config,
@@ -56,7 +65,7 @@ pub(super) async fn descend_into_skill(
 /// Leaves the verdict OPEN (uncached) when there is no prose to judge yet, so
 /// an undistilled step whose anchor did not resolve gets decided on a later
 /// pass instead of being silently recorded as "no handoff".
-pub(super) async fn resolve_handoff(
+pub(crate) async fn resolve_handoff(
     cursor: &mut crate::cli::commands::agent::skill_cursor::SkillCursor,
     installed: &[String],
     llm_worker: &LlmWorkerHandle,
@@ -92,7 +101,7 @@ pub(super) async fn resolve_handoff(
 }
 
 /// Distil the current step's instructions if they aren't cached yet.
-pub(super) async fn distill_current(
+pub(crate) async fn distill_current(
     cursor: &mut crate::cli::commands::agent::skill_cursor::SkillCursor,
     llm_worker: &LlmWorkerHandle,
     cancelled: &Arc<AtomicBool>,
@@ -151,7 +160,7 @@ pub(super) async fn distill_current(
 /// run, so the step went out empty, the model dutifully called `done` on it,
 /// and the frame popped before the handoff to `pkg-package-integrate` ever
 /// got a round.
-pub(super) async fn prepare_step(
+pub(crate) async fn prepare_step(
     cursor: &mut crate::cli::commands::agent::skill_cursor::SkillCursor,
     installed: &[String],
     config: &Config,
@@ -233,7 +242,7 @@ pub(super) async fn prepare_step(
 /// Surface what an advance left behind. Silent in the normal case; loud when
 /// a step was abandoned rather than finished, because that is precisely the
 /// thing the old `mark_done`-for-everything path made invisible.
-pub(super) fn report_cursor_gaps(cursor: &crate::cli::commands::agent::skill_cursor::SkillCursor) {
+pub(crate) fn report_cursor_gaps(cursor: &crate::cli::commands::agent::skill_cursor::SkillCursor) {
     if let Some(skill) = cursor.rewound_into() {
         let step = cursor
             .current()
@@ -264,7 +273,7 @@ pub(super) fn report_cursor_gaps(cursor: &crate::cli::commands::agent::skill_cur
 /// step is active or the judge produced nothing (caller falls back to its
 /// plain nudge/note).
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn step_judge_escalation(
+pub(crate) async fn step_judge_escalation(
     goal: &str,
     trigger: &str,
     config: &Config,
