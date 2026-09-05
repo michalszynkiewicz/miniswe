@@ -83,6 +83,12 @@ pub(super) async fn run_agent_loop(
         live_jobs_gate: false,
         failure_tracking: false,
         stuck_tracking: false,
+        snapshot_revert_arm: false,
+        flat_refactor_aliases: false,
+        inline_mcp_permission_check: false,
+        register_shell_jobs: false,
+        jobs_on_pool: true,
+        plan_job_direct_await: false,
     };
 
     'round: loop {
@@ -556,243 +562,19 @@ pub(super) async fn run_agent_loop(
             //  appended to the tool result; the model decides what to do.)
 
             // Execute tool (permissions already checked above for shell/web/mcp)
-            let mut result = if matches!(
-                tc.function.name.as_str(),
-                "replace_range" | "insert_at" | "revert" | "show_rev" | "check"
-            ) && config.tools.edit_mode == EditMode::Fast
-            {
-                let tool_name = tc.function.name.clone();
-                let args = args.clone();
-                let config = config.clone();
-                let perms = perms.clone();
-                let lsp = lsp.clone();
-                let revisions = fast_revisions.clone();
-                let baseline = fast_baseline_errors;
-                let result_rx = tool_pool.submit(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| e.to_string())?;
-                    let Some(revisions) = revisions else {
-                        return Ok(crate::tools::ToolResult::err(
-                            "fast mode: revision store unavailable".into(),
-                        ));
-                    };
-                    runtime
-                        .block_on(async move {
-                            tools::execute_fast_tool(
-                                &tool_name,
-                                &args,
-                                &config,
-                                perms.as_ref(),
-                                lsp.as_deref(),
-                                revisions.as_ref(),
-                                baseline,
-                            )
-                            .await
-                        })
-                        .map_err(|e| format!("fast tool error: {e}"))
-                });
-                ui.await_tool_job(result_rx, &tc.function.name, cancelled)
-                    .await
-            } else if tc.function.name == "mcp_use" {
-                let server = args["server"].as_str().unwrap_or("").to_string();
-                let tool = args["tool"].as_str().unwrap_or("").to_string();
-                let tool_args = args.get("arguments").cloned().unwrap_or_default();
-                if server.is_empty() || tool.is_empty() {
-                    crate::tools::ToolResult::err(
-                        "mcp_use requires top-level 'server' and 'tool' string fields. \
-                         Example: {\"server\": \"my-server\", \"tool\": \"my-tool\", \"arguments\": {}}".into(),
-                    )
-                } else {
-                    let registry = mcp_registry.clone();
-                    let result_rx = tool_pool.submit(move || match registry {
-                        Some(registry) => {
-                            let mut guard = registry.lock();
-                            guard
-                                .call_tool(&server, &tool, tool_args)
-                                .map(crate::tools::ToolResult::ok)
-                                .map_err(|e| format!("MCP error: {e}"))
-                        }
-                        None => Ok(crate::tools::ToolResult::err(
-                            "No MCP servers connected".into(),
-                        )),
-                    });
-                    ui.await_tool_job(result_rx, "mcp_use", cancelled).await
-                }
-            } else if tc.function.name == "spawn_agents" {
-                let tasks = crate::cli::commands::agent::subagent::parse_tasks(&args);
-                if tasks.is_empty() {
-                    crate::tools::ToolResult::err(
-                        "spawn_agents: 'agents' must be a non-empty array of {label, prompt}"
-                            .into(),
-                    )
-                } else {
-                    let outputs = ui
-                        .drive_subagents(
-                            tasks,
-                            config,
-                            llm_worker,
-                            tool_pool,
-                            tool_defs,
-                            perms,
-                            mcp_registry,
-                            lsp,
-                            fast_revisions,
-                            fast_baseline_errors,
-                            cancelled,
-                        )
-                        .await;
-                    let combined = crate::cli::commands::agent::subagent::format_outputs(outputs);
-                    crate::tools::ToolResult::ok(combined)
-                }
-            } else if tc.function.name == "edit_file" {
-                let args = args.clone();
-                let config = config.clone();
-                let perms = perms.clone();
-                let router = router.clone();
-                let lsp = lsp.clone();
-                let cancelled_for_job = cancelled.clone();
-                let log_for_job = log.clone();
-                let result_rx = tool_pool.submit(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| e.to_string())?;
-                    runtime
-                        .block_on(async move {
-                            crate::tools::execute_edit_file_tool(
-                                &args,
-                                &config,
-                                perms.as_ref(),
-                                router.as_ref(),
-                                lsp.as_deref(),
-                                Some(cancelled_for_job.as_ref()),
-                                Some(log_for_job.as_ref()),
-                            )
-                            .await
-                        })
-                        .map_err(|e| format!("edit_file error: {e}"))
-                });
-                ui.await_tool_job(result_rx, "edit_file", cancelled).await
-            } else if tc.function.name == "plan" {
-                let args = args.clone();
-                let config_for_job = config.clone();
-                let result_rx = tool_pool.submit(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| e.to_string())?;
-                    runtime
-                        .block_on(async move {
-                            tools::plan::execute(&args, &config_for_job, round).await
-                        })
-                        .map_err(|e| format!("plan error: {e}"))
-                });
-                let r = ui.await_tool_job(result_rx, "plan", cancelled).await;
-                // The plan tool just mutated plan.md mid-round — refresh the
-                // panel and redraw now so a checked/added/refined step appears
-                // immediately instead of lagging to the next round's refresh.
-                ui.refresh_plan(config, round);
-                let _ = ui.terminal.draw(|frame| ui::draw(frame, ui.app));
-                r
-            } else if tc.function.name == "refactor" {
-                let args = args.clone();
-                let config = config.clone();
-                let router = router.clone();
-                let lsp = lsp.clone();
-                let log_for_job = log.clone();
-                let revisions_for_job = fast_revisions.clone();
-                let cancelled_for_job = cancelled.clone();
-                let result_rx = tool_pool.submit(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| e.to_string())?;
-                    runtime
-                        .block_on(async move {
-                            crate::tools::execute_refactor_tool(
-                                &args,
-                                &config,
-                                router.as_ref(),
-                                lsp.as_deref(),
-                                Some(log_for_job.as_ref()),
-                                revisions_for_job.as_deref(),
-                                Some(cancelled_for_job.as_ref()),
-                            )
-                            .await
-                        })
-                        .map_err(|e| format!("refactor error: {e}"))
-                });
-                ui.await_tool_job(result_rx, "refactor", cancelled).await
-            } else if (tc.function.name == "shell" && args["action"].as_str() == Some("run"))
-                || (tc.function.name == "file" && file_action == "shell")
-            {
-                if args["background"].as_bool() == Some(true) {
-                    // Explicit background start (cheap, non-blocking) —
-                    // registered in the session job registry, managed via
-                    // the jobs tool in this or any later turn.
-                    tools::jobs::start_background(&args, config, job_registry.as_ref())
-                } else {
-                    ui.await_shell_job(
-                        tool_pool.submit_shell(args.clone(), config.clone(), cancelled.clone()),
-                        cancelled,
-                        None,
-                    )
-                    .await
-                }
-            } else if tc.function.name == "shell" {
-                // Runs on the pool (own runtime) so jobs(wait) keeps the TUI
-                // responsive via await_tool_job_ui, like other pooled tools.
-                let args_for_job = args.clone();
-                let config_for_job = config.clone();
-                let perms_for_job = perms.clone();
-                let registry_for_job = job_registry.clone();
-                let cancelled_for_job = cancelled.clone();
-                let result_rx = tool_pool.submit(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| e.to_string())?;
-                    Ok(runtime.block_on(async {
-                        tools::jobs::execute(
-                            &args_for_job,
-                            &config_for_job,
-                            perms_for_job.as_ref(),
-                            registry_for_job.as_ref(),
-                            Some(cancelled_for_job.as_ref()),
-                        )
-                        .await
-                    }))
-                });
-                ui.await_tool_job(result_rx, "jobs", cancelled).await
-            } else {
-                let tool_name = tc.function.name.clone();
-                let args = args.clone();
-                let config = config.clone();
-                let perms = perms.clone();
-                let lsp = lsp.clone();
-                let result_rx = tool_pool.submit(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| e.to_string())?;
-                    runtime
-                        .block_on(async move {
-                            tools::execute_tool(
-                                &tool_name,
-                                &args,
-                                &config,
-                                perms.as_ref(),
-                                lsp.as_deref(),
-                            )
-                            .await
-                        })
-                        .map_err(|e| format!("Tool error: {e}"))
-                });
-                ui.await_tool_job(result_rx, &tc.function.name, cancelled)
-                    .await
-            };
+            let mut result = turn::dispatch::execute(
+                ctx,
+                opts,
+                &mut skill_state,
+                &mut ui,
+                round,
+                tc,
+                &args,
+                file_action,
+                router,
+                &log,
+            )
+            .await;
 
             match turn::dispatch::finish_call(
                 ctx,

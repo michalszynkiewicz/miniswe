@@ -81,6 +81,13 @@ impl AgentUi for HeadlessUi {
 
     fn refresh_plan(&mut self, _config: &Config, _round: usize) {}
 
+    /// No-op: headless has no live plan panel to refresh.
+    fn after_plan_tool(&mut self, _config: &Config, _round: usize) {}
+
+    fn spawning_subagents(&mut self, count: usize) {
+        tui::print_status(&format!("spawning {} subagents...", count));
+    }
+
     fn notify_interrupted(&mut self) {}
 
     async fn pump<T>(&mut self, fut: impl Future<Output = T>) -> T {
