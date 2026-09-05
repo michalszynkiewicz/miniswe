@@ -82,6 +82,47 @@ pub(crate) struct TurnOptions {
     /// Headless: feed the stuck-signature tracker, read by the
     /// `tools.stuck_check` fire in the headless postamble.
     pub stuck_tracking: bool,
+    /// Headless: the `file(action='revert')` arm (snapshot-manager revert)
+    /// exists at all. The REPL has no such arm — a revert call falls
+    /// through to the generic dispatcher instead.
+    pub snapshot_revert_arm: bool,
+    /// Headless: the refactor arm also accepts the flat single-purpose
+    /// aliases (`add_function_param`, `drop_function_param`,
+    /// `rename_symbol`), normalizing their args into the grouped
+    /// `refactor` shape via `flat_to_refactor_args`. The REPL's refactor
+    /// arm matches only `"refactor"`; calls under the flat names fall
+    /// through to the generic dispatcher instead.
+    pub flat_refactor_aliases: bool,
+    /// Headless: the `mcp_use` arm checks the MCP permission inline
+    /// (`perms.check(&Action::McpUse(..))`) before submitting to the tool
+    /// pool, and awaits the job by matching `tool_pool.submit(..)`
+    /// directly instead of through `AgentUi::await_tool_job`. The REPL's
+    /// permission modal already ran upstream of dispatch, so it skips the
+    /// inline check and always awaits via
+    /// `ui.await_tool_job(.., "mcp_use", ..)`.
+    pub inline_mcp_permission_check: bool,
+    /// Headless: a shell-run whose foreground wait times out may
+    /// auto-promote to a tracked background job (`Some(job_registry)`
+    /// passed as `await_shell_job`'s `promote_to`) — but only in true
+    /// `--headless` runs (nobody can answer the continue/kill prompt);
+    /// a plain one-shot `run()` invocation still prompts. Set to the
+    /// loop's own `headless` flag, not a constant. The REPL always passes
+    /// `None` — jobs are a headless-only surface; the human answers the
+    /// continue/kill modal instead.
+    pub register_shell_jobs: bool,
+    /// REPL: the `shell` (jobs) arm submits `tools::jobs::execute` to the
+    /// tool-worker pool and awaits it via `ui.await_tool_job(.., "jobs",
+    /// ..)`, keeping the TUI responsive. Headless awaits
+    /// `tools::jobs::execute(..)` inline on the calling task instead.
+    pub jobs_on_pool: bool,
+    /// Headless: the `plan` tool job is awaited by matching
+    /// `tool_pool.submit(..)` directly instead of going through
+    /// `AgentUi::await_tool_job`. Cost: unlike every other pooled tool,
+    /// headless's plan job is NOT bounded by `TOOL_JOB_DEADLINE_SECS`
+    /// (that timeout lives inside headless's `await_tool_job`, in
+    /// `run/ui.rs`). Preserved as-is — this is a refactor, not a behavior
+    /// change; fixing the missing deadline is a separate decision.
+    pub plan_job_direct_await: bool,
 }
 
 /// How the error ladder's compact-retry branches announce themselves and

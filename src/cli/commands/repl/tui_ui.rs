@@ -130,6 +130,16 @@ impl AgentUi for TuiUi<'_> {
         refresh_plan_panel(self.app, config, round);
     }
 
+    fn after_plan_tool(&mut self, config: &Config, round: usize) {
+        let (app, _, terminal, _) = self.parts();
+        refresh_plan_panel(app, config, round);
+        let _ = terminal.draw(|frame| ui::draw(frame, app));
+    }
+
+    /// The REPL has never printed this line — `drive_subagents` already
+    /// streams each subagent's own output live as it runs.
+    fn spawning_subagents(&mut self, _count: usize) {}
+
     fn notify_interrupted(&mut self) {
         self.app.push_output("(interrupted)", LineStyle::Status);
     }

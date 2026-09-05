@@ -48,7 +48,7 @@ use crate::runtime::{
     LlmWorkerEvent, LlmWorkerHandle, ShellControl, ShellWorkerEvent, ToolWorkerPool,
 };
 use crate::tools;
-use crate::tools::permissions::{Action, PermissionManager};
+use crate::tools::permissions::PermissionManager;
 use crate::tui;
 
 use crate::cli::commands::agent::skill_step::*;

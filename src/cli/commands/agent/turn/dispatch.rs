@@ -4,20 +4,28 @@
 //! escalation, and spiral-reset. Shared verbatim by both loops except where
 //! [`TurnOptions`] names a delta.
 
+use std::sync::Arc;
+
 use crate::cli::commands::agent::debugger;
 use crate::cli::commands::agent::hints::{
     PLAN_CHECKPOINT_AFTER_EDITS, PLAN_CHECKPOINT_WARNING, PLAN_PROGRESS_NUDGE, is_file_write,
     is_prunable_refactor_failure,
 };
 use crate::cli::commands::agent::job_banners::note_job_banners;
+use crate::cli::commands::agent::skill_cursor;
+use crate::cli::commands::agent::skill_step::{
+    descend_into_skill, report_cursor_gaps, resolve_handoff,
+};
 use crate::cli::commands::agent::spiral;
 use crate::cli::commands::agent::stuck_check;
 use crate::cli::commands::agent::turn_state::{SkillTurnState, TurnState};
 use crate::cli::commands::agent::ui::AgentUi;
 use crate::cli::commands::agent::validation;
 use crate::config::EditMode;
-use crate::llm::Message;
+use crate::llm::{Message, ModelRouter};
+use crate::logging::SessionLog;
 use crate::tools;
+use crate::tools::permissions::Action;
 
 use super::restart;
 use super::{CallFlow, TurnCtx, TurnOptions};
@@ -276,4 +284,517 @@ pub(crate) async fn finish_call(
     }
 
     CallFlow::NextCall
+}
+
+/// Dispatch one tool call to its executor and return the raw
+/// [`crate::tools::ToolResult`] — shared verbatim by both loops except
+/// where [`TurnOptions`] names a delta. `router` and `log` are separate
+/// from [`TurnCtx`] because its `router`/`log` fields are bare references
+/// (unlike every other Arc-wrapped service field there): the `edit_file`
+/// and `refactor` arms need an owned, `'static`-safe `Arc` to move into a
+/// `tool_pool.submit(move || ..)` closure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute(
+    ctx: TurnCtx<'_>,
+    opts: TurnOptions,
+    skill_state: &mut SkillTurnState,
+    ui: &mut impl AgentUi,
+    round: usize,
+    tc: &crate::llm::ToolCall,
+    args: &serde_json::Value,
+    file_action: &str,
+    router: &Arc<ModelRouter>,
+    log: &Arc<SessionLog>,
+) -> crate::tools::ToolResult {
+    if opts.snapshot_revert_arm && tc.function.name == "file" && file_action == "revert" {
+        let snapshots = ctx.snapshots.clone();
+        let args = args.clone();
+        match ctx
+            .tool_pool
+            .submit(move || {
+                let to_round = args["to_round"].as_u64().unwrap_or(0) as usize;
+                let path = args["path"].as_str().unwrap_or("").to_string();
+                match snapshots {
+                    Some(snap) => {
+                        let guard = snap.lock();
+                        let res = if !path.is_empty() {
+                            guard.revert_file(&path, to_round)
+                        } else {
+                            guard.revert_to_round(to_round)
+                        };
+                        res.map(crate::tools::ToolResult::ok)
+                            .map_err(|e| format!("Revert failed: {e}"))
+                    }
+                    None => Ok(crate::tools::ToolResult::err(
+                        "Snapshot system not available (git not found?)".into(),
+                    )),
+                }
+            })
+            .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => crate::tools::ToolResult::err(e),
+            Err(_) => crate::tools::ToolResult::err("Tool worker dropped revert job".into()),
+        }
+    } else if tc.function.name == "plan" {
+        let plan_args = args.clone();
+        let config = ctx.config.clone();
+        let result_rx = ctx.tool_pool.submit(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime
+                .block_on(async move { tools::plan::execute(&plan_args, &config, round).await })
+                .map_err(|e| format!("plan error: {e}"))
+        });
+        if opts.plan_job_direct_await {
+            match result_rx.await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => crate::tools::ToolResult::err(e),
+                Err(_) => crate::tools::ToolResult::err("Tool worker dropped plan job".into()),
+            }
+        } else {
+            let r = ui.await_tool_job(result_rx, "plan", ctx.cancelled).await;
+            // The plan tool just mutated plan.md mid-round — refresh the
+            // panel and redraw now so a checked/added/refined step appears
+            // immediately instead of lagging to the next round's refresh.
+            ui.after_plan_tool(ctx.config, round);
+            r
+        }
+    } else if tc.function.name == "edit_file" {
+        let args = args.clone();
+        let config = ctx.config.clone();
+        let perms = ctx.perms.clone();
+        let router = router.clone();
+        let lsp = ctx.lsp.clone();
+        let cancelled_for_job = ctx.cancelled.clone();
+        let log_for_job = log.clone();
+        ui.await_tool_job(
+            ctx.tool_pool.submit(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                runtime
+                    .block_on(async move {
+                        tools::execute_edit_file_tool(
+                            &args,
+                            &config,
+                            perms.as_ref(),
+                            router.as_ref(),
+                            lsp.as_deref(),
+                            Some(cancelled_for_job.as_ref()),
+                            Some(log_for_job.as_ref()),
+                        )
+                        .await
+                    })
+                    .map_err(|e| format!("edit_file error: {e}"))
+            }),
+            "edit_file",
+            ctx.cancelled,
+        )
+        .await
+    } else if tc.function.name == "refactor"
+        || (opts.flat_refactor_aliases
+            && matches!(
+                tc.function.name.as_str(),
+                "add_function_param" | "drop_function_param" | "rename_symbol"
+            ))
+    {
+        // Flat refactor tools normalize into the grouped
+        // `refactor` args shape; same executor.
+        let args = tools::definitions::flat_to_refactor_args(&tc.function.name, args)
+            .unwrap_or_else(|| args.clone());
+        let config = ctx.config.clone();
+        let router = router.clone();
+        let lsp = ctx.lsp.clone();
+        let log_for_job = log.clone();
+        let revisions_for_job = ctx.fast_revisions.clone();
+        let cancelled_for_job = ctx.cancelled.clone();
+        ui.await_tool_job(
+            ctx.tool_pool.submit(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                runtime
+                    .block_on(async move {
+                        tools::execute_refactor_tool(
+                            &args,
+                            &config,
+                            router.as_ref(),
+                            lsp.as_deref(),
+                            Some(log_for_job.as_ref()),
+                            revisions_for_job.as_deref(),
+                            Some(cancelled_for_job.as_ref()),
+                        )
+                        .await
+                    })
+                    .map_err(|e| format!("refactor error: {e}"))
+            }),
+            "refactor",
+            ctx.cancelled,
+        )
+        .await
+    } else if (tc.function.name == "shell" && args["action"].as_str() == Some("run"))
+        || (tc.function.name == "file" && file_action == "shell")
+    {
+        if args["background"].as_bool() == Some(true) {
+            // Explicit background start: the sanctioned form of the
+            // model's "cmd & echo $! > .pid" instinct — registered,
+            // output-captured, managed via the jobs tool.
+            tools::jobs::start_background(args, ctx.config, ctx.job_registry.as_ref())
+        } else {
+            ui.await_shell_job(
+                ctx.tool_pool
+                    .submit_shell(args.clone(), ctx.config.clone(), ctx.cancelled.clone()),
+                ctx.cancelled,
+                opts.register_shell_jobs
+                    .then_some(ctx.job_registry.as_ref()),
+            )
+            .await
+        }
+    } else if tc.function.name == "shell" {
+        if opts.jobs_on_pool {
+            // Runs on the pool (own runtime) so jobs(wait) keeps the TUI
+            // responsive via await_tool_job_ui, like other pooled tools.
+            let args_for_job = args.clone();
+            let config_for_job = ctx.config.clone();
+            let perms_for_job = ctx.perms.clone();
+            let registry_for_job = ctx.job_registry.clone();
+            let cancelled_for_job = ctx.cancelled.clone();
+            let result_rx = ctx.tool_pool.submit(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                Ok(runtime.block_on(async {
+                    tools::jobs::execute(
+                        &args_for_job,
+                        &config_for_job,
+                        perms_for_job.as_ref(),
+                        registry_for_job.as_ref(),
+                        Some(cancelled_for_job.as_ref()),
+                    )
+                    .await
+                }))
+            });
+            ui.await_tool_job(result_rx, "jobs", ctx.cancelled).await
+        } else {
+            tools::jobs::execute(
+                args,
+                ctx.config,
+                ctx.perms.as_ref(),
+                ctx.job_registry.as_ref(),
+                Some(ctx.cancelled.as_ref()),
+            )
+            .await
+        }
+    } else if matches!(
+        tc.function.name.as_str(),
+        "replace_range" | "insert_at" | "revert" | "show_rev" | "check"
+    ) && ctx.config.tools.edit_mode == EditMode::Fast
+    {
+        let tool_name = tc.function.name.clone();
+        let args = args.clone();
+        let config = ctx.config.clone();
+        let perms = ctx.perms.clone();
+        let lsp = ctx.lsp.clone();
+        let revisions = ctx.fast_revisions.clone();
+        let baseline = ctx.fast_baseline_errors;
+        ui.await_tool_job(
+            ctx.tool_pool.submit(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let Some(revisions) = revisions else {
+                    return Ok(crate::tools::ToolResult::err(
+                        "fast mode: revision store unavailable".into(),
+                    ));
+                };
+                runtime
+                    .block_on(async move {
+                        tools::execute_fast_tool(
+                            &tool_name,
+                            &args,
+                            &config,
+                            perms.as_ref(),
+                            lsp.as_deref(),
+                            revisions.as_ref(),
+                            baseline,
+                        )
+                        .await
+                    })
+                    .map_err(|e| format!("fast tool error: {e}"))
+            }),
+            &tc.function.name,
+            ctx.cancelled,
+        )
+        .await
+    } else if tc.function.name == "mcp_use" {
+        let server = args["server"].as_str().unwrap_or("").to_string();
+        let tool = args["tool"].as_str().unwrap_or("").to_string();
+        let tool_args = args.get("arguments").cloned().unwrap_or_default();
+        if server.is_empty() || tool.is_empty() {
+            crate::tools::ToolResult::err(
+                "mcp_use requires top-level 'server' and 'tool' string fields. \
+                 Example: {\"server\": \"my-server\", \"tool\": \"my-tool\", \"arguments\": {}}"
+                    .into(),
+            )
+        } else if opts.inline_mcp_permission_check {
+            match ctx
+                .perms
+                .check(&Action::McpUse(server.clone(), tool.clone()))
+            {
+                Err(e) => crate::tools::ToolResult::err(e),
+                Ok(()) => {
+                    let registry = ctx.mcp_registry.clone();
+                    match ctx
+                        .tool_pool
+                        .submit(move || match registry {
+                            Some(registry) => {
+                                let mut guard = registry.lock();
+                                guard
+                                    .call_tool(&server, &tool, tool_args)
+                                    .map(crate::tools::ToolResult::ok)
+                                    .map_err(|e| format!("MCP error: {e}"))
+                            }
+                            None => Ok(crate::tools::ToolResult::err(
+                                "No MCP servers connected".into(),
+                            )),
+                        })
+                        .await
+                    {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => crate::tools::ToolResult::err(e),
+                        Err(_) => {
+                            crate::tools::ToolResult::err("Tool worker dropped mcp job".into())
+                        }
+                    }
+                }
+            }
+        } else {
+            let registry = ctx.mcp_registry.clone();
+            let result_rx = ctx.tool_pool.submit(move || match registry {
+                Some(registry) => {
+                    let mut guard = registry.lock();
+                    guard
+                        .call_tool(&server, &tool, tool_args)
+                        .map(crate::tools::ToolResult::ok)
+                        .map_err(|e| format!("MCP error: {e}"))
+                }
+                None => Ok(crate::tools::ToolResult::err(
+                    "No MCP servers connected".into(),
+                )),
+            });
+            ui.await_tool_job(result_rx, "mcp_use", ctx.cancelled).await
+        }
+    } else if tc.function.name == "spawn_agents" {
+        let tasks = crate::cli::commands::agent::subagent::parse_tasks(args);
+        if tasks.is_empty() {
+            crate::tools::ToolResult::err(
+                "spawn_agents: 'agents' must be a non-empty array of {label, prompt}".into(),
+            )
+        } else {
+            ui.spawning_subagents(tasks.len());
+            let outputs = ui
+                .drive_subagents(
+                    tasks,
+                    ctx.config,
+                    ctx.llm_worker,
+                    ctx.tool_pool,
+                    ctx.tool_defs,
+                    ctx.perms,
+                    ctx.mcp_registry,
+                    ctx.lsp,
+                    ctx.fast_revisions,
+                    ctx.fast_baseline_errors,
+                    ctx.cancelled,
+                )
+                .await;
+            let combined = crate::cli::commands::agent::subagent::format_outputs(outputs);
+            crate::tools::ToolResult::ok(combined)
+        }
+    } else if opts.skill_steps && tc.function.name == "skill" {
+        // Harness-owned step cursor: the model signals it finished the
+        // current [SKILL STEP]; advance and announce the next one (its
+        // instructions arrive via [SKILL STEP] on the next round,
+        // distilled in round maintenance).
+        let action = args["action"].as_str().unwrap_or("done");
+        if action == "done" {
+            let mut cursor = skill_cursor::load(ctx.config);
+            match cursor
+                .current()
+                .map(|(sk, st)| (sk.to_string(), st.name.clone()))
+            {
+                Some((skill, finished)) => {
+                    // Gate on the step's completion check with a
+                    // one-retry override: the FIRST skill(done) runs the
+                    // check and, on failure, is refused with the check
+                    // output; a SECOND consecutive skill(done) advances
+                    // anyway (the model overrules a possibly-wrong check —
+                    // the probe measured ~6% of checks over-specify and
+                    // false-fail, so the model needs an escape hatch).
+                    let check = cursor.current_check().map(str::to_string);
+                    let unchecked = check.is_none();
+                    let attempt = cursor.note_done_attempt();
+                    let blocked = match check.filter(|_| attempt < 2) {
+                        Some(cmd) => match validation::run_check_command(ctx.config, &cmd).await {
+                            validation::CheckOutcome::Fail(out) => Some(out),
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    if let Some(out) = blocked {
+                        // Persist the incremented attempt; do NOT advance.
+                        skill_cursor::save(ctx.config, &cursor);
+                        crate::tools::ToolResult::err(format!(
+                            "Step '{finished}' does not meet its DONE WHEN yet — the \
+                             completion check failed:\n{out}\nFix it and call \
+                             skill(action='done') again. If you are certain the step is \
+                             actually complete and the check is wrong, call it once more \
+                             to override."
+                        ))
+                    } else {
+                        // LOG-ONLY judge-veto observation (2026-09-01
+                        // e2e: 4 unchecked steps advanced right over a
+                        // standing not-done verdict). An UNCHECKED
+                        // step leans on the judge alone, so when one
+                        // gets a done with a standing verdict and no
+                        // mutating edit since (the verdict can't be
+                        // stale), record what an enforced veto would
+                        // have refused. Enforcement waits on measured
+                        // live judge quality — verdicts have been
+                        // observed zero times in the field.
+                        if unchecked
+                            && let Some((key, reason, at_edits)) = &skill_state.last_judge_block
+                            && *key == format!("{skill}::{finished}")
+                            && *at_edits == skill_state.edits_total
+                        {
+                            ui.status(&format!(
+                                "[skills] judge-veto (log-only) on '{finished}': {reason}"
+                            ));
+                        }
+                        skill_state.last_judge_block = None;
+                        // prepare_step guarantees the parked step is
+                        // distilled, so a `done` here is always a
+                        // verdict on something the model was actually
+                        // shown. If that ever stops holding the step
+                        // was invisible this round and the verdict is
+                        // meaningless — say so rather than let it pass
+                        // silently, as it did before the loop in
+                        // prepare_step closed that window.
+                        if cursor.cached().is_none() {
+                            ui.status(&format!(
+                                "[skills] warning: done on '{finished}' while undistilled \
+                                 — the step was never shown"
+                            ));
+                        }
+                        // A skill's LAST step often exists only to hand
+                        // off (build → integrate). Resolve that BEFORE
+                        // mark_done pops the frame: once popped there is
+                        // no cursor left to descend from, and the run
+                        // ends the build → integrate → validate lifecycle
+                        // a phase early while reporting success. Live
+                        // e2e: `done` on the build skill's
+                        // EnterIntegrationPhase step silently dropped the
+                        // Package CR, networking, Postgres, IDP,
+                        // monitoring and validation steps.
+                        let installed: Vec<String> =
+                            crate::skills::discover(&ctx.config.project_root)
+                                .into_iter()
+                                .map(|e| e.name)
+                                .collect();
+                        let handed_off = match resolve_handoff(
+                            &mut cursor,
+                            &installed,
+                            ctx.llm_worker,
+                            ctx.cancelled,
+                        )
+                        .await
+                        {
+                            Some(next) => {
+                                descend_into_skill(
+                                    &mut cursor,
+                                    &next,
+                                    ctx.config,
+                                    ctx.llm_worker,
+                                    ctx.cancelled,
+                                )
+                                .await
+                            }
+                            None => false,
+                        };
+                        // descend() already consumed the invoking step —
+                        // marking done as well would skip the sub-skill's
+                        // first step.
+                        if !handed_off {
+                            cursor.mark_done();
+                        }
+                        report_cursor_gaps(&cursor);
+                        skill_cursor::save(ctx.config, &cursor);
+                        let msg = match cursor.current() {
+                            Some((_, next)) => format!(
+                                "Step '{finished}' marked done. Next step: '{}'. Its full \
+                                 instructions will appear under [SKILL STEP] — follow them \
+                                 exactly.",
+                                next.name
+                            ),
+                            // The frame popped. That only means every
+                            // step is complete when none were abandoned
+                            // on the way — say which are outstanding
+                            // rather than inviting a finish over them.
+                            None if !cursor.dropped_unfinished().is_empty() => format!(
+                                "Step '{finished}' marked done, but the {skill} skill ends \
+                                 with unfinished steps: {}. Those were never completed — \
+                                 go back and finish them before you stop.",
+                                cursor.dropped_unfinished().join(", ")
+                            ),
+                            None => format!(
+                                "Step '{finished}' marked done. All {skill} skill steps are \
+                                 complete — finish the task."
+                            ),
+                        };
+                        crate::tools::ToolResult::ok(msg)
+                    }
+                }
+                None => crate::tools::ToolResult::err("No active skill step to complete.".into()),
+            }
+        } else {
+            crate::tools::ToolResult::err(format!(
+                "Unknown skill action '{action}'. Use action='done'."
+            ))
+        }
+    } else {
+        let tool_name = tc.function.name.clone();
+        let args = args.clone();
+        let config = ctx.config.clone();
+        let perms = ctx.perms.clone();
+        let lsp = ctx.lsp.clone();
+        ui.await_tool_job(
+            ctx.tool_pool.submit(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                runtime
+                    .block_on(async move {
+                        tools::execute_tool(
+                            &tool_name,
+                            &args,
+                            &config,
+                            perms.as_ref(),
+                            lsp.as_deref(),
+                        )
+                        .await
+                    })
+                    .map_err(|e| format!("Tool error: {e}"))
+            }),
+            &tc.function.name,
+            ctx.cancelled,
+        )
+        .await
+    }
 }

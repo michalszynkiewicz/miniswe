@@ -113,6 +113,16 @@ pub(crate) trait AgentUi {
     fn separator(&mut self);
     /// Refresh the live plan panel from `plan.md` (no-op headless).
     fn refresh_plan(&mut self, config: &Config, round: usize);
+    /// After a `plan` tool call returns: refresh the live plan panel and
+    /// redraw immediately, so a checked/added/refined step appears right
+    /// away instead of lagging to the next round's `refresh_plan`. No-op
+    /// headless (same reason `refresh_plan` is a no-op there).
+    fn after_plan_tool(&mut self, config: &Config, round: usize);
+    /// Announce a `spawn_agents` dispatch is starting — byte-identical to
+    /// the line headless has always printed here. No-op in the REPL:
+    /// `drive_subagents` already streams each subagent's own output live
+    /// as it runs, so a separate announcement line was never added.
+    fn spawning_subagents(&mut self, count: usize);
     /// The user interrupted the turn (REPL ctrl-c checkpoints; the headless
     /// loop has no interrupt checkpoints and never calls this).
     fn notify_interrupted(&mut self);
