@@ -1,12 +1,30 @@
-# Benchmarking small local models as coding agents
+# Miniswe on current local models
 
-After [making miniswe 2.5× faster](https://michalszynkiewicz.dev/blog/miniswe-2_5x-faster/), I had something more valuable than a faster tool: a benchmark I trusted. So I pointed it at every interesting small model that fits on my RTX 3090 (power-capped to 200 W).
+It's been 1.5 years since I bought a used RTX 3090 with the intent of running local LLMs.
+Roughly a year later, I started `miniswe` - I wanted to figure out whether I could build some smartness around a small model to let it handle real tasks.
 
-Six models went in. Two came out with a 100% record. Two got dropped entirely. And one of them turned out to have a bug in the vendor's own chat template.
+My first test model was Devstral Small 2. Dense, rather slow but fitting my GPU.
+A month or so later Google introduced Gemma 4, with a 26B MoE model that is crazy fast compared to Devstral on my hardware.
+
+At first it didn't seem as smart as Devstral on my benchmarks, but when I added a few workarounds to `miniswe`, it started working nearly as well as Devstral on my benchmarks.
+
+A few weeks ago I had a bit of time and decided to check what's new on the market for models that I could run locally. It turned out a lot has changed.
+I knew I had to benchmark the models to see what I could use as Gemma's replacement.
+
+After a bit of research I decided to bench models from the following families: Gemma, Devstral, Laguna, Muse Glimmer, North Mini, Nemotron and GPT OSS.
+
+The most notable absentee from the benchmark is Qwen3.8. I'd expect strong results from it, but for some of my use cases its origin rules it out.
+
+## Hardware
+
+I'm running the models on:
+* RTX 3090 capped to 200 W - an old 24 GB VRAM card
+* Ryzen 9950X3D + 128 GB of RAM
 
 ## Methodology
 
-The task is real work on a real codebase: add a `--system-prompt-override` CLI flag to a pinned version of miniswe itself. That means a clap flag, threading the value through a few layers of calls, and updating every call site — including the test crate.
+The task is real work on a real codebase: add a `--system-prompt-override` CLI flag to a pinned, old version of miniswe itself. That means a clap flag, threading the value through a few layers of calls, and updating every callsite.
+The project is not huge, but it is not that easy to work with: a couple of 500–900 line files, Rust code, a few layers of prod code to change, and fourteen callsites in the test crate alone.
 
 Six checks decide the score:
 
@@ -19,35 +37,42 @@ Six checks decide the score:
 
 Smoke is the only check that proves the feature works end to end. A 5/6 with smoke failing usually means "the flag exists but is wired to nothing".
 
-The rules: 57-minute timeout, up to three attempts (each attempt gets a fresh context; the working tree carries over). Everything runs headless in Docker. llama-server is restarted between runs — a long-running server is an uncontrolled variable. The GPU is a 24 GB RTX 3090 held at a 200 W power cap for every run, so the tok/s numbers below are lower than an uncapped card would give, but they are directly comparable to each other. And at this model size, never trust a single run: LLM non-determinism is brutal, so I run each configuration several times.
+The rules: 57-minute timeout, up to three attempts (each attempt gets a fresh context; the working tree carries over). Everything runs headless in Docker. llama-server is restarted between runs — a long-running server is an uncontrolled variable.
+At this model size, LLM non-determinism is brutal, so I run each configuration several times.
 
-One caveat: miniswe itself evolved during these weeks — every model failure taught the harness something (more on that at the end). The headline table below is the final validation round: all models, same day, same shipped defaults, fresh server per run.
+## Contestants
 
-## The contestants
+| Model | Parameters | CPU offload | Thinking | Quant |
+|---|---|---|---|---|
+| Gemma 4 26B | 26B-A4B MoE | none | both arms | UD-Q4_K_M / q8_0 KV |
+| Devstral Small 2 | 24B dense | none | instruct only — no thinking mode | UD-Q4_K_XL / q8_0 KV |
+| Laguna XS 2.1 | 33B-A3B MoE | experts of 6 layers out of 39 | both arms | IQ4_XS / q8_0 KV |
+| Laguna S 2.1 | 118B-A8B MoE | experts of 40 layers out of 48, 68 GB of RAM | instruct only — thinking arm not run | UD-Q4_K_XL / q8_0 KV |
+| Muse Glimmer | 30B dense | none | thinking only — can't be turned off | Q4_K_M / f16 KV |
+| North Mini Code 1.0 | 30B-A3B MoE | experts of 10 layers out of 48 | both arms | UD-Q4_K_M / q8_0 KV |
+| Nemotron 3.5 Lightning | 30B-A3B MoE, hybrid Mamba-Transformer | every expert | both arms | UD-Q4_K_XL / q4_0 KV |
+| GPT OSS | 20B-A3.6B MoE | none | always reasons, at `reasoning_effort: high` | MXFP4 native / q4_0 KV |
 
-| Model | Architecture | On the card | Decode (tok/s) |
-|---|---|---|---|
-| Gemma 4 26B A4B | MoE | fully on GPU | — |
-| Devstral Small 2 | 24B dense | 19.1 GB, 60k ctx | — |
-| Laguna XS 2.1 | 33B-A3B MoE | 17.2 GB (some experts on CPU) | 129 |
-| Muse Glimmer 30B | dense, always-thinking | 17.6 GB | 21 |
-| North Mini Code 1.0 | ~30B MoE | ~17 GB | ~98 |
-| Nemotron 3.5 Lightning | 30B | — | — |
 
-All at Q4 quants, mostly with quantized KV cache. Gemma is the reference model — the one the previous post's numbers were tuned on.
-
-**Sampling.** Every instruct run is at temperature 0.2. Thinking runs are at 0.6 — reasoning traces degenerate at code-task temperatures, so miniswe raises the temperature whenever it enables thinking. That coupling matters for reading this post: a thinking-vs-instruct comparison below is a *two*-variable change, not one, and I have not separated them. Muse Glimmer can't disable thinking at all, so all of its runs are at 0.6 while the models it sits next to in the table are at 0.2.
+**Sampling.** Every instruct (non-thinking) run is at temperature 0.2. Thinking runs are at 0.6, because 0.2 is too low for reasoning: long chains of thought start repeating themselves and circling the same idea. So miniswe raises the temperature whenever it enables thinking. That coupling matters for reading this post: a thinking-vs-instruct comparison below is a *two*-variable change, not one. Muse Glimmer can't disable thinking at all, so all of its runs are at 0.6 while the models it sits next to in the table are at 0.2.
 
 ## Results
 
-The final round:
+The final round: 23 runs, seven models, 16:07 to 00:40.
 
-| Model | Result | Wall time |
-|---|---|---|
-| Laguna XS 2.1 | 6/6, 6/6 — both first attempt | 422s, 304s |
-| Gemma 4 26B | 5/6 after 3 attempts | 2850s |
-| Muse Glimmer 30B | 6/6, first attempt | 1277s |
-| Devstral Small 2 | 6/6, first attempt | 806s |
+| Model | Arm | Attempt 1 | Final | Wall times |
+|---|---|---|---|---|
+| Laguna XS 2.1 | thinking | 6/6, 6/6, 5/6 | 6/6, 6/6, 6/6 | 465s, 525s, 753s |
+| Muse Glimmer | thinking | 6/6, 6/6, 6/6 | 6/6, 6/6, 6/6 | 543s, 552s, 633s |
+| Laguna XS 2.1 | instruct | 6/6, 6/6, 6/6 | 6/6, 6/6, 6/6 | 529s, 597s, 2046s |
+| Gemma 4 26B | instruct | 6/6, 5/6, 5/6 | 6/6, 6/6, 6/6 | 355s, 641s, 864s |
+| Laguna S 2.1 | instruct | 6/6, 6/6, 6/6 | 6/6, 6/6, 6/6 | 690s, 898s, 983s |
+| Gemma 4 26B | thinking | 6/6, 6/6, 6/6 | 6/6, 6/6, 6/6 | 741s, 1133s, 1145s |
+| Devstral Small 2 | instruct | 6/6, 6/6, **0/6** | 6/6, 6/6, **0/6** | 1149s, 3071s, 3402s |
+| GPT OSS | reasoning: high | 3/6 | 5/6 | 3413s |
+| North Mini Code 1.0 | thinking | 0/6 | 0/6 | 3409s |
+
+Twenty of the twenty-three runs scored 6/6, seventeen of them on the first attempt. All three failures ran out the full 57-minute clock: devstral and North both ended on `compile:FAIL`, and GPT OSS got the flag wired but failed smoke.
 
 And what the full history behind that snapshot says:
 
