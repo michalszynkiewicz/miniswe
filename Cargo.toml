@@ -97,7 +97,7 @@ ignore = "0.4"          # respects .gitignore (used by the indexer and search)
 grep-searcher = "0.1"
 grep-regex = "0.1"
 futures = "0.3"
-dirs = "6"
+dirs = "7"
 chrono = { version = "0.4", features = ["serde"] }
 lsp-types = "0.97.0"
 dashmap = "6.2.1"
