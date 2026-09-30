@@ -17,7 +17,7 @@ miniswe is built around one principle: **give the model the right tools and let 
 - **LSP diagnostics + navigation** — auto-downloads the right language server (rust-analyzer, pyright, gopls, …) for fast diagnostics and `goto_definition` / `find_references`.
 - **Line-level edits with per-edit feedback** — edits produce AST + LSP feedback and a revision table; regressions roll back with `revert`.
 - **Context compression** — when the conversation grows past budget, older turns are LLM-summarized and archived to `.miniswe/session_archive.md`.
-- **MCP support** — connect any MCP server via `.mcp.json` (Claude Code compatible). *Not yet tested end-to-end.*
+- **MCP support** — connect any MCP server via `.mcp.json` (Claude Code compatible).
 - **Permission model** — path jailing, shell approval, per-query web access, MCP approval.
 - **Skills** — guided multi-step workflows from `.ai/skills/<name>/SKILL.md` (project) or `~/.ai/skills/` (global): a router picks the right skill for the task and the harness walks the model through its steps.
 - **Background jobs & sub-agents** — long-running commands run as managed background jobs; `spawn_agents` runs independent sub-tasks concurrently.
