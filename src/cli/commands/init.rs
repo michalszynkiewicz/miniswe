@@ -27,7 +27,6 @@ pub async fn run() -> Result<()> {
     fs::create_dir_all(miniswe_dir.join("index"))?;
     fs::create_dir_all(miniswe_dir.join("snippets"))?;
     fs::create_dir_all(miniswe_dir.join("sessions"))?;
-    fs::create_dir_all(miniswe_dir.join("docs"))?;
 
     // Detect project and generate profile
     tui::print_status("Detecting project configuration...");
@@ -107,8 +106,7 @@ pub async fn run() -> Result<()> {
              snippets/\n\
              sessions/\n\
              scratchpad.md\n\
-             plan.md\n\
-             docs/\n",
+             plan.md\n",
         )?;
     }
 
