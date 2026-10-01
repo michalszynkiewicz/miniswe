@@ -196,14 +196,6 @@ fn loop_hint_fast_mentions_revision_table_tools() {
 }
 
 #[test]
-fn consume_interrupt_clears_flag_after_first_read() {
-    let cancelled = AtomicBool::new(true);
-    assert!(consume_interrupt(&cancelled));
-    assert!(!consume_interrupt(&cancelled));
-    assert!(!cancelled.load(Ordering::Relaxed));
-}
-
-#[test]
 fn reconcile_streamed_assistant_content_appends_missing_suffix() {
     assert_eq!(
         reconcile_streamed_assistant_content("Hello", "Hello world"),

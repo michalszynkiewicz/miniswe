@@ -1,6 +1,6 @@
 //! Shared round phases extracted from the two agent loops (headless
 //! `run()` and the REPL). Phases return [`RoundFlow`] instead of doing
-//! raw control flow — the loop skeletons alone own `break`/`continue`.
+//! raw control flow — `driver::run_turn` alone owns them.
 
 use std::sync::Arc;
 
@@ -20,6 +20,7 @@ use crate::tools::permissions::PermissionManager;
 pub(crate) mod call_gate;
 pub(crate) mod dispatch;
 pub(crate) mod done_gate;
+pub(crate) mod driver;
 pub(crate) mod llm_call;
 pub(crate) mod postamble;
 pub(crate) mod preamble;
@@ -142,6 +143,18 @@ pub(crate) struct TurnOptions {
     /// treated as an ordinary loop (bounded to 2 redirects per turn). The
     /// REPL has no job-poll redirect.
     pub jobs_poll_redirect: bool,
+    /// REPL: consume the cancel flag at the two interrupt checkpoints (top
+    /// of the round, top of the `for tc` body) and end the turn when it was
+    /// armed. Headless has never consumed the cancel flag at these points —
+    /// an armed flag stays armed for the LLM/tool paths to read themselves.
+    pub interrupt_checkpoints: bool,
+    /// Headless: the two `EndTurn { error }` arms from
+    /// `preamble::begin_round` and `llm_call::generate` fold `error` into
+    /// `had_error`. The REPL ignores it (both still `break` either way).
+    /// Does not govern `done_gate::check`'s `EndTurn` (its error is always
+    /// ignored) or `AdmitFlow::StopCalls` (both loops already fold its
+    /// error unconditionally).
+    pub fatal_marks_error: bool,
 }
 
 /// How the error ladder's compact-retry branches announce themselves and

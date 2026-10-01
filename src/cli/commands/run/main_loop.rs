@@ -202,8 +202,6 @@ pub async fn run(
     let strict = config.tools.ceremony == crate::config::CeremonyMode::Strict;
 
     let mut conversation_history: Vec<Message> = Vec::new();
-    let mut round = 0;
-    let mut had_error = false;
     // Per-turn agent-loop state shared with the REPL loop (see the field docs
     // on `turn_state::TurnState` and its sub-structs).
     let mut state = turn_state::TurnState::default();
@@ -438,218 +436,46 @@ pub async fn run(
         plan_job_direct_await: true,
         window_repeat_detector: true,
         jobs_poll_redirect: true,
+        interrupt_checkpoints: false,
+        fatal_marks_error: true,
     };
 
-    'round: loop {
-        if had_error {
-            break;
-        }
-        round += 1;
-        log.round_start(round);
-        // `tools.stuck_check`'s frozen-signature tracker: feed it the round
-        // number + elapsed wall time BEFORE the skill-cursor block below (its
-        // periodic judge is an LLM call, so the timestamp must be taken
-        // first). Headless only (`opts.stuck_tracking`); the REPL skips it.
-        if opts.stuck_tracking {
-            state
-                .stuck_tracker
-                .on_round(round, session_start.elapsed().as_secs_f64());
-        }
+    let ctx = turn::TurnCtx {
+        config: &config,
+        router: &router,
+        llm_worker: &llm_worker,
+        lsp: &lsp_client,
+        snapshots: &snapshots,
+        log: &log,
+        tool_defs: &tool_defs,
+        cancelled: &cancelled,
+        model_role,
+        fast_baseline_errors,
+        tool_def_tokens,
+        max_rounds,
+        perms: &perms,
+        tool_pool: &tool_pool,
+        mcp_registry: &mcp_registry,
+        fast_revisions: &fast_revisions,
+        job_registry: &job_registry,
+        task: message,
+        mcp_summary: mcp_summary.as_deref(),
+        plan_only,
+        session_start,
+    };
 
-        let ctx = turn::TurnCtx {
-            config: &config,
-            router: &router,
-            llm_worker: &llm_worker,
-            lsp: &lsp_client,
-            snapshots: &snapshots,
-            log: &log,
-            tool_defs: &tool_defs,
-            cancelled: &cancelled,
-            model_role,
-            fast_baseline_errors,
-            tool_def_tokens,
-            max_rounds,
-            perms: &perms,
-            tool_pool: &tool_pool,
-            mcp_registry: &mcp_registry,
-            fast_revisions: &fast_revisions,
-            job_registry: &job_registry,
-            task: message,
-            mcp_summary: mcp_summary.as_deref(),
-            plan_only,
-            session_start,
-        };
-
-        // Skill step-cursor maintenance (harness-owned; runs before the LLM
-        // call so the [SKILL STEP] re-injection is current) — handoff
-        // descent, prepare_step, periodic completion judge. Headless only;
-        // no-op on the REPL side (`opts.skill_steps` is false there).
-        turn::skill_round::prepare(
-            ctx,
-            opts,
-            &mut skill_state,
-            &mut ui,
-            &mut messages,
-            &mut conversation_history,
-        )
-        .await;
-
-        match turn::preamble::begin_round(ctx, &mut state, &mut ui, &mut messages, round).await {
-            turn::RoundFlow::Continue => {}
-            turn::RoundFlow::EndTurn { error } => {
-                had_error |= error;
-                break;
-            }
-        }
-
-        let assistant_msg = match turn::llm_call::generate(
-            ctx,
-            opts,
-            &mut state,
-            &mut ui,
-            &mut messages,
-            &mut conversation_history,
-        )
-        .await
-        {
-            turn::LlmFlow::Ready(msg) => msg,
-            turn::LlmFlow::Retry => continue,
-            turn::LlmFlow::EndTurn { error } => {
-                had_error |= error;
-                break;
-            }
-        };
-        let assistant_msg = &assistant_msg;
-
-        // Check for tool calls
-        let tool_calls = match &assistant_msg.tool_calls {
-            Some(tc) if !tc.is_empty() => tc.clone(),
-            _ => match turn::done_gate::check(
-                ctx,
-                opts,
-                &mut state,
-                &mut skill_state,
-                &mut ui,
-                &mut messages,
-                &mut conversation_history,
-                assistant_msg,
-            )
-            .await
-            {
-                turn::RoundFlow::Continue => continue,
-                turn::RoundFlow::EndTurn { .. } => break,
-            },
-        };
-
-        // Add assistant's tool call message to messages
-        messages.push(assistant_msg.clone());
-
-        // Snapshot lengths so we can rewind both buffers if every tool call
-        // in this assistant message turned out to be a prunable validator
-        // failure. The assistant message and its tool_results then get
-        // replaced with a single user-role corrective — this kills the
-        // priming chain that keeps the model copying the same bad shape.
-        // Both buffers' last entry IS the assistant_msg we just pushed, so
-        // truncate one before to also drop it.
-        let messages_pre = messages.len() - 1;
-        let history_pre = if conversation_history
-            .last()
-            .is_some_and(|m| m.role == "assistant")
-        {
-            conversation_history.len() - 1
-        } else {
-            conversation_history.len()
-        };
-        let mut all_prunable_failures = !tool_calls.is_empty();
-        let mut prunable_errors: Vec<String> = Vec::new();
-
-        // Active skill step, folded into each loop key below so the SAME tool
-        // call on different steps (notably skill(done), byte-identical on every
-        // step) yields distinct keys — legitimately advancing through steps is
-        // not misread as a repeat, while a within-step rut (constant tag) is.
-        let active_step_tag = skill_cursor::current_step_tag(&config);
-
-        for tc in &tool_calls {
-            let admitted = match turn::call_gate::admit(
-                ctx,
-                opts,
-                &mut state,
-                &mut ui,
-                &mut messages,
-                &mut conversation_history,
-                tc,
-                active_step_tag.as_deref(),
-            )
-            .await
-            {
-                turn::AdmitFlow::Run(a) => a,
-                turn::AdmitFlow::NextCall => continue,
-                turn::AdmitFlow::StopCalls { error } => {
-                    had_error |= error;
-                    break;
-                }
-                turn::AdmitFlow::RestartRound => continue 'round,
-            };
-
-            // Handle tool dispatch
-            let mut result = turn::dispatch::execute(
-                ctx,
-                opts,
-                &mut skill_state,
-                &mut ui,
-                round,
-                tc,
-                &admitted.args,
-                &admitted.file_action,
-                &router,
-                &log,
-            )
-            .await;
-
-            match turn::dispatch::finish_call(
-                ctx,
-                opts,
-                &mut state,
-                &mut skill_state,
-                &mut ui,
-                &mut messages,
-                &mut conversation_history,
-                round,
-                tc,
-                &admitted.args,
-                &admitted.args_summary,
-                &admitted.call_key,
-                &mut result,
-                &mut all_prunable_failures,
-                &mut prunable_errors,
-            )
-            .await
-            {
-                turn::CallFlow::NextCall => {}
-                turn::CallFlow::RestartRound => continue 'round,
-            }
-        }
-
-        turn::postamble::finish_round(
-            ctx,
-            opts,
-            &mut state,
-            &mut ui,
-            &mut messages,
-            &mut conversation_history,
-            round,
-            strict,
-            turn::Prunable {
-                messages_pre,
-                history_pre,
-                all_failures: all_prunable_failures,
-                errors: prunable_errors,
-            },
-        )
-        .await;
-    }
-
-    log.session_end(round, had_error);
+    let turn::driver::TurnResult { had_error, .. } = turn::driver::run_turn(
+        ctx,
+        opts,
+        &mut state,
+        &mut skill_state,
+        &mut ui,
+        &mut messages,
+        &mut conversation_history,
+        &router,
+        &log,
+    )
+    .await;
 
     // Shut down LSP
     if let Some(lsp) = lsp_client

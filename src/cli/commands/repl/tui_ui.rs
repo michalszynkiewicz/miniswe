@@ -63,6 +63,25 @@ impl<'a> TuiUi<'a> {
     }
 }
 
+/// Refresh the live plan panel from `plan.md` (the single source of truth).
+/// No-op when no task is active (Q&A turns). Called both at the top of each
+/// round and immediately after the plan tool runs, so a checked-off step shows
+/// the instant `plan(check)` returns rather than lagging to the next round.
+fn refresh_plan_panel(app: &mut App, config: &Config, round: usize) {
+    if app.plan_task.is_none() {
+        return;
+    }
+    app.plan_steps = tools::plan::parsed_steps(config)
+        .into_iter()
+        .map(|(checked, checked_round, text)| PlanStepView {
+            checked,
+            checked_round,
+            text,
+        })
+        .collect();
+    app.round = round;
+}
+
 impl AgentUi for TuiUi<'_> {
     fn status(&mut self, line: &str) {
         self.app.push_output(line, LineStyle::Status);
@@ -218,6 +237,11 @@ impl AgentUi for TuiUi<'_> {
 
     fn notify_interrupted(&mut self) {
         self.app.push_output("(interrupted)", LineStyle::Status);
+    }
+
+    fn after_tool_call(&mut self) {
+        let (app, _, terminal, _) = self.parts();
+        let _ = terminal.draw(|frame| ui::draw(frame, app));
     }
 
     async fn pump<T>(&mut self, fut: impl Future<Output = T>) -> T {

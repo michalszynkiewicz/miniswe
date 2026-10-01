@@ -34,10 +34,6 @@ pub(super) fn handle_background_key(app: &mut App, key: &crossterm::event::KeyEv
     }
 }
 
-pub(super) fn consume_interrupt(cancelled: &AtomicBool) -> bool {
-    cancelled.swap(false, Ordering::Relaxed)
-}
-
 /// Drop any input-kind events queued in `rx` without processing them.
 ///
 /// Called at the end of the Enter handler to discard keystrokes the user
