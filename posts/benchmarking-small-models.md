@@ -48,13 +48,13 @@ At this model size, LLM non-determinism is brutal, so I run each configuration s
 | Devstral Small 2 | 24B dense | none | instruct only — no thinking mode | UD-Q4_K_XL / q8_0 KV |
 | Laguna XS 2.1 | 33B-A3B MoE | experts of 6 layers out of 39 | both arms | IQ4_XS / q8_0 KV |
 | Laguna S 2.1 | 118B-A8B MoE | experts of 40 layers out of 48, 68 GB of RAM | instruct only — thinking arm not run | UD-Q4_K_XL / q8_0 KV |
-| Muse Glimmer | 30B dense | none | thinking only — can't be turned off | Q4_K_M / f16 KV |
+| Muse Glimmer | 30B dense | none | thinking only — no usable instruct mode | Q4_K_M / f16 KV |
 | North Mini Code 1.0 | 30B-A3B MoE | experts of 10 layers out of 48 | both arms | UD-Q4_K_M / q8_0 KV |
 | Nemotron 3.5 Lightning | 30B-A3B MoE, hybrid Mamba-Transformer | every expert | both arms | UD-Q4_K_XL / q4_0 KV |
 | GPT OSS | 20B-A3.6B MoE | none | always reasons, at `reasoning_effort: high` | MXFP4 native / q4_0 KV |
 
 
-**Sampling.** Every instruct (non-thinking) run is at temperature 0.2. Thinking runs are at 0.6, because 0.2 is too low for reasoning: long chains of thought start repeating themselves and circling the same idea. So miniswe raises the temperature whenever it enables thinking. That coupling matters for reading this post: a thinking-vs-instruct comparison below is a *two*-variable change, not one. Muse Glimmer can't disable thinking at all, so all of its runs are at 0.6 while the models it sits next to in the table are at 0.2.
+**Sampling.** Every instruct (non-thinking) run is at temperature 0.2. Thinking runs are at 0.6, because 0.2 is too low for reasoning: long chains of thought start repeating themselves and circling the same idea. So miniswe raises the temperature whenever it enables thinking. That coupling matters for reading this post: a thinking-vs-instruct comparison below is a *two*-variable change, not one. Muse Glimmer is the awkward one — it is a reasoning model, and the handful of runs where I switched thinking off and dropped to 0.2 were the worst it produced. So every Glimmer number here is a 0.6 thinking run standing next to models at 0.2.
 
 ## Results
 
@@ -74,21 +74,47 @@ The final round: 23 runs, seven models, 16:07 to 00:40.
 
 Twenty of the twenty-three runs scored 6/6, seventeen of them on the first attempt. All three failures ran out the full 57-minute clock: devstral and North both ended on `compile:FAIL`, and GPT OSS got the flag wired but failed smoke.
 
-And what the full history behind that snapshot says:
+That snapshot is one good night. The full history — more than a hundred scored runs between August 22nd and September 5th, all on the same harness lineage — is less flattering and more useful.
 
-**Gemma 4 26B — the reference.** Typical run: 6/6 first try in 5–8 minutes, historical band 279–1411s. The 5/6 above is its one recent blemish, and an instructive one: the production code was correct, but it corrupted its own test file with a non-idempotent `sed` and never recovered. Mostly-6/6 record, fastest converger of the field.
+| Model | Arm | Runs | Finished 6/6 | 6/6 on attempt 1 | Median clean run | Decode |
+|---|---|---|---|---|---|---|
+| Laguna S 2.1 | instruct | 8 | 8 | 8 | 856s | 19 tok/s |
+| Laguna XS 2.1 | instruct | 17 | 17 | 17 | 637s | 70 tok/s |
+| Laguna XS 2.1 | thinking | 7 | 7 | 5 | 525s | 75 tok/s |
+| Gemma 4 26B | instruct | 24 | 19 | 10 | 653s | 83 tok/s |
+| Gemma 4 26B | thinking | 8 | 8 | 7 | 799s | 80 tok/s |
+| Muse Glimmer | thinking | 13 | 12 | 11 | 775s | 20 tok/s |
+| Devstral Small 2 | instruct | 17 | 13 | 10 | 1384s | 22 → 13 tok/s |
+| GPT OSS | reasoning: high | 3 | 0 | 0 | — | 74 tok/s |
+| North Mini Code 1.0 | both | 5 | 0 | 0 | — | 59 tok/s |
+| Nemotron 3.5 Lightning | both | 4 | 1 | 1 | — | — |
+| Mistral Small 4 119B | instruct | 4 | 0 | 0 | — | — |
 
-**Laguna XS 2.1 — the surprise.** Five runs, five 6/6, all on the first attempt — the only model besides gemma with a clean first-try record, and its last two runs (422s, 304s) are gemma-class fast. Distinct personality: it leans on shell (grep, sed, python heredocs) over the structured edit tools, writes 23-step plans, and checks every box at the end. 129 tok/s from a 33B MoE with a slice of experts on the CPU.
+Decode rates are measured mid-run under real load, not from an idle probe. North and Nemotron were dropped early, so their rows count runs inside this window, not their lifetime totals.
 
-**Devstral Small 2 — solid.** Finishes 6/6 routinely; best run 806s, older band 1021–2463s. Its early runs stumbled on edit mechanics (one brace-dropping edit re-issued twenty times) — those runs are precisely where several harness guards came from.
+Laguna XS ran eighteen times; the eighteenth is excluded here — 57 minutes lost to a bug in miniswe rather than anything the model did, described below. The rest of the table is uncorrected, and the models did not all face the same harness: Laguna S, GPT OSS and Mistral only ever ran on the current one, while more than half of gemma's runs predate the fixes.
 
-**Muse Glimmer 30B — best edit economy, slowest clock.** Thinking can't be disabled, and at 21 tok/s reasoning is a tax: runs are 751–1277s even when clean. But it makes the fewest, most surgical edits of any model here — one run finished the feature with 8 edits and zero reverts. It was also the model most punished by harness gaps: before the stuck-detection nudge it would sit in half-hour read loops (3406s, 2735s); after, three consecutive clean passes.
+The most important thing here isn't in any row. Twenty-seven of those runs scored below 6/6 — and twenty-six of them took at least 47 minutes to get there. Exactly one model, exactly once, failed fast. Everything else failed by running out of clock: still editing, still re-reading, still convinced it was one fix away. A small model that can't do the task doesn't stop. It grinds until you stop it. That, not the score column, is what you have to budget for.
 
-**North Mini Code 1.0 — dropped.** Cohere's "works best with thinking enabled" is binary here (with the temperature caveat above — the thinking run is also the 0.6 run): instruct mode scored 0/6 (55 minutes re-reading one file, 235 reads, zero edits); thinking mode reached 5/6 at the timeout, one call site short. Even its good mode is 4–6× slower to converge than gemma or Laguna. Not worth the VRAM.
+**Laguna XS 2.1 — the surprise, and it held up.** Twenty-five runs across both arms, twenty-four of them 6/6, twenty-two on the first attempt. Its one sub-6/6 (4/6 at 3423s) wasn't the model — miniswe was rebuilding the prompt in a way that made llama.cpp re-read the whole context every round, and the run spent its 57 minutes on that. Fixed since; with it gone, Laguna XS has yet to lose a run on its own merits. It also owns the fastest run in the field at 298s. Distinct personality: it leans on shell (grep, sed, heredocs) over the structured edit tools, writes 23-step plans, and checks every box at the end. 70 tok/s from a 33B MoE with a slice of experts on the CPU.
 
-**Nemotron 3.5 Lightning — dropped, with a story.** Six instruct runs, never a single 6/6, never finished inside 57 minutes (4, 0, 5, 2...). Thinking mode — again, also a temperature change — came closer: it produced nemotron's only 6/6 tree, complete at minute 24 — and then spent the remaining half hour announcing it was done while issuing one more tool call, never ending its turn; the bench scored the finished tree at the timeout. In both modes it kept flooding thousands of blank lines mid-edit, burning its whole output budget. I chased temperature, repetition penalty, grammars — all refuted. The root cause: NVIDIA's own chat template prefills `<think></think>` with no trailing newline in non-thinking mode, and the model desperately wants that newline. Adding it: zero floods on exact replays — but the fix only exists for instruct mode; one thinking run drowned in a 13,005-line flood. As far as I can tell, this isn't publicly reported.
+**Gemma 4 26B — fastest, but it wants the retries.** Median clean run 653s and a floor of 278s: the quickest converger here. The catch is the attempt column. Ten of twenty-four instruct runs reached 6/6 on the first try; the rest needed a second or third pass. The score recovers, the clock doesn't — that's exactly what the 355s / 641s / 864s spread in the round above is showing you. Turning thinking on fixes precisely that (seven of eight first-try, eight of eight finished) for about 150 seconds of median wall. Its failures tend to be self-inflicted rather than confused: in one run the production code was already correct and it corrupted its own test file with a non-idempotent `sed`.
 
-**The verdict.** Gemma 4 26B and Laguna XS 2.1 are the top tier — fast, reliable, first-try finishers. Devstral is a dependable third. Glimmer works if you can pay the thinking tax. The rest of the small-model field, at least on this task, isn't there.
+**Laguna S 2.1 — the only perfect record.** Eight runs, eight 6/6, every one on the first attempt, 690–983s. Nothing else in the field has a band that tight. It is also the most expensive thing here by a wide margin: 118B-A8B with the experts of 40 of its 48 layers spilled into 68 GB of system RAM, decoding at 19 tok/s. What that buys is variance reduction, not capability — its little sibling reaches the same answer, usually sooner.
+
+**Muse Glimmer 30B — the surgeon.** Glimmer makes the fewest edits and the fewest reverts of anything in the field: one run built the whole feature in 8 edits with zero reverts. That matters because it is slow. At a flat 20 tok/s it generates a quarter as fast as gemma, and it still turns in a median clean run of 775s — ahead of devstral, within striking distance of gemma's 653s. It buys the difference back by getting it right the first time: eleven of its thirteen runs hit 6/6 on attempt one. It is, however, the model that most needs a harness watching it. Left alone it will settle into a read loop and stay there until the clock runs out; the stuck-detection nudge is what makes the numbers above possible.
+
+**Devstral Small 2 — the slow one.** Devstral finishes: 13 runs out of 17. But its median clean run is 1384s against gemma's 653s and Laguna XS's 637s, and its slowest *successful* run still took 3169s. It's also the only model whose throughput collapses over a run — 22 tok/s on a fresh context, 13 tok/s by the end of a long one — which is a feedback loop rather than a constant, since the longer it takes the slower it gets. All four of its failures ran out the clock. It's demanding on the harness, too: loop detection over longer periods, and hard caps on runaway tool arguments, both exist because of devstral.
+
+**GPT OSS 20B — the same failure, three times.** Three runs, no 6/6, and every one landed in the identical place: 5/6 with `smoke:FAIL`. The flag parses. The help text lists it. The build is green and the tests pass. The binary ignores the override. It builds the entire CLI surface, wires it to nothing, and reports success — which makes it the most interesting failure in the set, because it's the one a human reviewer skimming the diff would also wave through.
+
+**North Mini Code 1.0 — dropped.** Five runs across both arms, never a 6/6. Cohere's "works best with thinking enabled" is real but not sufficient (with the temperature caveat above — the thinking run is also the 0.6 run): instruct mode scored 0/6 by re-reading one file for 55 minutes, 235 reads and zero edits; its best thinking run reached 5/6 at the timeout, one call site short; its most recent one was 0/6 on `compile:FAIL`. Even its good mode is several times slower to converge than gemma or Laguna. Not worth the VRAM.
+
+**Nemotron 3.5 Lightning — dropped, with a story.** Six instruct runs, never a single 6/6, never a finish inside 57 minutes. Its one complete tree came out of thinking mode, done at minute 24 — after which it spent the remaining half hour announcing it was finished while issuing one more tool call, never ending its turn, and the bench scored the tree at the timeout. Underneath that sits a real bug that I can't find reported anywhere: NVIDIA's own chat template prefills `<think></think>` with no trailing newline in non-thinking mode, and the model wants that newline badly enough to flood thousands of blank lines mid-edit until its output budget is gone. Patch the template to add it and the floods stop dead. The patch only covers instruct mode, though — in thinking mode the flood still wins, and one run drowned in 13,005 blank lines.
+
+**Mistral Small 4 119B — the control group.** Four runs, four 0/6, `compile:FAIL` every time. One of them I gave a three-hour clock instead of 57 minutes, purely to rule out the deadline. It wasn't the deadline. A 119B model that can't get the tree to compile, sitting next to a 33B that finishes twenty-four times out of twenty-five, is the cleanest single result in this whole exercise: on this task, parameter count is not the variable.
+
+**The verdict.** Laguna XS 2.1 is the one I'd actually run — 24 of 25, the fastest floor in the field, and it fits in the card. Laguna S 2.1 is the same answer with better variance and ten times the hardware behind it. Gemma 4 26B is just as quick and lands just as often, but budget for a second attempt unless you turn thinking on. Glimmer trades throughput for precision and gets away with it. Devstral finishes, slowly. The rest didn't get there.
 
 ## What you actually find when you benchmark models
 
@@ -104,4 +130,4 @@ You think you're testing models. Mostly, you're fuzzing your own harness. Nearly
 
 Every model brings a new way to break the harness. That's the real reason to keep adding them.
 
-Next on the bench: Qwen3.8-27B — weights downloaded, launcher written. If you try miniswe with a model I haven't, I'd love to hear how it went.
+Next on the bench: Qwen3.8-27B. If you try miniswe with a model I haven't, I'd love to hear how it went.
