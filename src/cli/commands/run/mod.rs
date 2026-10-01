@@ -23,24 +23,11 @@ use parking_lot::Mutex;
 
 use anyhow::Result;
 
-use crate::cli::commands::agent::debugger;
-use crate::cli::commands::agent::display::summarize_args;
-use crate::cli::commands::agent::hints::{
-    REPEATED_READ_ESCALATION, REPEATED_READ_NUDGE, cycle_loop_hint, is_file_write,
-    loop_detected_hint, truncated_tool_call_hint,
-};
-use crate::cli::commands::agent::job_banners::failing_job_output;
-use crate::cli::commands::agent::loop_detector::{
-    cycle_period, is_mutating_call, key_is_file_edit, key_is_mutating, loop_call_key_tagged,
-};
-use crate::cli::commands::agent::stuck_check;
 use crate::cli::commands::agent::turn;
 use crate::cli::commands::agent::turn_state;
-use crate::cli::commands::agent::ui::AgentUi;
-use crate::cli::commands::agent::validation;
 use crate::config::{Config, EditMode, ModelRole};
 use crate::context;
-use crate::llm::{Message, ModelRouter, truncated_args_info, truncated_args_tool_result};
+use crate::llm::{Message, ModelRouter};
 use crate::logging::SessionLog;
 use crate::lsp::LspClient;
 use crate::mcp::{McpConfig, McpRegistry};
@@ -51,6 +38,5 @@ use crate::tools;
 use crate::tools::permissions::PermissionManager;
 use crate::tui;
 
-use crate::cli::commands::agent::skill_step::*;
 use support::*;
 use ui::*;
