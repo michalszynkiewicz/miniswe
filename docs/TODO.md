@@ -199,3 +199,83 @@ Fix: derive the header from the same probe instead of the constant — reuse `MO
 as the fallback when the server isn't reachable. Cosmetic today, but the header is what
 gets pasted into findings/scoreboard rows, so a wrong label there is a real
 misattribution risk.
+
+## Plan tool: remove support for free-form `content` plans
+
+`plan(action='set', content=...)` accepts prose. When the markdown contains no
+`- [ ]` / `- [x]` line, `src/tools/plan/actions.rs:142-156` falls back to
+treating **every non-empty line as a step**:
+
+```rust
+if steps.is_empty() {
+    // Treat raw text lines as steps
+    for line in content.lines() { ... push Step { checked: false, compile: true, .. } }
+}
+```
+
+So a headline, a `## Overview`, a paragraph and a nested bullet each become a
+compile-gated step the model then has to check off by number.
+
+**Why it exists:** nothing designed it. Before `5e094e7` (2026-04-05, "plan:
+per-step compile gates with refine action") `set` stored `content` verbatim and
+`check` scanned for `- [ ]` lines — checkbox-free markdown parsed to zero steps
+and was harmless. That commit introduced structured parsing plus
+`validate_steps`, whose first rule is `if steps.is_empty() → "Plan must have at
+least one step."`, which would have hard-rejected every previously-accepted
+prose plan. The raw-lines loop was added in the same commit as a silent
+compatibility shim: no mention in the commit message, no entry in
+`docs/plan-system-design.md`, no test, no hint in the schema. `1892a3c` only
+relocated it during the module split.
+
+The migration also flipped its blast radius — prose used to yield an unusable
+but inert plan; now it yields a plan the model can never finish.
+
+**Evidence (2026-09-05 round, Laguna XS 2.1, 7 runs).** The shape of the `set`
+call fully predicts checkoff:
+
+| plan shape | steps | checked |
+|---|---|---|
+| `steps` array | 6 | 6 |
+| `steps` array | 7 | 7 |
+| `steps` array | 6 | 6 |
+| prose `content` | 22 | 1 |
+| prose `content` | 24 | 0 |
+| prose `content` | 20 | 1 |
+
+The 24-step run (`benchmark_results/docker_20260905_180252__*Laguna-XS-2.1-GGUF_L`)
+starts `- [ ] # Plan: Add --system-prompt-override CLI flag [compile]`, i.e. the
+title is step 1. That run had the correct tree at 1094s and then flailed for
+another 922s: `has_unchecked_steps()` can never go false, so the premature-exit
+nudge in `agent/turn/done_gate.rs` fired, and the run burned to round 601/600.
+24 pseudo-steps also sail under `MAX_PLAN_STEPS = 30`, so validation never
+objects.
+
+**Fix:** delete the `steps.is_empty()` fallback. Keep `content` as a *checkbox
+list* only (the documented and tested shape — all three `tests/e2e_plan.rs`
+cases use `- [ ]` lines); when a `content` string yields no parsable step,
+reject it.
+
+The rejection message is load-bearing: a failed `set` means no plan, and
+`visible_tool_defs` hides every edit tool until a plan exists, so an unhelpful
+error converts this failure mode into a 0/6. It must name the accepted shapes
+concretely, e.g. *"No steps found. Send `steps: [{step: \"...\"}, ...]`, or
+`content` as `- [ ] step` lines — headings and prose are not steps."*
+
+Surfaces to update together:
+
+* `src/tools/plan/actions.rs` — remove the fallback, add the actionable error
+* `src/tools/definitions.rs` — `content`'s `"For set: plan in markdown."` should
+  say checkbox lines; the `set` blurb should point at `steps` first
+* `docs/plan-system-design.md:72` — documents only `content='...'`; `steps` is
+  absent from the design doc entirely
+* the `plan(action='help')` text and the WORKFLOW line in `src/context/mod.rs`,
+  which says "call `plan(action='set')` with your step-by-step approach" without
+  naming an argument
+* tests: `src/tools/plan/actions.rs` currently has **zero** `#[test]`s — add
+  prose-rejected and checkbox-accepted cases
+
+**Follow-up (separate question):** whether to drop `content` for `set` entirely
+and require `steps`. Every other model in the round (gemma, Glimmer, Laguna S)
+already sends `steps`; Laguna XS instruct is the only one sending prose. Worth a
+3-arm A/B — (A) this fix alone, (B) fix + reworded contract, (C) `steps`
+required — measured on Laguna XS instruct with >=3 runs per arm.
