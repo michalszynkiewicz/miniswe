@@ -93,7 +93,7 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
     // revert-to-green). Unlike run.rs (where one session IS one task, so a
     // single session-scoped instance is correct), REPL is a persistent
     // multi-turn surface — (re-)initialized fresh at the start of every turn
-    // below, right before run_agent_loop, so SCRAP's revert-to-round-0 only
+    // below, right before run_agent_turn, so SCRAP's revert-to-round-0 only
     // ever reverts the CURRENT turn's changes, never prior turns' work.
     // `SnapshotManager::init` wipes and recreates the shadow-git repo each
     // call, so this is just a relocation, not new plumbing. No instance
@@ -529,9 +529,9 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
 
                                 // Run agent loop inline (not spawned — needs mutable refs).
                                 // Context compaction now happens EVERY round inside
-                                // run_agent_loop (matching run.rs) rather than once
+                                // the turn driver (matching run.rs) rather than once
                                 // per turn out here.
-                                run_agent_loop(
+                                run_agent_turn(
                                     &mut app,
                                     &mut rx,
                                     &mut terminal,

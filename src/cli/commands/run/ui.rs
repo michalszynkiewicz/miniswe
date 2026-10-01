@@ -146,6 +146,8 @@ impl AgentUi for HeadlessUi {
 
     fn notify_interrupted(&mut self) {}
 
+    fn after_tool_call(&mut self) {}
+
     async fn pump<T>(&mut self, fut: impl Future<Output = T>) -> T {
         fut.await
     }

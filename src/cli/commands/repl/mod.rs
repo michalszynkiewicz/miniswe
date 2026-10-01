@@ -1,6 +1,6 @@
 //! Interactive REPL mode with ratatui TUI.
 
-mod agent_loop;
+mod agent_turn;
 mod explore;
 mod session;
 mod support;
@@ -28,8 +28,7 @@ use tokio::sync::mpsc;
 use crate::cli::commands::agent::hints::is_file_write;
 use crate::cli::commands::agent::turn;
 use crate::cli::commands::agent::turn_state;
-use crate::cli::commands::agent::ui::AgentUi;
-use crate::config::{CeremonyMode, Config, EditMode, ModelRole};
+use crate::config::{Config, EditMode, ModelRole};
 use crate::context;
 use crate::llm::{ChatRequest, Message, ModelRouter};
 use crate::logging::SessionLog;
@@ -58,7 +57,7 @@ use crate::cli::commands::agent::permissions::permission_action;
 #[cfg(test)]
 use crate::tools::permissions::Action;
 
-use agent_loop::*;
+use agent_turn::*;
 use explore::*;
 use support::*;
 use tui_ui::*;

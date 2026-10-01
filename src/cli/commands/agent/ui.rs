@@ -1,8 +1,8 @@
 //! The frontend seam between the agent round loops and their two UIs.
 //!
-//! Both round loops — headless `run()` (`run/main_loop.rs`) and the REPL's
-//! `run_agent_loop()` (`repl/agent_loop.rs`) — do the same work but render
-//! it differently: plain ANSI lines on stderr/stdout vs a ratatui frame
+//! Both frontends — headless `run()` (`run/main_loop.rs`) and the REPL's
+//! `repl/agent_turn.rs` — drive the same round loop, `agent/turn/driver.rs::run_turn`,
+//! but render it differently: plain ANSI lines on stderr/stdout vs a ratatui frame
 //! that must keep redrawing while long awaits are in flight (every long
 //! await on the TUI side races the event channel for Tick redraws,
 //! background scroll keys, ctrl-c, and in-band permission requests). This
@@ -19,8 +19,8 @@
 //!
 //! Deliberately NOT part of the trait (they stay per-loop for now): the LLM
 //! error-recovery ladders (`had_error` marking and the endpoint hint are
-//! headless-only), tool permission prompting, and the REPL-only interrupt
-//! checkpoints — see the behavior-delta table in the unification plan.
+//! headless-only) and tool permission prompting — see the behavior-delta
+//! table in the unification plan.
 //!
 //! Static dispatch only — two construction sites, no `dyn`.
 
@@ -169,6 +169,9 @@ pub(crate) trait AgentUi {
     /// The user interrupted the turn (REPL ctrl-c checkpoints; the headless
     /// loop has no interrupt checkpoints and never calls this).
     fn notify_interrupted(&mut self);
+    /// Re-render after a tool result landed — the TUI redraws its frame so
+    /// the result shows before the next call starts; no-op headless.
+    fn after_tool_call(&mut self);
 
     /// Drive a long non-tool await (context compaction) to completion while
     /// keeping the frontend alive — the TUI impl races the event channel
