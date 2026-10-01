@@ -57,12 +57,14 @@ impl SnapshotManager {
         // self-referential tracking that `git reset --hard` (unlike the
         // gentler `checkout <commit> -- <pathspec>`) refuses to reconcile.
         // `info/exclude` is git's repo-local, untracked equivalent of
-        // .gitignore — exclude the shadow-git dir from ever being added.
-        std::fs::write(
-            git_dir.join("info").join("exclude"),
-            "/.miniswe/shadow-git/\n",
-        )
-        .context("failed to write shadow-git exclude file")?;
+        // .gitignore — exclude the whole `.miniswe/` harness state dir, not
+        // just the shadow repo: a whole-tree `git reset --hard` (SCRAP,
+        // revert-to-green, gate_context_reset) must never rewind the
+        // session log, plan, or sessions dir. `SessionLog` holds one append
+        // handle for the whole session, so a reverted log file would leave
+        // it writing to a dead inode and silently lose every later line.
+        std::fs::write(git_dir.join("info").join("exclude"), "/.miniswe/\n")
+            .context("failed to write shadow-git exclude file")?;
 
         // Initial snapshot
         manager.snapshot("session start")?;
