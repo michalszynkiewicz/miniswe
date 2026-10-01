@@ -11,7 +11,9 @@ use super::*;
 use std::future::Future;
 
 use crate::cli::commands::agent::subagent::{AgentOutput, AgentTask, run_subagents};
-use crate::cli::commands::agent::ui::{AgentUi, LlmOutcome, PauseDecision, UiEvent};
+use crate::cli::commands::agent::ui::{
+    AgentUi, LlmOutcome, PauseDecision, PreflightPermission, UiEvent,
+};
 
 pub(super) struct HeadlessUi {
     /// True for `--headless` runs: interaction points auto-continue with a
@@ -61,6 +63,60 @@ impl AgentUi for HeadlessUi {
                 tui::print_status(&format!(
                     "Check that your LLM server is running at {endpoint}"
                 ));
+            }
+            UiEvent::TruncatedArgs { name, .. } => {
+                tui::print_tool_result(
+                    &name,
+                    false,
+                    "arguments cut off by the output limit — not executed",
+                );
+            }
+            UiEvent::RepeatedRead {
+                name,
+                args_summary,
+                escalate,
+            } => {
+                tui::print_status(&format!(
+                    "Repeated read: {name}({args_summary}) — {}, continuing",
+                    if escalate {
+                        "nudge failed, forcing compaction next round"
+                    } else {
+                        "nudge sent"
+                    }
+                ));
+            }
+            UiEvent::LoopDetected {
+                name,
+                args_summary,
+                cycle_period,
+            } => {
+                let how = match cycle_period {
+                    Some(period) => {
+                        format!("cycling through the same {period} calls (period-{period} cycle)")
+                    }
+                    None => "repeated 3 times".to_string(),
+                };
+                tui::print_error(&format!(
+                    "Loop detected: {name}({args_summary}) {how} — surfacing a hint, giving the model one more round"
+                ));
+            }
+            UiEvent::LoopRecovering { name, args_summary } => {
+                tui::print_error(&format!(
+                    "Loop detected again ({name}({args_summary})) — routing through the recovery ladder instead of stopping"
+                ));
+            }
+            UiEvent::LoopStopping { name, args_summary } => {
+                tui::print_error(&format!(
+                    "Loop detected again ({name}({args_summary})) after the recovery hint — stopping this turn"
+                ));
+            }
+            UiEvent::ExploreBlocked { name } => {
+                // Never fires headless (no explore mode) — rendering chosen
+                // for consistency with the other tool_result-style events.
+                tui::print_tool_result(&name, false, "blocked — read-only mode");
+            }
+            UiEvent::WriteBlockedNoPlan { name } => {
+                tui::print_tool_result(&name, false, "blocked: no plan");
             }
         }
     }
@@ -206,6 +262,16 @@ impl AgentUi for HeadlessUi {
             Some("y") | Some("yes") | Some("") => PauseDecision::Continue,
             _ => PauseDecision::WrapUp,
         }
+    }
+
+    async fn preflight_permission(
+        &mut self,
+        _perms: &crate::tools::permissions::PermissionManager,
+        _action: &crate::tools::permissions::Action,
+    ) -> PreflightPermission {
+        // Headless has no preflight modal; permission prompts (if any) are
+        // handled lazily on stdin inside tool execution.
+        PreflightPermission::Allowed
     }
 }
 

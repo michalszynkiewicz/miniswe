@@ -17,11 +17,14 @@ use crate::runtime::{LlmWorkerHandle, ToolWorkerPool};
 use crate::tools;
 use crate::tools::permissions::PermissionManager;
 
+pub(crate) mod call_gate;
 pub(crate) mod dispatch;
 pub(crate) mod done_gate;
 pub(crate) mod llm_call;
+pub(crate) mod postamble;
 pub(crate) mod preamble;
 pub(crate) mod restart;
+pub(crate) mod skill_round;
 
 /// Borrowed per-turn view of the services both loops thread through every
 /// phase. `Copy` — call sites build it inline and pass it by value.
@@ -35,6 +38,13 @@ pub(crate) struct TurnCtx<'a> {
     pub log: &'a SessionLog,
     pub tool_defs: &'a [ToolDefinition],
     pub cancelled: &'a Arc<AtomicBool>,
+    /// When this turn started — read by the headless-only `tools.stuck_check`
+    /// fire in `postamble::finish_round` as
+    /// `session_start.elapsed().as_secs_f64()`. The REPL passes
+    /// `Instant::now()` captured once above its round loop; it is never
+    /// read there because `opts.stuck_tracking` is always false on that
+    /// side.
+    pub session_start: std::time::Instant,
     pub model_role: ModelRole,
     pub fast_baseline_errors: usize,
     pub tool_def_tokens: usize,
@@ -123,6 +133,15 @@ pub(crate) struct TurnOptions {
     /// `run/ui.rs`). Preserved as-is — this is a refactor, not a behavior
     /// change; fixing the missing deadline is a separate decision.
     pub plan_job_direct_await: bool,
+    /// Headless: the soft "recurred 4x in a 12-call window" loop-breaker
+    /// (`WINDOW_REPEAT_FREQ`) runs before the streak/cycle check. The REPL
+    /// has no such pre-pass.
+    pub window_repeat_detector: bool,
+    /// Headless: a shell/status-poll call while a background job is
+    /// running gets redirected to `shell(action='wait')` instead of being
+    /// treated as an ordinary loop (bounded to 2 redirects per turn). The
+    /// REPL has no job-poll redirect.
+    pub jobs_poll_redirect: bool,
 }
 
 /// How the error ladder's compact-retry branches announce themselves and
@@ -157,6 +176,15 @@ pub(crate) enum CallFlow {
     RestartRound,
 }
 
+/// The round's prunable-failure bookkeeping, filled by `dispatch::finish_call`
+/// across the batch and consumed by `postamble::finish_round`.
+pub(crate) struct Prunable {
+    pub messages_pre: usize,
+    pub history_pre: usize,
+    pub all_failures: bool,
+    pub errors: Vec<String>,
+}
+
 /// Outcome of the LLM-call phase.
 pub(crate) enum LlmFlow {
     /// The sanitized assistant message — already logged, streamed text
@@ -167,4 +195,33 @@ pub(crate) enum LlmFlow {
     Retry,
     /// End the turn; same `error` contract as [`RoundFlow::EndTurn`].
     EndTurn { error: bool },
+}
+
+/// A tool call that cleared every pre-dispatch gate — loop detection,
+/// plan-only, write-gating, explore mode, permission preflight — and is
+/// ready for [`dispatch::execute`].
+pub(crate) struct Admitted {
+    /// The parsed (and possibly loop-repair-mutated) call arguments.
+    pub args: serde_json::Value,
+    pub args_summary: String,
+    pub call_key: String,
+    pub file_action: String,
+}
+
+/// Outcome of [`call_gate::admit`] — the pre-dispatch phase for one tool
+/// call in the round's batch.
+pub(crate) enum AdmitFlow {
+    /// The call is admitted; dispatch it.
+    Run(Admitted),
+    /// This call is rejected (bad JSON, truncated args, explore-blocked,
+    /// permission-denied, plan-only, write-gated, …) — move on to the next
+    /// call in the batch.
+    NextCall,
+    /// Stop processing the rest of this round's batch and end the turn.
+    /// `error` feeds the headless `had_error` exit path, same contract as
+    /// [`RoundFlow::EndTurn`].
+    StopCalls { error: bool },
+    /// Abandon the rest of the batch and restart the round loop — the
+    /// context was re-assembled underneath us (debugger SCRAP).
+    RestartRound,
 }

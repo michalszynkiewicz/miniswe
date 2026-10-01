@@ -8,6 +8,7 @@
 
 pub mod debugger;
 pub mod display;
+pub mod explore_gate;
 pub mod hints;
 pub mod job_banners;
 pub mod loop_detector;

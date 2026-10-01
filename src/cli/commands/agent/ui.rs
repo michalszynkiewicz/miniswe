@@ -64,6 +64,18 @@ pub(crate) enum PauseDecision {
     WrapUp,
 }
 
+/// Outcome of a permission preflight for one shell/MCP tool call (see
+/// [`AgentUi::preflight_permission`]).
+pub(crate) enum PreflightPermission {
+    /// No prompt was needed, or the user approved it.
+    Allowed,
+    /// The user declined the prompt.
+    Denied,
+    /// Blocklisted — `check_needs_prompt` returned this explanatory error
+    /// instead of a prompt.
+    Blocked(String),
+}
+
 /// A loop notification whose rendering deliberately differs per frontend
 /// (wording, style, or channel). One variant per divergence; each impl owns
 /// its exact bytes.
@@ -87,6 +99,37 @@ pub(crate) enum UiEvent {
     /// A fatal LLM error was just surfaced (headless adds a check-your-
     /// server hint; the REPL shows nothing extra).
     LlmErrorEndpointHint { endpoint: String },
+    /// A tool call's arguments were cut off by the output limit and the
+    /// call was not executed (headless's summary omits the char count; the
+    /// REPL's names it).
+    TruncatedArgs { name: String, original_chars: usize },
+    /// A read/inspection tool call repeated 3x with identical args — a
+    /// nudge was sent (or, on re-detection, `escalate` is true and the
+    /// escalated nudge also forced a compaction next round).
+    RepeatedRead {
+        name: String,
+        args_summary: String,
+        escalate: bool,
+    },
+    /// First loop detection this turn: a hint was surfaced to the model and
+    /// it gets one more round. `cycle_period` is `Some` for a short
+    /// edit/revert-style cycle, `None` for a plain 3x-identical streak.
+    LoopDetected {
+        name: String,
+        args_summary: String,
+        cycle_period: Option<usize>,
+    },
+    /// Second loop detection this turn: routing through the behavioral
+    /// done-gate / recovery ladder instead of stopping.
+    LoopRecovering { name: String, args_summary: String },
+    /// Second loop detection this turn with no recovery path available (or
+    /// the recovery budget already exhausted) — the turn stops.
+    LoopStopping { name: String, args_summary: String },
+    /// REPL explore mode blocked a mutating tool call before dispatch
+    /// (never fires headless, which has no explore mode).
+    ExploreBlocked { name: String },
+    /// A write tool was blocked: strict ceremony requires a plan first.
+    WriteBlockedNoPlan { name: String },
 }
 
 /// Everything an agent round loop needs from its frontend: line output,
@@ -193,4 +236,15 @@ pub(crate) trait AgentUi {
     /// prompt wording and input mechanism (stdin line vs TUI modal); the
     /// headless auto-continue notice lives in the headless impl.
     async fn confirm_continue(&mut self, pause_at: usize) -> PauseDecision;
+
+    /// Permission preflight for a shell/MCP tool call, run before dispatch.
+    /// The REPL shows a blocking TUI modal (`check_needs_prompt` → y/n/a)
+    /// here; headless has no preflight — permission prompts, if any, are
+    /// handled lazily on stdin inside tool execution — so it always
+    /// returns `Allowed`.
+    async fn preflight_permission(
+        &mut self,
+        perms: &crate::tools::permissions::PermissionManager,
+        action: &crate::tools::permissions::Action,
+    ) -> PreflightPermission;
 }

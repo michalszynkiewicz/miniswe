@@ -436,6 +436,8 @@ pub async fn run(
         register_shell_jobs: headless,
         jobs_on_pool: false,
         plan_job_direct_await: true,
+        window_repeat_detector: true,
+        jobs_poll_redirect: true,
     };
 
     'round: loop {
@@ -444,177 +446,14 @@ pub async fn run(
         }
         round += 1;
         log.round_start(round);
-        state
-            .stuck_tracker
-            .on_round(round, session_start.elapsed().as_secs_f64());
-
-        // Skill step-cursor maintenance (harness-owned; runs before the LLM
-        // call so the [SKILL STEP] re-injection is current):
-        //  1. Handoff: if the current step delegates to an installed skill
-        //     not yet on the stack (e.g. build -> integrate), DESCEND into it
-        //     (extract its steps + push a frame). The model never resolves
-        //     the handoff name itself (a lookup a probe showed it won't do).
-        //  2. prepare_step: distil the current step, resolve a prose-level
-        //     handoff, generate its DONE WHEN check. Runs once in the normal
-        //     position AND again after every advance in this block — see the
-        //     note on prepare_step for why an unprepared step is dangerous.
-        // There is deliberately NO per-step round budget here — a fixed cap
-        // is a refuted rounds-only trigger and fires unavoidably on an
-        // unsatisfiable step (rationale at STEP_JUDGE_PROMPT). A stuck step
-        // escalates to the step judge through two triggers instead: the
-        // stuck_check Red fire (frozen signals), and every K-th blocked
-        // premature finish at the stop-valve (the model insisting the task
-        // is done while steps remain).
-        {
-            let mut cursor = skill_cursor::load(&config);
-            if cursor.is_active() {
-                let installed: Vec<String> = crate::skills::discover(&config.project_root)
-                    .into_iter()
-                    .map(|e| e.name)
-                    .collect();
-                if let Some(next) = cursor.handoff_target(&installed)
-                    && !descend_into_skill(&mut cursor, &next, &config, &llm_worker, &cancelled)
-                        .await
-                {
-                    // Name-based handoff (umbrella "Invoke X skill" step) but
-                    // extraction failed. Step extraction is an LLM call, so a
-                    // failure can be transient — retry on later rounds and only
-                    // consume the invoke step (skipping the whole sub-skill)
-                    // after several consecutive failures.
-                    const MAX_HANDOFF_FAILURES: usize = 3;
-                    let n = cursor.note_handoff_failure();
-                    if n >= MAX_HANDOFF_FAILURES {
-                        // Abandoned, not done: skipping an invoke step skips
-                        // the entire sub-skill behind it. Not guarded by
-                        // may_auto_advance — the blocker here is an extraction
-                        // that will not resolve, so holding on the step would
-                        // retry it forever instead of grinding on real work.
-                        cursor.mark_abandoned();
-                        ui.status(&format!(
-                            "[skills] handoff '{next}' yielded no steps {n}x; skipping (sub-skill NOT run)"
-                        ));
-                        report_cursor_gaps(&cursor);
-                    } else {
-                        ui.status(&format!(
-                            "[skills] handoff '{next}' yielded no steps (attempt {n}); will retry"
-                        ));
-                    }
-                }
-                if cursor.is_active() {
-                    let n = cursor.note_round();
-                    if !prepare_step(&mut cursor, &installed, &config, &llm_worker, &cancelled)
-                        .await
-                    {
-                        // Periodic completion judge — the out-of-band advance
-                        // driver, for models that don't call skill(done) on
-                        // their own (an early e2e model managed 2 calls in 4
-                        // attempts). Do NOT assume it is the primary path: the
-                        // 2026-08-28 Laguna run advanced 14 steps by the
-                        // model's own done-tool call against 2 from this judge,
-                        // so changes to the done-tool handler sit on the hot
-                        // path. Every JUDGE_EVERY rounds we ask out-of-band
-                        // whether the step is done. On DONE the
-                        // step's check acts as a VETO (not an auto-advancer, which
-                        // would skip a creates-then-modifies step the instant its
-                        // file exists): check fails → hold + tell it; check passes
-                        // or is absent → advance. Probe: judge 40/40 honest (8/8
-                        // NOT DONE on stubs), so DONE is earned, not rubber-stamped.
-                        const JUDGE_EVERY: usize = 3;
-                        if n.is_multiple_of(JUDGE_EVERY)
-                            && let Some(def) = cursor.cached().map(str::to_string)
-                        {
-                            let (skill_name, step_name) = cursor
-                                .current()
-                                .map(|(sk, st)| (sk.to_string(), st.name.clone()))
-                                .unwrap_or_default();
-                            let check = cursor.current_check().map(str::to_string);
-                            let recent = recent_activity(&messages, 8, 2600);
-                            let (judged_done, reason) = skill_router::judge_step_done(
-                                &llm_worker,
-                                &step_name,
-                                &def,
-                                &recent,
-                                &cancelled,
-                            )
-                            .await;
-                            if judged_done {
-                                let verdict = match &check {
-                                    Some(cmd) => validation::run_check_command(&config, cmd).await,
-                                    None => validation::CheckOutcome::Skipped,
-                                };
-                                if let validation::CheckOutcome::Fail(out) = verdict {
-                                    ui.status(&format!(
-                                        "[skills] '{step_name}' judged done but its check failed — holding"
-                                    ));
-                                    let msg = Message::user(&format!(
-                                        "[Status check on the '{step_name}' step: you consider it \
-                                     done, but its completion check failed:\n{out}\nThe step is \
-                                     NOT complete — fix this before moving on.]"
-                                    ));
-                                    messages.push(msg.clone());
-                                    conversation_history.push(msg);
-                                } else {
-                                    cursor.mark_done();
-                                    skill_state.last_judge_block = None;
-                                    match cursor.current() {
-                                        Some((_, next)) => ui.status(&format!(
-                                            "[skills] '{step_name}' judged done → advancing to '{}'",
-                                            next.name
-                                        )),
-                                        None => ui.status(&format!(
-                                            "[skills] '{step_name}' judged done → {skill_name} skill complete"
-                                        )),
-                                    }
-                                    report_cursor_gaps(&cursor);
-                                    // The judge runs LAST in this block, so the
-                                    // step it advances onto has missed this
-                                    // round's preparation. Prepare it now — an
-                                    // unprepared step goes out with no body, no
-                                    // DONE WHEN check to veto a premature done,
-                                    // and no handoff resolution.
-                                    prepare_step(
-                                        &mut cursor,
-                                        &installed,
-                                        &config,
-                                        &llm_worker,
-                                        &cancelled,
-                                    )
-                                    .await;
-                                }
-                            } else {
-                                // Surface the judge's reason to the model — it's
-                                // often the correct diagnosis the silent gate was
-                                // discarding (e2e: it flagged the tmp_repo build).
-                                // Dedup so an identical reason isn't re-nudged every
-                                // cycle (repeats feed loops).
-                                ui.status(&format!(
-                                    "[skills] '{step_name}' judged not done: {reason}"
-                                ));
-                                // Record the standing verdict for the log-only
-                                // judge-veto check in the skill(done) handler.
-                                skill_state.last_judge_block = Some((
-                                    format!("{skill_name}::{step_name}"),
-                                    reason.clone(),
-                                    skill_state.edits_total,
-                                ));
-                                if !reason.is_empty()
-                                    && skill_state.last_judge_nudge.as_deref()
-                                        != Some(reason.as_str())
-                                {
-                                    skill_state.last_judge_nudge = Some(reason.clone());
-                                    let msg = Message::user(&format!(
-                                        "[Status check on the '{step_name}' step — it is NOT done \
-                                     yet: {reason}\nAddress this specifically before continuing.]"
-                                    ));
-                                    messages.push(msg.clone());
-                                    conversation_history.push(msg);
-                                }
-                            }
-                        }
-                    }
-                }
-                skill_cursor::save(&config, &cursor);
-            }
+        // `tools.stuck_check`'s frozen-signature tracker: feed it the round
+        // number + elapsed wall time BEFORE the skill-cursor block below (its
+        // periodic judge is an LLM call, so the timestamp must be taken
+        // first). Headless only (`opts.stuck_tracking`); the REPL skips it.
+        if opts.stuck_tracking {
+            state
+                .stuck_tracker
+                .on_round(round, session_start.elapsed().as_secs_f64());
         }
 
         let ctx = turn::TurnCtx {
@@ -638,7 +477,23 @@ pub async fn run(
             task: message,
             mcp_summary: mcp_summary.as_deref(),
             plan_only,
+            session_start,
         };
+
+        // Skill step-cursor maintenance (harness-owned; runs before the LLM
+        // call so the [SKILL STEP] re-injection is current) — handoff
+        // descent, prepare_step, periodic completion judge. Headless only;
+        // no-op on the REPL side (`opts.skill_steps` is false there).
+        turn::skill_round::prepare(
+            ctx,
+            opts,
+            &mut skill_state,
+            &mut ui,
+            &mut messages,
+            &mut conversation_history,
+        )
+        .await;
+
         match turn::preamble::begin_round(ctx, &mut state, &mut ui, &mut messages, round).await {
             turn::RoundFlow::Continue => {}
             turn::RoundFlow::EndTurn { error } => {
@@ -715,458 +570,26 @@ pub async fn run(
         let active_step_tag = skill_cursor::current_step_tag(&config);
 
         for tc in &tool_calls {
-            let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
-                Ok(v) => v,
-                Err(e) => {
-                    // Unreachable after sanitize_truncated_tool_calls above,
-                    // kept as a belt-and-braces path. Never echo the raw
-                    // arguments back: that is the flood we just refused to
-                    // persist.
-                    let result_msg = Message::tool_result(
-                        &tc.id,
-                        &format!("Invalid JSON in tool arguments: {e}"),
-                    );
-                    messages.push(result_msg.clone());
-                    conversation_history.push(result_msg);
-                    ui.tool_result(&tc.function.name, false, "invalid JSON args");
-                    continue;
-                }
-            };
-            if let Some(info) = truncated_args_info(&args) {
-                // A call stubbed by sanitize_truncated_tool_calls: the
-                // arguments were cut off by the output limit, so there is
-                // nothing to execute. Answer with guidance, not a run.
-                let result_msg = Message::tool_result(
-                    &tc.id,
-                    &format!(
-                        "{}\n\n{}",
-                        truncated_args_tool_result(&tc.function.name, &info),
-                        truncated_tool_call_hint(config.tools.edit_mode)
-                    ),
-                );
-                messages.push(result_msg.clone());
-                conversation_history.push(result_msg);
-                log.tool_debug(
-                    "agent",
-                    &format!(
-                        "{} call skipped: arguments truncated after {} chars",
-                        tc.function.name, info.original_chars
-                    ),
-                );
-                ui.tool_result(
-                    &tc.function.name,
-                    false,
-                    "arguments cut off by the output limit — not executed",
-                );
-                continue;
-            }
-
-            let args_summary = summarize_args(&tc.function.name, &args);
-
-            // Detect tool call loops: identical calls repeated consecutively
-            // (period-1), or the SAME two calls alternating (period-2 — the
-            // edit↔revert oscillation that the streak counter is blind to
-            // because every alternation resets it).
-            let call_key =
-                loop_call_key_tagged(&tc.function.name, &args, active_step_tag.as_deref());
-            if state.loops.last_call_key.as_ref() == Some(&call_key) {
-                state.loops.same_call_streak += 1;
-            } else {
-                state.loops.last_call_key = Some(call_key.clone());
-                state.loops.same_call_streak = 1;
-            }
-            state.loops.recent_call_keys.push(call_key.clone());
-            if state.loops.recent_call_keys.len() > 12 {
-                state.loops.recent_call_keys.remove(0);
-            }
-            // Soft loop-breaker for the "wandering grind": a call that recurs
-            // FREQUENTLY in the window even when INTERSPERSED (so it never
-            // trips the 3-consecutive detector below) — e.g. the model
-            // re-`ls -R`ing / re-`helm show`ing the chart between other calls.
-            // Clear the window on fire so it must re-accumulate — bounds the
-            // escalation below to at most one fire per ~N repeats.
-            // 4 (not 5) in a 12-window: a period-3 cycle (A,B,C,A,B,C…) puts
-            // each element at exactly 12/3=4, so 4 catches period-2 AND
-            // period-3 wandering; 5 would miss period-3.
-            const WINDOW_REPEAT_FREQ: usize = 4;
-            if state
-                .loops
-                .recent_call_keys
-                .iter()
-                .filter(|k| **k == call_key)
-                .count()
-                >= WINDOW_REPEAT_FREQ
+            let admitted = match turn::call_gate::admit(
+                ctx,
+                opts,
+                &mut state,
+                &mut ui,
+                &mut messages,
+                &mut conversation_history,
+                tc,
+                active_step_tag.as_deref(),
+            )
+            .await
             {
-                state.loops.recent_call_keys.clear();
-                // Escalate on a RECURRING file edit: one recurrence can be a
-                // legitimate retry, a second is a rut, so break the cache-hot
-                // prefix for real. Reads/checks/tests are exempt — repeating
-                // those between different edits is a normal rhythm.
-                let escalate = key_is_file_edit(&call_key) && {
-                    state.loops.window_edit_fires += 1;
-                    state.loops.window_edit_fires >= 2
-                };
-                if escalate {
-                    state.force_compact_next_round = true;
-                    state.loops.window_edit_fires = 0;
-                }
-                ui.status(&format!(
-                    "[loop] '{args_summary}' recurred {WINDOW_REPEAT_FREQ}x in the window{}",
-                    if escalate {
-                        " — forcing context compaction next round"
-                    } else {
-                        ""
-                    }
-                ));
-            }
-            let cycle = cycle_period(&state.loops.recent_call_keys);
-            if state.loops.same_call_streak >= 3 || cycle.is_some() {
-                // Cycle-only detection (not also a plain streak). Captured
-                // before any state resets below so messaging stays accurate.
-                let cycle_only = cycle.filter(|_| state.loops.same_call_streak < 3);
-                // A cycle is harmful if ANY member mutates (the classic case
-                // is edit↔revert — both mutate; edit↔read still re-applies
-                // the same broken edit).
-                let mutating = if let Some(period) = cycle_only {
-                    let tail = &state.loops.recent_call_keys
-                        [state.loops.recent_call_keys.len().saturating_sub(period)..];
-                    tail.iter().any(|k| key_is_mutating(k))
-                } else {
-                    is_mutating_call(&tc.function.name, &args)
-                };
-                log.loop_detected(
-                    &tc.function.name,
-                    &args_summary,
-                    state.loops.same_call_streak as usize,
-                );
-
-                // Polling a status command while a background job runs is
-                // the unpaced form of monitoring — redirect to the paced one,
-                // naming the polled command as the check probe. Fires BEFORE
-                // the mutating classification: shell commands classify as
-                // mutating, which routed the jobs e2e's status-poll loop into
-                // the turn-stopping path (2026-07-14, stuck scenario died 11s
-                // into a monitoring task). Capped so a genuine runaway still
-                // escalates normally.
-                if ((tc.function.name == "shell" && args["action"].as_str() == Some("run"))
-                    || (tc.function.name == "file" && args["action"].as_str() == Some("shell")))
-                    && !job_registry.is_empty()
-                    && state.loops.jobs_poll_redirects < 2
-                {
-                    state.loops.jobs_poll_redirects += 1;
-                    let polled = args["command"].as_str().unwrap_or("<status command>");
-                    let result_msg = Message::tool_result(
-                        &tc.id,
-                        &format!(
-                            "You are polling `{polled}` in a loop while a background job runs. \
-                             Use shell(action='wait', secs=60, check='{polled}') instead — it \
-                             waits, THEN runs the probe, one paced cycle per call."
-                        ),
-                    );
-                    messages.push(result_msg.clone());
-                    conversation_history.push(result_msg);
-                    ui.status(&format!(
-                        "Job-poll loop: {}({}) — redirected to jobs(wait), continuing",
-                        tc.function.name, args_summary
-                    ));
-                    state.loops.last_call_key = None;
-                    state.loops.same_call_streak = 0;
-                    state.loops.recent_call_keys.clear();
-                    continue;
-                }
-
-                // Read-only repetition: harmless per call, just wasted tokens.
-                // First detection: polite nudge inline, let the for-loop
-                // continue. Re-detection: escalate — the nudge can't reach a
-                // cache-numerics rut, so force a compaction next round.
-                if !mutating {
-                    state.loops.read_nudges += 1;
-                    let escalate = state.loops.read_nudges >= 2;
-                    let text = if escalate {
-                        state.loops.read_nudges = 0;
-                        state.force_compact_next_round = true;
-                        REPEATED_READ_ESCALATION
-                    } else {
-                        REPEATED_READ_NUDGE
-                    };
-                    let result_msg = Message::tool_result(&tc.id, text);
-                    messages.push(result_msg.clone());
-                    conversation_history.push(result_msg);
-                    ui.status(&format!(
-                        "Repeated read: {}({}) — {}, continuing",
-                        tc.function.name,
-                        args_summary,
-                        if escalate {
-                            "nudge failed, forcing compaction next round"
-                        } else {
-                            "nudge sent"
-                        }
-                    ));
-                    state.loops.last_call_key = None;
-                    state.loops.same_call_streak = 0;
-                    state.loops.recent_call_keys.clear();
-                    continue;
-                }
-
-                let hint = if let Some(period) = cycle_only {
-                    cycle_loop_hint(period)
-                } else {
-                    loop_detected_hint(config.tools.edit_mode).to_string()
-                };
-                let result_msg = Message::tool_result(&tc.id, &hint);
-                messages.push(result_msg.clone());
-                conversation_history.push(result_msg);
-
-                // First mutating loop in this turn: surface the hint, reset
-                // the streak, and let the model try a different approach.
-                // Subsequent loops mean the recovery itself spiraled —
-                // abort for real.
-                if state.loops.recoveries == 0 {
-                    state.loops.recoveries += 1;
-                    state.loops.last_call_key = None;
-                    state.loops.same_call_streak = 0;
-                    state.loops.recent_call_keys.clear();
-                    ui.error(&format!(
-                        "Loop detected: {}({}) {} — surfacing a hint, giving the model one more round",
-                        tc.function.name,
-                        args_summary,
-                        if let Some(period) = cycle_only {
-                            format!(
-                                "cycling through the same {period} calls (period-{period} cycle)"
-                            )
-                        } else {
-                            "repeated 3 times".to_string()
-                        }
-                    ));
+                turn::AdmitFlow::Run(a) => a,
+                turn::AdmitFlow::NextCall => continue,
+                turn::AdmitFlow::StopCalls { error } => {
+                    had_error |= error;
                     break;
                 }
-                // Second mutating loop after the recovery hint. With a
-                // behavioral done-gate configured this is NOT a dead end — it
-                // is the same "stuck but the task isn't done" state as a
-                // premature exit, so route it through the gate ladder (block →
-                // debugger/judge at 2 blocks) instead of dying with the whole
-                // recovery stack idle. (Real case: a run died at 70s looping
-                // on a malformed replace_range while gate + judge never ran.)
-                // Without a gate: original behavior — stop the turn. An active
-                // skill step's completion check counts as the gate here too.
-                let effective_check = skill_cursor::current_check_command(&config)
-                    .or_else(|| config.validation.command().map(str::to_string));
-                // Failure text to route through the recovery ladder, if we
-                // should recover at all, in priority order:
-                //  - the LOOPING COMMAND ITSELF keeps FAILING (its real error) —
-                //    the missing trigger: a read-only per-step check can PASS
-                //    while `pack package create` returns a lint error, so the
-                //    command's own failure never surfaced. A fresh-context
-                //    debugger fixes exactly this (probe: 10/10 on the flavor bug);
-                //  - else a check that FAILS → its output;
-                //  - else a skill step IS active (Fix 2) → synthesize the
-                //    stuck state so a non-checkable (or check-passing but
-                //    still looping) step reaches the debugger instead of the
-                //    hard stop below, which assumes no cursor.
-                let recover_output: Option<String> = if let Some((k, out)) =
-                    &state.last_tool_failure
-                    && *k == call_key
-                {
-                    Some(format!(
-                        "The agent is stuck repeating a tool call that keeps FAILING: \
-                         {}({}). Its latest error output:\n{out}\n\nDiagnose the root cause and \
-                         give the single concrete fix (exact command or edit) that makes it \
-                         succeed.",
-                        tc.function.name, args_summary
-                    ))
-                } else if let Some((cmd, out)) =
-                    failing_job_output(&tc.function.name, &args, &state.failed_job_commands)
-                {
-                    // The looping command launches a BACKGROUND job (e.g. the
-                    // detached `pkg run dev` deploy) that keeps FAILING — its
-                    // failure lands in a status result, not the launch, so it
-                    // never tripped the foreground trigger above.
-                    Some(format!(
-                        "The agent keeps re-running a command whose background job FAILS: \
-                         `{cmd}`. Its latest error output:\n{out}\n\nDiagnose the root cause and \
-                         give the single concrete fix (exact command or edit) that makes it \
-                         succeed."
-                    ))
-                } else {
-                    let check_fail = if let Some(cmd) = effective_check.as_deref() {
-                        match validation::run_check_command(&config, cmd).await {
-                            validation::CheckOutcome::Fail(o) => Some(o),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    check_fail.or_else(|| {
-                        // A passing (often read-only proxy) check does NOT
-                        // mean the step is unstuck — the model is still
-                        // looping. Fall through to the synthesized stuck
-                        // state rather than the cursor-less hard stop.
-                        let cursor = skill_cursor::load(&config);
-                        cursor.current().map(|(_, s)| {
-                            let def = cursor.cached().unwrap_or("");
-                            format!(
-                                "The agent is stuck in a repeating loop while executing the '{}' step \
-                                 of a skill and is making no progress. Repeated tool call: {}({}). \
-                                 The current step:\n{def}\n\nDiagnose why it is stuck and the single \
-                                 concrete action that would unblock it — or, if the current state is \
-                                 a dead end, whether to scrap and restart from a clean base.",
-                                s.name, tc.function.name, args_summary
-                            )
-                        })
-                    })
-                };
-                if let Some(output) = recover_output
-                    && state.gate.validation_blocks < config.validation.max_retries
-                {
-                    ui.error(&format!(
-                        "Loop detected again ({}({})) — routing through the recovery ladder instead of stopping",
-                        tc.function.name, args_summary
-                    ));
-                    {
-                        state.gate.validation_blocks += 1;
-                        // Fresh recovery budget for the rounds the ladder grants.
-                        state.loops.recoveries = 0;
-                        state.loops.last_call_key = None;
-                        state.loops.same_call_streak = 0;
-                        state.loops.recent_call_keys.clear();
-
-                        let fkey = debugger::failure_key(&output);
-                        let may_fire = if config.tools.debugger_multifire {
-                            state.debugger.fires < debugger::MAX_DEBUGGER_FIRES
-                                && state.debugger.last_failure.as_deref() != Some(fkey.as_str())
-                        } else {
-                            state.debugger.fires == 0
-                        };
-                        if (config.tools.reactive_debugger || config.tools.debugger_judge)
-                            && may_fire
-                            && state.gate.validation_blocks >= debugger::DEBUGGER_TRIGGER_BLOCKS
-                        {
-                            state.debugger.fires += 1;
-                            state.debugger.last_failure = Some(fkey);
-                            ui.status(
-                                "Looping + failing gate — spinning up a fresh-context debugger sub-agent…",
-                            );
-                            let verdict = debugger::run_debugger(
-                                &output,
-                                message,
-                                &config,
-                                &llm_worker,
-                                &tool_pool,
-                                &tool_defs,
-                                &perms,
-                                &mcp_registry,
-                                &lsp_client,
-                                &fast_revisions,
-                                fast_baseline_errors,
-                                &cancelled,
-                            )
-                            .await;
-
-                            let msg = match verdict {
-                                debugger::DebuggerVerdict::Scrap if !state.gate.restart_fired => {
-                                    state.gate.restart_fired = true;
-                                    state.plan_ever_set = false;
-                                    messages = turn::restart::scrap_restart(
-                                        &mut ui,
-                                        &config,
-                                        message,
-                                        mcp_summary.as_deref(),
-                                        &snapshots,
-                                        plan_only,
-                                        true,
-                                    );
-                                    conversation_history.clear();
-                                    state.gate.validation_blocks = 0;
-                                    state.gate.plan_step_failures.reset();
-                                    continue 'round;
-                                }
-                                debugger::DebuggerVerdict::Scrap => {
-                                    Message::user(debugger::SCRAP_ALREADY_RESET_MSG)
-                                }
-                                debugger::DebuggerVerdict::Rewind(candidate) => {
-                                    turn::restart::rewind_message(
-                                        &mut ui,
-                                        &candidate,
-                                        &config,
-                                        &perms,
-                                        &lsp_client,
-                                        &fast_revisions,
-                                        fast_baseline_errors,
-                                        &output,
-                                    )
-                                    .await
-                                }
-                                debugger::DebuggerVerdict::Report(body) => {
-                                    let output_note =
-                                        validation::gate_failure_note(&config, &output);
-                                    Message::user(&debugger::build_gate_report_message(
-                                        &body,
-                                        &output_note,
-                                    ))
-                                }
-                            };
-                            messages.push(msg.clone());
-                            conversation_history.push(msg);
-                            continue 'round;
-                        }
-
-                        let msg = Message::user(&validation::build_loop_abort_message(&output));
-                        messages.push(msg.clone());
-                        conversation_history.push(msg);
-                        continue 'round;
-                    }
-                }
-                // No check failed and no skill cursor is active — the loop is
-                // on something the recovery ladder can't act on; stop the turn.
-                ui.error(&format!(
-                    "Loop detected again ({}({})) after the recovery hint — stopping this turn",
-                    tc.function.name, args_summary
-                ));
-                had_error = true;
-                break;
-            }
-
-            log.tool_call_detail(&tc.function.name, &args);
-            ui.tool_call_started(&tc.function.name, &args_summary);
-
-            // Block write tools in plan-only mode
-            let file_action = args["action"].as_str().unwrap_or("");
-            if plan_only
-                && ((tc.function.name == "file" && file_action == "shell")
-                    || matches!(
-                        tc.function.name.as_str(),
-                        "edit_file" | "write_file" | "refactor"
-                    ))
-            {
-                let result_msg = Message::tool_result(
-                    &tc.id,
-                    "Blocked: plan mode is read-only. No edits or shell commands allowed.",
-                );
-                messages.push(result_msg.clone());
-                conversation_history.push(result_msg);
-                ui.tool_result(&tc.function.name, false, "blocked in plan mode");
-                continue;
-            }
-
-            // Write gating: require plan before write tools (strict only)
-            let is_write_action = is_file_write(tc.function.name.as_str());
-            if strict && config.tools.plan && !tools::plan::plan_exists(&config) && is_write_action
-            {
-                let result_msg = Message::tool_result(
-                    &tc.id,
-                    "Create a plan first: use plan(action='set') with your step-by-step approach before making changes.",
-                );
-                messages.push(result_msg.clone());
-                conversation_history.push(result_msg);
-                ui.tool_result(&tc.function.name, false, "blocked: no plan");
-                continue;
-            }
-            // (Plan-checkpoint used to hard-block writes after N edits without
-            //  a plan action; that interacted poorly with the compile-gate on
-            //  `plan(check)` — if the project didn't compile, the model
-            //  couldn't escape the block, couldn't fix the project, deadlock.
-            //  Now we just warn at the threshold via PLAN_CHECKPOINT_WARNING
-            //  appended to the tool result; the model decides what to do.)
+                turn::AdmitFlow::RestartRound => continue 'round,
+            };
 
             // Handle tool dispatch
             let mut result = turn::dispatch::execute(
@@ -1176,8 +599,8 @@ pub async fn run(
                 &mut ui,
                 round,
                 tc,
-                &args,
-                file_action,
+                &admitted.args,
+                &admitted.file_action,
                 &router,
                 &log,
             )
@@ -1193,9 +616,9 @@ pub async fn run(
                 &mut conversation_history,
                 round,
                 tc,
-                &args,
-                &args_summary,
-                &call_key,
+                &admitted.args,
+                &admitted.args_summary,
+                &admitted.call_key,
                 &mut result,
                 &mut all_prunable_failures,
                 &mut prunable_errors,
@@ -1207,173 +630,23 @@ pub async fn run(
             }
         }
 
-        // History pruning: if every tool call in this assistant message was
-        // a prunable validator failure, drop the assistant message + its
-        // tool_results and replace with a user-role corrective. The
-        // assistant's bad-shape arguments are what prime the model to
-        // repeat them; removing them breaks the loop. Verified empirically
-        // (probe D3): clean history → clean output.
-        if all_prunable_failures && !prunable_errors.is_empty() {
-            messages.truncate(messages_pre);
-            conversation_history.truncate(history_pre);
-            let hint = Message::user(&format!(
-                "Your previous refactor call(s) were rejected:\n\n{}\n\n\
-                 Retry with all required parameters and a clean position value \
-                 (one of 'start' or 'after:<single_param_name>').",
-                prunable_errors.join("\n\n---\n\n")
-            ));
-            messages.push(hint.clone());
-            conversation_history.push(hint);
-            log.tool_debug(
-                "agent",
-                &format!(
-                    "history pruned: dropped {} tool_result(s) after refactor validator failure",
-                    prunable_errors.len()
-                ),
-            );
-        }
-
-        // `tools.stuck_check`: T2c frozen-signature fire → append the stuck/
-        // done note to the round's last tool result (the placement the
-        // warm-replay probes validated; a trailing user message was not what
-        // was tested). Runs AFTER history pruning so the note can't land on
-        // a tool result that was just truncated away.
-        if config.tools.stuck_check
-            && let Some(kind) = state
-                .stuck_tracker
-                .check_fire(round, session_start.elapsed().as_secs_f64())
-        {
-            // Red fire while a skill step is active → the fresh-context step
-            // judge decides instead of the generic note (the removed
-            // MAX_ROUNDS_PER_STEP valve's replacement — rationale at
-            // STEP_JUDGE_PROMPT). The helper performs each verdict's side
-            // effects and returns one injected note; judge failure leaves
-            // `escalation` unset so the plain note goes out below. Bounded
-            // by the tracker's MAX_FIRES and the run's max_rounds.
-            let escalation: Option<String> = if kind == stuck_check::StuckKind::Red {
-                let trigger = format!(
-                    "Its observable state (compiler/test/check signals) has been frozen for the \
-                     last {} rounds.",
-                    state.stuck_tracker.frozen_rounds()
-                );
-                step_judge_escalation(
-                    message,
-                    &trigger,
-                    &config,
-                    &llm_worker,
-                    &tool_defs,
-                    &perms,
-                    &lsp_client,
-                    &fast_revisions,
-                    fast_baseline_errors,
-                    &cancelled,
-                    &mut state.force_compact_next_round,
-                )
-                .await
-            } else {
-                None
-            };
-            let plan_done =
-                tools::plan::plan_exists(&config) && !tools::plan::has_unchecked_steps(&config);
-            let note = if let Some(esc) = escalation {
-                esc
-            } else if kind == stuck_check::StuckKind::Green && plan_done {
-                stuck_check::done_note()
-            } else {
-                let first_unchecked = tools::plan::parsed_steps(&config)
-                    .iter()
-                    .find(|(checked, _, _)| !checked)
-                    .and_then(|(_, n, _)| *n);
-                stuck_check::stuck_note(
-                    state.stuck_tracker.frozen_rounds(),
-                    state.stuck_tracker.frozen_minutes(),
-                    state.stuck_tracker.looping_read_path(),
-                    first_unchecked,
-                )
-            };
-            let mut appended = false;
-            for msgs in [&mut messages, &mut conversation_history] {
-                if let Some(m) = msgs.iter_mut().rev().find(|m| m.role == "tool")
-                    && let Some(c) = m.content.as_mut()
-                {
-                    c.push('\n');
-                    c.push_str(&note);
-                    appended = true;
-                }
-            }
-            if !appended {
-                // No tool result this round (pruned, or a pure-text reply
-                // survived the gates) — fall back to a user message.
-                let msg = Message::user(&note);
-                messages.push(msg.clone());
-                conversation_history.push(msg);
-            }
-            ui.status(&format!(
-                "[stuck-check] fired ({}) after {} frozen rounds",
-                if kind == stuck_check::StuckKind::Green {
-                    "green"
-                } else {
-                    "red"
-                },
-                state.stuck_tracker.frozen_rounds(),
-            ));
-            log.tool_debug(
-                "agent",
-                &format!(
-                    "stuck-check fired: kind={kind:?} plan_done={plan_done} frozen_rounds={} note={}",
-                    state.stuck_tracker.frozen_rounds(),
-                    crate::truncate_chars(&note, 120),
-                ),
-            );
-        }
-
-        // Early no-plan nudge: edit tools are hidden until plan(action='set').
-        // The system prompt explains this but some models (GPT-OSS in particular)
-        // ignore it and explore until the stall warning fires at round 20+ —
-        // wasting most of an attempt. Nudge around round 12 so the model gets a
-        // course correction before it's deeply stuck, but late enough that real
-        // multi-file exploration has had room to breathe (a few file reads, a
-        // search, a goto_definition or two).
-        if strict && round >= 12 && !state.nudged_no_plan && !tools::plan::plan_exists(&config) {
-            // Must match the now-uniform post-unlock surface (refactor
-            // for all, edit_file hidden). Mismatch here is exactly the
-            // schema-runtime confusion we work to avoid.
-            let unlock_tools = "refactor, replace_range, insert_at, write_file";
-            messages.push(Message::user(&format!(
-                "[Reminder: you've explored for several rounds without a plan. \
-                 Call plan(action='set') with your step-by-step approach now — \
-                 the edit tools ({unlock_tools}) are hidden until you do, and \
-                 you'll need them to make changes.]"
-            )));
-            state.nudged_no_plan = true;
-        }
-
-        // Stall detection: too many tool calls without any edits.
-        // Content is plan-state aware: without a plan the edit tools are
-        // hidden, so pointing the model at them is a schema-runtime
-        // mismatch. Re-fire the plan nudge instead (with a more urgent
-        // tone than the round-12 first nudge).
-        if state.calls_since_last_edit >= 20 && state.calls_since_last_edit.is_multiple_of(20) {
-            let body = if strict && !tools::plan::plan_exists(&config) {
-                "Still no plan set after 20+ exploration calls. \
-                 Edit tools cannot appear in your tool list until plan(action='set') is called. \
-                 Stop exploring and set a plan now — even an imperfect plan can be refined later. \
-                 If something is blocking you from planning, say so."
-                    .to_string()
-            } else {
-                let edit_hint = match config.tools.edit_mode {
-                    EditMode::Smart => "Use edit_file for semantic file edits.",
-                    EditMode::Fast => "Use replace_range or insert_at to land targeted edits.",
-                };
-                format!(
-                    "You have used 20+ tool calls without making any edits. \
-                     You likely have enough information. Start making changes now. \
-                     {edit_hint} \
-                     If you're stuck, explain what's blocking you."
-                )
-            };
-            messages.push(Message::user(&format!("[WARNING: {body}]")));
-        }
+        turn::postamble::finish_round(
+            ctx,
+            opts,
+            &mut state,
+            &mut ui,
+            &mut messages,
+            &mut conversation_history,
+            round,
+            strict,
+            turn::Prunable {
+                messages_pre,
+                history_pre,
+                all_failures: all_prunable_failures,
+                errors: prunable_errors,
+            },
+        )
+        .await;
     }
 
     log.session_end(round, had_error);

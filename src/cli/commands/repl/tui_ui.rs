@@ -14,7 +14,9 @@ use super::*;
 use std::future::Future;
 
 use crate::cli::commands::agent::subagent::{AgentOutput, AgentTask, run_subagents};
-use crate::cli::commands::agent::ui::{AgentUi, LlmOutcome, PauseDecision, UiEvent};
+use crate::cli::commands::agent::ui::{
+    AgentUi, LlmOutcome, PauseDecision, PreflightPermission, UiEvent,
+};
 
 pub(super) struct TuiUi<'a> {
     pub(super) app: &'a mut App,
@@ -98,6 +100,80 @@ impl AgentUi for TuiUi<'_> {
             }
             // The REPL's stream_llm/error lines already said everything.
             UiEvent::LlmErrorEndpointHint { .. } => {}
+            UiEvent::TruncatedArgs {
+                name,
+                original_chars,
+            } => {
+                self.app.push_output(
+                    &format!(
+                        "  ✗ {name}: arguments cut off by the output limit after {original_chars} chars — not executed"
+                    ),
+                    LineStyle::ToolErr,
+                );
+            }
+            UiEvent::RepeatedRead {
+                name,
+                args_summary,
+                escalate,
+            } => {
+                self.app.push_output(
+                    &format!(
+                        "  ⓘ Repeated read: {name}({args_summary}) — {}, continuing",
+                        if escalate {
+                            "nudge failed, forcing compaction next round"
+                        } else {
+                            "nudge sent"
+                        }
+                    ),
+                    LineStyle::Status,
+                );
+            }
+            UiEvent::LoopDetected {
+                name,
+                args_summary,
+                cycle_period,
+            } => {
+                let how = match cycle_period {
+                    Some(period) => {
+                        format!("cycling through the same {period} calls (period-{period} cycle)")
+                    }
+                    None => "repeated 3 times".to_string(),
+                };
+                self.app.push_output(
+                    &format!(
+                        "  ⚠ Loop detected: {name}({args_summary}) {how} — surfacing a hint, giving the model one more round"
+                    ),
+                    LineStyle::Status,
+                );
+            }
+            UiEvent::LoopRecovering { name, args_summary } => {
+                self.app.push_output(
+                    &format!(
+                        "  Loop detected again ({name}({args_summary})) — routing through the done-gate instead of stopping"
+                    ),
+                    LineStyle::Status,
+                );
+            }
+            UiEvent::LoopStopping { name, args_summary } => {
+                self.app.push_output(
+                    &format!(
+                        "  ✗ Loop detected again ({name}({args_summary})) after the recovery hint — stopping this turn"
+                    ),
+                    LineStyle::Error,
+                );
+            }
+            UiEvent::ExploreBlocked { name } => {
+                self.app.push_output(
+                    &format!("  ⛔ {name}: blocked — read-only mode"),
+                    LineStyle::ToolErr,
+                );
+            }
+            UiEvent::WriteBlockedNoPlan { name } => {
+                self.app.push_output(
+                    &format!("  ✗ {name}: blocked — no plan"),
+                    LineStyle::ToolErr,
+                );
+            }
         }
     }
 
@@ -335,6 +411,53 @@ impl AgentUi for TuiUi<'_> {
         match response.as_str() {
             "y" | "yes" | "" => PauseDecision::Continue,
             _ => PauseDecision::WrapUp,
+        }
+    }
+
+    async fn preflight_permission(
+        &mut self,
+        perms: &crate::tools::permissions::PermissionManager,
+        action: &crate::tools::permissions::Action,
+    ) -> PreflightPermission {
+        match perms.check_needs_prompt(action) {
+            Err(e) => PreflightPermission::Blocked(e),
+            Ok(Some(prompt)) => {
+                let (app, rx, terminal, _) = self.parts();
+                app.pending_permission = Some(prompt);
+                app.input.clear();
+                app.cursor = 0;
+                let _ = terminal.draw(|frame| ui::draw(frame, app));
+
+                let response = wait_for_permission_input(app, rx, terminal).await;
+                app.pending_permission = None;
+
+                let result = match response.as_str() {
+                    "y" | "yes" => {
+                        perms.approve(action, false);
+                        app.push_output(
+                            "  · Permission granted, running tool...",
+                            LineStyle::Status,
+                        );
+                        PreflightPermission::Allowed
+                    }
+                    "a" | "always" => {
+                        perms.approve(action, true);
+                        app.push_output(
+                            "  · Permission granted and saved, running tool...",
+                            LineStyle::Status,
+                        );
+                        PreflightPermission::Allowed
+                    }
+                    _ => {
+                        app.push_output("  · Permission denied.", LineStyle::Status);
+                        PreflightPermission::Denied
+                    }
+                };
+
+                let _ = terminal.draw(|frame| ui::draw(frame, app));
+                result
+            }
+            Ok(None) => PreflightPermission::Allowed,
         }
     }
 }
