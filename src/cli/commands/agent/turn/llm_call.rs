@@ -364,6 +364,10 @@ pub(crate) async fn generate(
     state.context_compact_retries = 0;
     state.truncated_call_errors_in_a_row = 0;
 
+    if let Some(usage) = &response.usage {
+        ctx.log.llm_usage(usage);
+    }
+
     // Never let an unparseable tool call into history: the server's
     // chat template re-parses every persisted call on every later
     // request and fails the whole request when one is broken. Replace

@@ -122,6 +122,44 @@ impl SessionLog {
         self.write(&format!("[end] {rounds} rounds, status={status}"));
     }
 
+    /// Log one LLM call's token usage (info level). Called after a
+    /// successful response that carries a `usage` block — hosted providers
+    /// and llama.cpp both send one; a bare OpenAI-compatible stub may not,
+    /// in which case the caller simply never calls this.
+    pub fn llm_usage(&self, usage: &crate::llm::Usage) {
+        if self.level < LogLevel::Info {
+            return;
+        }
+        self.write(&format!(
+            "[usage] prompt={} completion={} cached={} total={}",
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cached_tokens(),
+            usage.total_tokens
+        ));
+    }
+
+    /// Log the session-wide token usage total, folded across every LLM
+    /// client the router used. Call once, right before `session_end`.
+    pub fn usage_total(&self, usage: &crate::llm::providers::UsageSnapshot) {
+        self.write(&format!(
+            "[usage:total] prompt={} completion={} cached={} total={} calls={}",
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cached_tokens,
+            usage.total_tokens(),
+            usage.calls
+        ));
+    }
+
+    /// Log the `runtime.max_session_input_tokens` budget guard tripping
+    /// (info level) — the turn is about to stop because of it.
+    pub fn budget_exceeded(&self, used: u64, limit: u64) {
+        self.write(&format!(
+            "[budget] session input-token budget exceeded: used={used} limit={limit}"
+        ));
+    }
+
     /// Log a loop detection event (info level).
     pub fn loop_detected(&self, name: &str, args_summary: &str, count: usize) {
         self.write(&format!("[loop] {name}({args_summary}) repeated {count}x"));
