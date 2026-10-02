@@ -74,6 +74,26 @@ pub(crate) async fn run_turn<U: AgentUi>(
 
         round += 1;
         log.round_start(round);
+
+        // Session-wide input-token budget guard. Opt-in (0 = disabled,
+        // the default) — a hosted provider's per-token billing makes an
+        // unbounded context window a real cost risk in a way a local
+        // server's own wall-clock slowness already self-limited. Checked
+        // at each round boundary against the router's running usage
+        // totals, so it trips before the next request goes out rather
+        // than mid-round.
+        let budget = ctx.config.runtime.max_session_input_tokens;
+        if budget > 0 {
+            let used = router.usage_totals().prompt_tokens;
+            if used >= budget {
+                log.budget_exceeded(used, budget);
+                ui.error(&format!(
+                    "Session input-token budget exceeded ({used} >= {budget} tokens) — stopping."
+                ));
+                had_error = true;
+                break;
+            }
+        }
         // `tools.stuck_check`'s frozen-signature tracker: feed it the round
         // number + elapsed wall time BEFORE the skill-cursor block below (its
         // periodic judge is an LLM call, so the timestamp must be taken
@@ -255,6 +275,7 @@ pub(crate) async fn run_turn<U: AgentUi>(
         .await;
     }
 
+    log.usage_total(&router.usage_totals());
     log.session_end(round, had_error);
 
     TurnResult {
