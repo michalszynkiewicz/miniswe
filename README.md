@@ -67,6 +67,24 @@ Other commands: `miniswe info` (project/index stats), `miniswe config` (show cur
 
 In the REPL, `/new` clears history+scratchpad+plan, `/clear` clears history, `/help` lists commands, `Ctrl+O` toggles the detail viewer, `Ctrl+C` interrupts generation, `Ctrl+D` exits.
 
+## Hosted models
+
+`miniswe` also speaks OpenRouter, OpenAI, and Anthropic (via its OpenAI-compatibility layer) directly, alongside any local llama.cpp / Ollama / vLLM server. Set `provider` and `model` in `[model]`, and give it an API key via `api_key`, `api_key_env`, or just export the provider's conventional environment variable (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`):
+
+```toml
+[model]
+provider = "openrouter"             # "openai" | "anthropic" | "openrouter"
+model = "anthropic/claude-sonnet-4.5"
+api_key_env = "OPENROUTER_API_KEY"  # or set `api_key` directly, or just export the env var above
+thinking = true                     # maps to each provider's own knob: `reasoning.effort` (OpenRouter), `reasoning_effort` (OpenAI), `thinking.budget_tokens` (Anthropic)
+```
+
+Keys belong in `~/.miniswe/config.toml` or the environment — never in a project's `.miniswe/config.toml`, which a project may not gitignore. `miniswe init` never writes one, and `miniswe config` / `miniswe info` show only where a key came from (inline / env var / unset), never its value.
+
+Token usage is logged per LLM call and totaled at session end (see `.miniswe/logs/*.log`); set `runtime.max_session_input_tokens` (0 = disabled, the default) to stop a turn once cumulative input tokens cross a budget rather than letting an unattended session run up a hosted bill.
+
+See `docs/hosted-providers.md` for the full per-provider wire-format decision table.
+
 ## Tools
 
 The model sees five grouped tools plus a few editing primitives (and `mcp_use` when MCP is configured, `skill` while a skill is active):
@@ -80,7 +98,7 @@ The model sees five grouped tools plus a few editing primitives (and `mcp_use` w
 
 ## Configuration
 
-`miniswe init` writes `.miniswe/config.toml`; `miniswe config` shows the live values. Key sections: `[model]` (provider, endpoint, model, context window, temperature), `[context]` (repo map budget, round limits), `[tools]` (web, plan), `[lsp]`, `[web]` (search/fetch backends).
+`miniswe init` writes `.miniswe/config.toml`; `miniswe config` shows the live values. Key sections: `[model]` (provider, endpoint, model, context window, temperature, `api_key`/`api_key_env` for hosted providers — see [Hosted models](#hosted-models)), `[context]` (repo map budget, round limits), `[tools]` (web, plan), `[lsp]`, `[web]` (search/fetch backends), `[runtime]` (e.g. `max_session_input_tokens`, an opt-in token-budget guard).
 
 For web search, put a Serper key in `~/.miniswe/serper.key`; without it, `web(search)` falls back to GitHub repository search.
 
