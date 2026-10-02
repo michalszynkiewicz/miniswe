@@ -20,6 +20,9 @@ pub async fn run(
     log.user_message(message);
 
     let router = Arc::new(ModelRouter::new(&config));
+    // Fail fast on a missing hosted-provider API key, before anything else
+    // starts (session dir, worker pool) only to die on the first LLM call.
+    router.check_credentials()?;
     // Probe the server for the actual model identity before building the
     // tool list — model-family checks need the server-reported name, not
     // the user's config alias. Probe failure leaves probed_model = None

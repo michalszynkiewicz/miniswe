@@ -12,10 +12,20 @@ use serde_json::Value;
 
 use crate::config::ModelConfig;
 
-use super::errors::{has_tool_call_leak, is_retryable_llm_error};
+use super::errors::{
+    has_tool_call_leak, is_retryable_llm_error, retry_after_from_message, retry_after_secs,
+    with_retry_after_marker,
+};
 use super::normalize::normalize_xml_tool_calls;
+use super::providers::{self, Provider, UsageSnapshot, UsageTotals};
 use super::tool_call_repair::{TOOL_CALL_ARGS_CAP_MARKER, tool_call_args_cap};
 use super::types::*;
+
+/// Cap on how long a 429's `Retry-After` can push a retry wait to. Honoring
+/// the server's requested cooldown is the point, but an unbounded or
+/// misbehaving value shouldn't be able to stall the agent indefinitely —
+/// the absolute `request_deadline_secs` backstops this further still.
+const MAX_RETRY_AFTER_WAIT_SECS: u64 = 60;
 
 /// Idle-window floor (secs) for a forced cold prefill (`cache_prompt=false`).
 /// A cold prompt eval reprocesses the whole context and emits no token until
@@ -123,6 +133,21 @@ fn maybe_dump_request(body: &Value) {
 pub struct LlmClient {
     client: Client,
     config: ModelConfig,
+    /// Parsed `config.provider` — the single source of truth for which
+    /// dialect this client speaks. Computed once at construction so every
+    /// call site doesn't re-parse the string.
+    provider: Provider,
+    /// Resolved API key (config field, named env var, or the provider's
+    /// conventional env var), if any. See `providers::auth::resolve_api_key`.
+    api_key: Option<String>,
+    /// The endpoint actually used for requests: `config.endpoint` unless a
+    /// hosted provider's own default takes over. See
+    /// `providers::endpoint::effective_endpoint`.
+    endpoint: String,
+    /// Running token-usage totals for this client, shared with whoever
+    /// holds a clone (cheap — just an `Arc` bump) so usage can be read back
+    /// after the client has been handed off to a router.
+    usage: Arc<UsageTotals>,
 }
 
 impl LlmClient {
@@ -136,34 +161,50 @@ impl LlmClient {
             .timeout(Duration::from_secs(config.request_deadline_secs))
             .build()
             .unwrap_or_else(|_| Client::new());
-        Self { client, config }
+        let provider = config.provider_kind();
+        let api_key = providers::resolve_api_key(
+            provider,
+            config.api_key.as_deref(),
+            config.api_key_env.as_deref(),
+        );
+        let endpoint = providers::effective_endpoint(provider, &config.endpoint);
+        Self {
+            client,
+            config,
+            provider,
+            api_key,
+            endpoint,
+            usage: Arc::new(UsageTotals::new()),
+        }
     }
 
     /// Build the API URL based on provider type.
     fn chat_url(&self) -> String {
-        let base = self.config.endpoint.trim_end_matches('/');
-        match self.config.provider.as_str() {
-            "ollama" => format!("{base}/api/chat"),
-            _ => format!("{base}/v1/chat/completions"),
-        }
+        providers::chat_url(self.provider, &self.endpoint)
     }
 
     /// Ask the server what model it's actually serving, via `/v1/models`
-    /// (or `/api/tags` for Ollama). Returns the first id the server reports.
-    /// Short timeout so a dead endpoint doesn't stall startup.
+    /// (or `/api/tags` for Ollama). For a local server that returns the
+    /// first id it reports — llama-server serves one model and reports
+    /// the GGUF path, which is the identity the model-family checks key on.
+    /// A hosted provider lists its whole catalogue instead, so there the
+    /// probe looks the configured `model` up in that list and returns it
+    /// (an early "no such model" check) rather than whichever id happens
+    /// to come first. Short timeout so a dead endpoint doesn't stall
+    /// startup.
     ///
     /// Error messages are kept short and URL-free — the caller already
     /// displays the endpoint alongside the probe result, so we avoid
     /// repeating it.
     pub async fn probe_model(&self) -> Result<String> {
-        let base = self.config.endpoint.trim_end_matches('/');
-        let (url, ollama) = match self.config.provider.as_str() {
-            "ollama" => (format!("{base}/api/tags"), true),
-            _ => (format!("{base}/v1/models"), false),
-        };
-        let resp = match tokio::time::timeout(Duration::from_secs(3), self.client.get(&url).send())
-            .await
-        {
+        let url = providers::models_url(self.provider, &self.endpoint);
+        let ollama = matches!(self.provider, Provider::Ollama);
+        let request = providers::apply_auth(
+            self.client.get(&url),
+            self.provider,
+            self.api_key.as_deref(),
+        );
+        let resp = match tokio::time::timeout(Duration::from_secs(3), request.send()).await {
             Err(_) => bail!("timeout"),
             Ok(Err(e)) if e.is_connect() => bail!("unreachable"),
             Ok(Err(e)) => bail!("transport error ({e})"),
@@ -173,24 +214,86 @@ impl LlmClient {
             bail!("HTTP {}", resp.status().as_u16());
         }
         let body: Value = resp.json().await.map_err(|_| anyhow::anyhow!("bad JSON"))?;
-        let first = if ollama {
-            body["models"]
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|m| m["name"].as_str())
-                .map(|s| s.to_string())
+        let (list, id_key) = if ollama {
+            (body["models"].as_array(), "name")
         } else {
-            body["data"]
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|m| m["id"].as_str())
-                .map(|s| s.to_string())
+            (body["data"].as_array(), "id")
         };
-        first.ok_or_else(|| anyhow::anyhow!("no models listed"))
+        let ids: Vec<&str> = list
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m[id_key].as_str())
+            .collect();
+        if self.provider.is_hosted() {
+            return if ids.contains(&self.config.model.as_str()) {
+                Ok(self.config.model.clone())
+            } else {
+                bail!("model {:?} not listed", self.config.model)
+            };
+        }
+        ids.first()
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("no models listed"))
     }
 
+    /// The endpoint actually used for requests (after hosted-provider
+    /// default substitution) — see `providers::effective_endpoint`.
     pub fn endpoint(&self) -> &str {
-        &self.config.endpoint
+        &self.endpoint
+    }
+
+    /// Which wire dialect this client speaks.
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    /// True if a non-empty API key was resolved at construction time.
+    pub fn has_api_key(&self) -> bool {
+        self.api_key.is_some()
+    }
+
+    /// Fail fast if this client's provider is hosted and no API key could
+    /// be resolved, naming the env var the user can set — called right
+    /// after startup so a missing key surfaces immediately instead of as a
+    /// 401 deep inside a round.
+    pub fn check_credentials(&self) -> Result<()> {
+        if self.provider.is_hosted() && !self.has_api_key() {
+            let hint = self
+                .config
+                .api_key_env
+                .as_deref()
+                .or_else(|| self.provider.default_api_key_env())
+                .unwrap_or("its conventional");
+            bail!(
+                "No API key configured for provider '{}' (model {:?} @ {}). Set \
+                 `api_key`, `api_key_env`, or the {hint} environment variable in \
+                 [model] (or the relevant [models.<slot>]).",
+                self.provider.name(),
+                self.config.model,
+                self.endpoint,
+            );
+        }
+        Ok(())
+    }
+
+    /// Snapshot of this client's cumulative token usage across every call
+    /// made so far.
+    pub fn usage_snapshot(&self) -> UsageSnapshot {
+        self.usage.snapshot()
+    }
+
+    /// Record one response's usage, if the server reported any. Must only
+    /// be called on a response actually handed back to the caller — never
+    /// on one discarded by the tool-call-leak retry — or usage would be
+    /// double-counted.
+    fn record_usage(&self, resp: &ChatResponse) {
+        if let Some(u) = &resp.usage {
+            self.usage.record(
+                u.prompt_tokens as u64,
+                u.completion_tokens as u64,
+                u.cached_tokens() as u64,
+            );
+        }
     }
 
     /// Send a chat completion request and return the full response.
@@ -213,38 +316,11 @@ impl LlmClient {
         let retry_delays = [1u64, 2, 4, 8, 16, 32];
         let max_retries = self.config.max_retries.min(retry_delays.len());
 
-        let mut body = serde_json::to_value(request)?;
-        // Inject model config — we ALWAYS stream now so we can detect
-        // idle connections, even though the public API returns a single
-        // ChatResponse to the caller.
-        body["model"] = Value::String(self.config.model.clone());
-        body["temperature"] = Value::from(
-            request
-                .temperature_override
-                .unwrap_or(self.config.temperature),
-        );
-        // Per-request override wins, otherwise the model's configured
-        // default. Some callers (e.g. refactor's ask_rewrite) need more
-        // budget for thinking-mode models that emit reasoning tokens
-        // before the final answer; if the default is too low the
-        // response collapses to empty.
-        let max_tokens = request
-            .max_tokens_override
-            .unwrap_or(self.config.max_output_tokens as u64);
-        body["max_tokens"] = Value::from(max_tokens);
-        body["stream"] = Value::Bool(true);
-        // Forward server-specific chat-template kwargs (e.g. to disable
-        // reasoning-mode on Gemma 4). Servers that don't recognise the
-        // field ignore it.
-        if let Some(kwargs) = &request.chat_template_kwargs {
-            body["chat_template_kwargs"] = kwargs.clone();
-        }
-        // Per-request cache_prompt override (e.g. force a cold prefill to break
-        // a q4-KV-cache loop). The tool-call-leak retry below may also flip
-        // this to false mid-loop.
-        if let Some(cp) = request.cache_prompt {
-            body["cache_prompt"] = Value::Bool(cp);
-        }
+        // We ALWAYS stream now so we can detect idle connections, even
+        // though the public API returns a single ChatResponse to the
+        // caller. `build_body` is the single choke point for everything
+        // provider-specific — see `providers::shape`.
+        let mut body = providers::build_body(self.provider, &self.config, request)?;
         maybe_dump_request(&body);
         let connect_timeout = Duration::from_secs(self.config.request_timeout_secs);
 
@@ -293,13 +369,28 @@ impl LlmClient {
                     // prior generations on the same llama.cpp slot. Force
                     // a fresh prompt eval and retry once.
                     tracing::warn!("LLM tool-call leak detected; retrying with cache_prompt=false");
-                    body["cache_prompt"] = Value::Bool(false);
+                    // Hosted providers never had this field in the body to
+                    // begin with (`build_body` strips it) — don't add it
+                    // back just for this retry.
+                    if !self.provider.strips_llama_fields() {
+                        body["cache_prompt"] = Value::Bool(false);
+                    }
                     cache_busted = true;
                     continue;
                 }
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    self.record_usage(&resp);
+                    return Ok(resp);
+                }
                 Err(err) if attempt < max_retries && is_retryable_llm_error(&err) => {
-                    let delay = retry_delays[attempt];
+                    let msg = err.to_string();
+                    // A 429's Retry-After is authoritative where present —
+                    // it reflects the server's actual rate-limit state,
+                    // which our fixed backoff ladder can't know. Capped so
+                    // a huge/misbehaving value can't stall the agent.
+                    let delay = retry_after_from_message(&msg)
+                        .map(|secs| secs.min(MAX_RETRY_AFTER_WAIT_SECS))
+                        .unwrap_or(retry_delays[attempt]);
                     attempt += 1;
                     // This branch used to be silent — a connect-phase wedge
                     // (see request_timeout_secs' doc comment) was only
@@ -342,9 +433,13 @@ impl LlmClient {
         // The initial connect/HTTP-handshake gets the wall-clock timeout —
         // we don't want to dial forever if the server is unreachable.
         let connect_future = async {
-            self.client
-                .post(url)
-                .json(body)
+            let request = providers::apply_auth(
+                self.client.post(url),
+                self.provider,
+                self.api_key.as_deref(),
+            )
+            .json(body);
+            request
                 .send()
                 .await
                 .with_context(|| format!("Failed to connect to LLM at {url}"))
@@ -372,8 +467,18 @@ impl LlmClient {
 
         if !response.status().is_success() {
             let status = response.status();
+            // A 429's Retry-After header is the server telling us exactly
+            // how long to back off — captured here (before the body is
+            // consumed) and carried through the error message since the
+            // retry loop only sees the stringified error.
+            let retry_after = (status == reqwest::StatusCode::TOO_MANY_REQUESTS)
+                .then(|| retry_after_secs(response.headers()))
+                .flatten();
             let text = response.text().await.unwrap_or_default();
-            bail!("LLM API error ({status}): {text}");
+            bail!(
+                "{}",
+                with_retry_after_marker(format!("LLM API error ({status}): {text}"), retry_after)
+            );
         }
 
         // Servers that honor `stream: true` return text/event-stream;
@@ -665,30 +770,7 @@ impl LlmClient {
         let retry_delays = [1u64, 2, 4, 8, 16, 32];
         let max_retries = self.config.max_retries.min(retry_delays.len());
 
-        let mut body = serde_json::to_value(request)?;
-        body["model"] = Value::String(self.config.model.clone());
-        body["temperature"] = Value::from(
-            request
-                .temperature_override
-                .unwrap_or(self.config.temperature),
-        );
-        let max_tokens = request
-            .max_tokens_override
-            .unwrap_or(self.config.max_output_tokens as u64);
-        body["max_tokens"] = Value::from(max_tokens);
-        body["stream"] = Value::Bool(true);
-        // Forward server-specific chat-template kwargs (e.g. to disable
-        // reasoning-mode on Gemma 4). Servers that don't recognise the
-        // field ignore it.
-        if let Some(kwargs) = &request.chat_template_kwargs {
-            body["chat_template_kwargs"] = kwargs.clone();
-        }
-        // Per-request cache_prompt override (e.g. force a cold prefill to break
-        // a q4-KV-cache loop). The tool-call-leak retry below may also flip
-        // this to false mid-loop.
-        if let Some(cp) = request.cache_prompt {
-            body["cache_prompt"] = Value::Bool(cp);
-        }
+        let body = providers::build_body(self.provider, &self.config, request)?;
         maybe_dump_request(&body);
         let connect_timeout = Duration::from_secs(self.config.request_timeout_secs);
 
@@ -728,11 +810,17 @@ impl LlmClient {
             };
 
             match result {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    self.record_usage(&resp);
+                    return Ok(resp);
+                }
                 Err(err)
                     if !had_progress && attempt < max_retries && is_retryable_llm_error(&err) =>
                 {
-                    let delay = retry_delays[attempt];
+                    let msg = err.to_string();
+                    let delay = retry_after_from_message(&msg)
+                        .map(|secs| secs.min(MAX_RETRY_AFTER_WAIT_SECS))
+                        .unwrap_or(retry_delays[attempt]);
                     attempt += 1;
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(delay)) => {}

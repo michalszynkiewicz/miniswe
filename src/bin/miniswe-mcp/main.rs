@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load()?;
     let perms = PermissionManager::headless(&config);
     let router = ModelRouter::new(&config);
+    router.check_credentials()?;
     let lsp = if config.lsp.enabled {
         match LspClient::spawn(config.project_root.clone()).await {
             Ok(client) => Some(Arc::new(client)),

@@ -174,6 +174,29 @@ pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    /// Breakdown of `prompt_tokens`, e.g. how many were served from a
+    /// provider-side cache. OpenAI and OpenRouter send this; absent on
+    /// llama.cpp and Ollama.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// Breakdown of [`Usage::prompt_tokens`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: usize,
+}
+
+impl Usage {
+    /// How many of `prompt_tokens` were served from a provider-side cache,
+    /// or `0` when the server didn't report a breakdown.
+    pub fn cached_tokens(&self) -> usize {
+        self.prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0)
+    }
 }
 
 /// A streaming chunk from SSE.

@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 
+use super::providers::UsageSnapshot;
 use super::{ChatRequest, ChatResponse, LlmClient};
 use crate::config::{Config, ModelConfig, ModelRole};
 
@@ -81,6 +82,27 @@ impl ModelRouter {
     /// Whether multiple distinct models are configured.
     pub fn is_multi_model(&self) -> bool {
         self.clients.len() > 1
+    }
+
+    /// Verify every configured client has the credentials its provider
+    /// needs. Call right after construction, at every real startup site —
+    /// a missing hosted-provider key should fail immediately with a
+    /// message naming the env var, not surface as a 401 deep in a round.
+    pub fn check_credentials(&self) -> Result<()> {
+        for client in self.clients.values() {
+            client.check_credentials()?;
+        }
+        Ok(())
+    }
+
+    /// Sum token usage recorded across every client this router holds
+    /// (one per configured model slot), for `[usage:total]` session
+    /// logging.
+    pub fn usage_totals(&self) -> UsageSnapshot {
+        self.clients
+            .values()
+            .map(|c| c.usage_snapshot())
+            .fold(UsageSnapshot::default(), |acc, snap| acc + snap)
     }
 
     /// Model name for a given role (for display).

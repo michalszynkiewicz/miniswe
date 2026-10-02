@@ -17,8 +17,10 @@ pub struct Config {
     pub model: ModelConfig,
     /// Named model slots for multi-model routing.
     /// If present, these override `model` for the corresponding roles.
-    /// Requires an OpenAI-compatible proxy like llama-swap to handle
-    /// on-demand model loading behind a single endpoint.
+    /// Each slot is an independent `[models.<name>]` table with its own
+    /// `provider`/`endpoint`/`model` — a local llama-swap/vLLM instance
+    /// serving multiple models behind one endpoint, a mix of local and
+    /// hosted providers, or several hosted accounts side by side.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<HashMap<String, ModelConfig>>,
     /// Which model slot to use for each role.
@@ -109,6 +111,15 @@ pub struct RuntimeConfig {
     /// (llama.cpp, Ollama) that can only run one inference at a time.
     /// Increase for API providers that support true parallelism.
     pub llm_concurrency: usize,
+    /// Opt-in budget guard: stop the turn once this session's cumulative
+    /// prompt-token usage (summed across every role, from `[usage]`
+    /// logging) exceeds this many tokens. `0` disables the guard — the
+    /// default, since it only matters once a hosted provider is billing
+    /// per token. A bench run is on the order of ~100 rounds × ~30k prompt
+    /// tokens; this is meant to catch a run that's grinding far past that,
+    /// not to cap a normal one.
+    #[serde(default)]
+    pub max_session_input_tokens: u64,
 }
 
 /// Behavioral "done-gate" validation. When `command` is non-empty it runs
@@ -232,6 +243,7 @@ impl Default for RuntimeConfig {
         Self {
             tool_worker_pool_size: 10,
             llm_concurrency: 1,
+            max_session_input_tokens: 0,
         }
     }
 }
@@ -270,19 +282,15 @@ impl Config {
         if project_config_path.exists() {
             let contents = std::fs::read_to_string(&project_config_path)
                 .with_context(|| format!("Failed to read {}", project_config_path.display()))?;
-            let project: Config = toml::from_str(&contents)
+            let mut project: Config = toml::from_str(&contents)
                 .with_context(|| format!("Failed to parse {}", project_config_path.display()))?;
 
-            // Project values override global. Inherit secrets from global
-            // if not set in project (serde fills Options with None by default).
-            let global_web = config.web.clone();
+            // Project values override global wholesale (this is not a deep
+            // merge) — except secrets, which the project config may not be
+            // gitignored and so shouldn't have to carry: reinherit anything
+            // left unset. See `config::secrets`.
+            super::secrets::inherit_secrets(&config, &mut project);
             config = project;
-            if config.web.search_api_key.is_none() {
-                config.web.search_api_key = global_web.search_api_key;
-            }
-            if config.web.searxng_url.is_none() {
-                config.web.searxng_url = global_web.searxng_url;
-            }
         }
 
         config.project_root = project_root;
