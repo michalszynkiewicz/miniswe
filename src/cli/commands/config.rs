@@ -3,6 +3,7 @@
 use anyhow::Result;
 
 use crate::config::Config;
+use crate::llm::providers;
 use crate::tui;
 
 pub async fn run() -> Result<()> {
@@ -13,10 +14,22 @@ pub async fn run() -> Result<()> {
     eprintln!("[model]");
     eprintln!("  provider = \"{}\"", config.model.provider);
     eprintln!("  endpoint = \"{}\"", config.model.endpoint);
+    let effective_endpoint = config.model.effective_endpoint();
+    if effective_endpoint != config.model.endpoint {
+        eprintln!("  effective_endpoint = \"{effective_endpoint}\"");
+    }
     eprintln!("  model = \"{}\"", config.model.model);
     eprintln!("  context_window = {}", config.model.context_window);
     eprintln!("  temperature = {}", config.model.temperature);
     eprintln!("  max_output_tokens = {}", config.model.max_output_tokens);
+    eprintln!(
+        "  api_key = {}",
+        providers::api_key_source(
+            config.model.provider_kind(),
+            config.model.api_key.as_deref(),
+            config.model.api_key_env.as_deref(),
+        )
+    );
     eprintln!();
     eprintln!("[context]");
     eprintln!("  repo_map_budget = {}", config.context.repo_map_budget);

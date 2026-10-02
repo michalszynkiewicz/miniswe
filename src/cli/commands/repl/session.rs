@@ -25,6 +25,9 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
     let log = Arc::new(SessionLog::new(&config));
 
     let router = Arc::new(ModelRouter::new(&config));
+    // Fail fast on a missing hosted-provider API key, before the terminal
+    // enters raw mode.
+    router.check_credentials()?;
     // Probe server for the actual model identity (see run.rs for rationale).
     config.model.probed_model = router.probe_default_model().await.ok();
     let llm_worker = LlmWorkerHandle::new(router.clone(), config.runtime.llm_concurrency);

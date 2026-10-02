@@ -33,9 +33,16 @@ pub fn is_truncated_tool_call_error(err_msg: &str) -> bool {
 /// folds into the error message verbatim. Not retryable as-is — the same
 /// request fails identically — but recoverable by compacting the message
 /// list and resending (see `compressor::force_compress`).
+///
+/// Also covers the hosted-provider equivalents: OpenAI's
+/// `context_length_exceeded` error code / "maximum context length" message,
+/// and Anthropic's "prompt is too long" message.
 pub fn is_context_exceeded_error(err_msg: &str) -> bool {
     err_msg.contains("exceed_context_size_error")
         || err_msg.contains("exceeds the available context size")
+        || err_msg.contains("context_length_exceeded")
+        || err_msg.contains("maximum context length")
+        || err_msg.contains("prompt is too long")
 }
 
 /// True if a *successful* response was silently cut off by the context
@@ -114,6 +121,7 @@ pub(super) fn is_retryable_llm_error(err: &anyhow::Error) -> bool {
 
 fn retryable_status_from_message(msg: &str) -> Option<StatusCode> {
     for code in [
+        StatusCode::TOO_MANY_REQUESTS,
         StatusCode::INTERNAL_SERVER_ERROR,
         StatusCode::BAD_GATEWAY,
         StatusCode::SERVICE_UNAVAILABLE,
@@ -124,4 +132,87 @@ fn retryable_status_from_message(msg: &str) -> Option<StatusCode> {
         }
     }
     None
+}
+
+/// Marker `stream_once_assembled` embeds in its error message when a 429
+/// response carried a `Retry-After` header, so the retry loop (which only
+/// sees the stringified `anyhow::Error`) can recover the server's requested
+/// wait. See [`retry_after_secs`] (parses the header) and
+/// [`retry_after_from_message`] (parses it back out of the message).
+const RETRY_AFTER_MARKER: &str = "[retry-after=";
+
+/// Parse a `Retry-After` header's value as whole seconds. Only the
+/// delay-seconds form is supported (what OpenRouter/OpenAI/Anthropic send
+/// in practice); an HTTP-date value returns `None` and the caller falls
+/// back to its normal backoff ladder.
+pub fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// Embed a parsed `Retry-After` value into an error message for later
+/// recovery by [`retry_after_from_message`].
+pub(super) fn with_retry_after_marker(msg: String, retry_after: Option<u64>) -> String {
+    match retry_after {
+        Some(secs) => format!("{msg} {RETRY_AFTER_MARKER}{secs}]"),
+        None => msg,
+    }
+}
+
+/// Recover a `Retry-After` value embedded by [`with_retry_after_marker`].
+pub(super) fn retry_after_from_message(msg: &str) -> Option<u64> {
+    let start = msg.find(RETRY_AFTER_MARKER)? + RETRY_AFTER_MARKER.len();
+    let rest = &msg[start..];
+    let end = rest.find(']')?;
+    rest[..end].parse::<u64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_exceeded_detects_openai_pattern() {
+        let msg = "LLM API error (400 Bad Request): {\"error\":{\"message\":\"This \
+                    model's maximum context length is 8192 tokens.\",\"type\":\
+                    \"invalid_request_error\",\"code\":\"context_length_exceeded\"}}";
+        assert!(is_context_exceeded_error(msg));
+    }
+
+    #[test]
+    fn context_exceeded_detects_anthropic_pattern() {
+        let msg = "LLM API error (400 Bad Request): {\"type\":\"error\",\"error\":\
+                    {\"type\":\"invalid_request_error\",\"message\":\"prompt is too \
+                    long: 215000 tokens > 200000 maximum\"}}";
+        assert!(is_context_exceeded_error(msg));
+    }
+
+    #[test]
+    fn context_exceeded_is_false_for_unrelated_errors() {
+        assert!(!is_context_exceeded_error(
+            "LLM API error (401 Unauthorized): bad key"
+        ));
+    }
+
+    #[test]
+    fn too_many_requests_is_retryable() {
+        let err = anyhow::anyhow!("LLM API error (429 Too Many Requests): slow down");
+        assert!(is_retryable_llm_error(&err));
+    }
+
+    #[test]
+    fn retry_after_marker_roundtrips() {
+        let msg =
+            with_retry_after_marker("LLM API error (429 Too Many Requests): x".into(), Some(7));
+        assert_eq!(retry_after_from_message(&msg), Some(7));
+    }
+
+    #[test]
+    fn retry_after_marker_absent_when_none() {
+        let msg =
+            with_retry_after_marker("LLM API error (500 Internal Server Error): x".into(), None);
+        assert_eq!(retry_after_from_message(&msg), None);
+    }
 }

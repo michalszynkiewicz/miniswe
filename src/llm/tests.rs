@@ -175,6 +175,7 @@ fn context_truncated_response_detected_via_usage() {
             prompt_tokens: 59_950,
             completion_tokens: 210,
             total_tokens: 60_160,
+            prompt_tokens_details: None,
         }),
     );
     assert!(is_context_truncated_response(&resp, 2000));
@@ -191,6 +192,7 @@ fn legitimate_max_tokens_stop_is_not_context_truncation() {
             prompt_tokens: 5_000,
             completion_tokens: 7_950,
             total_tokens: 12_950,
+            prompt_tokens_details: None,
         }),
     );
     assert!(!is_context_truncated_response(&resp, 8000));

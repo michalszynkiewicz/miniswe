@@ -2,6 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::llm::Provider;
+
+/// Local-provider default endpoint. Shared between `ModelConfig::default`
+/// and `providers::endpoint::effective_endpoint`'s "configured endpoint is
+/// still the untouched local default" check — kept as one constant so the
+/// two can't drift.
+pub(crate) const DEFAULT_ENDPOINT: &str = "http://localhost:8464";
+
 /// Which named model slot to use for each role.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -39,7 +47,9 @@ pub enum ModelRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelConfig {
-    /// Provider type: "llama-cpp", "ollama", "vllm", "openai-compatible"
+    /// Provider type: "llama-cpp", "ollama", "vllm", "openai-compatible",
+    /// "openrouter", "openai", or "anthropic". Unknown values are treated
+    /// as "openai-compatible" with a warning — see `Provider::parse`.
     pub provider: String,
     /// API endpoint URL
     pub endpoint: String,
@@ -131,6 +141,28 @@ pub struct ModelConfig {
     /// without relying on detection.
     #[serde(default)]
     pub tool_call_format: ToolCallFormat,
+    /// API key for a hosted provider. Belongs in `~/.miniswe/config.toml`
+    /// or the environment (`api_key_env` / the provider's conventional
+    /// env var) — never in a project's `.miniswe/config.toml`, which a
+    /// user's project may not gitignore. `miniswe init` never writes this
+    /// field (see `init_default_config_has_no_api_key`); `miniswe config`
+    /// / `miniswe info` show only where a key came from, never its value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Name of an environment variable to read the API key from, when
+    /// `api_key` isn't set directly. Falls back further to the provider's
+    /// conventional variable (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`,
+    /// `ANTHROPIC_API_KEY`) — see `providers::auth::resolve_api_key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Reasoning effort sent to OpenRouter/OpenAI when `thinking = true`
+    /// (`"low"` / `"medium"` / `"high"`, provider-dependent).
+    #[serde(default = "default_thinking_effort")]
+    pub thinking_effort: String,
+    /// Anthropic extended-thinking token budget (`thinking.budget_tokens`),
+    /// used when `thinking = true` and the provider is `anthropic`.
+    #[serde(default = "default_thinking_budget_tokens")]
+    pub thinking_budget_tokens: usize,
 }
 
 /// Wire format we expect the model to use for tool invocations.
@@ -153,6 +185,14 @@ fn default_stream_idle_timeout_secs() -> u64 {
 
 fn default_request_deadline_secs() -> u64 {
     600
+}
+
+fn default_thinking_effort() -> String {
+    "medium".into()
+}
+
+fn default_thinking_budget_tokens() -> usize {
+    2048
 }
 
 impl ModelConfig {
@@ -222,13 +262,26 @@ impl ModelConfig {
             .to_ascii_lowercase();
         name.contains("laguna") || name.contains("gpt-oss")
     }
+
+    /// Parsed [`Provider`] for `self.provider`.
+    pub fn provider_kind(&self) -> Provider {
+        Provider::parse(&self.provider)
+    }
+
+    /// The endpoint actually used: `self.endpoint` unless it is empty or
+    /// still the untouched local default, in which case a hosted
+    /// provider's own default endpoint takes over. See
+    /// `providers::endpoint::effective_endpoint`.
+    pub fn effective_endpoint(&self) -> String {
+        crate::llm::providers::effective_endpoint(self.provider_kind(), &self.endpoint)
+    }
 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             provider: "llama-cpp".into(),
-            endpoint: "http://localhost:8464".into(),
+            endpoint: DEFAULT_ENDPOINT.into(),
             model: "devstral-small-2".into(),
             context_window: 50000,
             temperature: 0.15,
@@ -241,6 +294,10 @@ impl Default for ModelConfig {
             max_retries: 6,
             probed_model: None,
             tool_call_format: ToolCallFormat::Auto,
+            api_key: None,
+            api_key_env: None,
+            thinking_effort: default_thinking_effort(),
+            thinking_budget_tokens: default_thinking_budget_tokens(),
         }
     }
 }

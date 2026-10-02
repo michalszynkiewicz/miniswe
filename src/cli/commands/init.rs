@@ -137,3 +137,23 @@ pub async fn run() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::config::Config;
+
+    /// `ModelConfig::api_key` is `skip_serializing_if = "Option::is_none"`
+    /// and `Config::default()` leaves it `None` — this locks in that a
+    /// freshly generated `config.toml` never carries a secret, since the
+    /// field doc on `ModelConfig::api_key` explicitly names this test as
+    /// the guarantee.
+    #[test]
+    fn init_default_config_has_no_api_key() {
+        let config = Config::default();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            !toml_str.contains("api_key"),
+            "miniswe init must never write api_key(s) to a project config:\n{toml_str}"
+        );
+    }
+}

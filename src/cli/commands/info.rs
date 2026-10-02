@@ -4,6 +4,7 @@ use anyhow::Result;
 
 use crate::config::Config;
 use crate::knowledge::ProjectIndex;
+use crate::llm::providers;
 use crate::tui;
 
 pub async fn run() -> Result<()> {
@@ -63,6 +64,18 @@ pub async fn run() -> Result<()> {
         config.model.model, config.model.provider
     );
     eprintln!("  Endpoint: {}", config.model.endpoint);
+    let effective_endpoint = config.model.effective_endpoint();
+    if effective_endpoint != config.model.endpoint {
+        eprintln!("  Effective endpoint: {effective_endpoint}");
+    }
+    eprintln!(
+        "  API key: {}",
+        providers::api_key_source(
+            config.model.provider_kind(),
+            config.model.api_key.as_deref(),
+            config.model.api_key_env.as_deref(),
+        )
+    );
     eprintln!("  Context window: {} tokens", config.model.context_window);
     eprintln!("  Temperature: {}", config.model.temperature);
     eprintln!(

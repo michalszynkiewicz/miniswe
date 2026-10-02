@@ -10,9 +10,11 @@ pub mod session;
 mod context;
 mod model;
 mod root;
+mod secrets;
 mod tools;
 
 pub use context::{CompactionStrategy, ContextConfig, ProvidersConfig};
+pub(crate) use model::DEFAULT_ENDPOINT;
 pub use model::{ModelConfig, ModelRole, RoutingConfig, ToolCallFormat};
 pub use root::{
     Config, HardwareConfig, LogConfig, LspConfig, RuntimeConfig, ShellConfig, ValidationConfig,
