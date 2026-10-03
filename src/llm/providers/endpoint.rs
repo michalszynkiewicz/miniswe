@@ -35,13 +35,19 @@ pub fn chat_url(provider: Provider, endpoint: &str) -> String {
 }
 
 /// Models-listing URL, same `/v1`-doubling rule as [`chat_url`]. Ollama
-/// uses `/api/tags`.
+/// uses `/api/tags`. Anthropic paginates the list (20 per page by default,
+/// newest first), so a valid older id would fall off the first page and
+/// the probe would wrongly report it "not listed"; ask for the maximum.
 pub fn models_url(provider: Provider, endpoint: &str) -> String {
     let base = endpoint.trim_end_matches('/');
-    match provider {
-        Provider::Ollama => format!("{base}/api/tags"),
+    let path = match provider {
+        Provider::Ollama => return format!("{base}/api/tags"),
         _ if base.ends_with("/v1") => format!("{base}/models"),
         _ => format!("{base}/v1/models"),
+    };
+    match provider {
+        Provider::Anthropic => format!("{path}?limit=1000"),
+        _ => path,
     }
 }
 
@@ -95,6 +101,10 @@ mod tests {
         assert_eq!(
             models_url(Provider::Ollama, "http://x"),
             "http://x/api/tags"
+        );
+        assert_eq!(
+            models_url(Provider::Anthropic, "https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/models?limit=1000"
         );
     }
 }
