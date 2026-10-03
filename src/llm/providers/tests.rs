@@ -166,7 +166,7 @@ async fn openrouter_sends_reasoning_object_and_omits_stream_options() {
 }
 
 #[tokio::test]
-async fn openai_sends_max_completion_tokens_and_no_temperature_when_thinking() {
+async fn openai_sends_max_completion_tokens_and_never_sends_temperature() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))

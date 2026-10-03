@@ -29,10 +29,18 @@ Verified 2026-10-01 against the live docs:
   `input_schema`, `tool_use` / `tool_result` content blocks, SSE events
   `message_start`, `content_block_start/delta/stop`, `message_delta`.
 
-Not verified (OpenAI's reference is behind a 403 from the dev container; from
-memory, to be confirmed by the first live run): OpenAI rejects unknown
-top-level fields with HTTP 400, reasoning models require
-`max_completion_tokens` and reject `temperature`.
+Confirmed live 2026-10-02 (OpenAI's reference is behind a 403 from the dev
+container): `gpt-5-mini` rejects `temperature` with HTTP 400
+`unsupported_value` even without reasoning requested, so OpenAI never gets
+`temperature`. Still unverified: whether unknown top-level fields produce a
+400 (none are sent today) and whether `max_completion_tokens` is required.
+
+Also verified 2026-10-02: Anthropic's `/v1/models` is paginated (20 per
+page, newest first); the manual `thinking: {type: enabled, budget_tokens}`
+form is deprecated on the 4.6 generation and not accepted on Claude 5
+models, which think adaptively by default (the compat layer ignores
+`reasoning_effort`). Set `thinking = false` on Claude 5 models until the
+phase 2 native client maps effort.
 
 ## Design
 
@@ -47,9 +55,9 @@ decides per provider:
 | auth | bearer if a key is configured | bearer, required | bearer, required | bearer, required (+ `x-api-key`, `anthropic-version`) |
 | llama-only fields | sent | stripped | stripped | stripped |
 | output cap | `max_tokens` | `max_tokens` | `max_completion_tokens` | `max_tokens` |
-| `thinking = true` | `enable_thinking` kwarg | `reasoning: {effort}` | `reasoning_effort`, no `temperature` | `thinking: {type: enabled, budget_tokens}`, `max_tokens` raised to at least budget + 1024 |
-| model probe | first id from `/v1/models` | configured model looked up in the catalogue | same | same |
-| `temperature` | sent | sent | sent unless thinking | never sent (deprecated on current models) |
+| `thinking = true` | `enable_thinking` kwarg | `reasoning: {effort}` | `reasoning_effort` | `thinking: {type: enabled, budget_tokens}`, `max_tokens` raised to at least budget + 1024 |
+| model probe | first id from `/v1/models`, 3s deadline | configured model looked up in the catalogue, 10s deadline | same | same, list fetched with `limit=1000` (paginated at 20) |
+| `temperature` | sent | sent | never sent (gpt-5 family rejects values other than 1) | never sent (deprecated on current models) |
 | usage | from stream | final chunk | `stream_options.include_usage` | `stream_options.include_usage` |
 
 Keys: `api_key` / `api_key_env` on each model slot, resolved as config field,

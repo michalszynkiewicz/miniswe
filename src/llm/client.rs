@@ -204,7 +204,14 @@ impl LlmClient {
             self.provider,
             self.api_key.as_deref(),
         );
-        let resp = match tokio::time::timeout(Duration::from_secs(3), request.send()).await {
+        // 3s fits a local server; a TLS round trip to a hosted catalogue of
+        // a few hundred models timed out at 3s live (OpenAI, 2026-10-02).
+        let deadline = if self.provider.is_hosted() {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(3)
+        };
+        let resp = match tokio::time::timeout(deadline, request.send()).await {
             Err(_) => bail!("timeout"),
             Ok(Err(e)) if e.is_connect() => bail!("unreachable"),
             Ok(Err(e)) => bail!("transport error ({e})"),

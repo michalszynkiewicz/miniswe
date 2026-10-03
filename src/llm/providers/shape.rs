@@ -79,9 +79,13 @@ pub fn build_body(
     let thinking = thinking_requested(request);
     let thinking_on = thinking != Thinking::Off;
 
-    // --- temperature: sent | sent | sent unless thinking | never sent ---
-    let send_temperature =
-        !matches!(provider, Provider::Anthropic) && !(provider == Provider::OpenAi && thinking_on);
+    // --- temperature: sent for local dialects + OpenRouter, never for OpenAI
+    // or Anthropic. OpenAI's reasoning models (gpt-5 family) reject any
+    // value other than the default even without reasoning requested —
+    // confirmed live 2026-10-02 ("Unsupported value: 'temperature' does
+    // not support 0.15 with this model"); Anthropic deprecates it on
+    // current models. The 0.15 default exists for small local models.
+    let send_temperature = !matches!(provider, Provider::OpenAi | Provider::Anthropic);
     if send_temperature {
         body["temperature"] =
             Value::from(request.temperature_override.unwrap_or(config.temperature));
@@ -180,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_uses_max_completion_tokens_and_no_temperature_when_thinking() {
+    fn openai_uses_max_completion_tokens_and_never_sends_temperature() {
         let config = ModelConfig {
             provider: "openai".into(),
             ..ModelConfig::default()
@@ -192,6 +196,10 @@ mod tests {
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("temperature").is_none());
         assert_eq!(body["reasoning_effort"], Value::String("medium".into()));
+        // Also without thinking: gpt-5 family rejects temperature != 1.
+        let body = build_body(Provider::OpenAi, &config, &request()).unwrap();
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]
