@@ -29,6 +29,16 @@
 #   STREAM_IDLE_SECS=90      model.stream_idle_timeout_secs floor (default 120)
 #   COMPACTION=unified       context.compaction (default lazy)
 #   GPU_SAMPLE_INTERVAL=10   seconds between nvidia-smi samples (0 = off)
+#   PROVIDER=anthropic       HYBRID hosted run: the agent talks to the hosted
+#                            provider (key from ANTHROPIC_API_KEY /
+#                            OPENAI_API_KEY / OPENROUTER_API_KEY, passed to the
+#                            container by name, never written to disk), while
+#                            the done-gate and grader smoke runs of the built
+#                            baseline binary (which predates hosted providers)
+#                            still use the local llama-server from /inner.
+#                            Needs --model <hosted id> AND a local server.
+#   BUDGET=3000000           hosted only: runtime.max_session_input_tokens
+#                            per attempt (spend cap)
 #   LLAMA_CONTAINER_FILTER   docker name filter for the server container
 #                            (default: llama-server-)
 
@@ -47,6 +57,18 @@ MODEL_TAG="$(
     | sed -E 's/\.gguf$//; s/[^A-Za-z0-9._-]/_/g' \
     | cut -c1-40
 )"
+# Hosted (hybrid) run: the local server only answers the inner smoke runs,
+# so label the result dir with the hosted model from --model instead.
+PROVIDER="${PROVIDER:-}"
+if [[ -n "${PROVIDER}" ]]; then
+    MODEL_TAG=""
+    _prev=""
+    for _arg in "$@"; do
+        [[ "${_prev}" == "--model" ]] && MODEL_TAG="$(printf '%s' "${_arg}" | sed -E 's/[^A-Za-z0-9._-]/_/g' | cut -c1-40)"
+        _prev="${_arg}"
+    done
+    MODEL_TAG="${PROVIDER}_${MODEL_TAG:-unknown}"
+fi
 MODEL_TAG="${MODEL_TAG:-unknown}"
 RESULTS_DIR="${REPO_DIR}/benchmark_results/docker_$(date +%Y%m%d_%H%M%S)_${MODEL_TAG}"
 BASELINE_SHA="cc34d2626faf32c1b6dd1b8b33af693fb936b098"
@@ -146,6 +168,25 @@ if ! curl -fsS --max-time 5 "${LLAMA_ENDPOINT}/v1/models" > /dev/null 2>&1; then
     exit 1
 fi
 
+# Hosted (hybrid) run: the key must be in the environment; it reaches the
+# container by NAME (docker -e VAR), so the value never lands on a command
+# line or in the results dir.
+HOSTED_KEY_ENV=""
+if [[ -n "${PROVIDER}" ]]; then
+    case "${PROVIDER}" in
+        anthropic)  HOSTED_KEY_ENV=ANTHROPIC_API_KEY ;;
+        openai)     HOSTED_KEY_ENV=OPENAI_API_KEY ;;
+        openrouter) HOSTED_KEY_ENV=OPENROUTER_API_KEY ;;
+        *) echo "ERROR: PROVIDER must be anthropic|openai|openrouter (got '${PROVIDER}')" >&2; exit 1 ;;
+    esac
+    if [[ -z "${!HOSTED_KEY_ENV:-}" ]]; then
+        echo "ERROR: PROVIDER=${PROVIDER} needs \$${HOSTED_KEY_ENV} exported" >&2
+        exit 1
+    fi
+    export "${HOSTED_KEY_ENV}"
+    echo "Hosted:   ${PROVIDER} / ${MODEL} (key from \$${HOSTED_KEY_ENV}; inner smoke runs use ${LLAMA_ENDPOINT})"
+fi
+
 gpu_bench_start "${RESULTS_DIR}"
 echo ""
 
@@ -158,6 +199,26 @@ echo ""
 
 generate_config() {
     local disabled="${1:-}"
+    # "local" forces the llama-server config even on a hosted run (the config
+    # the inner baseline binary reads from /inner).
+    local provider="${PROVIDER:-}"
+    [[ "${2:-}" == "local" ]] && provider=""
+
+    local model_head inner_run runtime_block=""
+    if [[ -n "${provider}" ]]; then
+        model_head="provider = \"${provider}\""
+        # The baseline binary can't reach a hosted provider: run it from
+        # /inner, whose config points at the local server.
+        inner_run="cd /inner && MINISWE_SKIP_VALIDATION=1 /work/target/debug/miniswe"
+        runtime_block="
+[runtime]
+max_session_input_tokens = ${BUDGET:-3000000}
+"
+    else
+        model_head="provider = \"llama-cpp\"
+endpoint = \"http://localhost:8464\""
+        inner_run="MINISWE_SKIP_VALIDATION=1 ./target/debug/miniswe"
+    fi
 
     # Helper for provider toggles
     _dis() { echo ",${disabled}," | grep -q ",${1}," && echo "false" || echo "true"; }
@@ -179,8 +240,7 @@ generate_config() {
 
     cat <<TOML
 [model]
-provider = "llama-cpp"
-endpoint = "http://localhost:8464"
+${model_head}
 model = "${MODEL}"
 context_window = ${CTX_WINDOW}
 temperature = ${TEMPERATURE}
@@ -288,10 +348,11 @@ enabled = true
 # gate-blocked until the timeout. Naming the case fixes it (12/12 Glimmer,
 # 6/6 gemma, 6/6 Devstral); 'hello' stays so the check still proves the
 # override is consumed rather than merely echoed.
-command = "out=\$(cargo build 2>&1) || { echo \"DOES NOT COMPILE:\"; echo \"\$out\" | tail -20; exit 1; }; run=\$(MINISWE_SKIP_VALIDATION=1 ./target/debug/miniswe --system-prompt-override 'Respond only with TOKEN_XYZ and nothing else. Even if the user just greets you, do not greet back — reply only TOKEN_XYZ.' --yes hello 2>&1); echo \"\$run\" | grep -q TOKEN_XYZ || { echo \"COMPILES but override NOT consumed. Expected TOKEN_XYZ, GOT: \$run\"; exit 1; }"
+command = "out=\$(cargo build 2>&1) || { echo \"DOES NOT COMPILE:\"; echo \"\$out\" | tail -20; exit 1; }; run=\$(${inner_run} --system-prompt-override 'Respond only with TOKEN_XYZ and nothing else. Even if the user just greets you, do not greet back — reply only TOKEN_XYZ.' --yes hello 2>&1); echo \"\$run\" | grep -q TOKEN_XYZ || { echo \"COMPILES but override NOT consumed. Expected TOKEN_XYZ, GOT: \$run\"; exit 1; }"
 timeout_secs = 180
 max_retries = 3
 TOML
+    printf '%s' "${runtime_block}"
 }
 
 # ── Run one variant in a fresh container ────────────────────────────────
@@ -308,6 +369,9 @@ run_variant() {
 
     # Generate config
     generate_config "${disabled}" > "${variant_dir}/config.toml"
+    if [[ -n "${PROVIDER}" ]]; then
+        generate_config "${disabled}" local > "${variant_dir}/inner-config.toml"
+    fi
 
     # Run in a fresh container:
     # 1. Extract code at pinned SHA
@@ -367,6 +431,17 @@ if ! miniswe init 2>/output/miniswe_init.txt; then
     exit 1
 fi
 mkdir -p .miniswe/logs
+
+# Hybrid hosted run: the built baseline binary predates hosted providers, so
+# its smoke runs happen from /inner, whose config points at the local server.
+SMOKE_DIR="."
+SMOKE_BIN="./target/debug/miniswe"
+if [ -f /config/inner-config.toml ]; then
+    mkdir -p /inner/.miniswe
+    cp /config/inner-config.toml /inner/.miniswe/config.toml
+    SMOKE_DIR="/inner"
+    SMOKE_BIN="/work/target/debug/miniswe"
+fi
 
 # Init git for diff tracking
 git init -q && git add -A && git commit -q -m "baseline" 2>/dev/null
@@ -532,7 +607,7 @@ HINT: These tests compiled but their assertions failed. Re-read the failing test
         # MINISWE_SKIP_VALIDATION: the edited binary may carry the done-gate;
         # this smoke run is a utility invocation, not a coding task, so it must
         # not re-enter the gate.
-        SMOKE_OUTPUT=$(MINISWE_SKIP_VALIDATION=1 timeout 120 "${BINARY}" \
+        SMOKE_OUTPUT=$(cd "${SMOKE_DIR}" && MINISWE_SKIP_VALIDATION=1 timeout 120 "${SMOKE_BIN}" \
             ${FLAG} "${SMOKE_OVERRIDE}" \
             --yes "ping" 2>/output/smoke_stderr.txt || true)
         echo "${SMOKE_OUTPUT}" > /output/smoke_output.txt
@@ -609,6 +684,12 @@ SCRIPT
         seed_mount=(-v "${SEED_PATCH}:/config/seed.patch:ro")
     fi
 
+    # Hybrid hosted run: inner config + the key, passed by name only.
+    local hosted_args=()
+    if [[ -n "${PROVIDER}" ]]; then
+        hosted_args=(-v "${variant_dir}/inner-config.toml:/config/inner-config.toml:ro" -e "${HOSTED_KEY_ENV}")
+    fi
+
     # MINISWE_LLM_DUMP_DIR captures every outgoing /v1/chat/completions
     # body to /output/llm_dumps/req-NNNNNN.json so we can replay the
     # exact request that produced a malformed response (the in-band
@@ -619,6 +700,7 @@ SCRIPT
         -v "${variant_dir}/config.toml:/config/config.toml:ro" \
         -v "${tmp_script}:/run.sh:ro" \
         "${seed_mount[@]}" \
+        "${hosted_args[@]}" \
         -e MINISWE_LLM_DUMP_DIR=/output/llm_dumps \
         -e "MINISWE_ADDPARAM_LEGACY_MSG=${MINISWE_ADDPARAM_LEGACY_MSG:-}" \
         --name "${container_name}" \
