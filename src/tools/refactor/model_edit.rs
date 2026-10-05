@@ -130,15 +130,39 @@ where
             format!("OLD:\n{first_window_line}\n")
         }
     };
+    // Providers that don't continue a partial assistant message get the
+    // same constraint spelled out in the prompt instead.
+    let send_prefill = router
+        .config_for(ModelRole::Fast)
+        .provider_kind()
+        .supports_prefill();
+    let base_prompt = if send_prefill {
+        base_prompt
+    } else {
+        format!(
+            "{base_prompt}{}",
+            no_prefill_instruction(known_old, &prefill)
+        )
+    };
     if let Some(log) = log {
+        let prefill_label = if send_prefill {
+            "assistant prefill"
+        } else {
+            "prefill (not sent)"
+        };
         log.tool_debug(
             "change_signature",
             &format!(
                 "ask_rewrite[{tag}] request:\n--- system ---\n{SYSTEM_PROMPT}\n\
-                 --- user ---\n{base_prompt}\n--- assistant prefill ---\n{prefill}"
+                 --- user ---\n{base_prompt}\n--- {prefill_label} ---\n{prefill}"
             ),
         );
     }
+    let mode = match (send_prefill, known_old) {
+        (true, _) => Prefill::Sent(&prefill),
+        (false, Some(_)) => Prefill::KnownOld(&prefill),
+        (false, None) => Prefill::None,
+    };
 
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=3u32 {
@@ -155,7 +179,7 @@ where
                 "{base_prompt}\n\n(reminder: close OLD with END_OLD and NEW with END_NEW; output nothing outside the OLD/NEW block.)"
             )
         };
-        match try_ask_once(router, log, tag, attempt, &prompt, &prefill, cancelled).await {
+        match try_ask_once(router, log, tag, attempt, &prompt, mode, cancelled).await {
             Ok(Some(rewrite)) => match validate(&rewrite) {
                 Ok(()) => return Ok(Some(rewrite)),
                 Err(e) => {
@@ -195,28 +219,65 @@ where
 /// is a no-op.
 const CHAT_TEMPLATE_LEAK_PREFIX: &str = "<|channel>thought\n<channel|>";
 
+/// How the OLD prefill reaches the model and the parser.
+#[derive(Clone, Copy)]
+enum Prefill<'a> {
+    /// Sent as a partial assistant message the model continues.
+    Sent(&'a str),
+    /// Not sent, but OLD is known: prepended to the reply so `old` is still
+    /// never model-generated (the parser anchors on the LAST `NEW:`, so a
+    /// reply that restates the whole block parses the same).
+    KnownOld(&'a str),
+    /// Not sent; the model writes the whole OLD/NEW block.
+    None,
+}
+
+/// Prompt suffix replacing the prefill for providers that can't take one.
+fn no_prefill_instruction(known_old: Option<&str>, prefill: &str) -> String {
+    match known_old {
+        Some(_) => format!(
+            "\n\nThe OLD block is fixed. Your output must begin with exactly:\n{prefill}\
+             and then continue with the replacement lines and END_NEW."
+        ),
+        None => format!("\n\nYour output must begin with exactly:\n{prefill}"),
+    }
+}
+
+/// The model's reply as a complete OLD/NEW text for `parse_old_new`.
+fn assemble_reply(mode: Prefill<'_>, raw: &str) -> String {
+    // Strip the chat-template leak if present, then prepend our prefill
+    // so the assembled text is a complete OLD/NEW block the parser can
+    // handle without special-casing.
+    let stripped = raw.strip_prefix(CHAT_TEMPLATE_LEAK_PREFIX).unwrap_or(raw);
+    match mode {
+        Prefill::Sent(prefill) | Prefill::KnownOld(prefill) => format!("{prefill}{stripped}"),
+        Prefill::None => stripped.to_string(),
+    }
+}
+
 /// One inference attempt. Logs the response and parse outcome individually
 /// so the trace shows whether the retry was the one that landed.
 ///
-/// `prefill` is sent as a partial assistant message; the model continues
-/// from where it leaves off. Combined with stripping the chat-template
-/// leak prefix, this gives us guaranteed control of OLD's first line
-/// (the caller writes it) while letting the model fill in the rest.
+/// A `Prefill::Sent` prefill goes out as a partial assistant message; the
+/// model continues from where it leaves off. Combined with stripping the
+/// chat-template leak prefix, this gives us guaranteed control of OLD's
+/// first line (the caller writes it) while letting the model fill in the
+/// rest.
 async fn try_ask_once(
     router: &ModelRouter,
     log: Option<&SessionLog>,
     tag: &str,
     attempt: u32,
     prompt: &str,
-    prefill: &str,
+    mode: Prefill<'_>,
     cancelled: Option<&AtomicBool>,
 ) -> Result<Option<SnippetRewrite>> {
+    let mut messages = vec![Message::system(SYSTEM_PROMPT), Message::user(prompt)];
+    if let Prefill::Sent(prefill) = mode {
+        messages.push(Message::assistant(prefill));
+    }
     let request = ChatRequest {
-        messages: vec![
-            Message::system(SYSTEM_PROMPT),
-            Message::user(prompt),
-            Message::assistant(prefill),
-        ],
+        messages,
         tools: None,
         tool_choice: None,
         max_tokens_override: None,
@@ -264,11 +325,7 @@ async fn try_ask_once(
     if raw.is_empty() {
         return Err(anyhow!("model returned no content"));
     }
-    // Strip the chat-template leak if present, then prepend our prefill
-    // so the assembled text is a complete OLD/NEW block the parser can
-    // handle without special-casing.
-    let stripped = raw.strip_prefix(CHAT_TEMPLATE_LEAK_PREFIX).unwrap_or(raw);
-    let assembled = format!("{prefill}{stripped}");
+    let assembled = assemble_reply(mode, raw);
     let parsed = parse_old_new(assembled.trim());
     if let Some(log) = log {
         match &parsed {
@@ -468,6 +525,39 @@ mod tests {
         let r = parse_old_new(text).unwrap().unwrap();
         assert_eq!(r.old, "  foo();");
         assert_eq!(r.new, "  foo(None);");
+    }
+
+    #[test]
+    fn unsent_known_old_prefill_still_pins_old() {
+        // Provider without prefill support: the model was only TOLD to begin
+        // with the fixed OLD block. Whether it restates the block (even
+        // mis-transcribed) or writes just NEW, `old` must be the known text.
+        let known_old = "fn run(\n    a: u32,\n) {";
+        let prefill = format!("OLD:\n{known_old}\nEND_OLD\nNEW:\n");
+        let mode = Prefill::KnownOld(&prefill);
+        for raw in [
+            "OLD:\nfn run(a: u32) {\nEND_OLD\nNEW:\nfn run(\n    a: u32,\n    b: u8,\n) {\nEND_NEW",
+            "fn run(\n    a: u32,\n    b: u8,\n) {\nEND_NEW",
+        ] {
+            let r = parse_old_new(assemble_reply(mode, raw).trim())
+                .unwrap()
+                .unwrap();
+            assert_eq!(r.old, known_old);
+            assert_eq!(r.new, "fn run(\n    a: u32,\n    b: u8,\n) {");
+        }
+    }
+
+    #[test]
+    fn unsent_prefill_without_known_old_parses_the_reply_whole() {
+        let raw = "OLD:\n  foo();\nEND_OLD\nNEW:\n  foo(None);\nEND_NEW";
+        let r = parse_old_new(assemble_reply(Prefill::None, raw).trim())
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.old, "  foo();");
+        assert_eq!(r.new, "  foo(None);");
+        // The instruction that replaces the prefill names the first line.
+        let hint = no_prefill_instruction(None, "OLD:\n  foo();\n");
+        assert!(hint.contains("begin with exactly:\nOLD:\n  foo();\n"));
     }
 
     #[test]
