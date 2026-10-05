@@ -16,6 +16,7 @@ pub fn context_window_from_props(body: &Value) -> Option<usize> {
         .get("n_ctx")?
         .as_u64()
         .map(|n| n as usize)
+        .filter(|&n| n > 0)
 }
 
 /// From a `/v1/models`-style listing body, the served context window for
@@ -51,7 +52,11 @@ pub fn context_window_from_models(provider: Provider, body: &Value, model: &str)
         .find(|m| m.get("id").and_then(Value::as_str) == Some(model))
         .or_else(|| (!provider.is_hosted()).then(|| list.first()).flatten())?;
 
-    entry.get(field)?.as_u64().map(|n| n as usize)
+    entry
+        .get(field)?
+        .as_u64()
+        .map(|n| n as usize)
+        .filter(|&n| n > 0)
 }
 
 #[cfg(test)]
@@ -74,6 +79,17 @@ mod tests {
         assert_eq!(context_window_from_props(&json!({})), None);
         assert_eq!(
             context_window_from_props(&json!({"default_generation_settings": {}})),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_window_is_none() {
+        let props = json!({"default_generation_settings": {"n_ctx": 0}});
+        assert_eq!(context_window_from_props(&props), None);
+        let models = json!({"data": [{"id": "test-model", "max_model_len": 0}]});
+        assert_eq!(
+            context_window_from_models(Provider::Vllm, &models, "test-model"),
             None
         );
     }
