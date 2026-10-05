@@ -20,15 +20,17 @@ pub fn effective_endpoint(provider: Provider, configured: &str) -> String {
     }
 }
 
-/// Chat-completions URL for an (already effective) endpoint. Ollama uses
-/// its own `/api/chat`; every other dialect uses the OpenAI
-/// `/v1/chat/completions` path — except a base that already ends in `/v1`
-/// (every hosted provider's default does), where appending the full
-/// `/v1/...` suffix would double it.
+/// Chat URL for an (already effective) endpoint. Ollama uses its own
+/// `/api/chat`, Anthropic its native `/v1/messages`; every other dialect
+/// uses the OpenAI `/v1/chat/completions` path — except a base that already
+/// ends in `/v1` (every hosted provider's default does), where appending
+/// the full `/v1/...` suffix would double it.
 pub fn chat_url(provider: Provider, endpoint: &str) -> String {
     let base = endpoint.trim_end_matches('/');
     match provider {
         Provider::Ollama => format!("{base}/api/chat"),
+        Provider::Anthropic if base.ends_with("/v1") => format!("{base}/messages"),
+        Provider::Anthropic => format!("{base}/v1/messages"),
         _ if base.ends_with("/v1") => format!("{base}/chat/completions"),
         _ => format!("{base}/v1/chat/completions"),
     }
@@ -98,6 +100,14 @@ mod tests {
             "http://localhost:8464/v1/chat/completions"
         );
         assert_eq!(chat_url(Provider::Ollama, "http://x"), "http://x/api/chat");
+        assert_eq!(
+            chat_url(Provider::Anthropic, "https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            chat_url(Provider::Anthropic, "http://x"),
+            "http://x/v1/messages"
+        );
     }
 
     #[test]

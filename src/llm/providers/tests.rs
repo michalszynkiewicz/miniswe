@@ -193,37 +193,6 @@ async fn openai_sends_max_completion_tokens_and_never_sends_temperature() {
 }
 
 #[tokio::test]
-async fn anthropic_sends_thinking_object_and_full_auth_headers() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(bearer_token("an-key"))
-        .and(header("x-api-key", "an-key"))
-        .and(header("anthropic-version", "2023-06-01"))
-        .respond_with(mock_text_response("ok"))
-        .mount(&server)
-        .await;
-
-    let mut config = config_for("anthropic", &server.uri());
-    config.api_key = Some("an-key".into());
-    config.thinking_budget_tokens = 1024;
-    let client = LlmClient::new(config);
-    client
-        .chat(&thinking_request())
-        .await
-        .expect("auth headers + body must reach the mock for the request to match");
-
-    let bodies = chat_request_bodies(&server).await;
-    let body = &bodies[0];
-    assert!(body.get("temperature").is_none());
-    assert_eq!(
-        body["thinking"],
-        json!({"type": "enabled", "budget_tokens": 1024})
-    );
-    assert_eq!(body["stream_options"], json!({"include_usage": true}));
-}
-
-#[tokio::test]
 async fn usage_is_parsed_and_accumulated_across_two_calls() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -486,4 +455,441 @@ async fn retry_after_429_then_200_succeeds() {
         resp.choices[0].message.content.as_deref(),
         Some("recovered")
     );
+}
+
+// ---------------------------------------------------------------------
+// Anthropic native Messages client
+// ---------------------------------------------------------------------
+
+fn sse(events: &[Value]) -> ResponseTemplate {
+    let body: String = events
+        .iter()
+        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+        .collect();
+    ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+}
+
+fn text_stream(text: &str) -> ResponseTemplate {
+    sse(&[
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 7}}}),
+        json!({"type": "content_block_start", "index": 0,
+               "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 0,
+               "delta": {"type": "text_delta", "text": text}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+               "usage": {"output_tokens": 3}}),
+        json!({"type": "message_stop"}),
+    ])
+}
+
+async fn mount_messages(server: &MockServer, resp: ResponseTemplate) {
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(resp)
+        .mount(server)
+        .await;
+}
+
+async fn mount_model_caps(server: &MockServer, adaptive: bool) {
+    Mock::given(method("GET"))
+        .and(path("/v1/models/test-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "capabilities": {"thinking": {"types": {"adaptive": {"supported": adaptive}}}}
+        })))
+        .mount(server)
+        .await;
+}
+
+fn anthropic_config(server: &MockServer) -> ModelConfig {
+    let mut c = config_for("anthropic", &server.uri());
+    c.api_key = Some("an-key".into());
+    c
+}
+
+async fn messages_bodies(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn anthropic_posts_to_messages_with_headers_and_betas() {
+    let server = MockServer::start().await;
+    mount_model_caps(&server, true).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("x-api-key", "an-key"))
+        .and(header("anthropic-version", "2023-06-01"))
+        .and(header(
+            "anthropic-beta",
+            "thinking-binding-controls-2026-08-01",
+        ))
+        .respond_with(text_stream("ok"))
+        .mount(&server)
+        .await;
+    let client = LlmClient::new(anthropic_config(&server));
+    let resp = client.chat(&thinking_request()).await.expect("matches");
+    assert_eq!(resp.choices[0].message.content.as_deref(), Some("ok"));
+    assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
+    let snap = client.usage_snapshot();
+    assert_eq!((snap.prompt_tokens, snap.completion_tokens), (7, 3));
+
+    let b = &messages_bodies(&server).await[0];
+    assert_eq!(b["thinking"]["type"], "adaptive");
+    assert_eq!(b["output_config"], json!({"effort": "medium"}));
+    assert_eq!(b["max_tokens"], 32_000);
+    for banned in [
+        "temperature",
+        "stream_options",
+        "chat_template_kwargs",
+        "cache_prompt",
+    ] {
+        assert!(b.get(banned).is_none(), "{banned}");
+    }
+}
+
+#[tokio::test]
+async fn anthropic_capability_lookup_happens_once_per_client() {
+    let server = MockServer::start().await;
+    mount_model_caps(&server, true).await;
+    mount_messages(&server, text_stream("ok")).await;
+    let client = LlmClient::new(anthropic_config(&server));
+    client.chat(&request()).await.unwrap();
+    client.chat(&request()).await.unwrap();
+    let gets = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "GET")
+        .count();
+    assert_eq!(gets, 1);
+}
+
+#[tokio::test]
+async fn anthropic_lookup_failure_assumes_adaptive() {
+    let server = MockServer::start().await; // GET /models/.. -> 404
+    mount_messages(&server, text_stream("ok")).await;
+    let client = LlmClient::new(anthropic_config(&server));
+    client.chat(&request()).await.unwrap();
+    let b = &messages_bodies(&server).await[0];
+    assert_eq!(b["thinking"]["type"], "adaptive");
+    assert_eq!(b["output_config"], json!({"effort": "low"}));
+}
+
+#[tokio::test]
+async fn anthropic_haiku_shapes_thinking_off_and_on() {
+    let server = MockServer::start().await;
+    mount_model_caps(&server, false).await;
+    mount_messages(&server, text_stream("ok")).await;
+    let mut cfg = anthropic_config(&server);
+    cfg.max_output_tokens = 1000;
+    cfg.thinking_budget_tokens = 2048;
+    let client = LlmClient::new(cfg);
+    client.chat(&request()).await.unwrap();
+    client.chat(&thinking_request()).await.unwrap();
+    let bodies = messages_bodies(&server).await;
+    assert!(bodies[0].get("thinking").is_none());
+    assert_eq!(bodies[0]["max_tokens"], 1000);
+    assert_eq!(bodies[1]["thinking"]["type"], "enabled");
+    assert_eq!(bodies[1]["thinking"]["budget_tokens"], 2048);
+    assert_eq!(bodies[1]["max_tokens"], 3072);
+    assert!(bodies[1].get("output_config").is_none());
+}
+
+#[tokio::test]
+async fn anthropic_per_request_effort_and_fallbacks() {
+    let server = MockServer::start().await;
+    mount_model_caps(&server, true).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(text_stream("ok"))
+        .mount(&server)
+        .await;
+    let mut cfg = anthropic_config(&server);
+    cfg.model = "claude-opus-5-5".into();
+    Mock::given(method("GET"))
+        .and(path("/v1/models/claude-opus-5-5"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let client = LlmClient::new(cfg);
+    let mut req = request();
+    req.chat_template_kwargs = Some(json!({"reasoning_effort": "high"}));
+    client.chat(&req).await.expect("both betas sent");
+    let b = &messages_bodies(&server).await[0];
+    assert_eq!(b["fallbacks"], "default");
+    let post = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.method.as_str() == "POST")
+        .unwrap();
+    assert_eq!(
+        post.headers["anthropic-beta"].to_str().unwrap(),
+        "thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01"
+    );
+    assert_eq!(b["output_config"], json!({"effort": "high"}));
+}
+
+#[tokio::test]
+async fn anthropic_converts_system_tools_results_and_breakpoints() {
+    let server = MockServer::start().await;
+    mount_model_caps(&server, true).await;
+    mount_messages(&server, text_stream("ok")).await;
+    let client = LlmClient::new(anthropic_config(&server));
+    let marker = crate::context::compressor::CURRENT_STATE_MARKER;
+    let call = crate::llm::ToolCall {
+        id: "t1".into(),
+        r#type: "function".into(),
+        function: crate::llm::FunctionCall {
+            name: "read".into(),
+            arguments: "{\"p\":1}".into(),
+        },
+    };
+    let req = ChatRequest {
+        messages: vec![
+            Message::system("sys"),
+            Message::user("go"),
+            Message::assistant_tool_calls(vec![call]),
+            Message::tool_result("t1", "contents"),
+            Message::user(&format!("next{marker}plan")),
+        ],
+        tools: Some(vec![crate::llm::ToolDefinition {
+            r#type: "function".into(),
+            function: crate::llm::FunctionDefinition {
+                name: "read".into(),
+                description: "d".into(),
+                parameters: json!({"type": "object"}),
+            },
+        }]),
+        ..Default::default()
+    };
+    client.chat(&req).await.unwrap();
+    let b = &messages_bodies(&server).await[0];
+    assert_eq!(b["system"][0]["text"], "sys");
+    assert_eq!(b["tools"][0]["input_schema"], json!({"type": "object"}));
+    assert_eq!(b["tools"][0]["eager_input_streaming"], true);
+    let msgs = b["messages"].as_array().unwrap();
+    assert_eq!(
+        msgs.len(),
+        3,
+        "tool result merges with the following user text"
+    );
+    let last = msgs[2]["content"].as_array().unwrap();
+    assert_eq!(last[0]["type"], "tool_result");
+    assert_eq!(last[1]["text"], "next");
+    assert!(last[1].get("cache_control").is_some());
+    assert!(last[2]["text"].as_str().unwrap().starts_with(marker));
+    assert!(last[2].get("cache_control").is_none());
+    assert_eq!(b.to_string().matches("cache_control").count(), 3);
+}
+
+#[tokio::test]
+async fn anthropic_without_marker_puts_third_breakpoint_on_last_block() {
+    let server = MockServer::start().await;
+    mount_model_caps(&server, true).await;
+    mount_messages(&server, text_stream("ok")).await;
+    let client = LlmClient::new(anthropic_config(&server));
+    let mut req = request();
+    req.messages.insert(0, Message::system("sys"));
+    client.chat(&req).await.unwrap();
+    let b = &messages_bodies(&server).await[0];
+    assert!(
+        b["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_some()
+    );
+    assert_eq!(b.to_string().matches("cache_control").count(), 2);
+}
+
+#[tokio::test]
+async fn anthropic_tool_use_thinking_and_replay_verbatim() {
+    let server = MockServer::start().await;
+    mount_model_caps(&server, true).await;
+    mount_messages(
+        &server,
+        sse(&[
+            json!({"type": "message_start", "message": {"usage": {
+                "input_tokens": 5, "cache_creation_input_tokens": 20,
+                "cache_read_input_tokens": 100}}}),
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "thinking", "thinking": ""}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "thinking_delta", "thinking": "plan"}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "signature_delta", "signature": "SIG"}}),
+            json!({"type": "content_block_start", "index": 1,
+                   "content_block": {"type": "tool_use", "id": "t9", "name": "read", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "input_json_delta", "partial_json": "{\"p\""}}),
+            json!({"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "input_json_delta", "partial_json": ": 2}"}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+                   "usage": {"output_tokens": 9}}),
+            json!({"type": "message_stop"}),
+        ]),
+    )
+    .await;
+    let client = LlmClient::new(anthropic_config(&server));
+    let resp = client.chat(&request()).await.unwrap();
+    let msg = resp.choices[0].message.clone();
+    assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(
+        msg.tool_calls.as_ref().unwrap()[0].function.arguments,
+        "{\"p\": 2}"
+    );
+    let snap = client.usage_snapshot();
+    assert_eq!(snap.prompt_tokens, 125);
+    assert_eq!(snap.cached_tokens, 100);
+    assert_eq!(snap.cache_write_tokens, 20);
+
+    let mut req = request();
+    req.messages.push(msg);
+    req.messages.push(Message::tool_result("t9", "file"));
+    client.chat(&req).await.unwrap();
+    let b = &messages_bodies(&server).await[1];
+    assert_eq!(
+        b["messages"][1]["content"],
+        json!([
+            {"type": "thinking", "thinking": "plan", "signature": "SIG"},
+            {"type": "tool_use", "id": "t9", "name": "read", "input": {"p": 2}},
+        ])
+    );
+}
+
+#[tokio::test]
+async fn anthropic_edited_tool_arguments_drop_the_thinking_on_replay() {
+    let server = MockServer::start().await;
+    mount_model_caps(&server, true).await;
+    mount_messages(&server, text_stream("ok")).await;
+    let client = LlmClient::new(anthropic_config(&server));
+    let mut asst = Message::assistant_tool_calls(vec![crate::llm::ToolCall {
+        id: "t".into(),
+        r#type: "function".into(),
+        function: crate::llm::FunctionCall {
+            name: "read".into(),
+            arguments: "{\"p\":999}".into(),
+        },
+    }]);
+    asst.provider_blocks = Some(vec![
+        json!({"type": "thinking", "thinking": "x", "signature": "S"}),
+        json!({"type": "tool_use", "id": "t", "name": "read", "input": {"p": 1}}),
+    ]);
+    let mut req = request();
+    req.messages.push(asst);
+    req.messages.push(Message::tool_result("t", "r"));
+    client.chat(&req).await.unwrap();
+    let b = &messages_bodies(&server).await[0];
+    assert_eq!(
+        b["messages"][1]["content"],
+        json!([{"type": "tool_use", "id": "t", "name": "read", "input": {"p": 999}}])
+    );
+}
+
+#[tokio::test]
+async fn anthropic_refusal_is_a_non_retried_error() {
+    let server = MockServer::start().await;
+    mount_model_caps(&server, true).await;
+    mount_messages(
+        &server,
+        sse(&[
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+            json!({"type": "message_delta",
+                   "delta": {"stop_reason": "refusal", "stop_details": {"category": "cyber"}},
+                   "usage": {"output_tokens": 0}}),
+            json!({"type": "message_stop"}),
+        ]),
+    )
+    .await;
+    let client = LlmClient::new(anthropic_config(&server));
+    let err = client.chat(&request()).await.unwrap_err().to_string();
+    assert!(err.contains("refusal") && err.contains("cyber"), "{err}");
+    assert_eq!(messages_bodies(&server).await.len(), 1, "no retry");
+}
+
+#[tokio::test]
+async fn anthropic_stream_error_event_overloaded_is_retried() {
+    let server = MockServer::start().await;
+    mount_model_caps(&server, true).await;
+    mount_messages(
+        &server,
+        sse(&[json!({"type": "error",
+                     "error": {"type": "overloaded_error", "message": "Overloaded"}})]),
+    )
+    .await;
+    let client = LlmClient::new(anthropic_config(&server));
+    let err = client.chat(&request()).await.unwrap_err().to_string();
+    assert!(err.contains("overloaded_error"), "{err}");
+    assert_eq!(messages_bodies(&server).await.len(), 2, "1 try + 1 retry");
+}
+
+#[tokio::test]
+async fn anthropic_529_is_retried() {
+    let server = MockServer::start().await;
+    mount_model_caps(&server, true).await;
+    mount_messages(
+        &server,
+        ResponseTemplate::new(529).set_body_string("overloaded"),
+    )
+    .await;
+    let client = LlmClient::new(anthropic_config(&server));
+    assert!(client.chat(&request()).await.is_err());
+    assert_eq!(messages_bodies(&server).await.len(), 2);
+}
+
+#[tokio::test]
+async fn anthropic_max_tokens_stop_maps_to_length() {
+    let server = MockServer::start().await;
+    mount_model_caps(&server, true).await;
+    mount_messages(
+        &server,
+        sse(&[
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "text_delta", "text": "cut"}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"},
+                   "usage": {"output_tokens": 3}}),
+            json!({"type": "message_stop"}),
+        ]),
+    )
+    .await;
+    let client = LlmClient::new(anthropic_config(&server));
+    let resp = client.chat(&request()).await.unwrap();
+    assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("length"));
+}
+
+#[tokio::test]
+async fn anthropic_non_streaming_json_body_is_accepted() {
+    let server = MockServer::start().await;
+    mount_model_caps(&server, true).await;
+    mount_messages(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "type": "message", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "whole"}],
+            "usage": {"input_tokens": 4, "output_tokens": 2}
+        })),
+    )
+    .await;
+    let client = LlmClient::new(anthropic_config(&server));
+    let mut streamed = String::new();
+    let resp = client
+        .chat_stream(
+            &request(),
+            |t| streamed.push_str(t),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.choices[0].message.content.as_deref(), Some("whole"));
+    assert_eq!(streamed, "whole");
 }

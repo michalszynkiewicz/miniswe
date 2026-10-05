@@ -396,7 +396,7 @@ pub async fn force_compress(
 /// message list every round. Lets `refresh_current_state` find-and-strip
 /// whatever it previously appended before appending a fresh copy, so at
 /// most one live copy exists at a time, always on the last message.
-const CURRENT_STATE_MARKER: &str = "\n\n[CURRENT STATE]\n";
+pub(crate) const CURRENT_STATE_MARKER: &str = "\n\n[CURRENT STATE]\n";
 
 /// Build the current-state block (plan + scratchpad), or `None` if both are
 /// empty.

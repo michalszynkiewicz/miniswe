@@ -131,10 +131,11 @@ impl SessionLog {
             return;
         }
         self.write(&format!(
-            "[usage] prompt={} completion={} cached={} total={}",
+            "[usage] prompt={} completion={} cached={} cache_write={} total={}",
             usage.prompt_tokens,
             usage.completion_tokens,
             usage.cached_tokens(),
+            usage.cache_write_tokens(),
             usage.total_tokens
         ));
     }
@@ -143,10 +144,11 @@ impl SessionLog {
     /// client the router used. Call once, right before `session_end`.
     pub fn usage_total(&self, usage: &crate::llm::providers::UsageSnapshot) {
         self.write(&format!(
-            "[usage:total] prompt={} completion={} cached={} total={} calls={}",
+            "[usage:total] prompt={} completion={} cached={} cache_write={} total={} calls={}",
             usage.prompt_tokens,
             usage.completion_tokens,
             usage.cached_tokens,
+            usage.cache_write_tokens,
             usage.total_tokens(),
             usage.calls
         ));
