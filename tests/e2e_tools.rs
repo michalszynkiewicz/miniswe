@@ -920,13 +920,13 @@ fn tools_has_grouped_tools() {
 fn tool_output_budget_scales_with_context() {
     let mut config = miniswe::config::Config::default();
 
-    config.model.context_window = 32000;
+    config.model.context_window = Some(32000);
     assert_eq!(config.tool_output_budget_chars(), 3200);
 
-    config.model.context_window = 50000;
+    config.model.context_window = Some(50000);
     assert_eq!(config.tool_output_budget_chars(), 5000);
 
-    config.model.context_window = 128000;
+    config.model.context_window = Some(128000);
     assert_eq!(config.tool_output_budget_chars(), 12800);
 }
 
@@ -1054,7 +1054,7 @@ fn compressor_no_op_when_under_budget() {
         .filter(|m| m.role != "system")
         .map(|m| miniswe::context::estimate_tokens(m.content.as_deref().unwrap_or("")))
         .sum();
-    let budget = config.model.context_window / 4;
+    let budget = config.model.context_window() / 4;
 
     assert!(
         total_tokens < budget,

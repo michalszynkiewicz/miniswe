@@ -51,6 +51,18 @@ pub fn models_url(provider: Provider, endpoint: &str) -> String {
     }
 }
 
+/// llama.cpp's `/props` endpoint URL for an (already effective) endpoint.
+/// Strips a trailing `/` and a trailing `/v1` (every hosted provider's
+/// default endpoint, and any local endpoint pointed at an OpenAI-style
+/// base, carries one) before appending `/props`.
+pub fn props_url(endpoint: &str) -> String {
+    let base = endpoint
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    format!("{base}/props")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +98,22 @@ mod tests {
             "http://localhost:8464/v1/chat/completions"
         );
         assert_eq!(chat_url(Provider::Ollama, "http://x"), "http://x/api/chat");
+    }
+
+    #[test]
+    fn props_url_rules() {
+        assert_eq!(
+            props_url("http://localhost:8464/v1"),
+            "http://localhost:8464/props"
+        );
+        assert_eq!(
+            props_url("http://localhost:8464"),
+            "http://localhost:8464/props"
+        );
+        assert_eq!(
+            props_url("http://localhost:8464/"),
+            "http://localhost:8464/props"
+        );
     }
 
     #[test]

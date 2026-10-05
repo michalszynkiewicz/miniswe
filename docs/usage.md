@@ -15,7 +15,10 @@ Per-project overrides: `.miniswe/config.toml` (optional, overrides global).
 Key settings:
 - `model.endpoint` — LLM API URL (e.g., `http://localhost:8464`)
 - `model.model` — model name (e.g., `devstral-small-2`)
-- `model.context_window` — context size in tokens (default: 50000)
+- `model.context_window` — context size in tokens. Unset (the default) means
+  auto: taken from the server at startup (llama.cpp `/props`, vLLM
+  `max_model_len`, OpenRouter `context_length`), else 50000. A set value
+  always wins and is never validated against the server.
 - put your Serper key in `~/.miniswe/serper.key` to enable general web search
 - `logging.level` — log verbosity: `info`, `debug` (default), `trace`
 - `logging.enabled` — write session logs to `.miniswe/logs/` (default: true)

@@ -44,7 +44,7 @@ async fn run_strategy(strategy: CompactionStrategy, endpoint: &str) -> (usize, u
     let mut config = Config::default();
     config.model.endpoint = endpoint.to_string();
     config.model.model = "gemma-4-26B-A4B-it".to_string();
-    config.model.context_window = 60_000;
+    config.model.context_window = Some(60_000);
     config.context.compaction = strategy;
     config.tools.plan = false; // skip the plan-anchor early-return; compact directly
 

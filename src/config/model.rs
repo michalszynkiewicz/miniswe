@@ -10,6 +10,11 @@ use crate::llm::Provider;
 /// two can't drift.
 pub(crate) const DEFAULT_ENDPOINT: &str = "http://localhost:8464";
 
+/// Fallback context window (tokens) when neither the user configured one
+/// nor the server's startup probe reported one. See
+/// [`ModelConfig::context_window`].
+pub const DEFAULT_CONTEXT_WINDOW: usize = 50_000;
+
 /// Which named model slot to use for each role.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -55,8 +60,11 @@ pub struct ModelConfig {
     pub endpoint: String,
     /// Model name/identifier
     pub model: String,
-    /// Context window size in tokens
-    pub context_window: usize,
+    /// Context window in tokens. Unset (the default) means auto: taken
+    /// from the server's startup probe when it reports one, else 50000. A
+    /// configured value always wins and is never validated against the
+    /// server.
+    pub context_window: Option<usize>,
     /// Sampling temperature (low for code tasks)
     pub temperature: f64,
     /// Enable thinking-mode reasoning (`enable_thinking: true`) on the main
@@ -133,6 +141,12 @@ pub struct ModelConfig {
     /// since it's a runtime probe result, not user config.
     #[serde(skip)]
     pub probed_model: Option<String>,
+    /// Context window reported by the server's startup probe (llama.cpp
+    /// `/props`, vLLM `max_model_len`, OpenRouter `context_length`).
+    /// Skipped from (de)serialization since it's a runtime probe result,
+    /// not user config. See [`Self::context_window`].
+    #[serde(skip)]
+    pub probed_context_window: Option<usize>,
     /// How to interpret tool calls from the model. `auto` (default) accepts
     /// OpenAI JSON tool_calls and falls back to parsing Anthropic-style XML
     /// embedded in content when tool_calls is empty. `json` ignores XML;
@@ -263,6 +277,27 @@ impl ModelConfig {
         name.contains("laguna") || name.contains("gpt-oss")
     }
 
+    /// Effective context window: the configured value, else the server's
+    /// probed value, else [`DEFAULT_CONTEXT_WINDOW`]. A configured value
+    /// always wins and is never validated against what the server reports.
+    pub fn context_window(&self) -> usize {
+        self.context_window
+            .or(self.probed_context_window)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+    }
+
+    /// Where [`Self::context_window`]'s effective value came from:
+    /// `"config"`, `"server"`, or `"default"`.
+    pub fn context_window_source(&self) -> &'static str {
+        if self.context_window.is_some() {
+            "config"
+        } else if self.probed_context_window.is_some() {
+            "server"
+        } else {
+            "default"
+        }
+    }
+
     /// Parsed [`Provider`] for `self.provider`.
     pub fn provider_kind(&self) -> Provider {
         Provider::parse(&self.provider)
@@ -283,7 +318,7 @@ impl Default for ModelConfig {
             provider: "llama-cpp".into(),
             endpoint: DEFAULT_ENDPOINT.into(),
             model: "devstral-small-2".into(),
-            context_window: 50000,
+            context_window: None,
             temperature: 0.15,
             thinking: false,
             thinking_temperature: 0.6,
@@ -293,11 +328,39 @@ impl Default for ModelConfig {
             request_deadline_secs: default_request_deadline_secs(),
             max_retries: 6,
             probed_model: None,
+            probed_context_window: None,
             tool_call_format: ToolCallFormat::Auto,
             api_key: None,
             api_key_env: None,
             thinking_effort: default_thinking_effort(),
             thinking_budget_tokens: default_thinking_budget_tokens(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_window_precedence() {
+        // Configured value always wins, even over a probed one.
+        let mut config = ModelConfig {
+            context_window: Some(40_000),
+            probed_context_window: Some(60_000),
+            ..ModelConfig::default()
+        };
+        assert_eq!(config.context_window(), 40_000);
+        assert_eq!(config.context_window_source(), "config");
+
+        // No configured value: fall back to the server's probed value.
+        config.context_window = None;
+        assert_eq!(config.context_window(), 60_000);
+        assert_eq!(config.context_window_source(), "server");
+
+        // Neither configured nor probed: the hardcoded default.
+        config.probed_context_window = None;
+        assert_eq!(config.context_window(), DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(config.context_window_source(), "default");
     }
 }

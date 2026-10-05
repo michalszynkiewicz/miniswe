@@ -343,6 +343,122 @@ async fn hosted_probe_looks_up_the_configured_model_instead_of_taking_the_first(
 }
 
 #[tokio::test]
+async fn llama_cpp_probe_reads_context_window_from_props() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "test-model"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/props"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "default_generation_settings": {"n_ctx": 60000},
+            "total_slots": 1
+        })))
+        .mount(&server)
+        .await;
+
+    let client = LlmClient::new(config_for("llama-cpp", &server.uri()));
+    let probe = client.probe().await.expect("probe succeeds");
+    assert_eq!(probe.model, "test-model");
+    assert_eq!(probe.context_window, Some(60000));
+}
+
+#[tokio::test]
+async fn llama_cpp_probe_tolerates_missing_props_endpoint() {
+    // /props returning 404 (an older or stripped-down server) must not
+    // fail the probe — the model identity is still useful without a
+    // context window.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "test-model"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/props"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let client = LlmClient::new(config_for("llama-cpp", &server.uri()));
+    let probe = client
+        .probe()
+        .await
+        .expect("probe succeeds despite /props 404");
+    assert_eq!(probe.model, "test-model");
+    assert_eq!(probe.context_window, None);
+}
+
+#[tokio::test]
+async fn vllm_probe_reads_max_model_len_and_never_calls_props() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "test-model", "max_model_len": 32768}]
+        })))
+        .mount(&server)
+        .await;
+    // Deliberately not mounted: vllm's /v1/models already carried a
+    // window, so no /props request should ever go out.
+
+    let client = LlmClient::new(config_for("vllm", &server.uri()));
+    let probe = client.probe().await.expect("probe succeeds");
+    assert_eq!(probe.context_window, Some(32768));
+
+    let reqs = server.received_requests().await.unwrap();
+    assert!(
+        reqs.iter().all(|r| r.url.path() != "/props"),
+        "vllm probe must not fall through to /props when /v1/models already has a window"
+    );
+}
+
+#[tokio::test]
+async fn openrouter_probe_matches_context_length_of_configured_model() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"id": "openai/gpt-oss-120b", "context_length": 131072},
+                {"id": "test-model", "context_length": 200000},
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = config_for("openrouter", &server.uri());
+    config.api_key = Some("or-key".into());
+    let client = LlmClient::new(config);
+    let probe = client.probe().await.expect("probe succeeds");
+    assert_eq!(probe.context_window, Some(200000));
+}
+
+#[tokio::test]
+async fn openai_probe_has_no_context_window() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "test-model"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = config_for("openai", &server.uri());
+    config.api_key = Some("oa-key".into());
+    let client = LlmClient::new(config);
+    let probe = client.probe().await.expect("probe succeeds");
+    assert_eq!(probe.context_window, None);
+}
+
+#[tokio::test]
 async fn retry_after_429_then_200_succeeds() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

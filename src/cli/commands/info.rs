@@ -76,7 +76,13 @@ pub async fn run() -> Result<()> {
             config.model.api_key_env.as_deref(),
         )
     );
-    eprintln!("  Context window: {} tokens", config.model.context_window);
+    match config.model.context_window {
+        Some(n) => eprintln!("  Context window: {n} tokens"),
+        None => eprintln!(
+            "  Context window: auto (probed at startup, default {})",
+            crate::config::DEFAULT_CONTEXT_WINDOW
+        ),
+    }
     eprintln!("  Temperature: {}", config.model.temperature);
     eprintln!(
         "  Context budget: repo_map={}",

@@ -31,7 +31,7 @@ fn msg_token_cost(msg: &Message) -> usize {
 
 /// Check if compression is needed without doing it.
 pub fn needs_compression(messages: &[Message], config: &Config, tool_def_tokens: usize) -> bool {
-    let context_window = config.model.context_window;
+    let context_window = config.model.context_window();
     let available = context_window
         .saturating_sub(tool_def_tokens)
         .saturating_sub(context_window / 6);
@@ -50,7 +50,7 @@ pub fn needs_compression(messages: &[Message], config: &Config, tool_def_tokens:
 /// fixed overhead (tool definitions + output headroom). Shared by every
 /// strategy so they all fire at the same `raw_budget` threshold.
 fn budgets(config: &Config, tool_def_tokens: usize) -> (usize, usize) {
-    let context_window = config.model.context_window;
+    let context_window = config.model.context_window();
     let available = context_window
         .saturating_sub(tool_def_tokens)
         .saturating_sub(context_window / 6);
@@ -1093,7 +1093,7 @@ async fn llm_summarize_timeline(
     llm_worker: &LlmWorkerHandle,
     style: SummaryStyle,
 ) -> Option<String> {
-    let max_prompt_chars = router.config_for(ModelRole::Fast).context_window * 3;
+    let max_prompt_chars = router.config_for(ModelRole::Fast).context_window() * 3;
     // The stated budget and the hard cap must agree — asking for "under
     // 11k tokens" while capping at 1k invites truncated-mid-line output.
     let budget_tokens = budget_tokens.min(SUMMARY_MAX_TOKENS as usize);

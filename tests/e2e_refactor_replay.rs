@@ -81,7 +81,7 @@ fn real_gemma_config(project_root: std::path::PathBuf) -> miniswe::config::Confi
     config.model.provider = "llama-cpp".into();
     config.model.endpoint = endpoint;
     config.model.model = "gemma-4-26B-A4B-it".into();
-    config.model.context_window = 40000;
+    config.model.context_window = Some(40000);
     config.model.temperature = 0.2;
     config.model.max_output_tokens = 4000;
     config.model.max_retries = 3;

@@ -139,9 +139,15 @@ pub(crate) async fn generate(
                 && state.context_compact_retries < context::compressor::FORCE_COMPRESS_MAX_RETRIES
             {
                 state.context_compact_retries += 1;
-                if opts.compaction == CompactionUx::Interactive {
-                    ui.status("Context window exceeded — compacting and retrying.");
-                }
+                let n = ctx.config.model.context_window();
+                let source = ctx.config.model.context_window_source();
+                let warning = format!(
+                    "⚠ Context window exceeded — compacting and retrying. Effective \
+                     context_window = {n} ({source}); if this repeats, set \
+                     model.context_window below the server's real window."
+                );
+                ui.status(&warning);
+                tracing::warn!("{warning}");
                 if ui
                     .pump(context::compressor::force_compress(
                         messages,
@@ -154,9 +160,6 @@ pub(crate) async fn generate(
                 {
                     ctx.log
                         .llm_error("context window exceeded — compacted history, retrying");
-                    if opts.compaction == CompactionUx::Batch {
-                        ui.status("Context window exceeded — compacting and retrying.");
-                    }
                     return LlmFlow::Retry;
                 }
                 // Nothing could be freed — retrying would fail identically.
@@ -231,7 +234,7 @@ pub(crate) async fn generate(
                 // (the server clamps generation to the remaining room):
                 // a hint can't fix that, compaction can.
                 if context::compressor::estimated_context_tokens(messages, ctx.tool_def_tokens)
-                    > ctx.config.model.context_window * 3 / 4
+                    > ctx.config.model.context_window() * 3 / 4
                     && state.context_compact_retries
                         < context::compressor::FORCE_COMPRESS_MAX_RETRIES
                 {
@@ -324,7 +327,7 @@ pub(crate) async fn generate(
         max_tokens_override.unwrap_or(ctx.config.model.max_output_tokens as u64) as usize;
     if is_context_truncated_response(&response, effective_max_tokens)
         && context::compressor::estimated_context_tokens(messages, ctx.tool_def_tokens)
-            > ctx.config.model.context_window * 3 / 4
+            > ctx.config.model.context_window() * 3 / 4
         && state.context_compact_retries < context::compressor::FORCE_COMPRESS_MAX_RETRIES
     {
         state.context_compact_retries += 1;

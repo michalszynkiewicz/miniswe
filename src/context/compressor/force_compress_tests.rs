@@ -15,7 +15,7 @@ fn config_in(dir: &std::path::Path, strategy: CompactionStrategy) -> Config {
     config.ensure_session_dir().unwrap();
     config.model.endpoint = "http://127.0.0.1:9".into();
     config.model.max_retries = 0;
-    config.model.context_window = 60_000;
+    config.model.context_window = Some(60_000);
     config.context.compaction = strategy;
     config
 }

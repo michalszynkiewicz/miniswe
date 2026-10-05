@@ -26,8 +26,12 @@ pub async fn run(
     // Probe the server for the actual model identity before building the
     // tool list — model-family checks need the server-reported name, not
     // the user's config alias. Probe failure leaves probed_model = None
-    // and we fall back to the config string.
-    config.model.probed_model = router.probe_default_model().await.ok();
+    // and we fall back to the config string. Also picks up the server's
+    // reported context window (probed_context_window), used when the user
+    // didn't configure one explicitly — see `ModelConfig::context_window`.
+    let probe = router.probe_default().await.ok();
+    config.model.probed_model = probe.as_ref().map(|p| p.model.clone());
+    config.model.probed_context_window = probe.and_then(|p| p.context_window);
     let llm_worker = LlmWorkerHandle::new(router.clone(), config.runtime.llm_concurrency);
     let perms = Arc::new(if headless {
         PermissionManager::headless(&config)

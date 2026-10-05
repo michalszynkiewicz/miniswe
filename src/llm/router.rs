@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::Result;
 
 use super::providers::UsageSnapshot;
-use super::{ChatRequest, ChatResponse, LlmClient};
+use super::{ChatRequest, ChatResponse, LlmClient, ProbeResult};
 use crate::config::{Config, ModelConfig, ModelRole};
 
 /// Routes LLM requests to the appropriate client based on model role.
@@ -110,11 +110,14 @@ impl ModelRouter {
         &self.config_for(role).model
     }
 
-    /// Probe the default-role endpoint for the model it's actually serving.
-    /// Used at startup to populate `ModelConfig::probed_model`, which drives
-    /// model-family checks more reliably than the user-supplied config alias.
-    pub async fn probe_default_model(&self) -> anyhow::Result<String> {
-        self.client_for(ModelRole::Default).probe_model().await
+    /// Probe the default-role endpoint for the model it's actually serving
+    /// and the context window it reports. Used at startup to populate
+    /// `ModelConfig::probed_model` (drives model-family checks more
+    /// reliably than the user-supplied config alias) and
+    /// `ModelConfig::probed_context_window` (the auto context-window
+    /// fallback, used when the user didn't configure one explicitly).
+    pub async fn probe_default(&self) -> anyhow::Result<ProbeResult> {
+        self.client_for(ModelRole::Default).probe().await
     }
 
     /// Probe each distinct endpoint we route to and format one line per
@@ -149,8 +152,19 @@ impl ModelRouter {
                 continue;
             };
             let endpoint = client.endpoint();
-            match client.probe_model().await {
-                Ok(model) => lines.push(format!("Model: {model} @ {endpoint}")),
+            match client.probe().await {
+                Ok(probe) => {
+                    let (n, source) =
+                        match (client.configured_context_window(), probe.context_window) {
+                            (Some(n), _) => (n, "config"),
+                            (None, Some(n)) => (n, "server"),
+                            (None, None) => (crate::config::DEFAULT_CONTEXT_WINDOW, "default"),
+                        };
+                    lines.push(format!(
+                        "Model: {} @ {endpoint} — context {n} ({source})",
+                        probe.model
+                    ));
+                }
                 Err(e) => lines.push(format!("Model: (probe failed: {e}) @ {endpoint}")),
             }
         }

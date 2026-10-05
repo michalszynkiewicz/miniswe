@@ -5,7 +5,7 @@ use crate::config::Config;
 // A ~400-char message is ~100 tokens, so a handful of them blows the budget.
 fn cfg() -> Config {
     let mut c = Config::default();
-    c.model.context_window = 1200;
+    c.model.context_window = Some(1200);
     c
 }
 fn blob() -> String {

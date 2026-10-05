@@ -18,7 +18,7 @@ pub(super) async fn execute_preplanned_steps(
     baseline_lsp_errors: Option<usize>,
     perms: Option<&PermissionManager>,
 ) -> Result<PreplanResult> {
-    let max_literal_lines = max_literal_replace_lines(config.model.context_window);
+    let max_literal_lines = max_literal_replace_lines(config.model.context_window());
     let mut current = original.to_string();
     let mut repair_context: Option<RepairContext> = None;
     // Track the best (lowest) candidate LSP error count observed across
