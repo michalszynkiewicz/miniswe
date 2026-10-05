@@ -59,6 +59,13 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The assistant turn's raw Anthropic content blocks (thinking, text,
+    /// tool_use, anything unknown), verbatim, so the next request can replay
+    /// them with their signatures. `serde(skip)` keeps it out of every
+    /// OpenAI-shaped body; the Anthropic request builder only trusts it
+    /// while it still matches `content` / `tool_calls`.
+    #[serde(skip)]
+    pub provider_blocks: Option<Vec<Value>>,
 }
 
 impl Message {
@@ -69,6 +76,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            provider_blocks: None,
         }
     }
 
@@ -79,6 +87,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            provider_blocks: None,
         }
     }
 
@@ -89,6 +98,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            provider_blocks: None,
         }
     }
 
@@ -99,6 +109,7 @@ impl Message {
             tool_calls: Some(tool_calls),
             tool_call_id: None,
             name: None,
+            provider_blocks: None,
         }
     }
 
@@ -109,6 +120,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             name: None,
+            provider_blocks: None,
         }
     }
 
@@ -186,6 +198,10 @@ pub struct Usage {
 pub struct PromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: usize,
+    /// Tokens written to a provider-side cache on this call (Anthropic
+    /// `cache_creation_input_tokens`; OpenRouter spells it the same).
+    #[serde(default)]
+    pub cache_write_tokens: usize,
 }
 
 impl Usage {
@@ -195,6 +211,14 @@ impl Usage {
         self.prompt_tokens_details
             .as_ref()
             .map(|d| d.cached_tokens)
+            .unwrap_or(0)
+    }
+
+    /// How many of `prompt_tokens` were written to a provider-side cache.
+    pub fn cache_write_tokens(&self) -> usize {
+        self.prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cache_write_tokens)
             .unwrap_or(0)
     }
 }

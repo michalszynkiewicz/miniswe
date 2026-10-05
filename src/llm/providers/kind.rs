@@ -79,9 +79,18 @@ impl Provider {
     /// True if usage must be requested explicitly via
     /// `stream_options: {include_usage: true}`. OpenRouter (like the local
     /// dialects) already includes usage in its final stream chunk with no
-    /// flag needed; only OpenAI and Anthropic require asking for it.
+    /// flag needed; only OpenAI requires asking for it (Anthropic speaks its
+    /// native wire format, where usage is always in the stream).
     pub fn wants_stream_usage(self) -> bool {
-        matches!(self, Provider::OpenAi | Provider::Anthropic)
+        matches!(self, Provider::OpenAi)
+    }
+
+    /// Whether a trailing partial assistant message is continued by the
+    /// model (a "prefill"). The local chat templates do; Anthropic rejects
+    /// it with a 400 on current models and OpenAI starts a fresh reply
+    /// instead of continuing.
+    pub fn supports_prefill(self) -> bool {
+        !matches!(self, Provider::OpenAi | Provider::Anthropic)
     }
 }
 
@@ -138,12 +147,27 @@ mod tests {
     }
 
     #[test]
-    fn only_openai_and_anthropic_want_explicit_stream_usage() {
+    fn only_openai_wants_explicit_stream_usage() {
         // OpenRouter already includes usage in its final stream chunk with
-        // no flag needed, same as the local dialects — only OpenAI and
-        // Anthropic require `stream_options.include_usage`.
+        // no flag needed, same as the local dialects — only OpenAI requires
+        // `stream_options.include_usage`; Anthropic has its own wire format.
         assert!(!Provider::OpenRouter.wants_stream_usage());
         assert!(Provider::OpenAi.wants_stream_usage());
-        assert!(Provider::Anthropic.wants_stream_usage());
+        assert!(!Provider::Anthropic.wants_stream_usage());
+    }
+
+    #[test]
+    fn openai_and_anthropic_do_not_support_prefill() {
+        assert!(!Provider::OpenAi.supports_prefill());
+        assert!(!Provider::Anthropic.supports_prefill());
+        for p in [
+            Provider::LlamaCpp,
+            Provider::Ollama,
+            Provider::Vllm,
+            Provider::OpenAiCompatible,
+            Provider::OpenRouter,
+        ] {
+            assert!(p.supports_prefill(), "{}", p.name());
+        }
     }
 }

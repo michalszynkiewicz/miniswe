@@ -177,6 +177,11 @@ pub struct ModelConfig {
     /// used when `thinking = true` and the provider is `anthropic`.
     #[serde(default = "default_thinking_budget_tokens")]
     pub thinking_budget_tokens: usize,
+    /// Send `fallbacks: "default"` on Anthropic models that support it, so a
+    /// classifier decline is re-run server-side on another model instead of
+    /// ending the turn. Ignored by every other provider.
+    #[serde(default = "default_true")]
+    pub anthropic_fallbacks: bool,
 }
 
 /// Wire format we expect the model to use for tool invocations.
@@ -203,6 +208,10 @@ fn default_request_deadline_secs() -> u64 {
 
 fn default_thinking_effort() -> String {
     "medium".into()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_thinking_budget_tokens() -> usize {
@@ -334,6 +343,7 @@ impl Default for ModelConfig {
             api_key_env: None,
             thinking_effort: default_thinking_effort(),
             thinking_budget_tokens: default_thinking_budget_tokens(),
+            anthropic_fallbacks: true,
         }
     }
 }

@@ -1,5 +1,6 @@
-//! The OpenAI-compatible HTTP client: streaming, idle-timeout sizing,
-//! retries, and optional request-body dumping.
+//! The LLM HTTP client: streaming (OpenAI chat-completions and the native
+//! Anthropic Messages wire format), idle-timeout sizing, retries, and
+//! optional request-body dumping.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,10 +17,11 @@ use super::errors::{
     has_tool_call_leak, is_retryable_llm_error, retry_after_from_message, retry_after_secs,
     with_retry_after_marker,
 };
-use super::normalize::normalize_xml_tool_calls;
+use super::openai_stream::OpenAiStream;
+use super::providers::anthropic::{self, AnthropicStream, ModelCaps};
 use super::providers::{self, Provider, UsageSnapshot, UsageTotals};
-use super::tool_call_repair::{TOOL_CALL_ARGS_CAP_MARKER, tool_call_args_cap};
 use super::types::*;
+use super::wire::StreamParser;
 
 /// Cap on how long a 429's `Retry-After` can push a retry wait to. Honoring
 /// the server's requested cooldown is the point, but an unbounded or
@@ -156,6 +158,16 @@ pub struct LlmClient {
     /// holds a clone (cheap — just an `Arc` bump) so usage can be read back
     /// after the client has been handed off to a router.
     usage: Arc<UsageTotals>,
+    /// Anthropic model capabilities, looked up once before the first chat
+    /// (see `providers::anthropic::caps`). Unused for other providers.
+    anthropic_caps: tokio::sync::OnceCell<ModelCaps>,
+}
+
+/// A request ready to send: the JSON body plus the `anthropic-beta` header
+/// value it needs, if any.
+struct PreparedRequest {
+    body: Value,
+    beta: Option<String>,
 }
 
 impl LlmClient {
@@ -183,12 +195,42 @@ impl LlmClient {
             api_key,
             endpoint,
             usage: Arc::new(UsageTotals::new()),
+            anthropic_caps: tokio::sync::OnceCell::new(),
         }
     }
 
     /// Build the API URL based on provider type.
     fn chat_url(&self) -> String {
         providers::chat_url(self.provider, &self.endpoint)
+    }
+
+    /// Build the wire request for this client's provider. Everything but
+    /// Anthropic goes through `providers::build_body`, the single choke point
+    /// for the OpenAI-shaped dialects; Anthropic gets its own Messages body
+    /// shaped by the model's capabilities.
+    async fn prepare(&self, request: &ChatRequest) -> Result<PreparedRequest> {
+        if self.provider != Provider::Anthropic {
+            return Ok(PreparedRequest {
+                body: providers::build_body(self.provider, &self.config, request)?,
+                beta: None,
+            });
+        }
+        let caps = self
+            .anthropic_caps
+            .get_or_init(|| {
+                anthropic::lookup_caps(
+                    &self.client,
+                    &self.endpoint,
+                    &self.config.model,
+                    self.api_key.as_deref(),
+                )
+            })
+            .await;
+        let built = anthropic::build_request(&self.config, request, caps)?;
+        Ok(PreparedRequest {
+            body: built.body,
+            beta: built.beta,
+        })
     }
 
     /// Ask the server what model it's actually serving, via `/v1/models`
@@ -389,6 +431,7 @@ impl LlmClient {
                 u.prompt_tokens as u64,
                 u.completion_tokens as u64,
                 u.cached_tokens() as u64,
+                u.cache_write_tokens() as u64,
             );
         }
     }
@@ -417,8 +460,8 @@ impl LlmClient {
         // though the public API returns a single ChatResponse to the
         // caller. `build_body` is the single choke point for everything
         // provider-specific — see `providers::shape`.
-        let mut body = providers::build_body(self.provider, &self.config, request)?;
-        maybe_dump_request(&body);
+        let mut prepared = self.prepare(request).await?;
+        maybe_dump_request(&prepared.body);
         let connect_timeout = Duration::from_secs(self.config.request_timeout_secs);
 
         let mut attempt = 0usize;
@@ -442,14 +485,14 @@ impl LlmClient {
             // cache_prompt to false mid-loop, and a cold prefill needs the
             // wider idle window.
             let idle_timeout = attempt_idle_timeout(
-                &body,
+                &prepared.body,
                 self.config.stream_idle_timeout_secs,
                 self.config.request_deadline_secs,
             );
             let result = self
                 .stream_once_assembled(
                     &url,
-                    &body,
+                    &prepared,
                     connect_timeout,
                     idle_timeout,
                     cancelled,
@@ -458,7 +501,13 @@ impl LlmClient {
                 .await;
 
             match result {
-                Ok(resp) if !cache_busted && has_tool_call_leak(&resp) => {
+                // A leak is a llama.cpp chat-template artifact; it never applies to
+                // Anthropic's native wire format.
+                Ok(resp)
+                    if !cache_busted
+                        && self.provider != Provider::Anthropic
+                        && has_tool_call_leak(&resp) =>
+                {
                     // Devstral occasionally emits chat-template tokens
                     // ([TOOL_CALLS]/[ARGS]) embedded inside tool-call
                     // arguments. Verbatim replay shows this is not bytes-
@@ -470,7 +519,7 @@ impl LlmClient {
                     // begin with (`build_body` strips it) — don't add it
                     // back just for this retry.
                     if !self.provider.strips_llama_fields() {
-                        body["cache_prompt"] = Value::Bool(false);
+                        prepared.body["cache_prompt"] = Value::Bool(false);
                     }
                     cache_busted = true;
                     continue;
@@ -517,11 +566,13 @@ impl LlmClient {
     /// `ChatResponse`. `on_token` fires once per content delta — pass a
     /// no-op closure if the caller is not surfacing intermediate tokens
     /// to the UI. Used by both `chat_with_cancel` (no-op) and
-    /// `chat_stream` (live UI callback).
+    /// `chat_stream` (live UI callback). The wire format of the events
+    /// (OpenAI chat-completions vs Anthropic Messages) is the only thing
+    /// that varies; everything here is shared.
     async fn stream_once_assembled<F: FnMut(&str)>(
         &self,
         url: &str,
-        body: &Value,
+        request: &PreparedRequest,
         connect_timeout: Duration,
         idle_timeout: Duration,
         cancelled: Option<&AtomicBool>,
@@ -530,13 +581,16 @@ impl LlmClient {
         // The initial connect/HTTP-handshake gets the wall-clock timeout —
         // we don't want to dial forever if the server is unreachable.
         let connect_future = async {
-            let request = providers::apply_auth(
+            let mut builder = providers::apply_auth(
                 self.client.post(url),
                 self.provider,
                 self.api_key.as_deref(),
             )
-            .json(body);
-            request
+            .json(&request.body);
+            if let Some(beta) = &request.beta {
+                builder = builder.header("anthropic-beta", beta);
+            }
+            builder
                 .send()
                 .await
                 .with_context(|| format!("Failed to connect to LLM at {url}"))
@@ -578,6 +632,40 @@ impl LlmClient {
             );
         }
 
+        match self.provider {
+            Provider::Anthropic => {
+                self.drain_response(
+                    response,
+                    AnthropicStream::new(),
+                    idle_timeout,
+                    cancelled,
+                    on_token,
+                )
+                .await
+            }
+            _ => {
+                self.drain_response(
+                    response,
+                    OpenAiStream::new(self.config.tool_call_format),
+                    idle_timeout,
+                    cancelled,
+                    on_token,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Read one successful response through `parser`, whichever shape it
+    /// came back in.
+    async fn drain_response<P: StreamParser, F: FnMut(&str)>(
+        &self,
+        response: reqwest::Response,
+        mut parser: P,
+        idle_timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+        on_token: &mut F,
+    ) -> Result<ChatResponse> {
         // Servers that honor `stream: true` return text/event-stream;
         // some servers (and our test mocks) ignore the flag and return
         // a single application/json body. We dispatch on Content-Type
@@ -592,28 +680,12 @@ impl LlmClient {
 
         if !is_sse {
             return self
-                .read_non_streaming_body(response, idle_timeout, cancelled, on_token)
+                .read_non_streaming_body(response, parser, idle_timeout, cancelled, on_token)
                 .await;
         }
 
         let mut stream = response.bytes_stream();
-        let mut full_content = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut current_tool_call_parts: std::collections::HashMap<
-            usize,
-            (String, String, String),
-        > = std::collections::HashMap::new();
         let mut sse_buf = String::new();
-        // Warn at most once per stream if the server omits tool_call index;
-        // a broken server would otherwise spam a line per delta.
-        let mut warned_missing_index = false;
-        // Real finish_reason/usage from the stream (the final chunks carry
-        // them). finish_reason matters downstream: "length" is the only
-        // signal that a generation was cut off by the context ceiling
-        // rather than finishing on its own — see
-        // `is_context_truncated_response`.
-        let mut finish_reason: Option<String> = None;
-        let mut usage: Option<Usage> = None;
 
         loop {
             // Wrap each chunk read in an idle-timeout. If the model has
@@ -652,148 +724,26 @@ impl LlmClient {
             while let Some(idx) = sse_buf.find("\n\n") {
                 let event = sse_buf[..idx].to_string();
                 sse_buf.drain(..idx + 2);
-
-                let mut done = false;
-                for line in event.lines() {
-                    let line = line.trim();
-                    if line == "data: [DONE]" {
-                        done = true;
-                        break;
-                    }
-                    let Some(data) = line.strip_prefix("data: ") else {
-                        continue;
-                    };
-                    let Ok(parsed) = serde_json::from_str::<StreamChunk>(data) else {
-                        continue;
-                    };
-                    if let Some(u) = parsed.usage {
-                        usage = Some(u);
-                    }
-                    if let Some(choice) = parsed.choices.first() {
-                        if let Some(fr) = &choice.finish_reason {
-                            finish_reason = Some(fr.clone());
-                        }
-                        if let Some(content) = &choice.delta.content {
-                            on_token(content);
-                            full_content.push_str(content);
-                        }
-                        if let Some(tc_deltas) = &choice.delta.tool_calls {
-                            for tc_delta in tc_deltas {
-                                // Per OpenAI spec every tool-call delta carries `index`.
-                                // Guessing 0 would silently corrupt parallel calls by
-                                // merging stray deltas into call #0. Skip instead.
-                                let Some(idx) = tc_delta.index else {
-                                    if !warned_missing_index {
-                                        tracing::warn!(
-                                            "LLM stream: tool_call delta missing `index`; skipping. \
-                                             The server emitted a non-spec-compliant SSE chunk — \
-                                             if you see this often, the upstream tool call may be incomplete."
-                                        );
-                                        warned_missing_index = true;
-                                    }
-                                    continue;
-                                };
-                                let entry =
-                                    current_tool_call_parts.entry(idx).or_insert_with(|| {
-                                        (
-                                            tc_delta.id.clone().unwrap_or_default(),
-                                            String::new(),
-                                            String::new(),
-                                        )
-                                    });
-                                if let Some(id) = &tc_delta.id
-                                    && !id.is_empty()
-                                {
-                                    entry.0 = id.clone();
-                                }
-                                if let Some(func) = &tc_delta.function {
-                                    if let Some(name) = &func.name {
-                                        entry.1.push_str(name);
-                                    }
-                                    if let Some(args) = &func.arguments {
-                                        entry.2.push_str(args);
-                                        // Anchor-only tools never need more
-                                        // than a few hundred chars; a call
-                                        // growing past the cap is the model
-                                        // pasting code into an anchor field.
-                                        // Abort now (the server cancels the
-                                        // slot on disconnect) instead of
-                                        // burning minutes until the context
-                                        // ceiling truncates it anyway.
-                                        if let Some(cap) = tool_call_args_cap(&entry.1)
-                                            && entry.2.len() > cap
-                                        {
-                                            bail!(
-                                                "{TOOL_CALL_ARGS_CAP_MARKER}: `{}` arguments \
-                                                 reached {} chars (cap {cap}) — generation aborted",
-                                                entry.1,
-                                                entry.2.len()
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if done {
+                if parser.feed_event(&event, &mut *on_token)? {
                     break;
                 }
             }
         }
 
-        // Assemble tool calls from accumulated parts
-        let mut indices: Vec<usize> = current_tool_call_parts.keys().copied().collect();
-        indices.sort();
-        for idx in indices {
-            let Some((id, name, arguments)) = current_tool_call_parts.remove(&idx) else {
-                continue;
-            };
-            tool_calls.push(ToolCall {
-                id,
-                r#type: "function".into(),
-                function: FunctionCall { name, arguments },
-            });
-        }
-
-        let mut resp = ChatResponse {
-            choices: vec![Choice {
-                message: Message {
-                    role: "assistant".into(),
-                    content: if full_content.is_empty() {
-                        None
-                    } else {
-                        Some(full_content)
-                    },
-                    tool_calls: if tool_calls.is_empty() {
-                        None
-                    } else {
-                        Some(tool_calls)
-                    },
-                    tool_call_id: None,
-                    name: None,
-                },
-                // Real finish_reason from the stream when the server sent
-                // one; "stop" preserves the old behavior for servers/mocks
-                // that never emit it.
-                finish_reason: Some(finish_reason.unwrap_or_else(|| "stop".into())),
-            }],
-            usage,
-        };
-        normalize_xml_tool_calls(&mut resp, self.config.tool_call_format);
-        Ok(resp)
+        parser.finish()
     }
 
     /// Drain a non-streamed JSON response body chunk-by-chunk so the
     /// idle-timeout still applies (we don't want a hanging body to wedge
     /// the request indefinitely just because the server returned
     /// `application/json` instead of `text/event-stream`). After the
-    /// body finishes we parse it as a single `ChatResponse` and forward
-    /// any assistant text to `on_token` so streaming-style callers still
-    /// get one final UI update.
-    async fn read_non_streaming_body<F: FnMut(&str)>(
+    /// body finishes the parser turns it into a single `ChatResponse` and
+    /// any assistant text is forwarded to `on_token` so streaming-style
+    /// callers still get one final UI update.
+    async fn read_non_streaming_body<P: StreamParser, F: FnMut(&str)>(
         &self,
         response: reqwest::Response,
+        parser: P,
         idle_timeout: Duration,
         cancelled: Option<&AtomicBool>,
         on_token: &mut F,
@@ -829,9 +779,7 @@ impl LlmClient {
             buf.extend_from_slice(&chunk);
         }
 
-        let mut resp: ChatResponse =
-            serde_json::from_slice(&buf).context("Failed to parse LLM response")?;
-        normalize_xml_tool_calls(&mut resp, self.config.tool_call_format);
+        let resp = parser.finish_body(&buf)?;
         if let Some(content) = resp
             .choices
             .first()
@@ -867,8 +815,8 @@ impl LlmClient {
         let retry_delays = [1u64, 2, 4, 8, 16, 32];
         let max_retries = self.config.max_retries.min(retry_delays.len());
 
-        let body = providers::build_body(self.provider, &self.config, request)?;
-        maybe_dump_request(&body);
+        let prepared = self.prepare(request).await?;
+        maybe_dump_request(&prepared.body);
         let connect_timeout = Duration::from_secs(self.config.request_timeout_secs);
 
         let mut attempt = 0usize;
@@ -886,7 +834,7 @@ impl LlmClient {
             }
             let mut had_progress = false;
             let idle_timeout = attempt_idle_timeout(
-                &body,
+                &prepared.body,
                 self.config.stream_idle_timeout_secs,
                 self.config.request_deadline_secs,
             );
@@ -897,7 +845,7 @@ impl LlmClient {
                 };
                 self.stream_once_assembled(
                     &url,
-                    &body,
+                    &prepared,
                     connect_timeout,
                     idle_timeout,
                     Some(cancelled.as_ref()),

@@ -1,20 +1,23 @@
-//! LLM interface — OpenAI-compatible API client.
+//! LLM interface — OpenAI-compatible API client plus a native Anthropic
+//! Messages client.
 //!
 //! Supports llama.cpp server, Ollama, vLLM, and any OpenAI-compatible
 //! endpoint, plus the hosted providers OpenRouter, OpenAI, and Anthropic
-//! (via its OpenAI-compatibility layer) — see `providers` and
+//! (via its native Messages API) — see `providers` and
 //! `docs/hosted-providers.md`. Handles streaming responses and tool call
 //! parsing.
 
 mod client;
 mod errors;
 mod normalize;
+mod openai_stream;
 pub mod providers;
 pub mod router;
 #[cfg(test)]
 mod tests;
 pub mod tool_call_repair;
 mod types;
+mod wire;
 mod xml_tool_calls;
 
 pub use client::{LlmClient, ProbeResult};

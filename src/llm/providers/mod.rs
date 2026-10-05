@@ -1,13 +1,15 @@
 //! Provider dialect layer.
 //!
-//! Every provider miniswe speaks to shares the OpenAI chat-completions wire
-//! protocol at the top level; this module is the single place that decides
+//! Every provider miniswe speaks to except Anthropic shares the OpenAI
+//! chat-completions wire protocol at the top level; this module is the single place that decides
 //! the per-provider differences (default endpoint, auth headers, which
 //! fields go in the request body, output-cap field name, thinking/reasoning
 //! translation, usage reporting). See `docs/hosted-providers.md` for the
-//! full decision table. Type definitions and re-exports only — logic lives
+//! full decision table. Anthropic has its own wire format (`anthropic`).
+//! Type definitions and re-exports only — logic lives
 //! in the named submodules below.
 
+pub mod anthropic;
 mod auth;
 mod endpoint;
 mod kind;
@@ -40,7 +42,6 @@ pub enum Provider {
     OpenRouter,
     /// OpenAI (`https://api.openai.com/v1`).
     OpenAi,
-    /// Anthropic's OpenAI-compatibility layer (`https://api.anthropic.com/v1`).
-    /// Phase 1 only — the native Messages API client is phase 2.
+    /// Anthropic via its native Messages API (`https://api.anthropic.com/v1`).
     Anthropic,
 }

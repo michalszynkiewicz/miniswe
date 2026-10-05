@@ -116,17 +116,32 @@ pub(super) fn is_retryable_llm_error(err: &anyhow::Error) -> bool {
         || msg.contains("Stream read error")
         || msg.contains("connection reset")
         || msg.contains("connection closed")
+        || retryable_stream_error(&msg)
         || retryable_status_from_message(&msg).is_some()
 }
 
+/// Anthropic's mid-stream `error` events (`LLM API error (stream): <type>:
+/// <message>`) carry the same error types an HTTP status would; the
+/// transient ones retry like a 429/5xx.
+fn retryable_stream_error(msg: &str) -> bool {
+    ["overloaded_error", "api_error", "rate_limit_error"]
+        .iter()
+        .any(|t| msg.contains(&format!("LLM API error (stream): {t}")))
+}
+
 fn retryable_status_from_message(msg: &str) -> Option<StatusCode> {
+    // 529 is Anthropic's "overloaded".
+    let overloaded = StatusCode::from_u16(529).ok();
     for code in [
         StatusCode::TOO_MANY_REQUESTS,
         StatusCode::INTERNAL_SERVER_ERROR,
         StatusCode::BAD_GATEWAY,
         StatusCode::SERVICE_UNAVAILABLE,
         StatusCode::GATEWAY_TIMEOUT,
-    ] {
+    ]
+    .into_iter()
+    .chain(overloaded)
+    {
         if msg.contains(&format!("LLM API error ({code})")) {
             return Some(code);
         }
@@ -202,6 +217,35 @@ mod tests {
         assert!(is_retryable_llm_error(&err));
     }
 
+    #[test]
+    fn overloaded_and_5xx_are_retryable_but_400_401_are_not() {
+        for msg in [
+            "LLM API error (529 <unknown status code>): overloaded",
+            "LLM API error (500 Internal Server Error): x",
+            "LLM API error (502 Bad Gateway): x",
+            "LLM API error (503 Service Unavailable): x",
+            "LLM API error (504 Gateway Timeout): x",
+            "LLM API error (stream): overloaded_error: Overloaded",
+            "LLM API error (stream): api_error: Internal server error",
+            "LLM API error (stream): rate_limit_error: slow down",
+        ] {
+            assert!(
+                is_retryable_llm_error(&anyhow::anyhow!(msg.to_string())),
+                "{msg}"
+            );
+        }
+        for msg in [
+            "LLM API error (400 Bad Request): bad",
+            "LLM API error (401 Unauthorized): bad key",
+            "LLM API error (stream): invalid_request_error: nope",
+            "LLM refused the request (stop_reason=refusal, category=cyber)",
+        ] {
+            assert!(
+                !is_retryable_llm_error(&anyhow::anyhow!(msg.to_string())),
+                "{msg}"
+            );
+        }
+    }
     #[test]
     fn retry_after_marker_roundtrips() {
         let msg =

@@ -19,7 +19,7 @@ use crate::llm::types::ChatRequest;
 /// only, keyed on the probed model). Hosted dialects never see the kwarg
 /// itself, so this is the one signal they translate into their own shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Thinking {
+pub(super) enum Thinking {
     Off,
     /// On, with an explicit effort when the caller named one
     /// (`reasoning_effort`); `None` means "use `ModelConfig::thinking_effort`".
@@ -28,7 +28,7 @@ enum Thinking {
     },
 }
 
-fn thinking_requested(request: &ChatRequest) -> Thinking {
+pub(super) fn thinking_requested(request: &ChatRequest) -> Thinking {
     let Some(kwargs) = request.chat_template_kwargs.as_ref() else {
         return Thinking::Off;
     };
@@ -47,12 +47,6 @@ fn thinking_requested(request: &ChatRequest) -> Thinking {
     }
 }
 
-/// Extra room left above `thinking.budget_tokens` for the visible answer
-/// when Anthropic extended thinking is on: the API requires
-/// `max_tokens > budget_tokens`, and a bare `+1` would satisfy it while
-/// leaving no room for the reply.
-const ANTHROPIC_ANSWER_HEADROOM: u64 = 1024;
-
 /// Build the full JSON request body for `provider`. This replaces the
 /// duplicated body-building code that used to live directly in
 /// `LlmClient::chat_with_cancel` / `chat_stream` — both now call this
@@ -66,6 +60,8 @@ const ANTHROPIC_ANSWER_HEADROOM: u64 = 1024;
 /// `ChatRequest` itself serializes to (`messages`, `tools`,
 /// `tool_choice`). This is benchmarked code — see the wiremock test
 /// `llama_cpp_body_is_unchanged` for the exact key-set assertion.
+/// Not used for `Provider::Anthropic`, which has its own wire format (see
+/// `providers::anthropic`).
 pub fn build_body(
     provider: Provider,
     config: &ModelConfig,
@@ -77,15 +73,14 @@ pub fn build_body(
     body["stream"] = Value::Bool(true);
 
     let thinking = thinking_requested(request);
-    let thinking_on = thinking != Thinking::Off;
 
-    // --- temperature: sent for local dialects + OpenRouter, never for OpenAI
-    // or Anthropic. OpenAI's reasoning models (gpt-5 family) reject any
+    // --- temperature: sent for local dialects + OpenRouter, never for
+    // OpenAI. OpenAI's reasoning models (gpt-5 family) reject any
     // value other than the default even without reasoning requested —
     // confirmed live 2026-10-02 ("Unsupported value: 'temperature' does
-    // not support 0.15 with this model"); Anthropic deprecates it on
-    // current models. The 0.15 default exists for small local models.
-    let send_temperature = !matches!(provider, Provider::OpenAi | Provider::Anthropic);
+    // not support 0.15 with this model"). The 0.15 default exists for
+    // small local models.
+    let send_temperature = !matches!(provider, Provider::OpenAi);
     if send_temperature {
         body["temperature"] =
             Value::from(request.temperature_override.unwrap_or(config.temperature));
@@ -98,12 +93,6 @@ pub fn build_body(
     match provider {
         Provider::OpenAi => {
             body["max_completion_tokens"] = Value::from(max_tokens);
-        }
-        Provider::Anthropic if thinking_on => {
-            // Anthropic requires max_tokens to exceed thinking.budget_tokens;
-            // keep real headroom for the answer, not just the required +1.
-            let budget = config.thinking_budget_tokens as u64;
-            body["max_tokens"] = Value::from(max_tokens.max(budget + ANTHROPIC_ANSWER_HEADROOM));
         }
         _ => {
             body["max_tokens"] = Value::from(max_tokens);
@@ -137,18 +126,12 @@ pub fn build_body(
             Provider::OpenAi => {
                 body["reasoning_effort"] = Value::String(effort);
             }
-            Provider::Anthropic => {
-                body["thinking"] = json!({
-                    "type": "enabled",
-                    "budget_tokens": config.thinking_budget_tokens,
-                });
-            }
             _ => {}
         }
     }
 
     // --- usage: local dialects + OpenRouter get it unconditionally; OpenAI
-    // and Anthropic require asking for it explicitly ---
+    // requires asking for it explicitly ---
     if provider.wants_stream_usage() {
         body["stream_options"] = json!({ "include_usage": true });
     }
@@ -203,26 +186,6 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_never_sends_temperature_and_bumps_max_tokens_for_thinking() {
-        let config = ModelConfig {
-            provider: "anthropic".into(),
-            max_output_tokens: 100,
-            thinking_budget_tokens: 2048,
-            ..ModelConfig::default()
-        };
-        let mut req = request();
-        req.chat_template_kwargs = Some(json!({"enable_thinking": true}));
-        let body = build_body(Provider::Anthropic, &config, &req).unwrap();
-        assert!(body.get("temperature").is_none());
-        // budget + 1024 of answer headroom beats the configured 100.
-        assert_eq!(body["max_tokens"], Value::from(3072u64));
-        assert_eq!(
-            body["thinking"],
-            json!({"type": "enabled", "budget_tokens": 2048})
-        );
-    }
-
-    #[test]
     fn openrouter_gets_usage_without_stream_options() {
         let config = ModelConfig {
             provider: "openrouter".into(),
@@ -265,7 +228,5 @@ mod tests {
         req.chat_template_kwargs = Some(json!({"reasoning_effort": "none"}));
         let body = build_body(Provider::OpenRouter, &config, &req).unwrap();
         assert!(body.get("reasoning").is_none());
-        let body = build_body(Provider::Anthropic, &config, &req).unwrap();
-        assert!(body.get("thinking").is_none());
     }
 }
