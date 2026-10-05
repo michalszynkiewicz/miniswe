@@ -57,6 +57,7 @@ decides per provider:
 | output cap | `max_tokens` | `max_tokens` | `max_completion_tokens` | `max_tokens` |
 | `thinking = true` | `enable_thinking` kwarg | `reasoning: {effort}` | `reasoning_effort` | `thinking: {type: enabled, budget_tokens}`, `max_tokens` raised to at least budget + 1024 |
 | model probe | first id from `/v1/models`, 3s deadline | configured model looked up in the catalogue, 10s deadline | same | same, list fetched with `limit=1000` (paginated at 20) |
+| context window probe | `/props` `default_generation_settings.n_ctx` (llama-cpp); `max_model_len` (vllm/openai-compatible); none (ollama) | `context_length` from the catalogue entry | none (stays at 50000 unless configured) | none (stays at 50000 unless configured) |
 | `temperature` | sent | sent | never sent (gpt-5 family rejects values other than 1) | never sent (deprecated on current models) |
 | usage | from stream | final chunk | `stream_options.include_usage` | `stream_options.include_usage` |
 
@@ -74,8 +75,15 @@ opt-in `runtime.max_session_input_tokens` guard that stops the turn instead of
 grinding into a bill (a bench run is ~100 rounds × ~30k prompt tokens; the
 600-round cap is an order of magnitude more).
 
-`context_window` keeps its 50000 default on hosted providers on purpose:
-compaction at 50k bounds per-round cost. Raise it per model if wanted.
+`context_window` is unset by default, which means auto: taken from the
+server's startup probe when it reports one, else 50000 (see
+`ModelConfig::context_window`). OpenAI and Anthropic listings report no
+served window, so both stay at the 50000 fallback unless you configure a
+value explicitly. OpenRouter's catalogue does report `context_length`, and
+the probe uses it — meaning the effective window (and therefore per-round
+compaction cost) can jump to whatever the routed model's real window is. Set
+`context_window` explicitly on OpenRouter if you want per-round cost bounded
+regardless of which model you route to.
 
 Routing already fits: `[models.<slot>]` tables plus `[routing]` let the main
 role run on a hosted model while the fast role (summaries, edit apply,

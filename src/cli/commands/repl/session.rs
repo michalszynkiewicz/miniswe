@@ -28,8 +28,11 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
     // Fail fast on a missing hosted-provider API key, before the terminal
     // enters raw mode.
     router.check_credentials()?;
-    // Probe server for the actual model identity (see run.rs for rationale).
-    config.model.probed_model = router.probe_default_model().await.ok();
+    // Probe server for the actual model identity and context window (see
+    // run.rs for rationale).
+    let probe = router.probe_default().await.ok();
+    config.model.probed_model = probe.as_ref().map(|p| p.model.clone());
+    config.model.probed_context_window = probe.and_then(|p| p.context_window);
     let llm_worker = LlmWorkerHandle::new(router.clone(), config.runtime.llm_concurrency);
     let perms = Arc::new(if headless {
         PermissionManager::headless(&config)

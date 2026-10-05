@@ -17,7 +17,7 @@ pub mod tool_call_repair;
 mod types;
 mod xml_tool_calls;
 
-pub use client::LlmClient;
+pub use client::{LlmClient, ProbeResult};
 pub use errors::{
     TRUNCATED_TOOL_CALL_MARKER, is_context_exceeded_error, is_context_truncated_response,
     is_truncated_tool_call_error,

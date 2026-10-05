@@ -490,7 +490,7 @@ pub fn assemble(
     plan_only: bool,
     mcp_summary: Option<&str>,
 ) -> AssembledContext {
-    let budget = config.model.context_window;
+    let budget = config.model.context_window();
     let output_budget = config.model.max_output_tokens;
     let _input_budget = budget.saturating_sub(output_budget);
 

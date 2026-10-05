@@ -11,6 +11,7 @@
 mod auth;
 mod endpoint;
 mod kind;
+mod probe;
 mod shape;
 pub mod usage;
 
@@ -18,7 +19,8 @@ pub mod usage;
 mod tests;
 
 pub use auth::{api_key_source, apply_auth, resolve_api_key};
-pub use endpoint::{chat_url, effective_endpoint, models_url};
+pub use endpoint::{chat_url, effective_endpoint, models_url, props_url};
+pub use probe::{context_window_from_models, context_window_from_props};
 pub use shape::build_body;
 pub use usage::{UsageSnapshot, UsageTotals};
 

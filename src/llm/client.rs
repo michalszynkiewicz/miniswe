@@ -129,6 +129,14 @@ fn maybe_dump_request(body: &Value) {
     }
 }
 
+/// Result of probing a server at startup: the model it's actually serving,
+/// plus the context window it reports, if any. See [`LlmClient::probe`].
+#[derive(Debug, Clone)]
+pub struct ProbeResult {
+    pub model: String,
+    pub context_window: Option<usize>,
+}
+
 /// Client for communicating with an OpenAI-compatible LLM API.
 pub struct LlmClient {
     client: Client,
@@ -193,10 +201,31 @@ impl LlmClient {
     /// to come first. Short timeout so a dead endpoint doesn't stall
     /// startup.
     ///
+    /// Thin wrapper over [`Self::probe`] for callers that only need the
+    /// model identity.
+    pub async fn probe_model(&self) -> Result<String> {
+        self.probe().await.map(|p| p.model)
+    }
+
+    /// This client's own configured `context_window`, if the user set one
+    /// — `None` means auto (server-probed, else the hardcoded default).
+    /// Exposes only this one field, not the whole config.
+    pub fn configured_context_window(&self) -> Option<usize> {
+        self.config.context_window
+    }
+
+    /// Probe the server for both the model it's actually serving and the
+    /// context window it reports, in one round trip to `/v1/models` (or
+    /// `/api/tags` for Ollama) plus, for llama.cpp and openai-compatible
+    /// servers only, a second round trip to `/props` when the models
+    /// listing itself didn't carry a window.
+    ///
     /// Error messages are kept short and URL-free — the caller already
     /// displays the endpoint alongside the probe result, so we avoid
-    /// repeating it.
-    pub async fn probe_model(&self) -> Result<String> {
+    /// repeating it. A `/props` failure (unreachable, non-2xx, bad JSON,
+    /// missing field) never fails the overall probe — it just leaves
+    /// `context_window = None`, logged at `debug`.
+    pub async fn probe(&self) -> Result<ProbeResult> {
         let url = providers::models_url(self.provider, &self.endpoint);
         let ollama = matches!(self.provider, Provider::Ollama);
         let request = providers::apply_auth(
@@ -231,16 +260,77 @@ impl LlmClient {
             .flatten()
             .filter_map(|m| m[id_key].as_str())
             .collect();
-        if self.provider.is_hosted() {
-            return if ids.contains(&self.config.model.as_str()) {
-                Ok(self.config.model.clone())
+        let model = if self.provider.is_hosted() {
+            if ids.contains(&self.config.model.as_str()) {
+                self.config.model.clone()
             } else {
                 bail!("model {:?} not listed", self.config.model)
-            };
+            }
+        } else {
+            ids.first()
+                .map(|s| s.to_string())
+                .ok_or_else(|| anyhow::anyhow!("no models listed"))?
+        };
+
+        let mut context_window =
+            providers::context_window_from_models(self.provider, &body, &self.config.model);
+        if context_window.is_none()
+            && matches!(
+                self.provider,
+                Provider::LlamaCpp | Provider::OpenAiCompatible
+            )
+        {
+            context_window = self.probe_props().await;
         }
-        ids.first()
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow::anyhow!("no models listed"))
+
+        Ok(ProbeResult {
+            model,
+            context_window,
+        })
+    }
+
+    /// Best-effort fetch of llama.cpp's `/props` for the context window,
+    /// when the models listing didn't carry one. Never fails the caller —
+    /// any error just means `None`, logged at `debug` so it's visible
+    /// without being alarming (plenty of openai-compatible servers simply
+    /// don't implement this endpoint).
+    async fn probe_props(&self) -> Option<usize> {
+        let url = providers::props_url(&self.endpoint);
+        let request = providers::apply_auth(
+            self.client.get(&url),
+            self.provider,
+            self.api_key.as_deref(),
+        );
+        let resp = match tokio::time::timeout(Duration::from_secs(3), request.send()).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::debug!("context-window probe: GET {url} failed: {e}");
+                return None;
+            }
+            Err(_) => {
+                tracing::debug!("context-window probe: GET {url} timed out");
+                return None;
+            }
+        };
+        if !resp.status().is_success() {
+            tracing::debug!(
+                "context-window probe: GET {url} returned HTTP {}",
+                resp.status().as_u16()
+            );
+            return None;
+        }
+        let body: Value = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!("context-window probe: GET {url} returned bad JSON: {e}");
+                return None;
+            }
+        };
+        let window = providers::context_window_from_props(&body);
+        if window.is_none() {
+            tracing::debug!("context-window probe: {url} response had no n_ctx field");
+        }
+        window
     }
 
     /// The endpoint actually used for requests (after hosted-provider

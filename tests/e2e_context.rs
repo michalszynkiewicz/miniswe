@@ -573,7 +573,7 @@ fn assembly_produces_reasonable_token_estimate() {
         assembled.token_estimate
     );
     assert!(
-        assembled.token_estimate < config.model.context_window,
+        assembled.token_estimate < config.model.context_window(),
         "should be within context window"
     );
 }

@@ -340,7 +340,7 @@ impl Config {
     /// to fit unmasked. So each result ≈ context_window/40 tokens ≈ context_window/10 chars.
     /// For 32K context: ~3200 chars (~80 lines). For 50K: ~5000 chars (~125 lines).
     pub fn tool_output_budget_chars(&self) -> usize {
-        self.model.context_window / 10
+        self.model.context_window() / 10
     }
 
     /// Get the model config for a given role.

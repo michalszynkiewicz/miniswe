@@ -279,3 +279,73 @@ and require `steps`. Every other model in the round (gemma, Glimmer, Laguna S)
 already sends `steps`; Laguna XS instruct is the only one sending prose. Worth a
 3-arm A/B — (A) this fix alone, (B) fix + reworded contract, (C) `steps`
 required — measured on Laguna XS instruct with >=3 runs per arm.
+
+## Context window: table of recommended sizes per model
+
+Since the context-window probe (2026-10-04), an unset `model.context_window`
+takes the server's value (llama.cpp `/props` n_ctx, vLLM `max_model_len`,
+OpenRouter `context_length`), else 50000. That is the server's *capacity*, not
+the window the agent works best at. The one data point we have says bigger is
+worse: Mistral Small 4 at 120k was slower and failed where 60k passed (7 -> 20
+re-prefills, 0/6 both arms — see the 2026-08 probe), because the `[CURRENT
+STATE]` re-anchor rewrites a larger KV prefix every round and prompts grow until
+compaction. Every clean 6/6 on the scoreboard ran at 50-60k.
+
+So `auto` currently exposes a user running `llama-server -c 131072` to the slow
+regime, and on OpenRouter it removes the per-round cost bound (Claude probes to
+200k, Gemini to 1M).
+
+Wanted: a table of recommended working windows per model family, used as the
+auto value when the probed capacity exceeds it, with the startup line saying so
+(`context 60000 (server 131072, capped by table)`). A configured value keeps
+winning unvalidated.
+
+Starting rows (fill from the scoreboard, `docs/model-scoreboard.md`):
+
+| family | recommended | evidence |
+|---|---|---|
+| Gemma 4 26B / 31B | 60000 | all 6/6 runs at 60k (bench pin) |
+| Mistral Small 4 | 60000 | 120k probe refuted |
+| Laguna XS 2.1 | 60000 | 3/3 first-try at 60k |
+| Devstral / Glimmer | 60000 | bench pin |
+| hosted (OpenRouter/OpenAI/Anthropic) | 50000 | cost bound, `docs/hosted-providers.md` |
+| unknown | min(server, 64000) | ceiling until measured |
+
+Measure before promoting a row: >=3 runs per arm on the usual task at 60k vs the
+probed capacity, same launcher, server restarted between runs. Keyed on
+`probed_model` (server identity), not the config alias, like the other
+model-family checks in `src/config/model.rs`.
+
+## Multi-model mode: budgets read `[model]`, not the routed default slot
+
+Found during the context-window probe review (2026-10-04). With `[models]` +
+`[routing]` configured, the two halves of a run disagree about which model
+config is in force:
+
+- LLM calls, the startup probe (`ModelRouter::probe_default`) and the startup
+  `Model: ... context N (source)` line all use the slot `routing.default` names.
+- Every budget reads the plain `[model]` table through `config.model`:
+  compaction thresholds (`context/compressor.rs` `needs_compression` /
+  `budgets`), `Config::tool_output_budget_chars`, the literal-replace cap in
+  `tools/edit_file/preplan.rs`, context assembly, and the context-exceeded
+  warning's `(source)` label in `agent/turn/llm_call.rs`. The same goes for
+  `temperature`, `thinking`, `max_output_tokens` read off `config.model`.
+
+So a `context_window` set on `[models.main]` is ignored for budgeting, and the
+startup line can say `(config)` while the budget in force is the probed value or
+the 50000 default. Pre-existing (budgets never read the routed slot), but phase
+3 of `docs/hosted-providers.md` (hosted main + local fast) is exactly the
+config that trips it.
+
+Sub-point, same root: the router clones every slot's `ModelConfig` in
+`ModelRouter::new`, before the probe runs, so `probed_context_window` never
+reaches `router.config_for(..)`. The summarizer prompt cap
+(`router.config_for(ModelRole::Fast).context_window() * 3`) stays at 50000 in
+auto mode. Cost-only.
+
+Fix direction: one source of truth. At `Config::load`, when `[models]` is
+present, resolve the `routing.default` slot into `config.model` (or make every
+budget go through `Config::model_for_role(ModelRole::Default)`), and run the
+probe before the router clones its configs so the Fast/Plan slots see their own
+probed window. Add a test that loads a `[models]` config with a window on the
+main slot only and asserts `needs_compression` uses it.

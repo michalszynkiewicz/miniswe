@@ -19,7 +19,13 @@ pub async fn run() -> Result<()> {
         eprintln!("  effective_endpoint = \"{effective_endpoint}\"");
     }
     eprintln!("  model = \"{}\"", config.model.model);
-    eprintln!("  context_window = {}", config.model.context_window);
+    match config.model.context_window {
+        Some(n) => eprintln!("  context_window = {n}"),
+        None => eprintln!(
+            "  context_window = auto (probed at startup, default {})",
+            crate::config::DEFAULT_CONTEXT_WINDOW
+        ),
+    }
     eprintln!("  temperature = {}", config.model.temperature);
     eprintln!("  max_output_tokens = {}", config.model.max_output_tokens);
     eprintln!(
