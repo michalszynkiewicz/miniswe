@@ -30,6 +30,8 @@ mod ast;
 mod auto_revert;
 mod dispatch;
 mod feedback;
+#[cfg(feature = "lang-yaml")]
+mod helm;
 mod lines;
 mod revisions;
 mod rewind_candidate;

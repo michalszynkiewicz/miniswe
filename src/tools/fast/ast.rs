@@ -49,6 +49,14 @@ fn parse_check_supported_ext(_ext: &str) -> bool {
 pub fn parse_check_ext(ext: &str, content: &str) -> Result<(), String> {
     use tree_sitter::Parser;
 
+    // Go/Helm templates (`{{ … }}` in YAML, `.tpl`) are not plain YAML;
+    // everything about them lives in `helm.rs`, so a future Helm LSP can
+    // replace it by changing only this call.
+    #[cfg(feature = "lang-yaml")]
+    if let Some(result) = super::helm::check(ext, content, &yaml_check_scoped) {
+        return result;
+    }
+
     #[cfg(feature = "lang-yaml")]
     if ext == "yaml" || ext == "yml" {
         return yaml_check(content);
@@ -128,6 +136,18 @@ fn first_error(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
 /// almost always a bug — parsers silently last-value-wins).
 #[cfg(feature = "lang-yaml")]
 fn yaml_check(content: &str) -> Result<(), String> {
+    yaml_check_scoped(content, &|_, _| true)
+}
+
+/// `yaml_check` with a filter on duplicate-key reports: `comparable(a, b)`
+/// says whether keys at 0-based `(row, col)` positions `a` and `b` can both
+/// be present at once (always, for plain YAML; a template checker narrows
+/// it to keys rendered together).
+#[cfg(feature = "lang-yaml")]
+fn yaml_check_scoped(
+    content: &str,
+    comparable: &dyn Fn((usize, usize), (usize, usize)) -> bool,
+) -> Result<(), String> {
     use tree_sitter::Parser;
 
     let mut parser = Parser::new();
@@ -150,19 +170,23 @@ fn yaml_check(content: &str) -> Result<(), String> {
             start.column + 1
         ));
     }
-    yaml_check_dup_keys(root, content)
+    yaml_check_dup_keys(root, content, comparable)
 }
 
 /// Recursively walk the tree and report the first duplicate key in any mapping.
 #[cfg(feature = "lang-yaml")]
-fn yaml_check_dup_keys(node: tree_sitter::Node, src: &str) -> Result<(), String> {
+fn yaml_check_dup_keys(
+    node: tree_sitter::Node,
+    src: &str,
+    comparable: &dyn Fn((usize, usize), (usize, usize)) -> bool,
+) -> Result<(), String> {
     if node.kind() == "block_mapping" || node.kind() == "flow_mapping" {
         let pair_kind = if node.kind() == "block_mapping" {
             "block_mapping_pair"
         } else {
             "flow_pair"
         };
-        let mut seen: std::collections::HashMap<String, (usize, usize)> = Default::default();
+        let mut seen: std::collections::HashMap<String, Vec<(usize, usize)>> = Default::default();
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.kind() != pair_kind {
@@ -173,18 +197,22 @@ fn yaml_check_dup_keys(node: tree_sitter::Node, src: &str) -> Result<(), String>
                 let key_text = &src[key_node.start_byte()..key_node.end_byte()];
                 let row = key_node.start_position().row + 1;
                 let col = key_node.start_position().column + 1;
-                if let Some(&(prev_row, prev_col)) = seen.get(key_text) {
+                let prior = seen.entry(key_text.to_string()).or_default();
+                if let Some(&(prev_row, prev_col)) = prior
+                    .iter()
+                    .find(|&&(r, c)| comparable((r - 1, c - 1), (row - 1, col - 1)))
+                {
                     return Err(format!(
                         "{row}:{col}: duplicate key '{key_text}' (first defined at {prev_row}:{prev_col})"
                     ));
                 }
-                seen.insert(key_text.to_string(), (row, col));
+                prior.push((row, col));
             }
         }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        yaml_check_dup_keys(child, src)?;
+        yaml_check_dup_keys(child, src, comparable)?;
     }
     Ok(())
 }
