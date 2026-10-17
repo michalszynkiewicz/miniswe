@@ -88,9 +88,12 @@ impl Provider {
     /// Whether a trailing partial assistant message is continued by the
     /// model (a "prefill"). The local chat templates do; Anthropic rejects
     /// it with a 400 on current models and OpenAI starts a fresh reply
-    /// instead of continuing.
+    /// instead of continuing. OpenRouter forwards it to whichever upstream
+    /// serves the model, so Claude models routed through it hit the same
+    /// 400; it is treated as unsupported for every model rather than kept
+    /// for the open ones. That leaves the local dialects.
     pub fn supports_prefill(self) -> bool {
-        !matches!(self, Provider::OpenAi | Provider::Anthropic)
+        !self.is_hosted()
     }
 }
 
@@ -157,15 +160,15 @@ mod tests {
     }
 
     #[test]
-    fn openai_and_anthropic_do_not_support_prefill() {
-        assert!(!Provider::OpenAi.supports_prefill());
-        assert!(!Provider::Anthropic.supports_prefill());
+    fn hosted_providers_do_not_support_prefill() {
+        for p in [Provider::OpenAi, Provider::Anthropic, Provider::OpenRouter] {
+            assert!(!p.supports_prefill(), "{}", p.name());
+        }
         for p in [
             Provider::LlamaCpp,
             Provider::Ollama,
             Provider::Vllm,
             Provider::OpenAiCompatible,
-            Provider::OpenRouter,
         ] {
             assert!(p.supports_prefill(), "{}", p.name());
         }
