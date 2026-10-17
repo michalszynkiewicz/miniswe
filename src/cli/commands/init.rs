@@ -39,10 +39,8 @@ pub async fn run() -> Result<()> {
     // Create default config if it doesn't exist
     let config_path = miniswe_dir.join("config.toml");
     if !config_path.exists() {
-        let config = Config::default();
-        let config_content = toml::to_string_pretty(&config)?;
-        fs::write(&config_path, config_content)?;
-        tui::print_status("  Created default config.toml");
+        fs::write(&config_path, default_config_template()?)?;
+        tui::print_status("  Created config.toml (all settings commented out)");
     }
 
     // Create guide.md if it doesn't exist
@@ -138,9 +136,47 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// The project `config.toml` written by `init`: every default setting,
+/// commented out. A project file only overrides the keys it sets, so writing
+/// live defaults here would mask `~/.miniswe/config.toml` (e.g. a hosted
+/// `[model]`) for every initialized project.
+fn default_config_template() -> Result<String> {
+    let defaults = toml::to_string_pretty(&Config::default())?;
+    let mut out = String::from(
+        "# Per-project overrides for miniswe. Uncomment a key to override it for this\n\
+         # project only; everything left commented falls back to ~/.miniswe/config.toml,\n\
+         # then to the built-in defaults shown here. Keep API keys out of this file.\n\n",
+    );
+    for line in defaults.lines() {
+        if line.is_empty() {
+            out.push('\n');
+        } else {
+            out.push_str("# ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::default_config_template;
     use crate::config::Config;
+
+    #[test]
+    fn init_template_sets_nothing() {
+        let template = default_config_template().unwrap();
+        let parsed: toml::Table = toml::from_str(&template).unwrap();
+        assert!(
+            parsed.is_empty(),
+            "template must only hold comments:\n{template}"
+        );
+        assert!(
+            template.contains("# [model]"),
+            "template should list the defaults"
+        );
+    }
 
     /// `ModelConfig::api_key` is `skip_serializing_if = "Option::is_none"`
     /// and `Config::default()` leaves it `None` — this locks in that a

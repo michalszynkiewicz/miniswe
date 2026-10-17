@@ -1,11 +1,10 @@
 //! Secret inheritance across the global/project config layers.
 //!
-//! `Config::load()` replaces the global config wholesale with the project
-//! config when `.miniswe/config.toml` is present (it is not a deep merge).
-//! That means a secret set only in the global file — an API key the user
-//! deliberately keeps out of a project directory that may not gitignore
-//! it — would otherwise vanish the moment a project overrides anything
-//! else. This module is the one place that reinherits those fields.
+//! `Config::load()` deep-merges the project `.miniswe/config.toml` over the
+//! global one, so a secret set only in the global file — an API key the user
+//! deliberately keeps out of a project directory that may not gitignore it —
+//! already survives a project override. This module states that guarantee
+//! explicitly and is applied after the merge as a backstop.
 
 use super::{Config, ModelConfig};
 

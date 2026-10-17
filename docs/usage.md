@@ -10,7 +10,7 @@
 ## Configuration
 
 Global config: `~/.miniswe/config.toml` (API keys, model, hardware settings).
-Per-project overrides: `.miniswe/config.toml` (optional, overrides global).
+Per-project overrides: `.miniswe/config.toml` (optional, overrides global key by key; `miniswe init` writes it fully commented out).
 
 Key settings:
 - `model.endpoint` — LLM API URL (e.g., `http://localhost:8464`)
