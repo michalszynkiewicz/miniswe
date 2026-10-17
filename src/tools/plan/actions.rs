@@ -13,6 +13,34 @@ use super::hints::architecture_review_hint;
 use super::step::{Step, parse_steps, plan_preview, steps_to_markdown};
 use super::validate::{MAX_PLAN_STEPS, validate_steps};
 
+/// Byte-compiles every `.py` file under the cwd, skipping hidden, virtualenv
+/// and build directories. Uses `compile()` rather than `py_compile` so no
+/// `.pyc` files are written, and prints one `path:line: error: ...` line per
+/// failure to stderr (the only stream the runner keeps) so the gate's error
+/// filter picks them up.
+const PY_COMPILE_ALL: &str = r#"
+import os, sys
+SKIP = {"node_modules", "__pycache__", "venv", "env", "build", "dist", "site-packages", "target"}
+bad = 0
+for root, dirs, files in os.walk("."):
+    dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP
+               and not os.path.exists(os.path.join(root, d, "pyvenv.cfg"))]
+    for f in files:
+        if not f.endswith(".py"):
+            continue
+        path = os.path.join(root, f)[2:]
+        try:
+            with open(path, "rb") as fh:
+                compile(fh.read(), path, "exec")
+        except SyntaxError as e:
+            bad += 1
+            print(f"{path}:{e.lineno}: error: {type(e).__name__}: {e.msg}", file=sys.stderr)
+        except (OSError, ValueError) as e:
+            bad += 1
+            print(f"{path}: error: {e}", file=sys.stderr)
+sys.exit(1 if bad else 0)
+"#;
+
 /// Run the project-level compile check (language-agnostic).
 /// Returns (success, output).
 async fn run_compile_check(config: &Config) -> (bool, String) {
@@ -28,9 +56,7 @@ async fn run_compile_check(config: &Config) -> (bool, String) {
                 "--message-format=short".into(),
             ],
         )
-    } else if project_root.join("tsconfig.json").exists()
-        || project_root.join("package.json").exists()
-    {
+    } else if project_root.join("tsconfig.json").exists() {
         (
             "npx",
             vec![
@@ -44,7 +70,7 @@ async fn run_compile_check(config: &Config) -> (bool, String) {
         ("go", vec!["build".into(), "./...".into()])
     } else if project_root.join("pyproject.toml").exists() || project_root.join("setup.py").exists()
     {
-        ("python3", vec!["-m".into(), "py_compile".into()])
+        ("python3", vec!["-c".into(), PY_COMPILE_ALL.into()])
     } else if project_root.join("pom.xml").exists() {
         ("mvn", vec!["compile".into(), "-q".into()])
     } else if project_root.join("build.gradle").exists() {
@@ -225,11 +251,16 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
             if needs_compile {
                 let (success, output) = run_compile_check(config).await;
                 if !success {
-                    let error_lines: Vec<&str> = output
+                    let mut error_lines: Vec<&str> = output
                         .lines()
                         .filter(|l| l.contains("error") || l.starts_with("  "))
                         .take(30)
                         .collect();
+                    // A checker that fails without "error" in its output (e.g. a
+                    // usage message) would otherwise leave the model an empty list.
+                    if error_lines.is_empty() {
+                        error_lines = output.lines().take(30).collect();
+                    }
 
                     let mut msg = format!(
                         "✗ Step {step_num} compile gate FAILED. Cannot check off — project does not compile.\n\n"
@@ -367,5 +398,69 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
         _ => Ok(ToolResult::err(format!(
             "Unknown action: {action}. Use 'set', 'check', 'refine', 'show', or 'scratchpad'."
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_config(dir: &std::path::Path) -> Config {
+        let mut cfg = Config::default();
+        cfg.project_root = dir.to_path_buf();
+        cfg
+    }
+
+    fn python_project(src: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("pkg")).unwrap();
+        std::fs::write(tmp.path().join("pkg/mod.py"), src).unwrap();
+        tmp
+    }
+
+    #[tokio::test]
+    async fn python_gate_passes_valid_project() {
+        let tmp = python_project("def f(x):\n    \"\"\"Doc.\"\"\"\n    return x\n");
+        let (ok, out) = run_compile_check(&scratch_config(tmp.path())).await;
+        assert!(ok, "valid Python must pass the gate, got: {out}");
+        assert!(
+            !tmp.path().join("pkg/__pycache__").exists(),
+            "gate must not write .pyc files"
+        );
+    }
+
+    #[tokio::test]
+    async fn python_gate_reports_syntax_error_with_path() {
+        let tmp = python_project("def f(x)\n    return x\n");
+        let (ok, out) = run_compile_check(&scratch_config(tmp.path())).await;
+        assert!(!ok, "broken Python must fail the gate");
+        assert!(out.contains("pkg/mod.py:1: error"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn python_gate_skips_virtualenvs() {
+        let tmp = python_project("x = 1\n");
+        let venv = tmp.path().join("venv/lib");
+        std::fs::create_dir_all(&venv).unwrap();
+        std::fs::write(venv.join("broken.py"), "def (:\n").unwrap();
+        let (ok, out) = run_compile_check(&scratch_config(tmp.path())).await;
+        assert!(ok, "files under venv/ must be ignored, got: {out}");
+    }
+
+    #[tokio::test]
+    async fn plain_js_project_skips_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package.json"), "{\"name\":\"x\"}").unwrap();
+        std::fs::write(tmp.path().join("index.js"), "module.exports = 1;\n").unwrap();
+        let (ok, out) = run_compile_check(&scratch_config(tmp.path())).await;
+        assert!(
+            ok,
+            "package.json without tsconfig must not run tsc, got: {out}"
+        );
     }
 }
