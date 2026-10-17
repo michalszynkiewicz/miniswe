@@ -760,4 +760,101 @@ mod tests {
         assert!(out.contains("foo(None);"));
         assert!(out.contains("bar();"));
     }
+
+    /// A stand-in for OpenRouter serving a Claude model: like Anthropic
+    /// upstream, it answers a request ending in an assistant message with
+    /// a 400, and otherwise replies with `reply`.
+    async fn openrouter_rejecting_prefill(reply: &'static str) -> wiremock::MockServer {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let last_role =
+                    body["messages"].as_array().unwrap().last().unwrap()["role"].clone();
+                if last_role == "assistant" {
+                    return ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {
+                            "code": 400,
+                            "message": "This model does not support assistant message prefill. \
+                                        The conversation must end with a user message.",
+                        }
+                    }));
+                }
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": reply},
+                        "finish_reason": "stop"
+                    }]
+                }))
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn openrouter_claude_router(endpoint: &str) -> ModelRouter {
+        let mut config = crate::config::Config::default();
+        config.model.provider = "openrouter".into();
+        config.model.model = "anthropic/claude-sonnet-4.6".into();
+        config.model.endpoint = endpoint.to_string();
+        config.model.api_key = Some("sk-or-test".into());
+        ModelRouter::new(&config)
+    }
+
+    /// Every request the server saw ends with the user turn, and that turn
+    /// spells out the start the prefill would have pinned.
+    async fn assert_no_prefill_sent(server: &wiremock::MockServer, expected_start: &str) {
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty());
+        for req in requests {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let last = body["messages"].as_array().unwrap().last().unwrap().clone();
+            assert_eq!(last["role"], "user", "prefill sent: {body}");
+            let prompt = last["content"].as_str().unwrap();
+            assert!(
+                prompt.contains(&format!("begin with exactly:\n{expected_start}")),
+                "{prompt}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openrouter_claude_rewrite_sends_no_prefill() {
+        let server =
+            openrouter_rejecting_prefill("OLD:\n  foo();\nEND_OLD\nNEW:\n  foo(None);\nEND_NEW")
+                .await;
+        let router = openrouter_claude_router(&server.uri());
+        let r = ask_rewrite(&router, None, "t", "Pass None to foo", "  foo();", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.old, "  foo();");
+        assert_eq!(r.new, "  foo(None);");
+        assert_no_prefill_sent(&server, "OLD:\n  foo();\n").await;
+    }
+
+    #[tokio::test]
+    async fn openrouter_claude_rewrite_with_known_old_sends_no_prefill() {
+        // The model writes only NEW, as it would after a prefill; the known
+        // OLD is still pinned on our side.
+        let server = openrouter_rejecting_prefill("fn run(a: u32, b: u8) {\nEND_NEW").await;
+        let router = openrouter_claude_router(&server.uri());
+        let r = ask_rewrite_validated(
+            &router,
+            None,
+            "t",
+            "Add b: u8",
+            "fn run(a: u32) {",
+            Some("fn run(a: u32) {"),
+            None,
+            |_| Ok::<(), anyhow::Error>(()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.old, "fn run(a: u32) {");
+        assert_eq!(r.new, "fn run(a: u32, b: u8) {");
+        assert_no_prefill_sent(&server, "OLD:\nfn run(a: u32) {\nEND_OLD\nNEW:\n").await;
+    }
 }
