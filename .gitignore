@@ -1,10 +1,6 @@
 /target
 models/
-.miniswe/*
-!/.miniswe/.gitignore
-!/.miniswe/profile.md
-!/.miniswe/guide.md
-!/.miniswe/lessons.md
+.miniswe/
 .mcp.json
 .env
 **/benchmark_results
