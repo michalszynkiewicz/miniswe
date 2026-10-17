@@ -98,7 +98,7 @@ The model sees five grouped tools plus a few editing primitives (and `mcp_use` w
 
 ## Configuration
 
-`miniswe init` writes `.miniswe/config.toml`; `miniswe config` shows the live values. Key sections: `[model]` (provider, endpoint, model, context window, temperature, `api_key`/`api_key_env` for hosted providers — see [Hosted models](#hosted-models)), `[context]` (repo map budget, round limits), `[tools]` (web, plan), `[lsp]`, `[web]` (search/fetch backends), `[runtime]` (e.g. `max_session_input_tokens`, an opt-in token-budget guard).
+Settings come from `~/.miniswe/config.toml`, with `.miniswe/config.toml` in the project overriding it key by key. `miniswe init` writes the project file with every setting commented out, so a fresh project uses your global config; uncomment a key to override it there. `miniswe config` shows the live values. (A project initialized before this change has a project file with every key set, which masks the global config; delete the sections you don't mean to override.) Key sections: `[model]` (provider, endpoint, model, context window, temperature, `api_key`/`api_key_env` for hosted providers — see [Hosted models](#hosted-models)), `[context]` (repo map budget, round limits), `[tools]` (web, plan), `[lsp]`, `[web]` (search/fetch backends), `[runtime]` (e.g. `max_session_input_tokens`, an opt-in token-budget guard).
 
 For web search, put a Serper key in `~/.miniswe/serper.key`; without it, `web(search)` falls back to GitHub repository search.
 

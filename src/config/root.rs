@@ -2,7 +2,7 @@
 //! the small leaf config sections.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -263,35 +263,51 @@ impl Config {
     pub fn load() -> Result<Self> {
         let project_root =
             std::env::current_dir().context("Failed to determine current directory")?;
+        let global_path = Self::global_dir().map(|d| d.join("config.toml"));
+        Self::load_from(global_path.as_deref(), project_root)
+    }
 
-        // Layer 1: global config (~/.miniswe/config.toml), or defaults
-        let mut config = if let Some(global_path) = Self::global_dir()
-            .map(|d| d.join("config.toml"))
-            .filter(|p| p.exists())
-        {
-            let contents = std::fs::read_to_string(&global_path)
-                .with_context(|| format!("Failed to read {}", global_path.display()))?;
-            toml::from_str(&contents)
-                .with_context(|| format!("Failed to parse {}", global_path.display()))?
+    /// [`Config::load`] with the global config path given explicitly.
+    ///
+    /// The project file is deep-merged over the global one key by key, so a
+    /// project overrides only what it sets: a project that tweaks
+    /// `[context]` still uses the global `[model]`.
+    pub fn load_from(global_path: Option<&Path>, project_root: PathBuf) -> Result<Self> {
+        let global = match global_path.filter(|p| p.exists()) {
+            Some(path) => Some(read_toml_table(path)?),
+            None => None,
+        };
+        let project_config_path = project_root.join(".miniswe").join("config.toml");
+        let project = if project_config_path.exists() {
+            Some(read_toml_table(&project_config_path)?)
         } else {
-            Config::default()
+            None
         };
 
-        // Layer 2: project config (.miniswe/config.toml), if present
-        let project_config_path = project_root.join(".miniswe").join("config.toml");
-        if project_config_path.exists() {
-            let contents = std::fs::read_to_string(&project_config_path)
-                .with_context(|| format!("Failed to read {}", project_config_path.display()))?;
-            let mut project: Config = toml::from_str(&contents)
-                .with_context(|| format!("Failed to parse {}", project_config_path.display()))?;
-
-            // Project values override global wholesale (this is not a deep
-            // merge) — except secrets, which the project config may not be
-            // gitignored and so shouldn't have to carry: reinherit anything
-            // left unset. See `config::secrets`.
-            super::secrets::inherit_secrets(&config, &mut project);
-            config = project;
-        }
+        let mut config = match (global, project) {
+            (None, None) => Config::default(),
+            (Some(global), None) => global
+                .try_into()
+                .context("Failed to parse global config.toml")?,
+            (global, Some(project)) => {
+                let global_config: Config = match &global {
+                    Some(g) => g
+                        .clone()
+                        .try_into()
+                        .context("Failed to parse global config.toml")?,
+                    None => Config::default(),
+                };
+                let mut merged = global.unwrap_or_else(|| toml::Value::Table(Default::default()));
+                merge_toml(&mut merged, project);
+                let mut config: Config = merged.try_into().with_context(|| {
+                    format!("Failed to parse {}", project_config_path.display())
+                })?;
+                // The merge already carries global secrets into unset project
+                // fields; this keeps the explicit guarantee in one place.
+                super::secrets::inherit_secrets(&global_config, &mut config);
+                config
+            }
+        };
 
         config.project_root = project_root;
         Ok(config)
@@ -362,5 +378,84 @@ impl Config {
     /// Whether multiple distinct models are configured.
     pub fn is_multi_model(&self) -> bool {
         self.models.as_ref().is_some_and(|m| m.len() > 1)
+    }
+}
+
+fn read_toml_table(path: &Path) -> Result<toml::Value> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    toml::from_str(&contents).with_context(|| format!("Failed to parse {}", path.display()))
+}
+
+/// Overlay `overlay` onto `base`: tables merge recursively, any other value
+/// (including arrays) in `overlay` replaces the one in `base`.
+fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_toml(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    const GLOBAL_OPENROUTER: &str = "[model]\nprovider = \"openrouter\"\nmodel = \"anthropic/claude-sonnet-4.5\"\napi_key_env = \"OPENROUTER_API_KEY\"\n";
+
+    #[test]
+    fn project_override_keeps_unset_global_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home/config.toml");
+        write(&global, GLOBAL_OPENROUTER);
+        let project = tmp.path().join("proj");
+        write(
+            &project.join(".miniswe/config.toml"),
+            "[model]\ntemperature = 0.5\n\n[context]\nmax_rounds = 7\n",
+        );
+
+        let cfg = Config::load_from(Some(&global), project).unwrap();
+        assert_eq!(cfg.model.model, "anthropic/claude-sonnet-4.5");
+        assert_eq!(cfg.model.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
+        assert_eq!(cfg.model.temperature, 0.5);
+        assert_eq!(cfg.context.max_rounds, 7);
+    }
+
+    #[test]
+    fn project_value_wins_over_global() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home/config.toml");
+        write(&global, GLOBAL_OPENROUTER);
+        let project = tmp.path().join("proj");
+        write(
+            &project.join(".miniswe/config.toml"),
+            "[model]\nmodel = \"openai/gpt-5\"\n",
+        );
+
+        let cfg = Config::load_from(Some(&global), project).unwrap();
+        assert_eq!(cfg.model.model, "openai/gpt-5");
+        assert_eq!(cfg.model.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn missing_files_fall_back_to_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg =
+            Config::load_from(Some(&tmp.path().join("nope.toml")), tmp.path().into()).unwrap();
+        assert_eq!(cfg.model.model, Config::default().model.model);
+        assert_eq!(cfg.project_root, tmp.path());
     }
 }

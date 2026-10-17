@@ -1,7 +1,8 @@
 //! Configuration management for miniswe.
 //!
-//! Single config file at `~/.miniswe/config.toml` for all settings (model,
-//! hardware, API keys). Project root is always the current working directory.
+//! Global settings (model, hardware, API keys) live in
+//! `~/.miniswe/config.toml`; an optional project `.miniswe/config.toml` is
+//! deep-merged over it. Project root is always the current working directory.
 //! Per-project data (index, scratchpad, profile) lives in `.miniswe/` in the
 //! project directory — created by `miniswe init`.
 
