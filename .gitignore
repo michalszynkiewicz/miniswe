@@ -1,6 +1,10 @@
 /target
 models/
-.miniswe/
+.miniswe/*
+!/.miniswe/.gitignore
+!/.miniswe/profile.md
+!/.miniswe/guide.md
+!/.miniswe/lessons.md
 .mcp.json
 .env
 **/benchmark_results
@@ -10,3 +14,6 @@ __pycache__/
 .claude/
 tests/skill_handoff_realdata.rs
 docs/app-with-deps-e2e-review.md
+nohup.out
+/bench.log
+.idea/
