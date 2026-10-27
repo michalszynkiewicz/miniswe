@@ -189,7 +189,8 @@ pub async fn download_clangd(cache_dir: &Path) -> Result<PathBuf> {
     let mut clangd_data = None;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        if file.name().ends_with("/bin/clangd") || file.name() == "clangd" {
+        let name = file.name()?;
+        if name.ends_with("/bin/clangd") || name == "clangd" {
             let mut buf = Vec::new();
             std::io::Read::read_to_end(&mut file, &mut buf)?;
             clangd_data = Some(buf);
