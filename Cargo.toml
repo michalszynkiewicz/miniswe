@@ -105,7 +105,7 @@ flate2 = "1.1.9"
 zip = "9.0.5"
 tar = "0.4.46"
 libc = "0.2"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 [dev-dependencies]
 portable-pty = "0.9.0"
