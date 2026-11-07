@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use miniswe::mcp::client::McpClient;
-use miniswe::mcp::config::McpServerConfig;
+use buzztr::mcp::client::McpClient;
+use buzztr::mcp::config::McpServerConfig;
 
 const MOCK_SERVER_SCRIPT: &str = r#"
 import sys, json

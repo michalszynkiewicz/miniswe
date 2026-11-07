@@ -7,9 +7,9 @@ mod helpers;
 
 use std::fs;
 
-use miniswe::config::Config;
-use miniswe::tools;
-use miniswe::tools::permissions::PermissionManager;
+use buzztr::config::Config;
+use buzztr::tools;
+use buzztr::tools::permissions::PermissionManager;
 use serde_json::json;
 
 fn perms(config: &Config) -> PermissionManager {
@@ -161,7 +161,7 @@ async fn auto_check_ok_on_valid_code() {
 fn token_budget_masking_keeps_newest() {
     // Token-budget masking: walk backwards, keep newest until budget exceeded.
     // Budget = 100 tokens (~400 chars). Each "big" entry is ~200 chars (50 tokens).
-    use miniswe::context::estimate_tokens;
+    use buzztr::context::estimate_tokens;
 
     let big = "x".repeat(200); // ~50 tokens
     let small = "y".repeat(40); // ~10 tokens
@@ -208,7 +208,7 @@ fn token_budget_masking_keeps_newest() {
 
 #[test]
 fn token_budget_masking_nothing_when_under_budget() {
-    use miniswe::context::estimate_tokens;
+    use buzztr::context::estimate_tokens;
 
     let small = "content".to_string(); // ~2 tokens
 
@@ -245,7 +245,7 @@ fn token_budget_masking_nothing_when_under_budget() {
 
 #[test]
 fn rich_summary_includes_function_signatures() {
-    use miniswe::context::compress::summarize_tool_result;
+    use buzztr::context::compress::summarize_tool_result;
 
     let content = r#"[src/cli/mod.rs: 59 lines]
    1│pub mod commands;
@@ -280,7 +280,7 @@ fn rich_summary_includes_function_signatures() {
 
 #[test]
 fn rich_summary_includes_impl_blocks() {
-    use miniswe::context::compress::summarize_tool_result;
+    use buzztr::context::compress::summarize_tool_result;
 
     let content = r#"[src/config.rs: 30 lines]
    1│pub struct Config {
@@ -324,7 +324,7 @@ fn rich_summary_includes_impl_blocks() {
 
 #[test]
 fn rich_summary_edit_with_errors() {
-    use miniswe::context::compress::summarize_tool_result;
+    use buzztr::context::compress::summarize_tool_result;
 
     let content =
         "✓ Edited src/main.rs (1 replacement)\n[cargo check]\nerror[E0061]: expected 4 arguments\n";
@@ -347,7 +347,7 @@ fn rich_summary_edit_with_errors() {
 
 #[test]
 fn rich_summary_edit_success() {
-    use miniswe::context::compress::summarize_tool_result;
+    use buzztr::context::compress::summarize_tool_result;
 
     let content = "✓ Edited src/main.rs (1 replacement)\n[cargo check] OK\n";
 

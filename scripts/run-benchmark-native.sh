@@ -80,10 +80,10 @@ curl -fsS --max-time 5 "${LLAMA_ENDPOINT}/v1/models" >/dev/null 2>&1 \
 
 # Build the DRIVER binary once from the current tree (the version under test).
 # This is separate from the per-run task workspace, which builds its own
-# ./target/debug/miniswe during validation.
+# ./target/debug/buzztr during validation.
 echo "Building driver binary (cargo build --release)..."
 ( cd "${REPO_DIR}" && cargo build --release 2>&1 | tail -3 )
-DRIVER="${REPO_DIR}/target/release/miniswe"
+DRIVER="${REPO_DIR}/target/release/buzztr"
 [[ -x "${DRIVER}" ]] || { echo "ERROR: driver build failed ($DRIVER missing)" >&2; exit 1; }
 echo ""
 
@@ -125,7 +125,7 @@ level = "trace"
 enabled = true
 
 [validation]
-command = "out=\$(cargo build 2>&1) || { echo \"DOES NOT COMPILE:\"; echo \"\$out\" | tail -20; exit 1; }; run=\$(MINISWE_SKIP_VALIDATION=1 ./target/debug/miniswe --system-prompt-override 'Respond only with TOKEN_XYZ and nothing else' --yes hello 2>&1); echo \"\$run\" | grep -q TOKEN_XYZ || { echo \"COMPILES but override NOT consumed. Expected TOKEN_XYZ, GOT: \$run\"; exit 1; }"
+command = "out=\$(cargo build 2>&1) || { echo \"DOES NOT COMPILE:\"; echo \"\$out\" | tail -20; exit 1; }; run=\$(BUZZTR_SKIP_VALIDATION=1 ./target/debug/buzztr --system-prompt-override 'Respond only with TOKEN_XYZ and nothing else' --yes hello 2>&1); echo \"\$run\" | grep -q TOKEN_XYZ || { echo \"COMPILES but override NOT consumed. Expected TOKEN_XYZ, GOT: \$run\"; exit 1; }"
 timeout_secs = 180
 max_retries = 3
 TOML
@@ -135,12 +135,12 @@ run_one() {
     local idx="$1"
     local vdir="${RESULTS_DIR}/run${idx}"
     mkdir -p "${vdir}"
-    local work; work="$(mktemp -d /tmp/miniswe-native-run${idx}.XXXXXX)"
+    local work; work="$(mktemp -d /tmp/buzztr-native-run${idx}.XXXXXX)"
 
     echo "--- run ${idx} (workdir ${work}) ---"
     # Fresh checkout at the pinned baseline SHA (mirrors the container).
     git -C "${REPO_DIR}" archive "${BASELINE_SHA}" | tar -x -C "${work}"
-    ( cd "${work}" && rm -rf target .miniswe )
+    ( cd "${work}" && rm -rf target .buzztr )
 
     # Optional seed patch (half-wired start).
     if [[ -n "${SEED_PATCH}" ]]; then
@@ -151,12 +151,12 @@ run_one() {
         fi
     fi
 
-    mkdir -p "${work}/.miniswe/logs"
-    generate_config > "${work}/.miniswe/config.toml"
-    cp "${work}/.miniswe/config.toml" "${vdir}/config.toml"
+    mkdir -p "${work}/.buzztr/logs"
+    generate_config > "${work}/.buzztr/config.toml"
+    cp "${work}/.buzztr/config.toml" "${vdir}/config.toml"
 
-    ( cd "${work}" && "${DRIVER}" init >/dev/null 2>"${vdir}/miniswe_init.txt" ) \
-        || { echo "  init failed"; cat "${vdir}/miniswe_init.txt"; }
+    ( cd "${work}" && "${DRIVER}" init >/dev/null 2>"${vdir}/buzztr_init.txt" ) \
+        || { echo "  init failed"; cat "${vdir}/buzztr_init.txt"; }
     ( cd "${work}" && git init -q && git add -A && git commit -q -m baseline 2>/dev/null )
 
     local t0; t0=$(date +%s)
@@ -175,7 +175,7 @@ run_one() {
         ( cd "${work}" && git diff > "${vdir}/diff_after_attempt${attempt}.patch" 2>/dev/null; git diff > "${vdir}/diff.patch" 2>/dev/null ) || true
 
         # === 6-check validation ===
-        local PASS=0 TOTAL=0 ERRORS="" BINARY="${work}/target/debug/miniswe" FLAG=""
+        local PASS=0 TOTAL=0 ERRORS="" BINARY="${work}/target/debug/buzztr" FLAG=""
         pushd "${work}" >/dev/null
 
         TOTAL=$((TOTAL+1))
@@ -208,7 +208,7 @@ $(grep -E '^error(\[|:)|^test .* \.\.\. FAILED$|panicked at' "${vdir}/cargo_test
 
         TOTAL=$((TOTAL+1))
         if [ -f "${BINARY}" ] && [ -n "${FLAG}" ] && [ "${PASS}" -ge 4 ]; then
-            local OUT; OUT=$(MINISWE_SKIP_VALIDATION=1 timeout 120 "${BINARY}" ${FLAG} 'You must respond with exactly the text PONG_42 and nothing else.' --yes ping 2>"${vdir}/smoke_stderr.txt" || true)
+            local OUT; OUT=$(BUZZTR_SKIP_VALIDATION=1 timeout 120 "${BINARY}" ${FLAG} 'You must respond with exactly the text PONG_42 and nothing else.' --yes ping 2>"${vdir}/smoke_stderr.txt" || true)
             echo "${OUT}" > "${vdir}/smoke_output.txt"
             if echo "${OUT}" | grep -q PONG_42; then echo "smoke:PASS" | tee -a "${vdir}/run.log"; PASS=$((PASS+1)); else echo "smoke:FAIL" | tee -a "${vdir}/run.log"; ERRORS="${ERRORS}
 SMOKE FAILED: expected PONG_42, got: $(echo "${OUT}" | head -3)"; fi
@@ -226,7 +226,7 @@ Please fix the issues. The modified files are still on disk."
     echo "=== FINAL: ${best}/6 after ${attempt} attempt(s) ===" | tee -a "${vdir}/run.log"
     echo $(( $(date +%s) - t0 )) > "${vdir}/wall_s.txt"
     # Persist the agent's own logs/plan/scratchpad for later inspection.
-    cp -a "${work}/.miniswe" "${vdir}/miniswe_state" 2>/dev/null || true
+    cp -a "${work}/.buzztr" "${vdir}/buzztr_state" 2>/dev/null || true
     rm -rf "${work}"
     echo "    run${idx}: ${best}/6  (wall $(cat "${vdir}/wall_s.txt")s)"
     echo ""

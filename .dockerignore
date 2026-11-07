@@ -3,4 +3,4 @@
 /target/
 /benchmark_results/
 *.log
-.miniswe/
+.buzztr/

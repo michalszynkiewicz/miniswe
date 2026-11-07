@@ -102,7 +102,7 @@ Fix:
 
 `docs/plan-system-design.md` describes a focused current-step plan view,
 compression on every `plan(action='check')`, and step-boundary snapshots.
-Current code stores full markdown in `.miniswe/plan.md`, injects the full plan,
+Current code stores full markdown in `.buzztr/plan.md`, injects the full plan,
 and does not run step-scoped compression from the plan tool.
 
 Impact:

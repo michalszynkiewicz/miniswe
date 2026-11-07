@@ -1,4 +1,4 @@
-//! MCP (Model Context Protocol) client for miniswe.
+//! MCP (Model Context Protocol) client for buzztr.
 //!
 //! Connects to MCP servers configured in `.mcp.json`, fetches tool schemas,
 //! and provides a lazy-loading bridge: only one-line summaries go into LLM

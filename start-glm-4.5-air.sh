@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start llama-server with GLM-4.5-Air for miniswe.
+# Start llama-server with GLM-4.5-Air for buzztr.
 #
 # Hardware target: RTX 3090 (24GB VRAM, ~21GB usable) + 128GB RAM
 # Model: GLM-4.5-Air (Zhipu's hybrid MoE, ~12B activated of ~106B total)
@@ -25,12 +25,12 @@
 
 set -euo pipefail
 
-MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/GLM-4.5-Air-GGUF}"
-PORT="${MINISWE_PORT:-8464}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-32768}"
-THREADS="${MINISWE_THREADS:-8}"
+MODEL_DIR="${BUZZTR_MODEL_DIR:-$HOME/models/GLM-4.5-Air-GGUF}"
+PORT="${BUZZTR_PORT:-8464}"
+CTX_SIZE="${BUZZTR_CTX_SIZE:-32768}"
+THREADS="${BUZZTR_THREADS:-8}"
 
-MODEL="${MINISWE_MODEL:-}"
+MODEL="${BUZZTR_MODEL:-}"
 if [ -z "$MODEL" ]; then
     MODEL=$(ls "$MODEL_DIR"/GLM-4.5-Air-*UD-Q4_K_XL*.gguf 2>/dev/null | head -1 || true)
     [ -z "$MODEL" ] && MODEL=$(ls "$MODEL_DIR"/GLM-4.5-Air-*Q4_K_M*.gguf 2>/dev/null | head -1 || true)
@@ -48,7 +48,7 @@ if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
     exit 1
 fi
 
-echo "Starting GLM-4.5-Air for miniswe..."
+echo "Starting GLM-4.5-Air for buzztr..."
 echo "  Model:   $MODEL"
 echo "  Context: $CTX_SIZE tokens"
 echo "  KV:      q4_0"

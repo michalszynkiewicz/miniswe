@@ -1,4 +1,4 @@
-# Plan: incorporating Aider techniques into miniswe
+# Plan: incorporating Aider techniques into buzztr
 
 Goal: borrow Aider's data-backed techniques for reliable edits from **small local
 models** (Gemma 4, Qwen3-Coder), *without* (for now) changing how edits are emitted.
@@ -40,7 +40,7 @@ told the agent it was done when the value wasn't threaded).
 ### 1a. Honest + instructive refactor results  *(started)*
 - DONE (uncommitted): `add_param` success no longer claims "COMPLETE"; it names the
   placeholder and says value-carrying callsites still need editing.
-  (`src/tools/refactor/add_param.rs`; A/B-gated by `MINISWE_ADDPARAM_LEGACY_MSG`.)
+  (`src/tools/refactor/add_param.rs`; A/B-gated by `BUZZTR_ADDPARAM_LEGACY_MSG`.)
 - NEXT: after `add_param` with a placeholder, **list the stubbed callsites** and,
   if feasible, flag which still pass the placeholder for the new param — turn the
   hidden threading work into a visible checklist. This is the deeper fix behind the

@@ -11,7 +11,7 @@ In `src/cli/commands/run.rs` `mask_old_tool_results()`:
 - **LLM summarization**: batches masked results into chunks, sends to LLM for summarization
 - **Chunking**: splits across multiple LLM calls if batch exceeds 1/3 context window
 - **Heuristic fallback**: rich summaries (function signatures, struct defs) if LLM fails
-- **Archive**: full content saved to `.miniswe/tool_history.md`, pointer in context
+- **Archive**: full content saved to `.buzztr/tool_history.md`, pointer in context
 - **Dedup**: `archived_indices` HashSet prevents re-archiving same results
 - **tool_call_id matching**: matches messages by ID, not positional counting
 
@@ -20,9 +20,9 @@ In `src/cli/commands/run.rs` `mask_old_tool_results()`:
 `config.tool_output_budget_chars() = context_window / 10`
 
 Large results from web_fetch, shell, docs_lookup get saved to file with preview + pointer:
-- web_fetch → `.miniswe/web_cache/<url>.md`
-- shell → `.miniswe/shell_output/cmd_<time>.txt`
-- docs_lookup → points to `.miniswe/docs/<lib>.txt`
+- web_fetch → `.buzztr/web_cache/<url>.md`
+- shell → `.buzztr/shell_output/cmd_<time>.txt`
+- docs_lookup → points to `.buzztr/docs/<lib>.txt`
 
 ### Implemented: Unified timeline compression
 
@@ -40,8 +40,8 @@ Large results from web_fetch, shell, docs_lookup get saved to file with preview 
 1. Count tokens in conversation (excluding system prompt)
 2. If over budget, find split point to keep newest within 1/4
 3. Send older messages to LLM for narrative summarization
-4. Archive full content to `.miniswe/session_archive.md`
+4. Archive full content to `.buzztr/session_archive.md`
 5. Replace compressed messages with `[Session summary]` + assistant acknowledgment
-6. Model can `read_file(".miniswe/session_archive.md")` for details
+6. Model can `read_file(".buzztr/session_archive.md")` for details
 
 **Replaces**: `mask_old_tool_results()` (removed, 240 lines) and `compress_history()` (still exists for `--continue` sessions but unified compressor handles in-session compression).

@@ -1,6 +1,6 @@
 //! Secret inheritance across the global/project config layers.
 //!
-//! `Config::load()` deep-merges the project `.miniswe/config.toml` over the
+//! `Config::load()` deep-merges the project `.buzztr/config.toml` over the
 //! global one, so a secret set only in the global file — an API key the user
 //! deliberately keeps out of a project directory that may not gitignore it —
 //! already survives a project override. This module states that guarantee

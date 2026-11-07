@@ -9,11 +9,11 @@ use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use miniswe::knowledge::ProjectIndex;
-use miniswe::knowledge::indexer;
-use miniswe::tools;
-use miniswe::tools::edit_file::{self, EditPlanStep, PatchOp};
-use miniswe::tools::permissions::PermissionManager;
+use buzztr::knowledge::ProjectIndex;
+use buzztr::knowledge::indexer;
+use buzztr::tools;
+use buzztr::tools::edit_file::{self, EditPlanStep, PatchOp};
+use buzztr::tools::permissions::PermissionManager;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer};
 
@@ -416,7 +416,7 @@ async fn execute_valid_patch_writes_file() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "fn main() {\n}\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "add setup call"});
     let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
@@ -458,7 +458,7 @@ async fn execute_failed_patch_writes_nothing() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "original\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change line"});
     let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
@@ -519,7 +519,7 @@ async fn execute_repairs_failed_first_patch() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "original\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change line"});
     let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
@@ -573,7 +573,7 @@ async fn execute_repairs_until_third_patch() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "original\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change line"});
     let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
@@ -610,7 +610,7 @@ async fn execute_no_changes_leaves_file_unchanged() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "original\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "no op"});
     let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
@@ -665,7 +665,7 @@ async fn execute_empty_response_at_finalize_retries_and_recovers() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "foo();\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "rename foo to bar",
@@ -710,7 +710,7 @@ async fn execute_empty_response_exhausts_retries_and_reports_failure() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "foo();\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "rename foo to bar",
@@ -773,7 +773,7 @@ async fn execute_empty_file_skips_windowed_pass() {
     // Create a truly empty file (0 bytes, 0 lines).
     fs::write(config.project_root.join("main.rs"), "").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "create a hello file",
@@ -843,7 +843,7 @@ async fn execute_lsp_off_succeeds_without_lsp_client() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "original\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "change line",
@@ -870,7 +870,7 @@ async fn execute_rejects_invalid_lsp_validation_mode() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "original\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "change line",
@@ -922,11 +922,11 @@ async fn execute_edit_file_tool_reindexes_successful_edit() {
     .unwrap();
 
     let index = indexer::index_project(&config.project_root, None).unwrap();
-    index.save(&config.miniswe_dir()).unwrap();
+    index.save(&config.buzztr_dir()).unwrap();
     assert!(!index.lookup("original").is_empty());
     assert!(index.lookup("replacement").is_empty());
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let perms = PermissionManager::headless(&config);
     let args = serde_json::json!({
         "path": "src/lib.rs",
@@ -940,7 +940,7 @@ async fn execute_edit_file_tool_reindexes_successful_edit() {
     assert!(result.success, "{}", result.content);
     // finalize + patch + verdict-finalize = 3
     assert_eq!(calls.load(Ordering::SeqCst), 3);
-    let updated_index = ProjectIndex::load(&config.miniswe_dir()).unwrap();
+    let updated_index = ProjectIndex::load(&config.buzztr_dir()).unwrap();
     assert!(
         !updated_index.lookup("replacement").is_empty(),
         "Index should contain replacement after edit_file reindex"

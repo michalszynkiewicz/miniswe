@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-/// miniswe — A lightweight CLI coding agent for local LLMs
+/// buzztr — A lightweight CLI coding agent for local LLMs
 #[derive(Parser, Debug)]
-#[command(name = "miniswe", version, about)]
+#[command(name = "buzztr", version, about)]
 pub struct Cli {
     /// Message to send to the agent (runs in single-shot mode)
     pub message: Option<String>,

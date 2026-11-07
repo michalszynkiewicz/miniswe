@@ -11,7 +11,7 @@
 //! advance — with one step in flight there is no plan checklist to
 //! rubber-stamp.
 //!
-//! State persists in `.miniswe/skill_cursor.json`. The model's `plan.md`
+//! State persists in `.buzztr/skill_cursor.json`. The model's `plan.md`
 //! stays entirely its own — no coupling, no conflict.
 
 use std::collections::HashMap;
@@ -125,7 +125,7 @@ pub struct SkillCursor {
 }
 
 fn path(config: &Config) -> PathBuf {
-    config.miniswe_dir().join("skill_cursor.json")
+    config.buzztr_dir().join("skill_cursor.json")
 }
 
 pub fn load(config: &Config) -> SkillCursor {
@@ -137,7 +137,7 @@ pub fn load(config: &Config) -> SkillCursor {
 
 pub fn save(config: &Config, cursor: &SkillCursor) {
     if let Ok(json) = serde_json::to_string(cursor) {
-        let _ = std::fs::create_dir_all(config.miniswe_dir());
+        let _ = std::fs::create_dir_all(config.buzztr_dir());
         let _ = std::fs::write(path(config), json);
     }
 }
@@ -1226,7 +1226,7 @@ mod tests {
         // live e2e model complied, popped the frame, and skipped the whole
         // integration phase.
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".miniswe")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".buzztr")).unwrap();
         let mut config = Config::default();
         config.project_root = tmp.path().to_path_buf();
 

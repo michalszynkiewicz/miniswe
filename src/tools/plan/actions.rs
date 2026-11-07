@@ -199,7 +199,7 @@ pub async fn execute(args: &Value, config: &Config, current_round: usize) -> Res
                 )));
             }
 
-            fs::create_dir_all(config.miniswe_dir()).ok();
+            fs::create_dir_all(config.buzztr_dir()).ok();
             let md = steps_to_markdown(&steps);
             fs::write(&plan_path, &md)?;
 

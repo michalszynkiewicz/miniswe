@@ -111,12 +111,12 @@ fn dump_session_prefix() -> &'static str {
     })
 }
 
-/// If `MINISWE_LLM_DUMP_DIR` is set, write the full request body to a
+/// If `BUZZTR_LLM_DUMP_DIR` is set, write the full request body to a
 /// numbered JSON file inside that directory. Used to capture exact
 /// llama.cpp request bodies for offline replay (the structured logger
 /// truncates large bodies, so it can't be used for verbatim replay).
 fn maybe_dump_request(body: &Value) {
-    let Ok(dir) = std::env::var("MINISWE_LLM_DUMP_DIR") else {
+    let Ok(dir) = std::env::var("BUZZTR_LLM_DUMP_DIR") else {
         return;
     };
     let n = DUMP_COUNTER.fetch_add(1, Ordering::SeqCst);

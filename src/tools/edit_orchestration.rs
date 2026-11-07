@@ -170,15 +170,15 @@ async fn lsp_error_count_inner(
 /// provider reads `ProjectIndex` fresh from disk each turn — a stale
 /// index means the model sees pre-edit structure for code it just wrote.
 pub(crate) fn reindex_changed_file(rel_path: &str, config: &Config) {
-    let miniswe_dir = config.miniswe_dir();
+    let buzztr_dir = config.buzztr_dir();
     let abs_path = config.project_root.join(rel_path);
 
-    let mut index = match ProjectIndex::load(&miniswe_dir) {
+    let mut index = match ProjectIndex::load(&buzztr_dir) {
         Ok(idx) => idx,
         Err(_) => return, // no index yet, skip
     };
 
-    indexer::reindex_file(rel_path, &abs_path, &mut index, &miniswe_dir);
+    indexer::reindex_file(rel_path, &abs_path, &mut index, &buzztr_dir);
 }
 
 /// Incrementally re-index every file whose mtime changed since the last
@@ -187,12 +187,12 @@ pub(crate) fn reindex_changed_file(rel_path: &str, config: &Config) {
 /// re-extracts files that actually changed, so this stays cheap.
 /// Best-effort — never fails the tool call.
 pub(crate) fn reindex_project_incremental(config: &Config) {
-    let miniswe_dir = config.miniswe_dir();
-    let previous = ProjectIndex::load(&miniswe_dir).ok();
+    let buzztr_dir = config.buzztr_dir();
+    let previous = ProjectIndex::load(&buzztr_dir).ok();
     let Ok(index) = indexer::index_project(&config.project_root, previous.as_ref()) else {
         return;
     };
-    let _ = index.save(&miniswe_dir);
+    let _ = index.save(&buzztr_dir);
 }
 
 /// Auto-run type checker after editing a source file. Appends output + source

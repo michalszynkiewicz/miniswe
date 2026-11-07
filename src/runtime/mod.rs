@@ -285,7 +285,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut config = Config::default();
         config.project_root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(config.miniswe_dir()).unwrap();
+        std::fs::create_dir_all(config.buzztr_dir()).unwrap();
         (tmp, config)
     }
 

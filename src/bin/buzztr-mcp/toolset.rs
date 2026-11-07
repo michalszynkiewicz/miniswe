@@ -1,16 +1,16 @@
 //! Tool schema + dispatch: bridges MCP `tools/list` and `tools/call` into
-//! miniswe's existing, unmodified `execute_tool` / `execute_refactor_tool`
+//! buzztr's existing, unmodified `execute_tool` / `execute_refactor_tool`
 //! entry points — the same functions the interactive agent loop uses.
 
 use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use miniswe::config::{Config, EditMode};
-use miniswe::llm::ModelRouter;
-use miniswe::lsp::LspClient;
-use miniswe::tools::definitions::{flat_refactor_tool_definitions, flat_to_refactor_args};
-use miniswe::tools::{PermissionManager, execute_refactor_tool, execute_tool, tool_definitions};
+use buzztr::config::{Config, EditMode};
+use buzztr::llm::ModelRouter;
+use buzztr::lsp::LspClient;
+use buzztr::tools::definitions::{flat_refactor_tool_definitions, flat_to_refactor_args};
+use buzztr::tools::{PermissionManager, execute_refactor_tool, execute_tool, tool_definitions};
 
 /// Shared, long-lived state for the life of the server process — built once
 /// at startup and reused across every `tools/call`.
@@ -24,7 +24,7 @@ pub struct Context {
 /// Tool schemas exposed over MCP: the production `code` tool (goto_definition,
 /// find_references, diagnostics, repo_map, project_info, architecture_notes)
 /// plus the flat, single-purpose refactor tools. Both are pulled verbatim
-/// from `miniswe::tools::definitions` — no schema is redefined here.
+/// from `buzztr::tools::definitions` — no schema is redefined here.
 pub fn list_tools() -> Value {
     let code_tool = tool_definitions(EditMode::Fast)
         .into_iter()
@@ -72,13 +72,13 @@ pub async fn call_tool(ctx: &Context, name: &str, arguments: &Value) -> Value {
                     )
                     .await
                 }
-                None => Ok(miniswe::tools::ToolResult::err(format!(
+                None => Ok(buzztr::tools::ToolResult::err(format!(
                     "internal error: '{name}' did not map to refactor args"
                 ))),
             }
         }
 
-        other => Ok(miniswe::tools::ToolResult::err(format!(
+        other => Ok(buzztr::tools::ToolResult::err(format!(
             "Unknown tool: '{other}'"
         ))),
     };

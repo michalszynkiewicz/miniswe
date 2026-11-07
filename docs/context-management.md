@@ -1,6 +1,6 @@
-# How miniswe manages context
+# How buzztr manages context
 
-miniswe runs a single LLM agent loop against a fixed context window (60K tokens
+buzztr runs a single LLM agent loop against a fixed context window (60K tokens
 in the benchmarks). Every tool round it **re-assembles** the prompt from scratch
 and, when the conversation outgrows its budget, **compacts** the history. This
 doc describes both halves: how a turn's context is built, and how it's kept
@@ -29,7 +29,7 @@ place; it composes a fresh `Vec<Message>`:
 2. **Project root** — the absolute path; all tool paths are relative to it.
 3. **Context providers** (see §3) — each enabled provider may append a tagged
    block (`[PLAN]`, `[REPO MAP]`, `[LESSONS]`, …) to the system message.
-4. **Active plan** — `.miniswe/plan.md`, if present, appended as `[PLAN]`.
+4. **Active plan** — `.buzztr/plan.md`, if present, appended as `[PLAN]`.
 5. **Conversation history** — all non-system messages so far, added verbatim
    (compaction has already run on them in the loop; see §4).
 6. **Current user message** — the task, or the latest follow-up.
@@ -71,15 +71,15 @@ source and contributes a tagged section, or nothing. Order is fixed by
 
 | provider | source | header | default | notes |
 |---|---|---|---|---|
-| `profile` | `.miniswe/profile.md` | — | **off** | language/structure/deps overview (compressed) |
-| `guide` | `.miniswe/guide.md` | `[GUIDE]` | **off** | project-specific instructions; skipped if it's the placeholder |
+| `profile` | `.buzztr/profile.md` | — | **off** | language/structure/deps overview (compressed) |
+| `guide` | `.buzztr/guide.md` | `[GUIDE]` | **off** | project-specific instructions; skipped if it's the placeholder |
 | `project_notes` | `.ai/README.md` | `[PROJECT NOTES]` | **off** | architecture notes, truncated to the output budget |
-| `plan` | `.miniswe/plan.md` | `[PLAN]` | **on** | the active step plan |
-| `lessons` | `.miniswe/lessons.md` | `[LESSONS]` | **off** | accumulated tips; keyword-filtered (full if <2000 chars) |
+| `plan` | `.buzztr/plan.md` | `[PLAN]` | **on** | the active step plan |
+| `lessons` | `.buzztr/lessons.md` | `[LESSONS]` | **off** | accumulated tips; keyword-filtered (full if <2000 chars) |
 | `repo_map` | index + dep graph | `[REPO MAP]` | **off** | PageRank-scored, task-personalized map; on-demand via `code(action='repo_map')` |
 | `mcp` | live MCP summary | `[MCP SERVERS]` | **on** | one line per connected MCP server |
-| `scratchpad` | `.miniswe/scratchpad.md` | `[SCRATCHPAD]` | **on** | the agent's persistent task notes |
-| `usage_guide` | embedded | `[USAGE GUIDE]` | **on** | only when the user asks a meta-question about miniswe |
+| `scratchpad` | `.buzztr/scratchpad.md` | `[SCRATCHPAD]` | **on** | the agent's persistent task notes |
+| `usage_guide` | embedded | `[USAGE GUIDE]` | **on** | only when the user asks a meta-question about buzztr |
 | `plan_mode` | runtime flag | `[MODE:PLAN]` | **on** | read-only marker in plan mode |
 
 > **Gotcha (learned the hard way):** the `off`-by-default providers
@@ -100,7 +100,7 @@ turns raw and act only on the older prefix; they differ in *what* replaces it.
 
 | strategy | action when over budget |
 |---|---|
-| **`unified`** *(default)* | miniswe's production approach: LLM rolling summary anchored on the plan, **keep recent raw**, full pre-compaction text archived to `.miniswe/session_archive.md` with a pointer in the summary |
+| **`unified`** *(default)* | buzztr's production approach: LLM rolling summary anchored on the plan, **keep recent raw**, full pre-compaction text archived to `.buzztr/session_archive.md` with a pointer in the summary |
 | `sliding_window` | pure truncation: drop the oldest turns, keep recent within budget. No summary, no LLM, no archive — just a one-line "older turns dropped" marker |
 | `rolling_summary` | textbook rolling LLM summary: summarize old → running summary, keep recent raw. No plan-anchor, no disk archive, neutral prompt |
 | `observation_masking` | keep the full action trajectory; replace old tool **observations** (results) with a placeholder, keeping the last 3 raw. No LLM call |
@@ -117,13 +117,13 @@ turns raw and act only on the older prefix; they differ in *what* replaces it.
    "one line per file changed, end with *Still need:*" prompt
    (`SummaryStyle::Structured`), carrying any prior summary forward.
 4. **Archive.** Append the *full, untruncated* old turns to
-   `.miniswe/session_archive.md` — the lossless on-disk record behind the lossy
+   `.buzztr/session_archive.md` — the lossless on-disk record behind the lossy
    in-context summary.
 5. **Replace.** Swap the old prefix for one `[Your earlier work in this session]`
    message containing the summary + a pointer to the archive, then re-append the
    recent raw turns.
 
-The three baselines exist mainly for benchmarking miniswe's approach against the
+The three baselines exist mainly for benchmarking buzztr's approach against the
 canonical alternatives; each is implemented at its honest textbook strength.
 
 ### Instrumentation
@@ -149,7 +149,7 @@ cosmetic.
 
 ## 6. Context-level recovery (the `[tools]` knobs)
 
-Beyond rolling compaction, miniswe has opt-in mechanisms that manipulate context
+Beyond rolling compaction, buzztr has opt-in mechanisms that manipulate context
 when the agent gets *stuck*, gated on the **behavioral done-gate** — a configured
 check (`[validation] command`) that runs the change end-to-end before accepting
 completion (e.g. "does the new flag actually change runtime behavior?"). When it

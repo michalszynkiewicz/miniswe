@@ -1,8 +1,9 @@
 [package]
-name = "miniswe"
+name = "buzztr"
 version = "0.1.0"
 edition = "2024"
 description = "A lightweight CLI coding agent for local LLMs"
+repository = "https://github.com/buzztr-ai/buzztr"
 license = "MIT"
 
 [features]
@@ -126,5 +127,5 @@ ptr_arg = "allow"                     # `&mut Vec<T>` matches caller intent
 duplicate_mod = "allow"               # `mod helpers;` shared across integration tests
 
 [[bin]]
-name = "miniswe"
+name = "buzztr"
 path = "src/main.rs"

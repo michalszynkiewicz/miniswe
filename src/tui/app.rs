@@ -32,7 +32,7 @@ pub enum LineStyle {
 }
 
 /// One step of the live plan, as a pure view-model. The REPL parses
-/// `.miniswe/plan.md` (the single source of truth) and feeds these in via
+/// `.buzztr/plan.md` (the single source of truth) and feeds these in via
 /// [`App::set_plan`]; the TUI never reads plan state itself.
 #[derive(Debug, Clone)]
 pub struct PlanStepView {
@@ -89,7 +89,7 @@ pub struct App {
     /// Live plan panel: the task title for the current turn (the user's
     /// message), or None when no plan exists yet.
     pub plan_task: Option<String>,
-    /// Live plan steps (projection of `.miniswe/plan.md`). Empty = the model
+    /// Live plan steps (projection of `.buzztr/plan.md`). Empty = the model
     /// is still exploring / hasn't set a plan.
     pub plan_steps: Vec<PlanStepView>,
     /// Current agent round (panel stall signal). 0 = idle.

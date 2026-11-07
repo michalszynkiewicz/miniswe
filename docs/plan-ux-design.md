@@ -104,7 +104,7 @@ Stopped at step 4/6. What now?
 `/resume` (no args) restores the single stashed plan.
 
 ```
-$ miniswe
+$ buzztr
 Found a stashed plan from 2026-06-17 14:02 (3/6 done):
   "Add --system-prompt-override flag"
 Resume it?  [y] resume   [n] start fresh (keeps the stash)   [x] discard stash
@@ -144,8 +144,8 @@ plan while a stash exists prompts once
 ## State & storage
 
 - **Live plan state:** in-session, as today (the plan tool's structure).
-- **Stash slot:** one serialized file under `.miniswe/` (e.g.
-  `.miniswe/stashed-plan.json`) holding `{task, steps[], checked[],
+- **Stash slot:** one serialized file under `.buzztr/` (e.g.
+  `.buzztr/stashed-plan.json`) holding `{task, steps[], checked[],
   current_step, stashed_at, round}`. Session-scoped project dir, so it
   travels with the working copy. Overwritten on stash; deleted on
   discard/consume.

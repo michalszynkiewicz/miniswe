@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start llama-server with Gemma 4 31B IT (dense, Q4) for miniswe.
+# Start llama-server with Gemma 4 31B IT (dense, Q4) for buzztr.
 #
 # Hardware: RTX 3090 (24 GB) + 128 GB RAM + Ryzen 9950X3D (16 cores).
 # Sized for a ~20 GB VRAM budget (rest of the card reserved for other work)
@@ -18,7 +18,7 @@
 # Tuning (the knob): watch `nvidia-smi` on load + during the first prefill —
 #   headroom  → raise NGL toward 50 (fewer CPU layers = faster)
 #   OOM       → lower NGL (overhead spikes during prefill, so leave margin)
-#   Override:  MINISWE_NGL=50 ./start-gemma4-31b.sh
+#   Override:  BUZZTR_NGL=50 ./start-gemma4-31b.sh
 #
 # Expected speed on this box: ~10-12 tok/s decode — ~3x slower than fully-GPU
 # Devstral-Small-2 Q4, ~8x slower than the gemma-4-26B MoE (measured 95 tok/s).
@@ -34,18 +34,18 @@
 
 set -euo pipefail
 
-MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/gemma-4-31B-it-GGUF}"
-PORT="${MINISWE_PORT:-8464}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-60000}"
-THREADS="${MINISWE_THREADS:-16}"      # physical cores, for the CPU-resident layers
-NGL="${MINISWE_NGL:-42}"              # GPU layers of 60; 18 on CPU (~30%). Measured on
+MODEL_DIR="${BUZZTR_MODEL_DIR:-$HOME/models/gemma-4-31B-it-GGUF}"
+PORT="${BUZZTR_PORT:-8464}"
+CTX_SIZE="${BUZZTR_CTX_SIZE:-60000}"
+THREADS="${BUZZTR_THREADS:-16}"      # physical cores, for the CPU-resident layers
+NGL="${BUZZTR_NGL:-42}"              # GPU layers of 60; 18 on CPU (~30%). Measured on
                                       # this box (RTX 3090, ~5.5 GB desktop baseline):
                                       # model footprint ~14.4 GB, ~3.8 GB VRAM free for
                                       # other work ("X"), decode ~8.6 tok/s. Raise toward
                                       # 48 (~16 GB, ~11 tok/s) if you don't need the
                                       # headroom; lower if X needs more or it OOMs.
 
-MODEL="${MINISWE_MODEL:-}"
+MODEL="${BUZZTR_MODEL:-}"
 if [ -z "$MODEL" ]; then
     MODEL=$(ls "$MODEL_DIR"/gemma-4-31B-it-UD-Q4_K_XL*.gguf 2>/dev/null | head -1 || true)
     [ -z "$MODEL" ] && MODEL=$(ls "$MODEL_DIR"/gemma-4-31B-it-Q4_K_M*.gguf 2>/dev/null | head -1 || true)
@@ -63,7 +63,7 @@ if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
     exit 1
 fi
 
-echo "Starting Gemma 4 31B IT (dense) for miniswe..."
+echo "Starting Gemma 4 31B IT (dense) for buzztr..."
 echo "  Model:   $MODEL"
 echo "  Context: $CTX_SIZE tokens"
 echo "  KV:      q4_0"

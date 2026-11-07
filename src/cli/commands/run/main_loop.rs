@@ -117,7 +117,7 @@ pub async fn run(
     tui::print_header(if plan_only {
         "Plan Mode (read-only)"
     } else {
-        "miniswe"
+        "buzztr"
     });
 
     // Ask the server what's actually running, so startup reflects reality
@@ -163,7 +163,7 @@ pub async fn run(
     // Initialize MCP servers
     let mcp_config = McpConfig::load(&config.project_root)?;
     let mcp_registry = if mcp_config.has_servers() {
-        let cache_dir = config.miniswe_path("mcp");
+        let cache_dir = config.buzztr_path("mcp");
         match McpRegistry::connect(&mcp_config, &cache_dir) {
             Ok(registry) => {
                 if registry.has_servers() {
@@ -194,10 +194,10 @@ pub async fn run(
     let tool_def_tokens =
         context::estimate_tokens(&serde_json::to_string(&tool_defs).unwrap_or_default());
 
-    // `MINISWE_MAX_ROUNDS` overrides the configured round cap without editing
+    // `BUZZTR_MAX_ROUNDS` overrides the configured round cap without editing
     // config.toml — used by the e2e harness to give long multi-phase skills
     // (build → integrate → deploy) enough budget. Invalid/absent → config.
-    let max_rounds = std::env::var("MINISWE_MAX_ROUNDS")
+    let max_rounds = std::env::var("BUZZTR_MAX_ROUNDS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
@@ -320,8 +320,8 @@ pub async fn run(
     // so regressions jump out.
     let fast_revisions: Option<Arc<tools::RevisionStore>> =
         if config.tools.edit_mode == EditMode::Fast {
-            let miniswe_dir = config.miniswe_path("revisions");
-            match tools::RevisionStore::new(&miniswe_dir) {
+            let buzztr_dir = config.buzztr_path("revisions");
+            match tools::RevisionStore::new(&buzztr_dir) {
                 Ok(s) => Some(Arc::new(s)),
                 Err(e) => {
                     tui::print_status(&format!("fast mode: revision store init failed ({e})"));

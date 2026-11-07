@@ -1,11 +1,11 @@
-//! miniswe — A lightweight CLI coding agent for local LLMs
+//! buzztr — A lightweight CLI coding agent for local LLMs
 
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use miniswe::cli::{Cli, Command};
-use miniswe::config::Config;
+use buzztr::cli::{Cli, Command};
+use buzztr::config::Config;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,17 +18,17 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Init) => {
-            miniswe::cli::commands::init::run().await?;
+            buzztr::cli::commands::init::run().await?;
         }
         Some(Command::Info) => {
-            miniswe::cli::commands::info::run().await?;
+            buzztr::cli::commands::info::run().await?;
         }
         Some(Command::Config) => {
-            miniswe::cli::commands::config::run().await?;
+            buzztr::cli::commands::config::run().await?;
         }
         Some(Command::Plan { message }) => {
             let config = Config::load()?;
-            miniswe::cli::commands::run::run(
+            buzztr::cli::commands::run::run(
                 config,
                 &message,
                 true,
@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
                 // arg is a placeholder (the real prompt is the trailing captured
                 // gate message).
                 let msg = cli.message.unwrap_or_else(|| "[replay]".to_string());
-                miniswe::cli::commands::run::run(
+                buzztr::cli::commands::run::run(
                     config,
                     &msg,
                     false,
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
                 .await?;
             } else if let Some(message) = cli.message {
                 // Single-shot mode
-                miniswe::cli::commands::run::run(
+                buzztr::cli::commands::run::run(
                     config,
                     &message,
                     false,
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
                 .await?;
             } else {
                 // Interactive REPL
-                miniswe::cli::commands::repl::run(config, cli.yes, cli.r#continue).await?;
+                buzztr::cli::commands::repl::run(config, cli.yes, cli.r#continue).await?;
             }
         }
     }

@@ -155,12 +155,12 @@ pub struct ModelConfig {
     /// without relying on detection.
     #[serde(default)]
     pub tool_call_format: ToolCallFormat,
-    /// API key for a hosted provider. Belongs in `~/.miniswe/config.toml`
+    /// API key for a hosted provider. Belongs in `~/.buzztr/config.toml`
     /// or the environment (`api_key_env` / the provider's conventional
-    /// env var) — never in a project's `.miniswe/config.toml`, which a
-    /// user's project may not gitignore. `miniswe init` never writes this
-    /// field (see `init_default_config_has_no_api_key`); `miniswe config`
-    /// / `miniswe info` show only where a key came from, never its value.
+    /// env var) — never in a project's `.buzztr/config.toml`, which a
+    /// user's project may not gitignore. `buzztr init` never writes this
+    /// field (see `init_default_config_has_no_api_key`); `buzztr config`
+    /// / `buzztr info` show only where a key came from, never its value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     /// Name of an environment variable to read the API key from, when
@@ -277,7 +277,7 @@ impl ModelConfig {
         // alias when the probe failed. A silent `None` would disable the
         // stickiness on exactly the models that need it, and the alias is a
         // usable signal here: the benchmark harness writes the full GGUF path
-        // into `model`, and so does anyone pointing miniswe at a local file.
+        // into `model`, and so does anyone pointing buzztr at a local file.
         let name = self
             .probed_model
             .as_deref()

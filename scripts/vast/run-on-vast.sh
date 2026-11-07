@@ -97,7 +97,7 @@ echo ">>> syncing repo..."
 rsync -az --delete \
     --exclude target --exclude benchmark_results --exclude 'benchmark_results_vast' \
     -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${SSH_PORT}" \
-    "${REPO_DIR}/" "root@${SSH_HOST}:/root/miniswe/"
+    "${REPO_DIR}/" "root@${SSH_HOST}:/root/buzztr/"
 
 # ── 5. On-VM dead-man's switch (independent of this machine) ─────────────
 # Destroys the instance via the Vast REST API after MAX_HOURS no matter what.
@@ -113,7 +113,7 @@ echo ">>> dead-man's switch armed (${MAX_HOURS}h)"
 
 # ── 6. Run the bench detached (survives SSH drops), poll for completion ──
 echo ">>> launching bench (${WHICH}, ${RUNS} runs each)..."
-${SSH} "cd /root/miniswe && HF_TOKEN='${HF_TOKEN}' nohup bash scripts/vast/bootstrap-vast.sh ${WHICH} ${RUNS} > /root/bench.log 2>&1 & echo started"
+${SSH} "cd /root/buzztr && HF_TOKEN='${HF_TOKEN}' nohup bash scripts/vast/bootstrap-vast.sh ${WHICH} ${RUNS} > /root/bench.log 2>&1 & echo started"
 echo ">>> tailing /root/bench.log (Ctrl-C is safe — instance still tears down)"
 while true; do
     ${SSH} "tail -n 5 /root/bench.log 2>/dev/null; echo ---; grep -q 'DONE. Results' /root/bench.log && echo BENCH_DONE || true" 2>/dev/null | sed 's/^/[vm] /'
@@ -125,7 +125,7 @@ done
 echo ">>> fetching results..."
 mkdir -p "${REPO_DIR}/benchmark_results_vast"
 rsync -az -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${SSH_PORT}" \
-    "root@${SSH_HOST}:/root/miniswe/benchmark_results/" "${REPO_DIR}/benchmark_results_vast/" || true
+    "root@${SSH_HOST}:/root/buzztr/benchmark_results/" "${REPO_DIR}/benchmark_results_vast/" || true
 ${SSH} "tail -n 40 /root/bench.log" 2>/dev/null | sed 's/^/[vm] /'
 
 echo ">>> done — results in ${REPO_DIR}/benchmark_results_vast/"

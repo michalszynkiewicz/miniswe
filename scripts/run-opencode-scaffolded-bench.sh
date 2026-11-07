@@ -20,7 +20,7 @@
 # SEPARATE `opencode run` invocation (tested with a canary phrase before
 # writing this script).
 #
-# This is the closest opencode-native analogue to miniswe's forced
+# This is the closest opencode-native analogue to buzztr's forced
 # plan-first ceremony — NOT identical (opencode's Plan agent is a read-only
 # analysis pass, not a persistent, checkable plan.md with compile gates),
 # but it's the mechanism opencode itself ships for "plan before you build."
@@ -34,7 +34,7 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-IMAGE_NAME="miniswe-opencode-bench"
+IMAGE_NAME="buzztr-opencode-bench"
 
 LLAMA_ENDPOINT="${LLAMA_ENDPOINT:-http://localhost:8464}"
 
@@ -138,7 +138,7 @@ JSON
 run_variant() {
     local name="$1"
     local variant_dir="${RESULTS_DIR}/${name}"
-    local container_name="miniswe-opencode-scaffolded-${name}-$$"
+    local container_name="buzztr-opencode-scaffolded-${name}-$$"
     mkdir -p "${variant_dir}"
     echo "--- ${name} ---"
 
@@ -281,7 +281,7 @@ $(grep -E '^error(\[|:)|^\s*-->|^\s*\|' /output/cargo_check.txt | head -60)"
     fi
 
     TOTAL=$((TOTAL + 1))
-    BINARY="./target/debug/miniswe"
+    BINARY="./target/debug/buzztr"
     if [ "$PASS" -ge 1 ]; then
         if RUSTFLAGS="-A warnings" cargo build 2> /output/cargo_build.txt; then
             echo "build:PASS"; PASS=$((PASS + 1))
@@ -356,7 +356,7 @@ SMOKE FAILED: expected PONG_42 in stdout but got: $(echo "${SMOKE_OUTPUT}" | hea
     fi
 
     # Next attempt starts a FRESH plan/build session pair (matching how
-    # miniswe/aider retries restart their own process fresh too) — but the
+    # buzztr/aider retries restart their own process fresh too) — but the
     # plan prompt for the retry includes what broke, so the new plan can
     # actually address it instead of repeating the same one blind.
     CURRENT_TASK="${TASK}

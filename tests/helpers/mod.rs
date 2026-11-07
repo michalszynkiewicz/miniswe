@@ -5,24 +5,24 @@
 use std::fs;
 use std::path::PathBuf;
 
-use miniswe::config::Config;
+use buzztr::config::Config;
 use tempfile::TempDir;
 use wiremock::ResponseTemplate;
 
-/// Create a temporary project directory with `.miniswe/` initialized.
+/// Create a temporary project directory with `.buzztr/` initialized.
 /// Returns the TempDir (must be held alive) and a Config pointed at it.
 pub fn create_test_project() -> (TempDir, Config) {
     let temp = TempDir::new().expect("failed to create temp dir");
     let project_root = temp.path().to_path_buf();
 
-    // Create .miniswe directory structure
-    let miniswe_dir = project_root.join(".miniswe");
-    fs::create_dir_all(&miniswe_dir).unwrap();
-    fs::create_dir_all(miniswe_dir.join("index")).unwrap();
+    // Create .buzztr directory structure
+    let buzztr_dir = project_root.join(".buzztr");
+    fs::create_dir_all(&buzztr_dir).unwrap();
+    fs::create_dir_all(buzztr_dir.join("index")).unwrap();
 
     // Write a minimal config.toml
     fs::write(
-        miniswe_dir.join("config.toml"),
+        buzztr_dir.join("config.toml"),
         r#"[model]
 provider = "llama-cpp"
 endpoint = "http://localhost:9999"
@@ -47,10 +47,10 @@ fetch_backend = "jina"
     .unwrap();
 
     // Write empty index files so tools don't error on missing index
-    fs::write(miniswe_dir.join("index/symbols.json"), "{}").unwrap();
-    fs::write(miniswe_dir.join("index/summaries.json"), "{}").unwrap();
-    fs::write(miniswe_dir.join("index/file_tree.txt"), "").unwrap();
-    fs::write(miniswe_dir.join("index/mtimes.json"), "{}").unwrap();
+    fs::write(buzztr_dir.join("index/symbols.json"), "{}").unwrap();
+    fs::write(buzztr_dir.join("index/summaries.json"), "{}").unwrap();
+    fs::write(buzztr_dir.join("index/file_tree.txt"), "").unwrap();
+    fs::write(buzztr_dir.join("index/mtimes.json"), "{}").unwrap();
 
     // Write empty .mcp.json so McpConfig::load doesn't fail
     fs::write(project_root.join(".mcp.json"), r#"{"servers":{}}"#).unwrap();

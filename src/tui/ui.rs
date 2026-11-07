@@ -80,7 +80,7 @@ fn draw_normal(frame: &mut Frame, app: &App) {
     }
 }
 
-/// Live plan panel: a projection of `.miniswe/plan.md`. Done steps are green,
+/// Live plan panel: a projection of `.buzztr/plan.md`. Done steps are green,
 /// the current (first unchecked) step is yellow, upcoming steps are blue.
 fn draw_plan_panel(frame: &mut Frame, app: &App, area: Rect) {
     let (done, total) = app.plan_progress();
@@ -188,7 +188,7 @@ fn draw_topbar(frame: &mut Frame, app: &App, area: Rect) {
 
     let line = Line::from(vec![
         Span::styled(
-            "miniswe",
+            "buzztr",
             Style::default()
                 .fg(TEXT_PRIMARY)
                 .bg(BG_PANEL)

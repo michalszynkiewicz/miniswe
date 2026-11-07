@@ -18,7 +18,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RESULTS_DIR="${REPO_DIR}/benchmark_results"
-IMAGE_NAME="miniswe-bench"
+IMAGE_NAME="buzztr-bench"
 
 TASK="${1:-all}"
 shift || true

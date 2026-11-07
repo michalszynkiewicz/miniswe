@@ -1,4 +1,4 @@
-You are working on miniswe, a CLI coding agent for local LLMs. Your goal is to make the benchmark pass reliably within 1200 seconds, without overfitting changes to the specific benchmark task.
+You are working on buzztr, a CLI coding agent for local LLMs. Your goal is to make the benchmark pass reliably within 1200 seconds, without overfitting changes to the specific benchmark task.
 
 ## How the benchmark works
 
@@ -6,15 +6,15 @@ CRITICAL: Understand the two-layer architecture before changing anything.
 
 The benchmark has two separate codebases:
 
-1. The miniswe binary (the agent) — built from the current HEAD of this repo during docker build. This is what you modify.
-2. The target project (the code miniswe works on) — checked out inside the container at a pinned SHA (cc34d2626faf32c1b6dd1b8b33af693fb936b098). This is an older snapshot of this same repo. You must NEVER change this SHA or modify the target project code.
+1. The buzztr binary (the agent) — built from the current HEAD of this repo during docker build. This is what you modify.
+2. The target project (the code buzztr works on) — checked out inside the container at a pinned SHA (cc34d2626faf32c1b6dd1b8b33af693fb936b098). This is an older snapshot of this same repo. You must NEVER change this SHA or modify the target project code.
 
 The benchmark flow:
-1. docker build compiles miniswe from HEAD into a Docker image
+1. docker build compiles buzztr from HEAD into a Docker image
 2. Container starts, extracts the target project at the pinned SHA via git archive
-3. miniswe runs inside the container, trying to complete the task on the target project
+3. buzztr runs inside the container, trying to complete the task on the target project
 4. Validation checks: compile, build, --help shows flag, flag parses, cargo test, smoke test (PONG_42)
-5. Up to 3 retry attempts if validation fails (errors fed back to miniswe)
+5. Up to 3 retry attempts if validation fails (errors fed back to buzztr)
 
 The benchmark task: "Add a CLI flag --system-prompt-override that replaces the default system prompt."
 
@@ -22,12 +22,12 @@ The benchmark task: "Add a CLI flag --system-prompt-override that replaces the d
 
 - Run benchmark: ./scripts/run-benchmark-docker.sh --timeout 1200
 - Kill running benchmark: ./scripts/kill-benchmark-docker.sh
-- Check progress: docker ps --filter name=miniswe-bench and then tail the most recent stderr file: find benchmark_results -name 'stderr_attempt*.txt' -newer benchmark_results -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2 | xargs tail -30
+- Check progress: docker ps --filter name=buzztr-bench and then tail the most recent stderr file: find benchmark_results -name 'stderr_attempt*.txt' -newer benchmark_results -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2 | xargs tail -30
 - Check results: Look for "=== FINAL: N/N ===" in the most recent container.log
 
 ## What to improve
 
-You are modifying the miniswe agent code (src/) to help it complete tasks better. Areas to experiment with:
+You are modifying the buzztr agent code (src/) to help it complete tasks better. Areas to experiment with:
 
 - System prompt (src/context/mod.rs) — what instructions help the model succeed
 - Tool behavior (src/tools/) — how tools report results, error messages, guardrails
@@ -64,7 +64,7 @@ Known issues from previous benchmark runs:
 2. Form a hypothesis about what would help
 3. Make a focused change
 4. Run ./scripts/run-benchmark-docker.sh --timeout 1200
-5. Wait for it to finish (check with docker ps --filter name=miniswe-bench) — the benchmark takes 5-20 minutes typically. Do not sit idle — read code or plan your next experiment while waiting.
+5. Wait for it to finish (check with docker ps --filter name=buzztr-bench) — the benchmark takes 5-20 minutes typically. Do not sit idle — read code or plan your next experiment while waiting.
 6. Analyze results in the most recent benchmark_results/docker_*/ directory
 7. If promising: git add the changed files specifically (not -A) && git commit -m "experiment: what you changed" && git tag experiment-NAME
 8. If not: revert with git checkout -- src/ and try a different approach

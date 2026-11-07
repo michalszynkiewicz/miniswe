@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Read-only status snapshot of a miniswe benchmark run. Safe to run
+# Read-only status snapshot of a buzztr benchmark run. Safe to run
 # repeatedly. Usage: bench-watch.sh [RESULTS_DIR]
 # Default targets the in-flight validation run.
 set -uo pipefail
 
-DIR="${1:-/home/michal/dev/miniswe/benchmark_results/docker_20260515_225155_Devstral-Small-2-24B-Instruct-2512-UD-Q4}"
+DIR="${1:-/home/michal/dev/buzztr/benchmark_results/docker_20260515_225155_Devstral-Small-2-24B-Instruct-2512-UD-Q4}"
 BL="$DIR/00_baseline"
 
 if [ ! -d "$BL" ]; then

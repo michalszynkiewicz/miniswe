@@ -8,12 +8,12 @@
 # Usage: scripts/run-helm-corpus-e2e.sh [--refresh]
 #   --refresh   delete the cached clones and download them again
 #
-# Env: HELM_CORPUS_DIR (default /tmp/miniswe-helm-corpus) — where the
+# Env: HELM_CORPUS_DIR (default /tmp/buzztr-helm-corpus) — where the
 # charts are cloned; existing clones are reused.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-CORPUS="${HELM_CORPUS_DIR:-/tmp/miniswe-helm-corpus}"
+CORPUS="${HELM_CORPUS_DIR:-/tmp/buzztr-helm-corpus}"
 
 REPOS=(
     "https://github.com/bitnami/charts.git bitnami"

@@ -13,7 +13,7 @@ Two artifacts, both already on disk for every run:
     dump whose last message is the gate rejection AND whose task message is the
     ORIGINAL task (skipping gate_context_reset's compacted "[Your earlier
     work...]" summaries, which aren't a natural pre-fix context).
-  * code state: miniswe's shadow-git commits the working tree per round
+  * code state: buzztr's shadow-git commits the working tree per round
     ("round N — before round N"). We map the chosen dump to its round by
     timestamp and `git archive` that commit's tree.
 
@@ -84,7 +84,7 @@ def shadow_git_rounds(sg: str):
 def map_messages_to_commit(messages, rounds):
     """Map the captured context to its shadow-git tree by ROUND, not time.
 
-    miniswe bumps its round counter once per main-agent turn, and shadow-git
+    buzztr bumps its round counter once per main-agent turn, and shadow-git
     commits "round N — before round N" at the start of each round. The number
     of assistant turns in the captured history == how many rounds the agent has
     taken, so the tree the gate just checked is "before round = #assistant".
@@ -108,7 +108,7 @@ def main():
     base = sys.argv[1].rstrip("/")
     out = sys.argv[2] if len(sys.argv) > 2 else "/tmp/replay-fixture"
     dumps_dir = os.path.join(base, "llm_dumps")
-    sg = os.path.join(base, "miniswe_state", "shadow-git")
+    sg = os.path.join(base, "buzztr_state", "shadow-git")
 
     if not os.path.isdir(dumps_dir):
         sys.exit(f"no llm_dumps in {base}")

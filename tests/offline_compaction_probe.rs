@@ -17,11 +17,11 @@
 //! `trajectory.json` is a JSON array of `Message` objects (no system message);
 //! build one with `scripts/replay/reconstruct-trajectory.py`.
 
-use miniswe::config::{CompactionStrategy, Config};
-use miniswe::context::compressor::maybe_compress;
-use miniswe::context::estimate_tokens;
-use miniswe::llm::{Message, ModelRouter};
-use miniswe::runtime::LlmWorkerHandle;
+use buzztr::config::{CompactionStrategy, Config};
+use buzztr::context::compressor::maybe_compress;
+use buzztr::context::estimate_tokens;
+use buzztr::llm::{Message, ModelRouter};
+use buzztr::runtime::LlmWorkerHandle;
 use std::sync::Arc;
 
 /// Load the captured trajectory (Message array, no system msg) from
@@ -55,7 +55,7 @@ async fn run_strategy(strategy: CompactionStrategy, endpoint: &str) -> (usize, u
     // history one turn at a time, compacting each step like the agent loop does.
     let traj = load_trajectory();
     let mut messages = vec![Message::system(
-        "You are miniswe, a coding agent. Complete the task using your tools.",
+        "You are buzztr, a coding agent. Complete the task using your tools.",
     )];
     let mut plan_flag = false;
     let mut compactions = 0usize;

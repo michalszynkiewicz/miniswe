@@ -37,7 +37,7 @@ quantized LLM with file/shell access jailed to the project root.
 - **Where:** `src/tools/permissions.rs:131-141`.
 - **What:** When the input path contains no `..` component, the function
   returns `project_root.join(path)` *without* canonicalizing. The in-source
-  comment justifies this for the `.miniswe → /output` symlink that the
+  comment justifies this for the `.buzztr → /output` symlink that the
   docker image installs. Side effect: any in-tree symlink is followed
   blindly.
 - **Exploits:** anything that can plant a symlink inside the project root
@@ -46,7 +46,7 @@ quantized LLM with file/shell access jailed to the project root.
   `replace_range` access to the symlink target.
 - **Fix:** still resolve symlinks (`canonicalize`), but accept any path
   whose canonical form starts with `project_root`. The legitimate
-  `.miniswe → /output` case can be handled by either (a) canonicalizing
+  `.buzztr → /output` case can be handled by either (a) canonicalizing
   `project_root` itself to include `/output`, or (b) maintaining an
   explicit allowlist of known "external" symlink targets.
 
@@ -174,7 +174,7 @@ quantized LLM with file/shell access jailed to the project root.
 
 - **Where:** `src/logging.rs:149-154` (`tool_call_detail`), `:228-235`
   (`llm_request`).
-- **What:** full JSON args are logged to `~/.miniswe/logs/*.log` at debug
+- **What:** full JSON args are logged to `~/.buzztr/logs/*.log` at debug
   level (which the README describes as routine). The Serper key is *not*
   in args (loaded from disk), but if the user pastes a credential into a
   prompt that gets passed to `web(query=…)` or `shell(command=…)`, it
@@ -253,7 +253,7 @@ the source. Listed here so they don't get re-discovered:
   validates before delegating. Real concern is the layering footgun (L5),
   not a live bypass.
 - **"Serper key is logged"** — the key is read from
-  `~/.miniswe/serper.key` and never appears in tool args. Real concern is
+  `~/.buzztr/serper.key` and never appears in tool args. Real concern is
   user-pasted secrets in unrelated args (L3).
 - **Various `chars().count()` perf nits** — measurable only in hot loops
   none of these are in.

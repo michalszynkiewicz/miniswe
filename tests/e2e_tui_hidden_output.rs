@@ -1,6 +1,6 @@
-//! Drives the real miniswe REPL in a PTY against a local llama-cpp server
+//! Drives the real buzztr REPL in a PTY against a local llama-cpp server
 //! to catch the "hidden tail" rendering bug that only surfaces after
-//! multiple roundtrips. Gated behind MINISWE_LIVE_MODEL=1.
+//! multiple roundtrips. Gated behind BUZZTR_LIVE_MODEL=1.
 
 #![cfg(test)]
 
@@ -59,8 +59,8 @@ impl VtReader {
 
 #[test]
 fn tui_hidden_output_across_multiple_turns() {
-    if std::env::var("MINISWE_LIVE_MODEL").is_err() {
-        eprintln!("skipped: set MINISWE_LIVE_MODEL=1 to run (needs llama-cpp on :8464)");
+    if std::env::var("BUZZTR_LIVE_MODEL").is_err() {
+        eprintln!("skipped: set BUZZTR_LIVE_MODEL=1 to run (needs llama-cpp on :8464)");
         return;
     }
 
@@ -77,7 +77,7 @@ fn tui_hidden_output_across_multiple_turns() {
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_miniswe"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_buzztr"));
     cmd.arg("-y");
     cmd.cwd(temp.path());
     cmd.env("TERM", "xterm-256color");
@@ -139,7 +139,7 @@ fn tui_hidden_output_across_multiple_turns() {
                 eprintln!("  [{li:02}] {line}");
             }
             // Dump session log immediately to capture what the LLM produced
-            let log_dir = temp.path().join(".miniswe").join("logs");
+            let log_dir = temp.path().join(".buzztr").join("logs");
             if let Ok(entries) = std::fs::read_dir(&log_dir) {
                 for entry in entries.flatten() {
                     if entry.path().extension().is_some_and(|e| e == "log") {
@@ -163,7 +163,7 @@ fn tui_hidden_output_across_multiple_turns() {
     }
 
     // Check session log to confirm LLM actually produced the text
-    let log_dir = temp.path().join(".miniswe").join("logs");
+    let log_dir = temp.path().join(".buzztr").join("logs");
     if let Ok(entries) = std::fs::read_dir(&log_dir) {
         for entry in entries.flatten() {
             if entry.path().extension().is_some_and(|e| e == "log") {
@@ -196,10 +196,10 @@ fn tui_hidden_output_across_multiple_turns() {
 }
 
 fn write_config(root: &std::path::Path) {
-    let miniswe = root.join(".miniswe");
-    std::fs::create_dir_all(&miniswe).unwrap();
+    let buzztr = root.join(".buzztr");
+    std::fs::create_dir_all(&buzztr).unwrap();
     std::fs::write(
-        miniswe.join("config.toml"),
+        buzztr.join("config.toml"),
         r#"
 [model]
 provider = "llama-cpp"

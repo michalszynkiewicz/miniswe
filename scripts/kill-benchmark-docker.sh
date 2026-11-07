@@ -1,3 +1,3 @@
 #!/bin/bash
 
-docker kill $(docker ps | grep miniswe | awk '{print $1}')
+docker kill $(docker ps | grep buzztr | awk '{print $1}')

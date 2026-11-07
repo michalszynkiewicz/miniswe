@@ -1,11 +1,11 @@
-//! Per-session state directories under `.miniswe/sessions/<id>/`.
+//! Per-session state directories under `.buzztr/sessions/<id>/`.
 //!
 //! `plan.md` and `scratchpad.md` are session working state, not project
-//! state, but they used to live at a fixed path in `.miniswe/`. That made
-//! every miniswe process in a project share one mutable copy, and since a
+//! state, but they used to live at a fixed path in `.buzztr/`. That made
+//! every buzztr process in a project share one mutable copy, and since a
 //! non-`--continue` session start deleted both files to clear stale state,
 //! any second process silently wiped the first one's plan. The benchmark hit
-//! this constantly: the task under test *is* miniswe, so when the agent
+//! this constantly: the task under test *is* buzztr, so when the agent
 //! smoke-tested the binary it had just built inside its own workspace, the
 //! child run deleted its parent's plan mid-run — which also stripped the
 //! parent's edit tools, because `plan_exists` gates them.
@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 /// How many session directories to keep. Older ones are pruned at session
-/// start so `.miniswe/sessions/` doesn't grow without bound.
+/// start so `.buzztr/sessions/` doesn't grow without bound.
 pub const RETENTION: usize = 20;
 
 /// Pointer file naming the most recent session, so `--continue` can find

@@ -1,6 +1,6 @@
 //! JSON-RPC 2.0 framing for the MCP stdio transport: one message per line.
 //!
-//! Mirrors the wire format already spoken by `miniswe::mcp::client::McpClient`
+//! Mirrors the wire format already spoken by `buzztr::mcp::client::McpClient`
 //! (which connects to MCP servers as a client) — this module is the server
 //! side of that same protocol.
 

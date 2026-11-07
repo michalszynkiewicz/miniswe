@@ -71,7 +71,7 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
 
     let response = client
         .get(url)
-        .header("User-Agent", "miniswe")
+        .header("User-Agent", "buzztr")
         .send()
         .await
         .context("http request")?;
@@ -155,7 +155,7 @@ pub async fn download_clangd(cache_dir: &Path) -> Result<PathBuf> {
     let client = reqwest::Client::new();
     let release: serde_json::Value = client
         .get(api_url)
-        .header("User-Agent", "miniswe")
+        .header("User-Agent", "buzztr")
         .send()
         .await?
         .json()
@@ -240,7 +240,7 @@ pub async fn download_jdtls(cache_dir: &Path) -> Result<PathBuf> {
     let client = reqwest::Client::new();
     let release: serde_json::Value = client
         .get(api_url)
-        .header("User-Agent", "miniswe")
+        .header("User-Agent", "buzztr")
         .send()
         .await?
         .json()

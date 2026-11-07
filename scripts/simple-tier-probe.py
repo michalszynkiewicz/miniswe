@@ -8,7 +8,7 @@ vs
   B) minimal flat 3-tool surface (read/search/shell as flat OpenAI tools;
      edits still via text SEARCH/REPLACE)
 provably better on Gemma-4-26B-A4B for a multi-file value-threading task
-(the exact shape of miniswe's documented 5-6/6 ceiling)?
+(the exact shape of buzztr's documented 5-6/6 ceiling)?
 
 Oracle: real `cargo check` + behavioral run of the produced binary.
 """
@@ -123,7 +123,7 @@ def scaffold(d):
 
 
 def sanitize_messages(msgs):
-    """Port of miniswe's context::sanitize_messages — strict chat-template
+    """Port of buzztr's context::sanitize_messages — strict chat-template
     hygiene for Mistral/Devstral. Returns a NEW list (wire-only; the
     harness keeps its own raw conversation state). Rules: single leading
     system; merge consecutive same-role (user/assistant); drop empty

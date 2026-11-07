@@ -4,7 +4,7 @@
 #
 # Task-specific scripts must define:
 #   TASK_NAME  — short identifier
-#   TASK       — initial prompt for miniswe
+#   TASK       — initial prompt for buzztr
 #   validate_result(attempt_dir, work_dir)
 #     → writes validation.txt (PASS/PARTIAL/FAIL)
 #     → writes validation_errors.txt (human-readable failures for retry)
@@ -119,7 +119,7 @@ TOML
 WORK_DIR=""
 
 init_workdir() {
-    WORK_DIR=$(mktemp -d "/tmp/miniswe-bench-XXXXXX")
+    WORK_DIR=$(mktemp -d "/tmp/buzztr-bench-XXXXXX")
     mkdir -p "${WORK_DIR}"
     cd "${WORK_DIR}" && git init -q && cd - > /dev/null
     prepare_workdir
@@ -135,22 +135,22 @@ prepare_workdir() {
 
     # Fix LFS pointer files (git archive doesn't resolve LFS)
     if grep -q "git-lfs" "${WORK_DIR}/.gitignore" 2>/dev/null; then
-        echo -e "target/\n.miniswe/\n*.log" > "${WORK_DIR}/.gitignore"
+        echo -e "target/\n.buzztr/\n*.log" > "${WORK_DIR}/.gitignore"
     fi
 
     # Clear cached builds from previous attempts
     rm -rf "${WORK_DIR}/target"
 
-    # Initialize miniswe fresh for this SHA's code
-    rm -rf "${WORK_DIR}/.miniswe"
+    # Initialize buzztr fresh for this SHA's code
+    rm -rf "${WORK_DIR}/.buzztr"
     cd "${WORK_DIR}"
-    if ! "${MINISWE}" init 2>"${WORK_DIR}/.miniswe/init.log"; then
-        echo "ERROR: miniswe init failed:"
-        cat "${WORK_DIR}/.miniswe/init.log"
+    if ! "${BUZZTR}" init 2>"${WORK_DIR}/.buzztr/init.log"; then
+        echo "ERROR: buzztr init failed:"
+        cat "${WORK_DIR}/.buzztr/init.log"
         exit 1
     fi
     cd - > /dev/null
-    mkdir -p "${WORK_DIR}/.miniswe/logs"
+    mkdir -p "${WORK_DIR}/.buzztr/logs"
 
     cd "${WORK_DIR}"
     git add -A && git commit -q --allow-empty -m "pinned at ${SHA}" 2>/dev/null || true
@@ -161,7 +161,7 @@ cleanup_workdir() {
     [ -n "${WORK_DIR}" ] && rm -rf "${WORK_DIR}"
 }
 
-# ── Metric extraction from a single miniswe invocation ──────────────────
+# ── Metric extraction from a single buzztr invocation ──────────────────
 
 extract_attempt_metrics() {
     local attempt_dir="$1"
@@ -268,12 +268,12 @@ EOF
 
 # ── Runner with validate-retry loop ─────────────────────────────────────
 
-# Run miniswe with retry on validation failure.
-# Does NOT reset workdir between attempts — miniswe sees its own changes.
+# Run buzztr with retry on validation failure.
+# Does NOT reset workdir between attempts — buzztr sees its own changes.
 # Calls validate_result() which must be defined by the task-specific script.
 #
 # Args: run_name disabled_provider run_number task
-run_miniswe() {
+run_buzztr() {
     local run_name="$1"
     local disabled="${2:-}"
     local run_num="${3:-1}"
@@ -285,8 +285,8 @@ run_miniswe() {
 
     # Fresh workdir for this run
     prepare_workdir
-    write_config "${WORK_DIR}/.miniswe/config.toml" "${disabled}"
-    cp "${WORK_DIR}/.miniswe/config.toml" "${run_dir}/config.toml"
+    write_config "${WORK_DIR}/.buzztr/config.toml" "${disabled}"
+    cp "${WORK_DIR}/.buzztr/config.toml" "${run_dir}/config.toml"
     echo "${disabled:-none}" > "${run_dir}/disabled_provider.txt"
 
     local run_start
@@ -313,9 +313,9 @@ run_miniswe() {
         echo "    attempt ${attempt}/${MAX_ATTEMPTS} (${remaining}s remaining)"
 
         # Clear logs from previous attempt
-        rm -f "${WORK_DIR}/.miniswe/logs/"*.log
+        rm -f "${WORK_DIR}/.buzztr/logs/"*.log
 
-        # Run miniswe — workdir retains modifications from previous attempts.
+        # Run buzztr — workdir retains modifications from previous attempts.
         # On retry attempts (2+), pass --continue so plan.md and scratchpad.md
         # from the previous attempt survive the startup wipe.
         local continue_flag=""
@@ -323,15 +323,15 @@ run_miniswe() {
             continue_flag="--continue"
         fi
         cd "${WORK_DIR}"
-        timeout "${remaining}" "${MINISWE}" ${continue_flag} --yes "${current_task}" \
+        timeout "${remaining}" "${BUZZTR}" ${continue_flag} --yes "${current_task}" \
             > "${attempt_dir}/stdout.txt" \
             2> "${attempt_dir}/stderr.txt" \
             || true
         cd - > /dev/null
 
         # Capture logs
-        if ls "${WORK_DIR}/.miniswe/logs/"*.log 1>/dev/null 2>&1; then
-            cp "${WORK_DIR}/.miniswe/logs/"*.log "${attempt_dir}/"
+        if ls "${WORK_DIR}/.buzztr/logs/"*.log 1>/dev/null 2>&1; then
+            cp "${WORK_DIR}/.buzztr/logs/"*.log "${attempt_dir}/"
         fi
 
         # Extract per-attempt metrics
@@ -385,15 +385,15 @@ Please fix the issues. The modified files are still on disk — read them, find 
 
 # ── Find binary ─────────────────────────────────────────────────────────
 
-find_miniswe_binary() {
-    if [ -f "${REPO_DIR}/target/release/miniswe" ]; then
-        MINISWE="${REPO_DIR}/target/release/miniswe"
-    elif [ -f "${REPO_DIR}/target/debug/miniswe" ]; then
-        MINISWE="${REPO_DIR}/target/debug/miniswe"
+find_buzztr_binary() {
+    if [ -f "${REPO_DIR}/target/release/buzztr" ]; then
+        BUZZTR="${REPO_DIR}/target/release/buzztr"
+    elif [ -f "${REPO_DIR}/target/debug/buzztr" ]; then
+        BUZZTR="${REPO_DIR}/target/debug/buzztr"
     else
-        echo "Building miniswe..."
+        echo "Building buzztr..."
         cargo build --release --manifest-path="${REPO_DIR}/Cargo.toml"
-        MINISWE="${REPO_DIR}/target/release/miniswe"
+        BUZZTR="${REPO_DIR}/target/release/buzztr"
     fi
 }
 
@@ -509,7 +509,7 @@ run_variant() {
     local variant_name="$1"
     local disabled="$2"
     for run in $(seq 1 "${RUNS_PER_VARIANT}"); do
-        run_miniswe "${variant_name}" "${disabled}" "${run}" "${TASK}"
+        run_buzztr "${variant_name}" "${disabled}" "${run}" "${TASK}"
     done
     average_metrics "${RESULTS_DIR}/${variant_name}"
 }
@@ -520,11 +520,11 @@ run_benchmark_init() {
     RESULTS_DIR="${RESULTS_DIR:-${REPO_DIR}/benchmark_results/${TASK_NAME}_${timestamp}}"
     mkdir -p "${RESULTS_DIR}"
 
-    find_miniswe_binary
+    find_buzztr_binary
     init_workdir
     trap cleanup_workdir EXIT
 
-    echo "=== miniswe provider benchmark: ${TASK_NAME} ==="
+    echo "=== buzztr provider benchmark: ${TASK_NAME} ==="
     echo "SHA:          ${SHA}"
     echo "Strategy:     ${STRATEGY}"
     echo "Task:         ${TASK:0:80}..."

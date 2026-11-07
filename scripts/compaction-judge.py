@@ -30,7 +30,7 @@ NEEDLES = [
     ("variable", "ovr_slot_88",
      "What is the name of the local variable that carries the override inside assemble()?",
      ["ovr_slot_88"]),
-    ("scratchpad", "DELETE the .miniswe/scratchpad.md",
+    ("scratchpad", "DELETE the .buzztr/scratchpad.md",
      "When the override is active, what must the agent do to the scratchpad file?",
      ["delete", "remove"]),
     ("loglevel", "logged at WARN level",

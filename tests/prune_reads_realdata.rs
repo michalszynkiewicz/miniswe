@@ -7,8 +7,8 @@
 //! assistant `tool_calls` message immediately before it, on history the model
 //! actually produced.
 
-use miniswe::cli::commands::agent::prune_reads::prune_repeated_reads;
-use miniswe::llm::Message;
+use buzztr::cli::commands::agent::prune_reads::prune_repeated_reads;
+use buzztr::llm::Message;
 
 #[test]
 fn prunes_a_real_read_loop_without_orphaning_results() {

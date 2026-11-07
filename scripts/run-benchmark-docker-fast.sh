@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run-benchmark-docker-fast.sh — Same benchmark harness as
-# run-benchmark-docker.sh, but runs miniswe with `edit_mode = "fast"`.
+# run-benchmark-docker.sh, but runs buzztr with `edit_mode = "fast"`.
 #
 # Fast mode replaces the inner-model edit_file planner with primitive
 # range-based edits (replace_range / insert_at / revert) and per-edit
@@ -30,7 +30,7 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # GPU telemetry + llama-server provenance (docs/gpu-hardening.md items 2, 5)
 source "${REPO_DIR}/scripts/bench-gpu.sh"
-IMAGE_NAME="miniswe-bench"
+IMAGE_NAME="buzztr-bench"
 
 # Probe the running llama-server for the loaded model so the result dir is
 # self-labeling. Falls back to "unknown" if the server isn't reachable.
@@ -103,7 +103,7 @@ echo ""
 
 # Verify LLM server is reachable before spending minutes on docker build
 # and hours on a doomed run. Container uses --network=host, so the host's
-# 8464 is the same endpoint miniswe will see.
+# 8464 is the same endpoint buzztr will see.
 if ! curl -fsS --max-time 5 "${LLAMA_ENDPOINT}/v1/models" > /dev/null 2>&1; then
     echo "ERROR: LLM server not responding at ${LLAMA_ENDPOINT}" >&2
     echo "" >&2
@@ -196,7 +196,7 @@ run_variant() {
     local name="$1"
     local disabled="${2:-}"
     local variant_dir="${RESULTS_DIR}/${name}"
-    local container_name="miniswe-bench-${name}-$$"
+    local container_name="buzztr-bench-${name}-$$"
     mkdir -p "${variant_dir}"
 
     echo "--- ${name} ---"
@@ -208,8 +208,8 @@ run_variant() {
     # Run in a fresh container:
     # 1. Extract code at pinned SHA
     # 2. Write config
-    # 3. Run miniswe init
-    # 4. Run miniswe --yes "task"
+    # 3. Run buzztr init
+    # 4. Run buzztr --yes "task"
     # 5. Run validation (cargo check/build/test + smoke test)
     local container_script
     container_script=$(cat <<'SCRIPT'
@@ -225,30 +225,30 @@ MAX_ATTEMPTS="$4"
 # Fresh checkout
 cd /work
 git -C /repo archive "${SHA}" | tar -x
-rm -rf target .miniswe
+rm -rf target .buzztr
 
 # Fix LFS pointer files (git archive doesn't resolve LFS) and make sure the
-# .miniswe symlink created below is always ignored (git would otherwise try
+# .buzztr symlink created below is always ignored (git would otherwise try
 # to add it to the baseline commit).
 if grep -q "git-lfs" .gitignore 2>/dev/null; then
-    echo -e "target/\n.miniswe\n*.log" > .gitignore
+    echo -e "target/\n.buzztr\n*.log" > .gitignore
 else
-    echo ".miniswe" >> .gitignore
+    echo ".buzztr" >> .gitignore
 fi
 
-# Route .miniswe through the bind-mounted /output volume. Every log line,
+# Route .buzztr through the bind-mounted /output volume. Every log line,
 # scratchpad write, session file, and index update lands on the host
 # filesystem as it is written. If the container is killed mid-run,
 # everything up to that point already survives — no post-run cp needed.
-mkdir -p /output/miniswe_state
-ln -sfn /output/miniswe_state .miniswe
-cp /config/config.toml .miniswe/config.toml
-if ! miniswe init 2>/output/miniswe_init.txt; then
-    echo "ERROR: miniswe init failed:"
-    cat /output/miniswe_init.txt
+mkdir -p /output/buzztr_state
+ln -sfn /output/buzztr_state .buzztr
+cp /config/config.toml .buzztr/config.toml
+if ! buzztr init 2>/output/buzztr_init.txt; then
+    echo "ERROR: buzztr init failed:"
+    cat /output/buzztr_init.txt
     exit 1
 fi
-mkdir -p .miniswe/logs
+mkdir -p .buzztr/logs
 
 # Init git for diff tracking
 git init -q && git add -A && git commit -q -m "baseline" 2>/dev/null
@@ -270,18 +270,18 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
 
     echo "=== ATTEMPT ${ATTEMPT}/${MAX_ATTEMPTS} (${REMAINING}s remaining) ==="
 
-    # Keep prior-attempt logs around: every miniswe run opens a fresh
-    # timestamped log file under .miniswe/logs/, so accumulation is natural
+    # Keep prior-attempt logs around: every buzztr run opens a fresh
+    # timestamped log file under .buzztr/logs/, so accumulation is natural
     # and lets us inspect a killed attempt alongside completed ones.
 
-    # Run miniswe (keep modified code from previous attempts)
-    timeout "${REMAINING}" miniswe --yes "${CURRENT_TASK}" \
+    # Run buzztr (keep modified code from previous attempts)
+    timeout "${REMAINING}" buzztr --yes "${CURRENT_TASK}" \
         > /output/stdout_attempt${ATTEMPT}.txt \
         2> /output/stderr_attempt${ATTEMPT}.txt \
         || true
 
     # Logs, scratchpad, tool_history, sessions, and index are all already on
-    # the host volume via the .miniswe → /output/miniswe_state symlink.
+    # the host volume via the .buzztr → /output/buzztr_state symlink.
     # Only git state needs an explicit capture here.
     git diff --name-only > /output/changed_files.txt 2>/dev/null || true
     git ls-files --others --exclude-standard >> /output/changed_files.txt 2>/dev/null || true
@@ -310,7 +310,7 @@ Affected files: ${COMPILE_ERR_FILES}"
 
     # Check 2: cargo build
     TOTAL=$((TOTAL + 1))
-    BINARY="./target/debug/miniswe"
+    BINARY="./target/debug/buzztr"
     if [ "$PASS" -ge 1 ]; then
         if RUSTFLAGS="-A warnings" cargo build 2> /output/cargo_build.txt; then
             echo "build:PASS"
@@ -339,7 +339,7 @@ Affected files: ${BUILD_ERR_FILES}"
         else
             echo "help:FAIL"
             ERRORS="${ERRORS}
-HELP FAILED: \`miniswe --help\` output does not contain any flag matching '--*prompt*'. The feature must add a new CLI flag whose long name contains 'prompt' (e.g. --system-prompt-override). Current --help output:
+HELP FAILED: \`buzztr --help\` output does not contain any flag matching '--*prompt*'. The feature must add a new CLI flag whose long name contains 'prompt' (e.g. --system-prompt-override). Current --help output:
 $(head -40 /output/help_output.txt)"
         fi
     fi
@@ -467,13 +467,13 @@ SCRIPT
 
     ACTIVE_CONTAINER_NAME="${container_name}"
 
-    # See run-benchmark-docker.sh for rationale on MINISWE_LLM_DUMP_DIR.
+    # See run-benchmark-docker.sh for rationale on BUZZTR_LLM_DUMP_DIR.
     docker run --rm \
         --network=host \
         -v "${variant_dir}:/output" \
         -v "${variant_dir}/config.toml:/config/config.toml:ro" \
         -v "${tmp_script}:/run.sh:ro" \
-        -e MINISWE_LLM_DUMP_DIR=/output/llm_dumps \
+        -e BUZZTR_LLM_DUMP_DIR=/output/llm_dumps \
         --name "${container_name}" \
         "${IMAGE_NAME}" \
         bash /run.sh "${BASELINE_SHA}" "${TASK}" "${TIMEOUT}" "${MAX_ATTEMPTS}" \
@@ -496,9 +496,9 @@ SCRIPT
     final_line=$(grep "=== FINAL:" "${variant_dir}/container.log" 2>/dev/null || echo "FINAL: ?/? after ? attempt(s)")
 
     # Count total rounds across all attempt logs. Logs now live under
-    # miniswe_state/logs/ thanks to the in-container symlink.
+    # buzztr_state/logs/ thanks to the in-container symlink.
     local rounds=0
-    for logfile in "${variant_dir}"/miniswe_state/logs/*.log; do
+    for logfile in "${variant_dir}"/buzztr_state/logs/*.log; do
         [ -f "${logfile}" ] || continue
         local r
         r=$(grep -c '\[round ' "${logfile}" 2>/dev/null || true)
@@ -534,7 +534,7 @@ echo "-----------------------------------------------------------------"
 for d in "${RESULTS_DIR}"/*/; do
     name=$(basename "$d")
     local_rounds=0
-    for logfile in "$d"/miniswe_state/logs/*.log; do
+    for logfile in "$d"/buzztr_state/logs/*.log; do
         [ -f "${logfile}" ] || continue
         local_r=$(grep -c '\[round ' "${logfile}" 2>/dev/null || true)
         local_rounds=$((local_rounds + ${local_r:-0}))

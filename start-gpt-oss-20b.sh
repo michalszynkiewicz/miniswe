@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start llama-server with GPT-OSS-20B for miniswe.
+# Start llama-server with GPT-OSS-20B for buzztr.
 #
 # Hardware target: RTX 3090 (24GB VRAM, ~21GB usable) + 128GB RAM
 # Model: GPT-OSS-20B (OpenAI's open-weight 20B, dense, native MXFP4
@@ -25,12 +25,12 @@
 
 set -euo pipefail
 
-MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/gpt-oss-20b-GGUF}"
-PORT="${MINISWE_PORT:-8464}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-60000}"
-THREADS="${MINISWE_THREADS:-8}"
+MODEL_DIR="${BUZZTR_MODEL_DIR:-$HOME/models/gpt-oss-20b-GGUF}"
+PORT="${BUZZTR_PORT:-8464}"
+CTX_SIZE="${BUZZTR_CTX_SIZE:-60000}"
+THREADS="${BUZZTR_THREADS:-8}"
 
-MODEL="${MINISWE_MODEL:-}"
+MODEL="${BUZZTR_MODEL:-}"
 if [ -z "$MODEL" ]; then
     # MXFP4 is the native format; F16 wrappers are the common llama.cpp ones.
     MODEL=$(ls "$MODEL_DIR"/gpt-oss-20b-*F16*.gguf 2>/dev/null | head -1 || true)
@@ -49,7 +49,7 @@ if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
     exit 1
 fi
 
-echo "Starting GPT-OSS-20B for miniswe..."
+echo "Starting GPT-OSS-20B for buzztr..."
 echo "  Model:   $MODEL"
 echo "  Context: $CTX_SIZE tokens"
 echo "  KV:      q4_0"

@@ -1,4 +1,4 @@
-//! `miniswe info` — Show project info and index stats.
+//! `buzztr info` — Show project info and index stats.
 
 use anyhow::Result;
 
@@ -11,14 +11,14 @@ pub async fn run() -> Result<()> {
     let config = Config::load()?;
 
     if !config.is_initialized() {
-        tui::print_error("Project not initialized. Run `miniswe init` first.");
+        tui::print_error("Project not initialized. Run `buzztr init` first.");
         return Ok(());
     }
 
     tui::print_header("Project Info");
 
     // Load and display profile
-    let profile_path = config.miniswe_path("profile.md");
+    let profile_path = config.buzztr_path("profile.md");
     if let Ok(profile) = std::fs::read_to_string(&profile_path) {
         eprintln!("{profile}");
     }
@@ -26,7 +26,7 @@ pub async fn run() -> Result<()> {
     tui::print_separator();
 
     // Load and display index stats
-    match ProjectIndex::load(&config.miniswe_dir()) {
+    match ProjectIndex::load(&config.buzztr_dir()) {
         Ok(index) => {
             eprintln!("Index Statistics:");
             eprintln!("  Files indexed:    {}", index.total_files);

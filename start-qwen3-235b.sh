@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start llama.cpp server with Qwen 3 235B for miniswe planning/reasoning.
+# Start llama.cpp server with Qwen 3 235B for buzztr planning/reasoning.
 #
 # Hardware target: AMD Ryzen 9 9950X3D (16C/32T) + 128GB RAM — CPU only
 # Model: UD-Q3_K_XL (~97GB across 3 shards) — too large for 24GB VRAM
@@ -13,11 +13,11 @@
 
 set -euo pipefail
 
-MODEL_DIR="${MINISWE_QWEN_DIR:-$HOME/models/qwen3-235b/UD-Q3_K_XL}"
+MODEL_DIR="${BUZZTR_QWEN_DIR:-$HOME/models/qwen3-235b/UD-Q3_K_XL}"
 MODEL="${MODEL_DIR}/Qwen3-235B-A22B-Thinking-2507-UD-Q3_K_XL-00001-of-00003.gguf"
-PORT="${MINISWE_QWEN_PORT:-8465}"
-CTX_SIZE="${MINISWE_QWEN_CTX:-32768}"
-THREADS="${MINISWE_QWEN_THREADS:-16}"
+PORT="${BUZZTR_QWEN_PORT:-8465}"
+CTX_SIZE="${BUZZTR_QWEN_CTX:-32768}"
+THREADS="${BUZZTR_QWEN_THREADS:-16}"
 
 if [ ! -f "$MODEL" ]; then
     echo "Model not found: $MODEL"
@@ -28,11 +28,11 @@ if [ ! -f "$MODEL" ]; then
     echo "    --include 'UD-Q3_K_XL/*' \\"
     echo "    --local-dir models/qwen3-235b/"
     echo ""
-    echo "Or set MINISWE_QWEN_DIR to point to your UD-Q3_K_XL directory."
+    echo "Or set BUZZTR_QWEN_DIR to point to your UD-Q3_K_XL directory."
     exit 1
 fi
 
-echo "Starting Qwen 3 235B for miniswe (planning/reasoning)..."
+echo "Starting Qwen 3 235B for buzztr (planning/reasoning)..."
 echo "  Model:   $MODEL"
 echo "  Shards:  3 (auto-detected from first shard)"
 echo "  Context: $CTX_SIZE tokens"

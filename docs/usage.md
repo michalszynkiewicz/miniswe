@@ -1,16 +1,16 @@
-# miniswe User Guide
+# buzztr User Guide
 
 ## Quick Start
 
-1. `miniswe init` — initialize a project (creates `.miniswe/` with index)
-2. `miniswe "your task"` — single-shot mode (runs task, exits)
-3. `miniswe` — interactive REPL mode
-4. `miniswe plan "your task"` — plan-only mode (read-only, no edits)
+1. `buzztr init` — initialize a project (creates `.buzztr/` with index)
+2. `buzztr "your task"` — single-shot mode (runs task, exits)
+3. `buzztr` — interactive REPL mode
+4. `buzztr plan "your task"` — plan-only mode (read-only, no edits)
 
 ## Configuration
 
-Global config: `~/.miniswe/config.toml` (API keys, model, hardware settings).
-Per-project overrides: `.miniswe/config.toml` (optional, overrides global key by key; `miniswe init` writes it fully commented out).
+Global config: `~/.buzztr/config.toml` (API keys, model, hardware settings).
+Per-project overrides: `.buzztr/config.toml` (optional, overrides global key by key; `buzztr init` writes it fully commented out).
 
 Key settings:
 - `model.endpoint` — LLM API URL (e.g., `http://localhost:8464`)
@@ -19,19 +19,19 @@ Key settings:
   auto: taken from the server at startup (llama.cpp `/props`, vLLM
   `max_model_len`, OpenRouter `context_length`), else 50000. A set value
   always wins and is never validated against the server.
-- put your Serper key in `~/.miniswe/serper.key` to enable general web search
+- put your Serper key in `~/.buzztr/serper.key` to enable general web search
 - `logging.level` — log verbosity: `info`, `debug` (default), `trace`
-- `logging.enabled` — write session logs to `.miniswe/logs/` (default: true)
+- `logging.enabled` — write session logs to `.buzztr/logs/` (default: true)
 
 ## Sessions and Continuity
 
 Each run is a fresh session. The agent does not automatically remember previous sessions.
 
 To maintain continuity across sessions:
-- **Scratchpad** (`.miniswe/scratchpad.md`): the agent writes working notes here via `plan(action='scratchpad')`. It's cleared at session start. To continue work, tell the agent what was done before or paste the previous scratchpad content.
+- **Scratchpad** (`.buzztr/scratchpad.md`): the agent writes working notes here via `plan(action='scratchpad')`. It's cleared at session start. To continue work, tell the agent what was done before or paste the previous scratchpad content.
 - **AI notes** (`.ai/README.md`): the agent updates this with architecture decisions and key changes after completing tasks. This persists across sessions and is automatically loaded into context.
-- **Lessons** (`.miniswe/lessons.md`): accumulated tips and gotchas. Add entries manually or let the agent learn from mistakes. Keyword-matched and injected into context when relevant.
-- **User guide** (`.miniswe/guide.md`): project-specific instructions for the agent (coding style, conventions, things to avoid). Always loaded into context.
+- **Lessons** (`.buzztr/lessons.md`): accumulated tips and gotchas. Add entries manually or let the agent learn from mistakes. Keyword-matched and injected into context when relevant.
+- **User guide** (`.buzztr/guide.md`): project-specific instructions for the agent (coding style, conventions, things to avoid). Always loaded into context.
 
 To continue work from a previous session, you can:
 1. Simply describe what needs to happen next — the agent reads `.ai/README.md` for context
@@ -87,23 +87,23 @@ Current tool surface:
 ## Web Search Notes
 
 - `web(search)` uses Serper for general web search when configured.
-- Recommended setup: put your Serper key in `~/.miniswe/serper.key`.
+- Recommended setup: put your Serper key in `~/.buzztr/serper.key`.
 - Without that key, `web(search)` falls back to GitHub repository search only.
 - `file(action='search', ...)` is local project/code search only. It cannot search GitHub or the web.
 
 ## Project Index
 
-`miniswe init` scans the project with tree-sitter to build a symbol index:
+`buzztr init` scans the project with tree-sitter to build a symbol index:
 - Symbols (functions, structs, classes, etc.) with line numbers
 - File summaries (one-liner per file)
 - Dependency graph with PageRank scores
 - Personalized repo map (injected into context, ranked by relevance to current task)
 
-The index is stored in `.miniswe/index/` and incrementally updated when the agent edits files. Run `miniswe init` again to do a full re-index.
+The index is stored in `.buzztr/index/` and incrementally updated when the agent edits files. Run `buzztr init` again to do a full re-index.
 
 ## Logging
 
-Session logs are written to `.miniswe/logs/` with timestamps. Configure via `logging.level`:
+Session logs are written to `.buzztr/logs/` with timestamps. Configure via `logging.level`:
 - `info` — tool calls and outcomes only
 - `debug` — full LLM interactions, tool arguments and results
 - `trace` — everything including context assembly stats and masking decisions
@@ -112,6 +112,6 @@ Session logs are written to `.miniswe/logs/` with timestamps. Configure via `log
 
 - Keep files under 200 lines for best results with small models
 - The agent auto-runs language-appropriate checks after editing source files when configured to do so
-- Use plan mode (`miniswe plan "task"`) to explore and plan without making changes
+- Use plan mode (`buzztr plan "task"`) to explore and plan without making changes
 - The repo map is personalized per task — keywords from your message boost relevant files
-- If the agent seems lost, check `.miniswe/logs/` for the session log
+- If the agent seems lost, check `.buzztr/logs/` for the session log

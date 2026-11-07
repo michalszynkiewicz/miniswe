@@ -1,6 +1,6 @@
 /target
 models/
-.miniswe/
+.buzztr/
 .mcp.json
 .env
 **/benchmark_results
@@ -13,3 +13,4 @@ docs/app-with-deps-e2e-review.md
 nohup.out
 /bench.log
 .idea/
+posts/

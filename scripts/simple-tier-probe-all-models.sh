@@ -3,7 +3,7 @@
 # modality probe. Reuses run-agent-comparison.sh's proven llama lifecycle.
 set -uo pipefail
 
-REPO="/home/michal/dev/miniswe"
+REPO="/home/michal/dev/buzztr"
 LLAMA_CONTAINER="llama-server-bench"
 ENDPOINT="http://localhost:8464"
 WORK="/tmp/simple-tier-probe"

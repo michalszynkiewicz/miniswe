@@ -1,4 +1,4 @@
-//! Session logger — writes structured logs to `.miniswe/logs/`.
+//! Session logger — writes structured logs to `.buzztr/logs/`.
 //!
 //! Three verbosity levels:
 //! - **info**: tool calls and outcomes (one-liner per action)
@@ -50,7 +50,7 @@ impl SessionLog {
         }
 
         let level = LogLevel::from_str(&config.logging.level);
-        let log_dir = config.miniswe_path("logs");
+        let log_dir = config.buzztr_path("logs");
         let _ = fs::create_dir_all(&log_dir);
 
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
@@ -66,7 +66,7 @@ impl SessionLog {
             // Write header
             let mut f = f.try_clone().ok();
             if let Some(ref mut f) = f {
-                let _ = writeln!(f, "# miniswe session log");
+                let _ = writeln!(f, "# buzztr session log");
                 let _ = writeln!(
                     f,
                     "# started: {}",

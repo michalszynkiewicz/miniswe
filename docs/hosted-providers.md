@@ -64,10 +64,10 @@ decides per provider:
 Keys: `api_key` / `api_key_env` on each model slot, resolved as config field,
 then the named env var, then the provider's conventional variable
 (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`). Keys belong in
-`~/.miniswe/config.toml` or the environment, never in a project's
-`.miniswe/config.toml` (a user's project may not gitignore it). The project
-override merge inherits keys from the global file, `miniswe init` never writes
-one, and `miniswe config` / `miniswe info` redact.
+`~/.buzztr/config.toml` or the environment, never in a project's
+`.buzztr/config.toml` (a user's project may not gitignore it). The project
+override merge inherits keys from the global file, `buzztr init` never writes
+one, and `buzztr config` / `buzztr info` redact.
 
 Cost visibility ships with the feature: a `[usage]` log line per main-loop
 call, a `[usage:total]` line before `[end]` summing every role, and an

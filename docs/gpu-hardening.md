@@ -69,7 +69,7 @@ exact command line, recovered from the coredump:
 ```
 
 Note this is **Laguna-S 2.1 (118B-A8B, 68.35 GB)**. The `devstral-small-2` string that
-appears in the request dumps is only the model name miniswe puts in the API payload —
+appears in the request dumps is only the model name buzztr puts in the API payload —
 llama.cpp ignores it. Do not use the dumps to identify the loaded model; use the coredump
 or the server's own log (item 2a).
 
@@ -611,8 +611,8 @@ Both remain the operator's responsibility.
 
 ## 6. Fix the e2e's failure reporting
 
-`run_agent()` in `tests/e2e/run-demo-skills-miniswe.sh` does `|| rc=$?` and then
-`return 0` unconditionally. A killed or crashed miniswe is therefore **indistinguishable
+`run_agent()` in `tests/e2e/run-demo-skills-buzztr.sh` does `|| rc=$?` and then
+`return 0` unconditionally. A killed or crashed buzztr is therefore **indistinguishable
 from a clean finish** in the log — which is what made the first run look like it had
 "stopped on its own" when it had been killed.
 

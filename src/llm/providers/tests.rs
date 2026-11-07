@@ -252,7 +252,7 @@ async fn env_var_api_key_resolves_and_is_sent() {
     // SAFETY: test-only env var, unique name avoids collisions with other
     // tests running in parallel in this process.
     unsafe {
-        std::env::set_var("MINISWE_TEST_PROVIDERS_LIVE_KEY", "env-secret");
+        std::env::set_var("BUZZTR_TEST_PROVIDERS_LIVE_KEY", "env-secret");
     }
 
     let server = MockServer::start().await;
@@ -264,7 +264,7 @@ async fn env_var_api_key_resolves_and_is_sent() {
         .await;
 
     let mut config = config_for("openrouter", &server.uri());
-    config.api_key_env = Some("MINISWE_TEST_PROVIDERS_LIVE_KEY".into());
+    config.api_key_env = Some("BUZZTR_TEST_PROVIDERS_LIVE_KEY".into());
     let client = LlmClient::new(config);
     client
         .chat(&request())
@@ -272,7 +272,7 @@ async fn env_var_api_key_resolves_and_is_sent() {
         .expect("the env-resolved key must reach the mock for the request to match");
 
     unsafe {
-        std::env::remove_var("MINISWE_TEST_PROVIDERS_LIVE_KEY");
+        std::env::remove_var("BUZZTR_TEST_PROVIDERS_LIVE_KEY");
     }
 }
 

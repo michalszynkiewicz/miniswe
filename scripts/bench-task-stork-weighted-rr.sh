@@ -47,12 +47,12 @@ prepare_workdir() {
     # Copy source tree (excluding .git of cache)
     rsync -a --exclude='.git' --exclude='.stork-cache' "${WORK_DIR}/.stork-cache/" "${WORK_DIR}/"
 
-    # Init miniswe
-    rm -rf "${WORK_DIR}/.miniswe"
+    # Init buzztr
+    rm -rf "${WORK_DIR}/.buzztr"
     cd "${WORK_DIR}"
-    "${MINISWE}" init 2>/dev/null || true
+    "${BUZZTR}" init 2>/dev/null || true
     cd - > /dev/null
-    mkdir -p "${WORK_DIR}/.miniswe/logs"
+    mkdir -p "${WORK_DIR}/.buzztr/logs"
 
     cd "${WORK_DIR}"
     git add -A && git commit -q --allow-empty -m "stork at ${STORK_SHA}" 2>/dev/null || true
@@ -61,7 +61,7 @@ prepare_workdir() {
 
 # Override init_workdir too
 init_workdir() {
-    WORK_DIR=$(mktemp -d "/tmp/miniswe-bench-XXXXXX")
+    WORK_DIR=$(mktemp -d "/tmp/buzztr-bench-XXXXXX")
     mkdir -p "${WORK_DIR}"
     cd "${WORK_DIR}" && git init -q && cd - > /dev/null
     prepare_workdir

@@ -247,6 +247,64 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
+name = "buzztr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "avt",
+ "chrono",
+ "clap",
+ "crossterm",
+ "dashmap",
+ "dirs",
+ "flate2",
+ "futures",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "libc",
+ "lsp-types",
+ "notify",
+ "parking_lot 0.13.0",
+ "petgraph",
+ "portable-pty",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter 0.26.13",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-elixir",
+ "tree-sitter-go",
+ "tree-sitter-haskell",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-kotlin",
+ "tree-sitter-lua",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-scala",
+ "tree-sitter-swift",
+ "tree-sitter-tags",
+ "tree-sitter-typescript",
+ "tree-sitter-yaml",
+ "tree-sitter-zig",
+ "wiremock",
+ "zip",
+]
+
+[[package]]
 name = "by_address"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1898,64 +1956,6 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
-
-[[package]]
-name = "miniswe"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "avt",
- "chrono",
- "clap",
- "crossterm",
- "dashmap",
- "dirs",
- "flate2",
- "futures",
- "grep-regex",
- "grep-searcher",
- "ignore",
- "libc",
- "lsp-types",
- "notify",
- "parking_lot 0.13.0",
- "petgraph",
- "portable-pty",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "tar",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "tree-sitter 0.26.13",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-cpp",
- "tree-sitter-elixir",
- "tree-sitter-go",
- "tree-sitter-haskell",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-kotlin",
- "tree-sitter-lua",
- "tree-sitter-php",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-scala",
- "tree-sitter-swift",
- "tree-sitter-tags",
- "tree-sitter-typescript",
- "tree-sitter-yaml",
- "tree-sitter-zig",
- "wiremock",
- "zip",
-]
 
 [[package]]
 name = "miniz_oxide"

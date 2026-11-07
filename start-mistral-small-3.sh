@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start llama-server with Mistral Small 3.1 24B Instruct for miniswe.
+# Start llama-server with Mistral Small 3.1 24B Instruct for buzztr.
 #
 # Hardware target: RTX 3090 (24GB VRAM, ~21GB usable) + 128GB RAM
 # Model: Mistral-Small-3.1-24B-Instruct (dense, 24B params, 128K max context)
@@ -24,12 +24,12 @@
 
 set -euo pipefail
 
-MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/Mistral-Small-3.1-24B-Instruct-GGUF}"
-PORT="${MINISWE_PORT:-8464}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-60000}"
-THREADS="${MINISWE_THREADS:-8}"
+MODEL_DIR="${BUZZTR_MODEL_DIR:-$HOME/models/Mistral-Small-3.1-24B-Instruct-GGUF}"
+PORT="${BUZZTR_PORT:-8464}"
+CTX_SIZE="${BUZZTR_CTX_SIZE:-60000}"
+THREADS="${BUZZTR_THREADS:-8}"
 
-MODEL="${MINISWE_MODEL:-}"
+MODEL="${BUZZTR_MODEL:-}"
 if [ -z "$MODEL" ]; then
     MODEL=$(ls "$MODEL_DIR"/Mistral-Small-3.1-24B-Instruct-*UD-Q4_K_XL*.gguf 2>/dev/null | head -1 || true)
     [ -z "$MODEL" ] && MODEL=$(ls "$MODEL_DIR"/Mistral-Small-3.1-24B-Instruct-*Q4_K_M*.gguf 2>/dev/null | head -1 || true)
@@ -47,7 +47,7 @@ if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
     exit 1
 fi
 
-echo "Starting Mistral Small 3.1 24B for miniswe..."
+echo "Starting Mistral Small 3.1 24B for buzztr..."
 echo "  Model:   $MODEL"
 echo "  Context: $CTX_SIZE tokens"
 echo "  KV:      q4_0"

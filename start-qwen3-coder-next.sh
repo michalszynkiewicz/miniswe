@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start llama-server with Qwen3-Coder-Next for miniswe.
+# Start llama-server with Qwen3-Coder-Next for buzztr.
 #
 # Released February 2026 — Qwen's purpose-built agentic-coding model
 # designed for local use. Hybrid MoE/attention architecture (12×(3×DeltaNet→MoE)
@@ -31,12 +31,12 @@
 
 set -euo pipefail
 
-MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/Qwen3-Coder-Next-GGUF}"
-PORT="${MINISWE_PORT:-8464}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-60000}"
-THREADS="${MINISWE_THREADS:-16}"
+MODEL_DIR="${BUZZTR_MODEL_DIR:-$HOME/models/Qwen3-Coder-Next-GGUF}"
+PORT="${BUZZTR_PORT:-8464}"
+CTX_SIZE="${BUZZTR_CTX_SIZE:-60000}"
+THREADS="${BUZZTR_THREADS:-16}"
 
-MODEL="${MINISWE_MODEL:-}"
+MODEL="${BUZZTR_MODEL:-}"
 if [ -z "$MODEL" ]; then
     # Without this check, `find` against a missing directory exits non-zero
     # under `set -euo pipefail`, killing the script before the helpful
@@ -49,7 +49,7 @@ if [ -z "$MODEL" ]; then
         echo "    --include '*UD-Q4_K_XL*' \\" >&2
         echo "    --local-dir $MODEL_DIR" >&2
         echo "" >&2
-        echo "Or set MINISWE_MODEL_DIR to point to an existing directory." >&2
+        echo "Or set BUZZTR_MODEL_DIR to point to an existing directory." >&2
         exit 1
     fi
 
@@ -73,7 +73,7 @@ if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
     exit 1
 fi
 
-echo "Starting Qwen3-Coder-Next 80B (MoE, 3B active) for miniswe..."
+echo "Starting Qwen3-Coder-Next 80B (MoE, 3B active) for buzztr..."
 echo "  Model:    $MODEL"
 echo "  Context:  $CTX_SIZE tokens"
 echo "  KV:       q4_0"

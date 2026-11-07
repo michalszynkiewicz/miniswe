@@ -223,16 +223,16 @@ pub(super) async fn lsp_find_references(
 
 /// Return the PageRank-scored repo map, optionally filtered by keywords.
 pub(super) fn context_tool_repo_map(keywords_str: &str, config: &Config) -> Result<ToolResult> {
-    let miniswe_dir = config.miniswe_dir();
-    let index = match ProjectIndex::load(&miniswe_dir) {
+    let buzztr_dir = config.buzztr_dir();
+    let index = match ProjectIndex::load(&buzztr_dir) {
         Ok(idx) => idx,
         Err(_) => {
             return Ok(ToolResult::err(
-                "No project index. Run `miniswe init` first.".into(),
+                "No project index. Run `buzztr init` first.".into(),
             ));
         }
     };
-    let graph = DependencyGraph::load(&miniswe_dir).unwrap_or_default();
+    let graph = DependencyGraph::load(&buzztr_dir).unwrap_or_default();
 
     let keywords: Vec<&str> = if keywords_str.is_empty() {
         vec![]
@@ -264,14 +264,14 @@ pub(super) fn context_tool_repo_map(keywords_str: &str, config: &Config) -> Resu
 pub(super) fn context_tool_project_info(config: &Config) -> Result<ToolResult> {
     let mut output = String::new();
 
-    let profile_path = config.miniswe_path("profile.md");
+    let profile_path = config.buzztr_path("profile.md");
     if let Ok(content) = std::fs::read_to_string(&profile_path) {
         output.push_str("[PROFILE]\n");
         output.push_str(&compress::compress_profile(&content));
         output.push('\n');
     }
 
-    let guide_path = config.miniswe_path("guide.md");
+    let guide_path = config.buzztr_path("guide.md");
     if let Ok(content) = std::fs::read_to_string(&guide_path)
         && (!content.contains("<!-- Add project-specific instructions")
             || content.lines().count() > 5)
@@ -281,7 +281,7 @@ pub(super) fn context_tool_project_info(config: &Config) -> Result<ToolResult> {
         output.push('\n');
     }
 
-    let lessons_path = config.miniswe_path("lessons.md");
+    let lessons_path = config.buzztr_path("lessons.md");
     if let Ok(content) = std::fs::read_to_string(&lessons_path)
         && (!content.contains("<!-- Accumulated tips") || content.lines().count() > 5)
     {
@@ -292,7 +292,7 @@ pub(super) fn context_tool_project_info(config: &Config) -> Result<ToolResult> {
 
     if output.is_empty() {
         Ok(ToolResult::ok(
-            "No project info available. Run `miniswe init` to generate.".into(),
+            "No project info available. Run `buzztr init` to generate.".into(),
         ))
     } else {
         Ok(ToolResult::ok(output))

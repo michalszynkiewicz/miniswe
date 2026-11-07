@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start llama-server with Cohere North Mini Code 1.0 (30B-A3B MoE, agentic
-# coding) for miniswe.
+# coding) for buzztr.
 #
 # North Mini Code 1.0 (CohereLabs, Jun 2026): sparse MoE, ~30B total / ~3B
 # ACTIVE per token — 128 routed experts, 8 active (sigmoid gating, no shared
@@ -25,7 +25,7 @@
 #     KV 60K q8_0         ~1.1 GB
 #     CUDA ctx + buffers  ~1.3 GB
 #     total               ~18.2 GB  → inside the budget with ~2 GB to spare
-#   Tune: lower MINISWE_NCMOE to pull experts back onto the GPU (each ≈ 0.34
+#   Tune: lower BUZZTR_NCMOE to pull experts back onto the GPU (each ≈ 0.34
 #   GB), raise it if nvidia-smi shows a spill. Do NOT use -ngl here — whole-
 #   layer offload moves attention too and costs ~5 ms/token per layer.
 #
@@ -35,14 +35,14 @@
 # `reasoning` kwarg (default TRUE) decides whether the generation prompt opens
 # `<|START_THINKING|>` or prefills an empty `<|START_THINKING|><|END_THINKING|>`
 # block; `reasoning_effort: "none"` is equivalent to `reasoning: false`. The
-# template has NO `enable_thinking` variable, so miniswe's per-request
+# template has NO `enable_thinking` variable, so buzztr's per-request
 # `{"enable_thinking": false/true}` is inert for this model — the server
-# default below (MINISWE_REASONING, default false = instruct arm) is what
+# default below (BUZZTR_REASONING, default false = instruct arm) is what
 # counts. The server merges request kwargs over the defaults key-by-key, so
-# miniswe's kwarg neither helps nor hurts. A thinking arm = MINISWE_REASONING=
-# true + `model.thinking = true` in miniswe (for temp 0.6) — with the caveat
+# buzztr's kwarg neither helps nor hurts. A thinking arm = BUZZTR_REASONING=
+# true + `model.thinking = true` in buzztr (for temp 0.6) — with the caveat
 # that the card says the model "works best" when prior turns' reasoning is
-# passed back in history; miniswe discards `reasoning_content`, so that arm is
+# passed back in history; buzztr discards `reasoning_content`, so that arm is
 # off-distribution (llama.cpp's --reasoning-preserve may help; untested).
 #
 # TOOL CALLS use Cohere's `<|START_ACTION|>[{"tool_call_id":…,"tool_name":…,
@@ -52,7 +52,7 @@
 # round trip before the first bench run.
 #
 # SAMPLING per the model card: temp 1.0, top-p 0.95 (benchmarks run with
-# exactly those). miniswe overrides `temperature` per request (bench config
+# exactly those). buzztr overrides `temperature` per request (bench config
 # 0.2; 0.6 when `model.thinking` is on); top-p comes from this flag.
 #
 # Download the model first (~19.2 GB, single file):
@@ -67,20 +67,20 @@
 
 set -euo pipefail
 
-MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/North-Mini-Code-1.0-GGUF}"
-PORT="${MINISWE_PORT:-8464}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-60000}"
-KV_TYPE="${MINISWE_KV_TYPE:-q8_0}"      # f16 also fits (+0.8 GB); q4_0 is a suspected loop-pathology contributor
-THREADS="${MINISWE_THREADS:-16}"        # physical cores; used for CPU-resident expert tensors
-NCMOE="${MINISWE_NCMOE:-10}"            # MoE layers (of 48) whose experts live on CPU; 0 = all on GPU
-REASONING="${MINISWE_REASONING:-false}" # template kwarg: false = instruct arm (empty think block), true = interleaved thinking
+MODEL_DIR="${BUZZTR_MODEL_DIR:-$HOME/models/North-Mini-Code-1.0-GGUF}"
+PORT="${BUZZTR_PORT:-8464}"
+CTX_SIZE="${BUZZTR_CTX_SIZE:-60000}"
+KV_TYPE="${BUZZTR_KV_TYPE:-q8_0}"      # f16 also fits (+0.8 GB); q4_0 is a suspected loop-pathology contributor
+THREADS="${BUZZTR_THREADS:-16}"        # physical cores; used for CPU-resident expert tensors
+NCMOE="${BUZZTR_NCMOE:-10}"            # MoE layers (of 48) whose experts live on CPU; 0 = all on GPU
+REASONING="${BUZZTR_REASONING:-false}" # template kwarg: false = instruct arm (empty think block), true = interleaved thinking
 
 case "$REASONING" in
     true|false) ;;
-    *) echo "MINISWE_REASONING must be true|false (got '$REASONING')" >&2; exit 1 ;;
+    *) echo "BUZZTR_REASONING must be true|false (got '$REASONING')" >&2; exit 1 ;;
 esac
 
-MODEL="${MINISWE_MODEL:-}"
+MODEL="${BUZZTR_MODEL:-}"
 if [ -z "$MODEL" ]; then
     for pat in 'North-Mini-Code-1.0-UD-Q4_K_M' 'North-Mini-Code-1.0-UD-Q4_K_S' 'North-Mini-Code-1.0-MXFP4_MOE' 'North-Mini-Code-1.0-UD-Q4_K_XL' 'North-Mini-Code-1.0-UD-IQ4_XS'; do
         MODEL=$(ls "$MODEL_DIR"/${pat}*.gguf 2>/dev/null | grep -v -- '-00002-of-' | head -1 || true)
@@ -116,12 +116,12 @@ ARGS=(
     --metrics
 )
 
-echo "Starting North Mini Code 1.0 (30B-A3B MoE) for miniswe..."
+echo "Starting North Mini Code 1.0 (30B-A3B MoE) for buzztr..."
 echo "  Model:     $MODEL"
 echo "  Context:   $CTX_SIZE tokens, KV $KV_TYPE (13 global layers cache full context)"
 echo "  Experts:   $NCMOE/48 MoE layers' experts on CPU (0 = all on GPU)"
-echo "  Thinking:  reasoning=$REASONING (template kwarg; miniswe's enable_thinking is inert for this model)"
-echo "  Sampling:  temp 1.0, top-p 0.95 (miniswe overrides temp per request)"
+echo "  Thinking:  reasoning=$REASONING (template kwarg; buzztr's enable_thinking is inert for this model)"
+echo "  Sampling:  temp 1.0, top-p 0.95 (buzztr overrides temp per request)"
 echo "  Port:      $PORT"
 echo ""
 

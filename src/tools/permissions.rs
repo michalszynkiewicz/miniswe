@@ -185,16 +185,16 @@ impl PermissionManager {
         // CAN point outside — catch that by canonicalizing symlinks and
         // verifying the target stays within the jail.
         //
-        // Exception: `.miniswe/` may legitimately be a symlink to an
-        // external directory (e.g. docker's `.miniswe/ → /output`), so
+        // Exception: `.buzztr/` may legitimately be a symlink to an
+        // external directory (e.g. docker's `.buzztr/ → /output`), so
         // paths under it are allowed to escape.
         let has_parent_dir = std::path::Path::new(path_str)
             .components()
             .any(|c| matches!(c, Component::ParentDir));
         if !has_parent_dir {
             if joined.is_symlink()
-                && !path_str.starts_with(".miniswe/")
-                && !path_str.starts_with(".miniswe\\")
+                && !path_str.starts_with(".buzztr/")
+                && !path_str.starts_with(".buzztr\\")
                 && let Ok(canonical) = joined.canonicalize()
                 && !canonical.starts_with(&self.project_root)
             {
@@ -730,19 +730,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn miniswe_symlink_allowed_to_escape() {
+    fn buzztr_symlink_allowed_to_escape() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.project_root = tmp.path().canonicalize().unwrap();
         let perms = PermissionManager::new(&config);
 
-        // .miniswe/ → external dir is the docker use case
+        // .buzztr/ → external dir is the docker use case
         let external = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(external.path(), tmp.path().join(".miniswe")).unwrap();
+        std::os::unix::fs::symlink(external.path(), tmp.path().join(".buzztr")).unwrap();
         std::fs::write(external.path().join("config.toml"), "").unwrap();
         assert!(
-            perms.resolve_and_check_path(".miniswe/config.toml").is_ok(),
-            ".miniswe symlink should be allowed to escape"
+            perms.resolve_and_check_path(".buzztr/config.toml").is_ok(),
+            ".buzztr symlink should be allowed to escape"
         );
     }
 

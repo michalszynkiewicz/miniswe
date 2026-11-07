@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bench-peek — read-only inspection helpers for a miniswe bench run.
+# bench-peek — read-only inspection helpers for a buzztr bench run.
 #
 # All subcommands are pure reads (cat, grep, ls, python3 on json). Safe to
 # permission once and reuse. No side effects, no network.

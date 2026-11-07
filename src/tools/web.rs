@@ -26,7 +26,7 @@ pub async fn search(args: &Value, config: &Config) -> Result<ToolResult> {
         _ => {
             // Try Serper if key is available, fall back to GitHub search
             let has_key_file = dirs::home_dir()
-                .map(|h| h.join(".miniswe").join("serper.key").exists())
+                .map(|h| h.join(".buzztr").join("serper.key").exists())
                 .unwrap_or(false);
             if config.web.search_api_key.is_some()
                 || has_key_file
@@ -46,9 +46,9 @@ async fn search_serper(query: &str, max_results: usize, config: &Config) -> Resu
     let api_key = match &config.web.search_api_key {
         Some(key) if !key.is_empty() => key,
         _ => {
-            // Check ~/.miniswe/serper.key, then environment variable
+            // Check ~/.buzztr/serper.key, then environment variable
             let home_key = dirs::home_dir()
-                .map(|h| h.join(".miniswe").join("serper.key"))
+                .map(|h| h.join(".buzztr").join("serper.key"))
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .map(|k| k.trim().to_string())
                 .filter(|k| !k.is_empty());
@@ -63,7 +63,7 @@ async fn search_serper(query: &str, max_results: usize, config: &Config) -> Resu
                     return Ok(ToolResult::err(
                         "General web search requires a Serper API key.\n\
                          Get a free key at https://serper.dev (2,500 queries/month).\n\
-                         Recommended setup: put the raw key in ~/.miniswe/serper.key\n\
+                         Recommended setup: put the raw key in ~/.buzztr/serper.key\n\
                          Without this key, web(search) falls back to GitHub repository search only."
                             .into(),
                     ));
@@ -193,7 +193,7 @@ async fn search_github(
     );
 
     let client = reqwest::Client::builder()
-        .user_agent("miniswe/0.1")
+        .user_agent("buzztr/0.1")
         .build()?;
 
     // Use gh CLI token if available (30/min vs 10/min unauthenticated)
@@ -270,7 +270,7 @@ async fn search_github(
 
 fn missing_serper_key_hint() -> String {
     "General web search is not configured, so this used GitHub repo search fallback.\n\
-     To enable general web search, get a free key at https://serper.dev and put the raw key in ~/.miniswe/serper.key."
+     To enable general web search, get a free key at https://serper.dev and put the raw key in ~/.buzztr/serper.key."
         .into()
 }
 
@@ -288,7 +288,7 @@ pub async fn fetch(args: &Value, config: &Config) -> Result<ToolResult> {
     };
 
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; miniswe/0.1)")
+        .user_agent("Mozilla/5.0 (compatible; buzztr/0.1)")
         .build()?;
 
     match client.get(&fetch_url).send().await {
@@ -304,7 +304,7 @@ pub async fn fetch(args: &Value, config: &Config) -> Result<ToolResult> {
                 )))
             } else {
                 // Too large — save full content to file, return preview + pointer
-                let cache_dir = config.miniswe_dir().join("web_cache");
+                let cache_dir = config.buzztr_dir().join("web_cache");
                 let _ = std::fs::create_dir_all(&cache_dir);
 
                 // Sanitize URL to filename
@@ -318,7 +318,7 @@ pub async fn fetch(args: &Value, config: &Config) -> Result<ToolResult> {
                 let cache_path = cache_dir.join(&filename);
                 let _ = std::fs::write(&cache_path, &content);
 
-                let rel_path = format!(".miniswe/web_cache/{filename}");
+                let rel_path = format!(".buzztr/web_cache/{filename}");
                 let preview = crate::truncate_chars(&content, budget);
 
                 Ok(ToolResult::ok(format!(

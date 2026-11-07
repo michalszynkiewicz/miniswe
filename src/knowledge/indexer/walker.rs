@@ -58,7 +58,7 @@ pub fn index_project(root: &Path, previous: Option<&ProjectIndex>) -> Result<Pro
         if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();
 
-            if rel_str.starts_with(".miniswe") {
+            if rel_str.starts_with(".buzztr") {
                 continue;
             }
 
@@ -146,7 +146,7 @@ pub fn index_project(root: &Path, previous: Option<&ProjectIndex>) -> Result<Pro
 ///
 /// Removes old symbols for that file, re-extracts, recomputes end_lines,
 /// updates mtime, and saves the index to disk. Takes <1ms per file.
-pub fn reindex_file(rel_path: &str, abs_path: &Path, index: &mut ProjectIndex, miniswe_dir: &Path) {
+pub fn reindex_file(rel_path: &str, abs_path: &Path, index: &mut ProjectIndex, buzztr_dir: &Path) {
     let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     if !SOURCE_EXTENSIONS.contains(&ext) {
@@ -202,7 +202,7 @@ pub fn reindex_file(rel_path: &str, abs_path: &Path, index: &mut ProjectIndex, m
     index.total_symbols = index.symbols.values().map(|v| v.len()).sum();
 
     // Save to disk (best-effort, don't fail the tool call)
-    let _ = index.save(miniswe_dir);
+    let _ = index.save(buzztr_dir);
 }
 
 /// Check file sizes and return warnings for large files.
@@ -234,7 +234,7 @@ pub fn audit_file_sizes(root: &Path, max_lines: usize) -> Vec<(String, usize)> {
 
         if let Ok(rel) = path.strip_prefix(root) {
             let rel_str = rel.to_string_lossy().to_string();
-            if rel_str.starts_with(".miniswe") {
+            if rel_str.starts_with(".buzztr") {
                 continue;
             }
 

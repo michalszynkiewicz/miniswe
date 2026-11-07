@@ -27,7 +27,7 @@ src/lsp/
 
 ## Key Features
 
-- **Auto-download**: if not in PATH (or PATH binary doesn't work, e.g. rustup proxy), downloads to `~/.miniswe/lsp-servers/`
+- **Auto-download**: if not in PATH (or PATH binary doesn't work, e.g. rustup proxy), downloads to `~/.buzztr/lsp-servers/`
 - **Binary verification**: runs `--version` to verify the binary works before using it
 - **Retry logic**: 3 attempts with 2s delays if server crashes on startup
 - **Stderr logging**: captures first 20 lines of server stderr for debugging

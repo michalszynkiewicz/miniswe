@@ -1,6 +1,6 @@
 //! edit_file tool — LLM plans and applies bounded edits atomically.
 //!
-//! The model describes the task, miniswe asks the inner LLM for a structured
+//! The model describes the task, buzztr asks the inner LLM for a structured
 //! edit plan, and then executes the planned steps against an in-memory working
 //! copy. If some steps succeed and later ones fail, the successful progress is
 //! preserved in memory and the tool asks for a repaired plan against the updated

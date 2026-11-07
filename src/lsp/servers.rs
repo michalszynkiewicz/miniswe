@@ -1,7 +1,7 @@
 //! LSP server discovery, download, and management.
 //!
 //! Auto-detects project language, downloads the right LSP server binary
-//! to `~/.miniswe/lsp-servers/`, and returns the command to spawn it.
+//! to `~/.buzztr/lsp-servers/`, and returns the command to spawn it.
 
 mod download;
 mod install;
@@ -179,7 +179,7 @@ impl LspServer {
                 // jdtls ships a launcher script at bin/jdtls
                 let mut cmd = Command::new(binary_path);
                 // -data is the workspace data dir (per-project)
-                let data_dir = project_root.join(".miniswe").join("jdtls-data");
+                let data_dir = project_root.join(".buzztr").join("jdtls-data");
                 cmd.arg("-data").arg(&data_dir);
                 cmd
             }
@@ -197,5 +197,5 @@ impl LspServer {
 /// Base directory for cached LSP server binaries.
 fn lsp_cache_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("no home directory")?;
-    Ok(home.join(".miniswe").join("lsp-servers"))
+    Ok(home.join(".buzztr").join("lsp-servers"))
 }

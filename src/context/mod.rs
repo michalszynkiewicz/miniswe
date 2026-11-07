@@ -46,7 +46,7 @@ pub(crate) fn is_meta_question(message: &str) -> bool {
 
     // Must reference the tool or its features
     let tool_terms = [
-        "miniswe",
+        "buzztr",
         "session",
         "continue",
         "previous",
@@ -69,7 +69,7 @@ pub(crate) fn is_meta_question(message: &str) -> bool {
         "init",
         "web search",
         "headless",
-        ".miniswe",
+        ".buzztr",
     ];
 
     tool_terms.iter().any(|term| lower.contains(term))
@@ -238,7 +238,7 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
             ""
         };
         return format!(
-            "You are miniswe, a coding agent. Complete the task using your tools.\n\
+            "You are buzztr, a coding agent. Complete the task using your tools.\n\
              {advise}\
              Tool routing — pick by intent:\n\
              - Add/remove a parameter, or rename a function/method/type/variable across callsites -> {sig_route}\n\
@@ -260,7 +260,7 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
 
     let preamble = if plan_set {
         format!(
-            "You are miniswe, a coding agent. A plan is set — you are in the EDITING phase. Make the changes now.\n\
+            "You are buzztr, a coding agent. A plan is set — you are in the EDITING phase. Make the changes now.\n\
              Tool routing — pick by intent:\n\
              - Add/remove a parameter, or rename a function/method/type/variable across callsites -> {sig_route}\n\
              - Insert new lines/code -> insert_at\n\
@@ -275,7 +275,7 @@ Every edit returns a revision table; if an edit regresses, call revert {{\"path\
             unlock_tools.join(", ")
         );
         format!(
-            "You are miniswe, a coding agent. Use your tools to complete the task.\n\
+            "You are buzztr, a coding agent. Use your tools to complete the task.\n\
              WORKFLOW: explore briefly to find the relevant files (use file(action='search') or code(action='repo_map') for an overview), then call plan(action='set') with your step-by-step approach, then edit. {workflow_unlock_preview} Use plan(action='refine') to adjust the plan as you learn more; reserve plan(action='set') for the initial plan and rare full restarts."
         )
     };

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start llama-server with Gemma 4 26B-A4B MoE for the miniswe benchmark.
+# Start llama-server with Gemma 4 26B-A4B MoE for the buzztr benchmark.
 #
 # First-time setup (downloads ~15 GB):
 #   mkdir -p $HOME/models
@@ -16,8 +16,8 @@ MODEL_DIR="$HOME/models/gemma-4-26B-A4B-it-GGUF"
 # with q4_0 under a ~20 GB budget, so q8_0 fits. q8_0 is the default since
 # 2026-08-22 (was q4_0 for every run before that): q4 KV is a suspected
 # contributor to the loop pathologies (the cache_prompt cold-prefill hack
-# exists for it). Override with MINISWE_KV_TYPE=q4_0 to reproduce old runs.
-KV_TYPE="${MINISWE_KV_TYPE:-q8_0}"
+# exists for it). Override with BUZZTR_KV_TYPE=q4_0 to reproduce old runs.
+KV_TYPE="${BUZZTR_KV_TYPE:-q8_0}"
 MODEL_FILE="$MODEL_DIR/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
 
 if [ ! -f "$MODEL_FILE" ]; then
