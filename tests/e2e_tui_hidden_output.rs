@@ -24,12 +24,12 @@ const PROMPTS: &[(&str, &str)] = &[
 ];
 
 struct VtReader {
-    vt: Arc<Mutex<avt::Vt>>,
+    vt: Arc<Mutex<avt::Terminal>>,
 }
 
 impl VtReader {
     fn spawn(mut reader: Box<dyn std::io::Read + Send>, cols: usize, rows: usize) -> Self {
-        let vt = Arc::new(Mutex::new(avt::Vt::builder().size(cols, rows).build()));
+        let vt = Arc::new(Mutex::new(avt::Terminal::new(cols, rows).unwrap()));
         let vt_clone = vt.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -39,7 +39,7 @@ impl VtReader {
                     Ok(n) => {
                         let chunk = String::from_utf8_lossy(&buf[..n]);
                         let mut vt = vt_clone.lock().unwrap();
-                        vt.feed_str(&chunk);
+                        vt.feed(&*chunk);
                     }
                     Err(_) => break,
                 }
@@ -50,7 +50,8 @@ impl VtReader {
 
     fn screen_text(&self) -> String {
         let vt = self.vt.lock().unwrap();
-        vt.view()
+        vt.screen()
+            .visible_lines()
             .map(|line| line.text())
             .collect::<Vec<_>>()
             .join("\n")
