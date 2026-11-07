@@ -150,6 +150,15 @@ DRAFT_P_MIN="${BUZZTR_DRAFT_P_MIN:-0}"   # upstream default: draft the whole blo
                                           # — so it trades away accepted tokens for nothing. Leave it at 0.
 DRAFT_KV_TYPE="${BUZZTR_DRAFT_KV_TYPE:-}"  # empty = server default; saves only ~20 MB, not a real lever
 
+# --- networking --------------------------------------------------------------
+# Defaults to the private `claude-box` docker network, so the sandboxed Claude Code
+# container (attached to it) can reach this server as http://llama:$PORT. The
+# host still gets it on 127.0.0.1:$PORT, so localhost clients are unaffected.
+# Host requests do pass through docker's port forwarding (well under 1 ms per
+# request), which the base script does not. For a strict A/B against
+# start-muse-glimmer-30b.sh, use host networking: LLAMA_NETWORK= ./start-...
+export LLAMA_NETWORK="${LLAMA_NETWORK-claude-box}"   # no colon: an explicit empty value disables it
+
 case "$REASONING_STRENGTH" in
     low|medium|high|xhigh) ;;
     *) echo "BUZZTR_REASONING_STRENGTH must be low|medium|high|xhigh (got '$REASONING_STRENGTH')" >&2; exit 1 ;;
@@ -232,6 +241,7 @@ echo "  Spec:       n-max=$DRAFT_MAX n-min=$DRAFT_MIN p-min=$DRAFT_P_MIN${DRAFT_
 echo "  Reasoning:  strength=$REASONING_STRENGTH, budget=$REASONING_BUDGET tokens (cannot be disabled)"
 echo "  Sampling:   temp 1.0, top-p 0.95, top-k 64 (buzztr overrides temp per request)"
 echo "  Port:       $PORT"
+echo "  Network:    ${LLAMA_NETWORK:-host}"
 echo ""
 echo "  Budget: ~20.6-21.1 GB of 24 GB (draft KV is window-capped at ~42 MB)."
 echo ""
