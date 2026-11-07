@@ -36,12 +36,22 @@
 #                            LLAMA_EXTRA_MOUNT="-v /data/models:/data/models:ro"
 #   LLAMA_ALLOW_EXISTING — start even if a llama-server container is already
 #                          running (see the guard below)
+#   LLAMA_NETWORK        — run on this user-defined docker network instead of
+#                          --network=host (created if missing). The server is
+#                          reachable there as http://llama:<port>, and the
+#                          host still gets it on 127.0.0.1:<port> through a
+#                          loopback-only port publish, so localhost clients
+#                          (bench scripts, --network=host containers) keep
+#                          working. Lets the sandboxed Claude Code container,
+#                          attached to the same network, reach the server
+#                          without seeing anything else on the host.
 
 set -euo pipefail
 
 IMAGE="${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda13}"
 CONTAINER_NAME="${LLAMA_CONTAINER_NAME:-llama-server-$$}"
 EXTRA_MOUNT="${LLAMA_EXTRA_MOUNT:-}"
+NETWORK="${LLAMA_NETWORK:-}"
 
 # Refuse to stack a second server on top of a running one.
 #
@@ -69,15 +79,37 @@ if [[ -n "${existing}" && -z "${LLAMA_ALLOW_EXISTING:-}" ]]; then
     exit 1
 fi
 
+# Networking. Default: host networking, as the bench scripts expect.
+net_args=(--network=host)
+host_args=()
+if [[ -n "${NETWORK}" ]]; then
+    port=8080   # llama-server's default when the caller passes no --port
+    args=("$@")
+    for ((i = 0; i < ${#args[@]}; i++)); do
+        case "${args[i]}" in
+            --port) port="${args[i+1]:-${port}}" ;;
+            --port=*) port="${args[i]#--port=}" ;;
+        esac
+    done
+    if ! docker network inspect "${NETWORK}" >/dev/null 2>&1; then
+        docker network create "${NETWORK}" >/dev/null
+    fi
+    # 0.0.0.0 binds inside this container's own namespace only (its loopback
+    # and the private network); the host side is published on loopback only.
+    net_args=(--network "${NETWORK}" --network-alias llama -p "127.0.0.1:${port}:${port}")
+    host_args=(--host 0.0.0.0)
+    echo "llama-server on docker network '${NETWORK}' as http://llama:${port} (host: 127.0.0.1:${port})" >&2
+fi
+
 # shellcheck disable=SC2086  # EXTRA_MOUNT is intentionally word-split
 exec docker run --rm \
     --log-driver=journald \
     --gpus all \
-    --network=host \
+    "${net_args[@]}" \
     --ulimit memlock=-1 \
     --cap-add IPC_LOCK \
     -v "$HOME/models:$HOME/models:ro" \
     $EXTRA_MOUNT \
     --name "$CONTAINER_NAME" \
     "$IMAGE" \
-    "$@"
+    "$@" "${host_args[@]}"
