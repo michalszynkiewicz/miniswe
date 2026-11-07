@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start llama-server with Poolside Laguna XS 2.1 (33B-A3B MoE, agentic) for miniswe.
+# Start llama-server with Poolside Laguna XS 2.1 (33B-A3B MoE, agentic) for buzztr.
 #
 # Laguna XS 2.1 (poolside, Aug 2026): sparse MoE, ~33B total / ~3B ACTIVE per
 # token — 256 routed experts + 1 shared, 8 routed active (moe_intermediate
@@ -25,7 +25,7 @@
 #     KV 60K q8_0         ~0.65 GB
 #     CUDA ctx + buffers  ~1.2 GB
 #     total               ~17.5 GB  → comfortably inside the budget
-#   Tune: MINISWE_NCMOE=0 puts everything on the GPU (~20 GB, at the line);
+#   Tune: BUZZTR_NCMOE=0 puts everything on the GPU (~20 GB, at the line);
 #   raise it if nvidia-smi shows a spill. Do NOT use -ngl for this model —
 #   whole-layer offload moves attention too and costs ~5 ms/token per layer.
 #
@@ -34,12 +34,12 @@
 #
 # THINKING: the chat template keys on the `enable_thinking` kwarg (template
 # default: false → it prefills `</think>` so the model answers directly;
-# true → leaves `<think>` open). miniswe sends
+# true → leaves `<think>` open). buzztr sends
 # `chat_template_kwargs: {"enable_thinking": false}` on instruct requests and
 # `true` when `model.thinking` is on; the server default below covers clients
 # that send no kwargs. CAVEAT for a thinking arm: Laguna is trained with
 # "preserved thinking" — it expects prior turns' reasoning echoed back in
-# `reasoning_content`. miniswe discards reasoning, so the thinking arm runs
+# `reasoning_content`. buzztr discards reasoning, so the thinking arm runs
 # in a slightly off-distribution regime; run instruct first.
 #
 # TOOL CALLS use the GLM-style `<tool_call>name<arg_key>k</arg_key>
@@ -47,7 +47,7 @@
 # (Laguna support merged 2026-07-22, PR #25165; our server-cuda13 image is
 # build 10524, the bartowski quants were made with b10087).
 #
-# SAMPLING per the model card: temp 1.0, top-k 20, top-p 1.0. miniswe
+# SAMPLING per the model card: temp 1.0, top-k 20, top-p 1.0. buzztr
 # overrides `temperature` per request (bench config 0.2; 0.6 when
 # `model.thinking` is on); top-k/top-p come from these flags.
 #
@@ -59,19 +59,19 @@
 #
 # Other 4-bit quants in that repo: Q4_0 19.2 GB, Q4_K_S 19.8 GB, Q4_K_M
 # 20.6 GB, Q4_K_L 20.7 GB — all fit only with more experts on CPU
-# (MINISWE_NCMOE=10-12). poolside/Laguna-XS-2.1-GGUF ships an official
+# (BUZZTR_NCMOE=10-12). poolside/Laguna-XS-2.1-GGUF ships an official
 # Q4_K_M (same size class) and BF16.
 
 set -euo pipefail
 
-MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/Laguna-XS-2.1-GGUF}"
-PORT="${MINISWE_PORT:-8464}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-60000}"
-KV_TYPE="${MINISWE_KV_TYPE:-q8_0}"      # f16 also fits (+0.6 GB); q4_0 is a suspected loop-pathology contributor
-THREADS="${MINISWE_THREADS:-16}"        # physical cores; used for CPU-resident expert tensors
-NCMOE="${MINISWE_NCMOE:-6}"             # MoE layers (of 39) whose experts live on CPU; 0 = all on GPU
+MODEL_DIR="${BUZZTR_MODEL_DIR:-$HOME/models/Laguna-XS-2.1-GGUF}"
+PORT="${BUZZTR_PORT:-8464}"
+CTX_SIZE="${BUZZTR_CTX_SIZE:-60000}"
+KV_TYPE="${BUZZTR_KV_TYPE:-q8_0}"      # f16 also fits (+0.6 GB); q4_0 is a suspected loop-pathology contributor
+THREADS="${BUZZTR_THREADS:-16}"        # physical cores; used for CPU-resident expert tensors
+NCMOE="${BUZZTR_NCMOE:-6}"             # MoE layers (of 39) whose experts live on CPU; 0 = all on GPU
 
-MODEL="${MINISWE_MODEL:-}"
+MODEL="${BUZZTR_MODEL:-}"
 if [ -z "$MODEL" ]; then
     # Preference order: the budget-safe IQ4_XS, then the larger 4-bit quants.
     for pat in 'Laguna-XS-2.1-IQ4_XS' 'Laguna-XS-2.1-Q4_K_S' 'Laguna-XS-2.1-Q4_0' 'Laguna-XS-2.1-Q4_K_M'; do
@@ -109,12 +109,12 @@ ARGS=(
     --metrics
 )
 
-echo "Starting Laguna XS 2.1 (33B-A3B MoE) for miniswe..."
+echo "Starting Laguna XS 2.1 (33B-A3B MoE) for buzztr..."
 echo "  Model:     $MODEL"
 echo "  Context:   $CTX_SIZE tokens, KV $KV_TYPE (10 global layers cache full context)"
 echo "  Experts:   $NCMOE/39 MoE layers' experts on CPU (0 = all on GPU)"
 echo "  Thinking:  off by default (enable_thinking=false); per-request kwargs override"
-echo "  Sampling:  temp 1.0, top-k 20, top-p 1.0 (miniswe overrides temp per request)"
+echo "  Sampling:  temp 1.0, top-k 20, top-p 1.0 (buzztr overrides temp per request)"
 echo "  Port:      $PORT"
 echo ""
 

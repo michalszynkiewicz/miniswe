@@ -1,9 +1,9 @@
-//! File snapshots via a shadow git repo in `.miniswe/shadow-git/`.
+//! File snapshots via a shadow git repo in `.buzztr/shadow-git/`.
 //!
 //! Creates a separate git repo that tracks the project working tree
 //! without touching the real `.git`. Each round can be snapshotted
 //! and reverted to. The shadow repo is never pushed, has no remotes,
-//! and is cleaned up on `miniswe init`.
+//! and is cleaned up on `buzztr init`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,7 +20,7 @@ pub struct SnapshotManager {
 impl SnapshotManager {
     /// Initialize the shadow git repo and take an initial snapshot (round 0).
     pub fn init(project_root: &Path) -> Result<Self> {
-        let git_dir = project_root.join(".miniswe").join("shadow-git");
+        let git_dir = project_root.join(".buzztr").join("shadow-git");
 
         // Create or reinitialize
         if git_dir.exists() {
@@ -46,8 +46,8 @@ impl SnapshotManager {
         };
 
         // Set identity so commits work in any environment
-        manager.git_config("user.email", "miniswe@local")?;
-        manager.git_config("user.name", "miniswe")?;
+        manager.git_config("user.email", "buzztr@local")?;
+        manager.git_config("user.name", "buzztr")?;
 
         // The shadow git dir lives INSIDE its own work tree (project_root),
         // unlike a normal repo's `.git`, which git auto-excludes from `git
@@ -57,13 +57,13 @@ impl SnapshotManager {
         // self-referential tracking that `git reset --hard` (unlike the
         // gentler `checkout <commit> -- <pathspec>`) refuses to reconcile.
         // `info/exclude` is git's repo-local, untracked equivalent of
-        // .gitignore — exclude the whole `.miniswe/` harness state dir, not
+        // .gitignore — exclude the whole `.buzztr/` harness state dir, not
         // just the shadow repo: a whole-tree `git reset --hard` (SCRAP,
         // revert-to-green, gate_context_reset) must never rewind the
         // session log, plan, or sessions dir. `SessionLog` holds one append
         // handle for the whole session, so a reverted log file would leave
         // it writing to a dead inode and silently lose every later line.
-        std::fs::write(git_dir.join("info").join("exclude"), "/.miniswe/\n")
+        std::fs::write(git_dir.join("info").join("exclude"), "/.buzztr/\n")
             .context("failed to write shadow-git exclude file")?;
 
         // Initial snapshot

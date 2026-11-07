@@ -2,7 +2,7 @@
 # bootstrap-vast.sh — run ON the Vast.ai VM. Sets up the toolchain, fetches the
 # model(s), starts a native CUDA llama-server, and runs the Docker-free bench.
 #
-# Assumes: a CUDA *devel* base image (nvcc present) with apt, plus the miniswe
+# Assumes: a CUDA *devel* base image (nvcc present) with apt, plus the buzztr
 # repo already synced to the current directory (the launcher rsyncs it here).
 #
 # Usage (from the repo root on the VM):

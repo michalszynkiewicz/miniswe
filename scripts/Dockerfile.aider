@@ -1,10 +1,10 @@
 # Dockerfile.aider — Isolated environment for running one aider variant.
 #
-# Mirrors Dockerfile.benchmark but installs aider-chat instead of miniswe.
+# Mirrors Dockerfile.benchmark but installs aider-chat instead of buzztr.
 # Keeps the Rust toolchain so the same 6-check validation can run in-container.
 #
 # Build:
-#   docker build -f scripts/Dockerfile.aider -t miniswe-aider-bench .
+#   docker build -f scripts/Dockerfile.aider -t buzztr-aider-bench .
 
 FROM rust:1.89-bookworm
 
@@ -20,12 +20,12 @@ RUN pip3 install --no-cache-dir --break-system-packages aider-chat
 WORKDIR /build
 
 # Bring the repo in so we have a .git for `git archive ${BASELINE_SHA}`.
-# Unlike the miniswe image we do NOT build a binary here — aider runs
+# Unlike the buzztr image we do NOT build a binary here — aider runs
 # against the freshly-archived /work tree at execution time.
 COPY . .
 RUN cd /build && cargo fetch
 
-# Keep the repo for git archive — same convention as the miniswe image.
+# Keep the repo for git archive — same convention as the buzztr image.
 RUN mkdir /repo && cp -r /build/.git /repo/.git
 
 # Clean source tree — each variant starts from a fresh git-archive.

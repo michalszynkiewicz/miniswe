@@ -1,4 +1,4 @@
-//! miniswe — A lightweight CLI coding agent for local LLMs
+//! buzztr — A lightweight CLI coding agent for local LLMs
 //!
 //! Library crate exposing core functionality for integration tests.
 

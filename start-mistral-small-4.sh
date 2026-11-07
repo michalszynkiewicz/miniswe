@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start llama-server with Mistral Small 4 for miniswe.
+# Start llama-server with Mistral Small 4 for buzztr.
 #
 # Released March 2026 — Mistral's unified MoE replacing the separate
 # Magistral (reasoning), Pixtral (vision), and Devstral (agentic coding)
@@ -32,12 +32,12 @@
 
 set -euo pipefail
 
-MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/Mistral-Small-4-119B-GGUF}"
-PORT="${MINISWE_PORT:-8464}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-60000}"
-THREADS="${MINISWE_THREADS:-16}"
+MODEL_DIR="${BUZZTR_MODEL_DIR:-$HOME/models/Mistral-Small-4-119B-GGUF}"
+PORT="${BUZZTR_PORT:-8464}"
+CTX_SIZE="${BUZZTR_CTX_SIZE:-60000}"
+THREADS="${BUZZTR_THREADS:-16}"
 
-MODEL="${MINISWE_MODEL:-}"
+MODEL="${BUZZTR_MODEL:-}"
 if [ -z "$MODEL" ]; then
     # Unsloth ships large multi-shard quants under a per-quant
     # subdirectory (e.g. UD-Q4_K_XL/<shards>.gguf), so search up to 2
@@ -60,7 +60,7 @@ if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
     exit 1
 fi
 
-echo "Starting Mistral Small 4 119B (MoE, 6B active) for miniswe..."
+echo "Starting Mistral Small 4 119B (MoE, 6B active) for buzztr..."
 echo "  Model:    $MODEL"
 echo "  Context:  $CTX_SIZE tokens"
 echo "  KV:       q4_0"

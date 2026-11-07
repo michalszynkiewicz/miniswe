@@ -1,6 +1,6 @@
 # Running the bench on Vast.ai (cheap, scriptable, auto-teardown)
 
-This runs the miniswe bench on a rented RTX 3090 instead of your local box — no
+This runs the buzztr bench on a rented RTX 3090 instead of your local box — no
 Docker, fully scripted: provision → fetch models → run → collect results →
 destroy. Picked Vast.ai because it's the only option that lets us *guarantee* a
 verified host with enough system RAM for qwen's CPU-expert offload (≥64 GB),
@@ -69,7 +69,7 @@ That single command:
 6. Rsyncs results to `benchmark_results_vast/`, then destroys the instance.
 
 Results land in `benchmark_results_vast/native_*/runN/` (same layout as the
-docker bench: `run.log`, `config.toml`, `diff.patch`, `miniswe_state/`).
+docker bench: `run.log`, `config.toml`, `diff.patch`, `buzztr_state/`).
 
 ### Tunables (env vars)
 | var | default | meaning |

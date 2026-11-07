@@ -23,13 +23,13 @@ set -uo pipefail
 
 SCENARIO="${1:-both}"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-MINISWE="${MINISWE:-$REPO_DIR/target/debug/miniswe}"
+BUZZTR="${BUZZTR:-$REPO_DIR/target/debug/buzztr}"
 LLAMA_ENDPOINT="${LLAMA_ENDPOINT:-http://localhost:8464}"
 RESULTS_ROOT="${RESULTS_ROOT:-$REPO_DIR/benchmark_results/jobs_e2e_$(date +%Y%m%d_%H%M%S)}"
 RUN_TIMEOUT=600
 
-if [ ! -x "$MINISWE" ]; then
-    echo "miniswe binary not found at $MINISWE (cargo build first, or set MINISWE=)" >&2
+if [ ! -x "$BUZZTR" ]; then
+    echo "buzztr binary not found at $BUZZTR (cargo build first, or set BUZZTR=)" >&2
     exit 1
 fi
 if ! curl -fsS --max-time 3 "$LLAMA_ENDPOINT/v1/models" >/dev/null 2>&1; then
@@ -119,14 +119,14 @@ EOS
 
 init_workspace() { # $1 = workspace dir
     local ws="$1"
-    (cd "$ws" && "$MINISWE" init >/dev/null 2>&1) || {
-        echo "miniswe init failed in $ws" >&2
+    (cd "$ws" && "$BUZZTR" init >/dev/null 2>&1) || {
+        echo "buzztr init failed in $ws" >&2
         return 1
     }
     # Promotion at 20s instead of 60 keeps a full run at ~3-5 min. Trace
     # logging turns on llm_dumps — grading reads tool results from there
     # (the TUI trace truncates them to one line).
-    python3 - "$ws/.miniswe/config.toml" "$LLAMA_ENDPOINT" <<'EOF'
+    python3 - "$ws/.buzztr/config.toml" "$LLAMA_ENDPOINT" <<'EOF'
 import re, sys
 path, endpoint = sys.argv[1], sys.argv[2]
 s = open(path).read()
@@ -185,13 +185,13 @@ and report the root cause. Do not modify any files; just deploy, monitor, and re
 
     local start
     start=$(date +%s)
-    (cd "$ws" && MINISWE_LLM_DUMP_DIR="$out/llm_dumps" timeout "$RUN_TIMEOUT" "$MINISWE" --yes "$task") \
+    (cd "$ws" && BUZZTR_LLM_DUMP_DIR="$out/llm_dumps" timeout "$RUN_TIMEOUT" "$BUZZTR" --yes "$task") \
         > "$out/stdout.txt" 2> "$out/stderr.txt"
     local exit_code=$?
     local wall=$(( $(date +%s) - start ))
     echo "  run: exit=$exit_code wall=${wall}s (timeout=$RUN_TIMEOUT)"
-    cp -r "$ws/.miniswe/logs" "$out/miniswe-logs" 2>/dev/null
-    cp -r "$ws/.miniswe/llm_dumps" "$out/llm_dumps" 2>/dev/null
+    cp -r "$ws/.buzztr/logs" "$out/buzztr-logs" 2>/dev/null
+    cp -r "$ws/.buzztr/llm_dumps" "$out/llm_dumps" 2>/dev/null
 
     local trace="$out/stderr.txt"
     local clean

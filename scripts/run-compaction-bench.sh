@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# run-compaction-bench.sh — A/B miniswe's conversation-compaction strategies.
+# run-compaction-bench.sh — A/B buzztr's conversation-compaction strategies.
 #
 # Compares four compaction strategies on the SAME task as run-benchmark-docker.sh
 # (the --system-prompt-override feature, from scratch), each in its own fresh
 # Docker container, N runs per strategy:
 #
-#   unified              miniswe production: rolling LLM summary + plan-anchor
+#   unified              buzztr production: rolling LLM summary + plan-anchor
 #                        + disk archive, keep recent raw
 #   sliding_window       pure truncation: drop oldest, keep recent within budget
 #   rolling_summary      textbook rolling LLM summary (no archive, no plan-anchor,
@@ -17,7 +17,7 @@
 # knob is forced OFF (notably gate_context_reset, which the regular bench leaves
 # on). The strategy is selected via config `[context] compaction`.
 #
-# The image is built ONCE (it bakes in the current-tree miniswe binary, which
+# The image is built ONCE (it bakes in the current-tree buzztr binary, which
 # carries the new compaction code), then reused for all runs.
 #
 # Usage:
@@ -32,7 +32,7 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # GPU telemetry + llama-server provenance (docs/gpu-hardening.md items 2, 5)
 source "${REPO_DIR}/scripts/bench-gpu.sh"
-IMAGE_NAME="miniswe-bench"
+IMAGE_NAME="buzztr-bench"
 BASELINE_SHA="cc34d2626faf32c1b6dd1b8b33af693fb936b098"
 LLAMA_ENDPOINT="${LLAMA_ENDPOINT:-http://localhost:8464}"
 
@@ -212,7 +212,7 @@ level = "trace"
 enabled = true
 
 [validation]
-command = "out=\$(cargo build 2>&1) || { echo \"DOES NOT COMPILE:\"; echo \"\$out\" | tail -20; exit 1; }; run=\$(MINISWE_SKIP_VALIDATION=1 ./target/debug/miniswe --system-prompt-override 'Respond only with TOKEN_XYZ and nothing else' --yes hello 2>&1); echo \"\$run\" | grep -q TOKEN_XYZ || { echo \"COMPILES but override NOT consumed. Expected TOKEN_XYZ, GOT: \$run\"; exit 1; }"
+command = "out=\$(cargo build 2>&1) || { echo \"DOES NOT COMPILE:\"; echo \"\$out\" | tail -20; exit 1; }; run=\$(BUZZTR_SKIP_VALIDATION=1 ./target/debug/buzztr --system-prompt-override 'Respond only with TOKEN_XYZ and nothing else' --yes hello 2>&1); echo \"\$run\" | grep -q TOKEN_XYZ || { echo \"COMPILES but override NOT consumed. Expected TOKEN_XYZ, GOT: \$run\"; exit 1; }"
 timeout_secs = 180
 max_retries = 3
 TOML
@@ -227,21 +227,21 @@ SHA="$1"; TASK="$2"; TIMEOUT="$3"; MAX_ATTEMPTS="$4"
 
 cd /work
 git -C /repo archive "${SHA}" | tar -x
-rm -rf target .miniswe
+rm -rf target .buzztr
 
 if grep -q "git-lfs" .gitignore 2>/dev/null; then
-    echo -e "target/\n.miniswe\n*.log" > .gitignore
+    echo -e "target/\n.buzztr\n*.log" > .gitignore
 else
-    echo ".miniswe" >> .gitignore
+    echo ".buzztr" >> .gitignore
 fi
 
-mkdir -p /output/miniswe_state
-ln -sfn /output/miniswe_state .miniswe
-cp /config/config.toml .miniswe/config.toml
-if ! miniswe init 2>/output/miniswe_init.txt; then
-    echo "ERROR: miniswe init failed:"; cat /output/miniswe_init.txt; exit 1
+mkdir -p /output/buzztr_state
+ln -sfn /output/buzztr_state .buzztr
+cp /config/config.toml .buzztr/config.toml
+if ! buzztr init 2>/output/buzztr_init.txt; then
+    echo "ERROR: buzztr init failed:"; cat /output/buzztr_init.txt; exit 1
 fi
-mkdir -p .miniswe/logs
+mkdir -p .buzztr/logs
 git init -q && git add -A && git commit -q -m "baseline" 2>/dev/null
 
 START_TIME=$(date +%s); DEADLINE=$((START_TIME + TIMEOUT)); ATTEMPT=0
@@ -252,7 +252,7 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
     if [ "$REMAINING" -le 30 ]; then echo "=== ATTEMPT ${ATTEMPT}: SKIPPED (${REMAINING}s left) ==="; break; fi
     echo "=== ATTEMPT ${ATTEMPT}/${MAX_ATTEMPTS} (${REMAINING}s remaining) ==="
 
-    timeout "${REMAINING}" miniswe --yes "${CURRENT_TASK}" \
+    timeout "${REMAINING}" buzztr --yes "${CURRENT_TASK}" \
         > /output/stdout_attempt${ATTEMPT}.txt 2> /output/stderr_attempt${ATTEMPT}.txt || true
 
     git diff --name-only > /output/changed_files.txt 2>/dev/null || true
@@ -260,7 +260,7 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
     git diff > /output/diff.patch 2>/dev/null || true
     git diff > /output/diff_after_attempt${ATTEMPT}.patch 2>/dev/null || true
 
-    PASS=0; TOTAL=0; ERRORS=""; BINARY="./target/debug/miniswe"; FLAG=""
+    PASS=0; TOTAL=0; ERRORS=""; BINARY="./target/debug/buzztr"; FLAG=""
 
     TOTAL=$((TOTAL + 1))
     if RUSTFLAGS="-A warnings" cargo check 2> /output/cargo_check.txt; then echo "compile:PASS"; PASS=$((PASS + 1)); else
@@ -316,7 +316,7 @@ $(grep -A5 -E 'panicked at|assertion .*failed|^test .* \.\.\. FAILED$|^error(\[|
     TOTAL=$((TOTAL + 1))
     if [ -f "${BINARY}" ] && [ -n "${FLAG}" ] && [ "$PASS" -ge 4 ]; then
         SMOKE_OVERRIDE='You must respond with exactly the text PONG_42 and nothing else. No explanation, no formatting, just PONG_42.'
-        SMOKE_OUTPUT=$(MINISWE_SKIP_VALIDATION=1 timeout 120 "${BINARY}" ${FLAG} "${SMOKE_OVERRIDE}" --yes "ping" 2>/output/smoke_stderr.txt || true)
+        SMOKE_OUTPUT=$(BUZZTR_SKIP_VALIDATION=1 timeout 120 "${BINARY}" ${FLAG} "${SMOKE_OVERRIDE}" --yes "ping" 2>/output/smoke_stderr.txt || true)
         echo "${SMOKE_OUTPUT}" > /output/smoke_output.txt
         if echo "${SMOKE_OUTPUT}" | grep -q "PONG_42"; then echo "smoke:PASS"; PASS=$((PASS + 1)); else
             echo "smoke:FAIL"
@@ -343,7 +343,7 @@ SCRIPT
 run_cell() {
     local strat="$1" idx="$2"
     local cell_dir="${RESULTS_DIR}/${strat}/run${idx}"
-    local cname="miniswe-compaction-${strat}-${idx}-$$"
+    local cname="buzztr-compaction-${strat}-${idx}-$$"
     mkdir -p "${cell_dir}"
 
     # Resume: if this cell's docker run already completed (container.log has a
@@ -362,7 +362,7 @@ run_cell() {
             -v "${cell_dir}:/output" \
             -v "${cell_dir}/config.toml:/config/config.toml:ro" \
             -v "${tmp}:/run.sh:ro" \
-            -e MINISWE_LLM_DUMP_DIR=/output/llm_dumps \
+            -e BUZZTR_LLM_DUMP_DIR=/output/llm_dumps \
             --name "${cname}" "${IMAGE_NAME}" \
             bash /run.sh "${BASELINE_SHA}" "${TASK}" "${TIMEOUT}" "${MAX_ATTEMPTS}" \
             > "${cell_dir}/container.log" 2>&1
@@ -375,7 +375,7 @@ run_cell() {
     local result rounds compactions elided wall r
     result=$(grep -oE "=== FINAL: [0-9]+/[0-9]+" "${cell_dir}/container.log" 2>/dev/null | tail -1 | grep -oE "[0-9]+/[0-9]+" || echo "?/?")
     rounds=0
-    for lf in "${cell_dir}"/miniswe_state/logs/*.log; do
+    for lf in "${cell_dir}"/buzztr_state/logs/*.log; do
         [ -f "${lf}" ] || continue
         r=$(grep -c '\[round ' "${lf}" 2>/dev/null || true)
         rounds=$((rounds + ${r:-0}))

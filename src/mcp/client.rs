@@ -106,7 +106,7 @@ impl McpClient {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {
-                    "name": "miniswe",
+                    "name": "buzztr",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             })),

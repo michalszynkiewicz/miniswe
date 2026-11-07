@@ -39,7 +39,7 @@ pub trait ContextProvider: Send + Sync {
 // Implementations
 // ---------------------------------------------------------------------------
 
-/// Project profile from `.miniswe/profile.md` (language, structure, deps).
+/// Project profile from `.buzztr/profile.md` (language, structure, deps).
 pub struct ProfileProvider;
 
 impl ContextProvider for ProfileProvider {
@@ -48,7 +48,7 @@ impl ContextProvider for ProfileProvider {
     }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
-        let path = input.config.miniswe_path("profile.md");
+        let path = input.config.buzztr_path("profile.md");
         let content = fs::read_to_string(path).ok()?;
         Some(ContextBlock {
             header: "",
@@ -57,7 +57,7 @@ impl ContextProvider for ProfileProvider {
     }
 }
 
-/// User guide from `.miniswe/guide.md` (project-specific instructions).
+/// User guide from `.buzztr/guide.md` (project-specific instructions).
 pub struct GuideProvider;
 
 impl ContextProvider for GuideProvider {
@@ -66,7 +66,7 @@ impl ContextProvider for GuideProvider {
     }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
-        let path = input.config.miniswe_path("guide.md");
+        let path = input.config.buzztr_path("guide.md");
         let content = fs::read_to_string(path).ok()?;
         if content.contains("<!-- Add project-specific instructions")
             && content.lines().count() <= 5
@@ -99,7 +99,7 @@ impl ContextProvider for ProjectNotesProvider {
     }
 }
 
-/// Keyword-matched lessons from `.miniswe/lessons.md`.
+/// Keyword-matched lessons from `.buzztr/lessons.md`.
 pub struct LessonsProvider;
 
 impl ContextProvider for LessonsProvider {
@@ -108,7 +108,7 @@ impl ContextProvider for LessonsProvider {
     }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
-        let path = input.config.miniswe_path("lessons.md");
+        let path = input.config.buzztr_path("lessons.md");
         let content = fs::read_to_string(path).ok()?;
         if content.contains("<!-- Accumulated tips") && content.lines().count() <= 5 {
             return None;
@@ -158,9 +158,9 @@ impl ContextProvider for RepoMapProvider {
     }
 
     fn provide(&self, input: &ProviderInput) -> Option<ContextBlock> {
-        let miniswe_dir = input.config.miniswe_dir();
-        let index = ProjectIndex::load(&miniswe_dir).ok()?;
-        let graph = DependencyGraph::load(&miniswe_dir).ok()?;
+        let buzztr_dir = input.config.buzztr_dir();
+        let index = ProjectIndex::load(&buzztr_dir).ok()?;
+        let graph = DependencyGraph::load(&buzztr_dir).ok()?;
         let map = repo_map::render(
             &index,
             &graph,

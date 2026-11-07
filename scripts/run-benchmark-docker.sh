@@ -45,7 +45,7 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-IMAGE_NAME="miniswe-bench"
+IMAGE_NAME="buzztr-bench"
 
 # Probe the running llama-server for the loaded model so the result dir is
 # self-labeling (devstral vs gemma vs qwen, etc.). Falls back to "unknown"
@@ -159,7 +159,7 @@ echo ""
 
 # Verify LLM server is reachable before spending minutes on docker build
 # and hours on a doomed run. Container uses --network=host, so the host's
-# 8464 is the same endpoint miniswe will see.
+# 8464 is the same endpoint buzztr will see.
 if ! curl -fsS --max-time 5 "${LLAMA_ENDPOINT}/v1/models" > /dev/null 2>&1; then
     echo "ERROR: LLM server not responding at ${LLAMA_ENDPOINT}" >&2
     echo "" >&2
@@ -209,7 +209,7 @@ generate_config() {
         model_head="provider = \"${provider}\""
         # The baseline binary can't reach a hosted provider: run it from
         # /inner, whose config points at the local server.
-        inner_run="cd /inner && MINISWE_SKIP_VALIDATION=1 /work/target/debug/miniswe"
+        inner_run="cd /inner && BUZZTR_SKIP_VALIDATION=1 /work/target/debug/buzztr"
         runtime_block="
 [runtime]
 max_session_input_tokens = ${BUDGET:-3000000}
@@ -217,7 +217,7 @@ max_session_input_tokens = ${BUDGET:-3000000}
     else
         model_head="provider = \"llama-cpp\"
 endpoint = \"http://localhost:8464\""
-        inner_run="MINISWE_SKIP_VALIDATION=1 ./target/debug/miniswe"
+        inner_run="BUZZTR_SKIP_VALIDATION=1 ./target/debug/buzztr"
     fi
 
     # Helper for provider toggles
@@ -340,7 +340,7 @@ enabled = true
 # "override NOT consumed" failure and prints the ACTUAL error/output, so the
 # model fixes the real problem instead of a misattributed one (a 2/6 run failed
 # because a brace error was reported as 'value not threaded'). TOKEN_XYZ is NOT
-# the grader's PONG_42 (grader stays independent); MINISWE_SKIP_VALIDATION=1
+# the grader's PONG_42 (grader stays independent); BUZZTR_SKIP_VALIDATION=1
 # stops the gate recursing into the inner run. \$ is escaped for the heredoc.
 # The override names the greeting case explicitly: Muse Glimmer (harmony
 # template, tools present) answers a bare 'hello' with a canned greeting no
@@ -361,7 +361,7 @@ run_variant() {
     local name="$1"
     local disabled="${2:-}"
     local variant_dir="${RESULTS_DIR}/${name}"
-    local container_name="miniswe-bench-${name}-$$"
+    local container_name="buzztr-bench-${name}-$$"
     mkdir -p "${variant_dir}"
 
     echo "--- ${name} ---"
@@ -376,8 +376,8 @@ run_variant() {
     # Run in a fresh container:
     # 1. Extract code at pinned SHA
     # 2. Write config
-    # 3. Run miniswe init
-    # 4. Run miniswe --yes "task"
+    # 3. Run buzztr init
+    # 4. Run buzztr --yes "task"
     # 5. Run validation (cargo check/build/test + smoke test)
     local container_script
     container_script=$(cat <<'SCRIPT'
@@ -393,7 +393,7 @@ MAX_ATTEMPTS="$4"
 # Fresh checkout
 cd /work
 git -C /repo archive "${SHA}" | tar -x
-rm -rf target .miniswe
+rm -rf target .buzztr
 
 # Optional seed patch: apply a half-wired starting state BEFORE the baseline
 # commit, so the agent's diff reflects only its own fix and the very first
@@ -410,37 +410,37 @@ if [ -f /config/seed.patch ]; then
 fi
 
 # Fix LFS pointer files (git archive doesn't resolve LFS) and make sure the
-# .miniswe symlink created below is always ignored (git would otherwise try
+# .buzztr symlink created below is always ignored (git would otherwise try
 # to add it to the baseline commit).
 if grep -q "git-lfs" .gitignore 2>/dev/null; then
-    echo -e "target/\n.miniswe\n*.log" > .gitignore
+    echo -e "target/\n.buzztr\n*.log" > .gitignore
 else
-    echo ".miniswe" >> .gitignore
+    echo ".buzztr" >> .gitignore
 fi
 
-# Route .miniswe through the bind-mounted /output volume. Every log line,
+# Route .buzztr through the bind-mounted /output volume. Every log line,
 # scratchpad write, session file, and index update lands on the host
 # filesystem as it is written. If the container is killed mid-run,
 # everything up to that point already survives — no post-run cp needed.
-mkdir -p /output/miniswe_state
-ln -sfn /output/miniswe_state .miniswe
-cp /config/config.toml .miniswe/config.toml
-if ! miniswe init 2>/output/miniswe_init.txt; then
-    echo "ERROR: miniswe init failed:"
-    cat /output/miniswe_init.txt
+mkdir -p /output/buzztr_state
+ln -sfn /output/buzztr_state .buzztr
+cp /config/config.toml .buzztr/config.toml
+if ! buzztr init 2>/output/buzztr_init.txt; then
+    echo "ERROR: buzztr init failed:"
+    cat /output/buzztr_init.txt
     exit 1
 fi
-mkdir -p .miniswe/logs
+mkdir -p .buzztr/logs
 
 # Hybrid hosted run: the built baseline binary predates hosted providers, so
 # its smoke runs happen from /inner, whose config points at the local server.
 SMOKE_DIR="."
-SMOKE_BIN="./target/debug/miniswe"
+SMOKE_BIN="./target/debug/buzztr"
 if [ -f /config/inner-config.toml ]; then
-    mkdir -p /inner/.miniswe
-    cp /config/inner-config.toml /inner/.miniswe/config.toml
+    mkdir -p /inner/.buzztr
+    cp /config/inner-config.toml /inner/.buzztr/config.toml
     SMOKE_DIR="/inner"
-    SMOKE_BIN="/work/target/debug/miniswe"
+    SMOKE_BIN="/work/target/debug/buzztr"
 fi
 
 # Init git for diff tracking
@@ -463,17 +463,17 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
 
     echo "=== ATTEMPT ${ATTEMPT}/${MAX_ATTEMPTS} (${REMAINING}s remaining) ==="
 
-    # Keep prior-attempt logs around: every miniswe run opens a fresh
-    # timestamped log file under .miniswe/logs/, so accumulation is natural
+    # Keep prior-attempt logs around: every buzztr run opens a fresh
+    # timestamped log file under .buzztr/logs/, so accumulation is natural
     # and lets us inspect a killed attempt alongside completed ones.
 
-    # Run miniswe (keep modified code from previous attempts)
-    timeout "${REMAINING}" miniswe --yes "${CURRENT_TASK}" \
+    # Run buzztr (keep modified code from previous attempts)
+    timeout "${REMAINING}" buzztr --yes "${CURRENT_TASK}" \
         > /output/stdout_attempt${ATTEMPT}.txt \
         2> /output/stderr_attempt${ATTEMPT}.txt \
         || true
 
-    # Degradation scan. miniswe can lose its LSP — and with it the whole
+    # Degradation scan. buzztr can lose its LSP — and with it the whole
     # refactor toolset — and still run to completion, producing a score that
     # looks like an ordinary result. One run in 38 did exactly that: the
     # rust-analyzer download failed, add_param was unavailable for the entire
@@ -489,7 +489,7 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
     fi
 
     # Logs, scratchpad, tool_history, sessions, and index are all already on
-    # the host volume via the .miniswe → /output/miniswe_state symlink.
+    # the host volume via the .buzztr → /output/buzztr_state symlink.
     # Only git state needs an explicit capture here.
     git diff --name-only > /output/changed_files.txt 2>/dev/null || true
     git ls-files --others --exclude-standard >> /output/changed_files.txt 2>/dev/null || true
@@ -518,7 +518,7 @@ Affected files: ${COMPILE_ERR_FILES}"
 
     # Check 2: cargo build
     TOTAL=$((TOTAL + 1))
-    BINARY="./target/debug/miniswe"
+    BINARY="./target/debug/buzztr"
     if [ "$PASS" -ge 1 ]; then
         if RUSTFLAGS="-A warnings" cargo build 2> /output/cargo_build.txt; then
             echo "build:PASS"
@@ -547,7 +547,7 @@ Affected files: ${BUILD_ERR_FILES}"
         else
             echo "help:FAIL"
             ERRORS="${ERRORS}
-HELP FAILED: \`miniswe --help\` output does not contain any flag matching '--*prompt*'. The feature must add a new CLI flag whose long name contains 'prompt' (e.g. --system-prompt-override). Current --help output:
+HELP FAILED: \`buzztr --help\` output does not contain any flag matching '--*prompt*'. The feature must add a new CLI flag whose long name contains 'prompt' (e.g. --system-prompt-override). Current --help output:
 $(head -40 /output/help_output.txt)"
         fi
     fi
@@ -604,10 +604,10 @@ HINT: These tests compiled but their assertions failed. Re-read the failing test
     TOTAL=$((TOTAL + 1))
     if [ -f "${BINARY}" ] && [ -n "${FLAG}" ] && [ "$PASS" -ge 4 ]; then
         SMOKE_OVERRIDE='You must respond with exactly the text PONG_42 and nothing else. No explanation, no formatting, just PONG_42.'
-        # MINISWE_SKIP_VALIDATION: the edited binary may carry the done-gate;
+        # BUZZTR_SKIP_VALIDATION: the edited binary may carry the done-gate;
         # this smoke run is a utility invocation, not a coding task, so it must
         # not re-enter the gate.
-        SMOKE_OUTPUT=$(cd "${SMOKE_DIR}" && MINISWE_SKIP_VALIDATION=1 timeout 120 "${SMOKE_BIN}" \
+        SMOKE_OUTPUT=$(cd "${SMOKE_DIR}" && BUZZTR_SKIP_VALIDATION=1 timeout 120 "${SMOKE_BIN}" \
             ${FLAG} "${SMOKE_OVERRIDE}" \
             --yes "ping" 2>/output/smoke_stderr.txt || true)
         echo "${SMOKE_OUTPUT}" > /output/smoke_output.txt
@@ -690,7 +690,7 @@ SCRIPT
         hosted_args=(-v "${variant_dir}/inner-config.toml:/config/inner-config.toml:ro" -e "${HOSTED_KEY_ENV}")
     fi
 
-    # MINISWE_LLM_DUMP_DIR captures every outgoing /v1/chat/completions
+    # BUZZTR_LLM_DUMP_DIR captures every outgoing /v1/chat/completions
     # body to /output/llm_dumps/req-NNNNNN.json so we can replay the
     # exact request that produced a malformed response (the in-band
     # logger truncates large bodies). Disable by unsetting the env.
@@ -701,8 +701,8 @@ SCRIPT
         -v "${tmp_script}:/run.sh:ro" \
         "${seed_mount[@]}" \
         "${hosted_args[@]}" \
-        -e MINISWE_LLM_DUMP_DIR=/output/llm_dumps \
-        -e "MINISWE_ADDPARAM_LEGACY_MSG=${MINISWE_ADDPARAM_LEGACY_MSG:-}" \
+        -e BUZZTR_LLM_DUMP_DIR=/output/llm_dumps \
+        -e "BUZZTR_ADDPARAM_LEGACY_MSG=${BUZZTR_ADDPARAM_LEGACY_MSG:-}" \
         --name "${container_name}" \
         "${IMAGE_NAME}" \
         bash /run.sh "${BASELINE_SHA}" "${TASK}" "${TIMEOUT}" "${MAX_ATTEMPTS}" \
@@ -725,9 +725,9 @@ SCRIPT
     final_line=$(grep "=== FINAL:" "${variant_dir}/container.log" 2>/dev/null || echo "FINAL: ?/? after ? attempt(s)")
 
     # Count total rounds across all attempt logs. Logs now live under
-    # miniswe_state/logs/ thanks to the in-container symlink.
+    # buzztr_state/logs/ thanks to the in-container symlink.
     local rounds=0
-    for logfile in "${variant_dir}"/miniswe_state/logs/*.log; do
+    for logfile in "${variant_dir}"/buzztr_state/logs/*.log; do
         [ -f "${logfile}" ] || continue
         local r
         r=$(grep -c '\[round ' "${logfile}" 2>/dev/null || true)
@@ -769,7 +769,7 @@ echo "-----------------------------------------------------------------"
 for d in "${RESULTS_DIR}"/*/; do
     name=$(basename "$d")
     local_rounds=0
-    for logfile in "$d"/miniswe_state/logs/*.log; do
+    for logfile in "$d"/buzztr_state/logs/*.log; do
         [ -f "${logfile}" ] || continue
         local_r=$(grep -c '\[round ' "${logfile}" 2>/dev/null || true)
         local_rounds=$((local_rounds + ${local_r:-0}))

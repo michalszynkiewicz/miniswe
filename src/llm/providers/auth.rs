@@ -23,7 +23,7 @@ pub fn resolve_api_key(
 }
 
 /// Human-readable description of where the resolved key (if any) came
-/// from, for display in `miniswe config` / `miniswe info`. Never returns
+/// from, for display in `buzztr config` / `buzztr info`. Never returns
 /// the key value itself.
 pub fn api_key_source(
     provider: Provider,
@@ -85,28 +85,28 @@ mod tests {
     fn resolve_falls_back_to_named_env_var() {
         // SAFETY: test-only env mutation, no concurrent access to this var.
         unsafe {
-            std::env::set_var("MINISWE_TEST_AUTH_KEY_1", "from-env");
+            std::env::set_var("BUZZTR_TEST_AUTH_KEY_1", "from-env");
         }
         assert_eq!(
-            resolve_api_key(Provider::OpenAi, None, Some("MINISWE_TEST_AUTH_KEY_1")),
+            resolve_api_key(Provider::OpenAi, None, Some("BUZZTR_TEST_AUTH_KEY_1")),
             Some("from-env".to_string())
         );
         unsafe {
-            std::env::remove_var("MINISWE_TEST_AUTH_KEY_1");
+            std::env::remove_var("BUZZTR_TEST_AUTH_KEY_1");
         }
     }
 
     #[test]
     fn resolve_empty_inline_falls_through_to_env() {
         unsafe {
-            std::env::set_var("MINISWE_TEST_AUTH_KEY_2", "from-env-2");
+            std::env::set_var("BUZZTR_TEST_AUTH_KEY_2", "from-env-2");
         }
         assert_eq!(
-            resolve_api_key(Provider::OpenAi, Some(""), Some("MINISWE_TEST_AUTH_KEY_2")),
+            resolve_api_key(Provider::OpenAi, Some(""), Some("BUZZTR_TEST_AUTH_KEY_2")),
             Some("from-env-2".to_string())
         );
         unsafe {
-            std::env::remove_var("MINISWE_TEST_AUTH_KEY_2");
+            std::env::remove_var("BUZZTR_TEST_AUTH_KEY_2");
         }
     }
 

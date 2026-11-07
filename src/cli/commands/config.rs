@@ -1,4 +1,4 @@
-//! `miniswe config` — Show configuration.
+//! `buzztr config` — Show configuration.
 
 use anyhow::Result;
 
@@ -55,12 +55,12 @@ pub async fn run() -> Result<()> {
 
     if !config.is_initialized() {
         eprintln!();
-        tui::print_status("Config file: (using defaults — run `miniswe init` to create)");
+        tui::print_status("Config file: (using defaults — run `buzztr init` to create)");
     } else {
         eprintln!();
         tui::print_status(&format!(
             "Config file: {}",
-            config.miniswe_path("config.toml").display()
+            config.buzztr_path("config.toml").display()
         ));
     }
 

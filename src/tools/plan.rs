@@ -6,9 +6,9 @@
 //! this by running `cargo check` (or the appropriate checker). If a
 //! step proves too coarse, the model can `refine` it into substeps.
 //!
-//! The plan persists in `.miniswe/sessions/<id>/plan.md` and is injected
+//! The plan persists in `.buzztr/sessions/<id>/plan.md` and is injected
 //! into context each round. It is session-scoped, not project-scoped, so a
-//! concurrent or nested miniswe run in the same project can neither read
+//! concurrent or nested buzztr run in the same project can neither read
 //! nor clobber it — see `config::session`.
 
 mod actions;

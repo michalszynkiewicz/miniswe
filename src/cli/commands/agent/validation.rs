@@ -40,9 +40,9 @@ pub async fn run_behavioral_check(config: &Config) -> CheckOutcome {
 /// spawn failure or timeout → `Skipped`, never a block.
 pub async fn run_check_command(config: &Config, cmd: &str) -> CheckOutcome {
     // Recursion guard: the check typically runs the project's own binary,
-    // which may itself be a miniswe build that would re-enter this gate (and
+    // which may itself be a buzztr build that would re-enter this gate (and
     // re-build, and re-run …). Nested invocations set this env var to opt out.
-    if std::env::var_os("MINISWE_SKIP_VALIDATION").is_some() {
+    if std::env::var_os("BUZZTR_SKIP_VALIDATION").is_some() {
         return CheckOutcome::Skipped;
     }
     let timeout = Duration::from_secs(config.validation.timeout_secs);
@@ -94,8 +94,8 @@ pub async fn run_check_command(config: &Config, cmd: &str) -> CheckOutcome {
 /// a write failure just means no pointer gets appended, never a hard error.
 pub(crate) fn write_gate_failure_output(config: &Config, output: &str) -> Option<String> {
     let rel = "last_gate_failure.txt";
-    std::fs::write(config.miniswe_path(rel), output).ok()?;
-    Some(format!(".miniswe/{rel}"))
+    std::fs::write(config.buzztr_path(rel), output).ok()?;
+    Some(format!(".buzztr/{rel}"))
 }
 
 /// The "read the raw output yourself" pointer appended to a debugger Report
@@ -150,8 +150,8 @@ mod gate_message_tests {
     #[test]
     fn raw_output_note_wording() {
         assert_eq!(
-            raw_output_note(".miniswe/last_gate_failure.txt"),
-            "\nFull raw check output: read(\".miniswe/last_gate_failure.txt\")."
+            raw_output_note(".buzztr/last_gate_failure.txt"),
+            "\nFull raw check output: read(\".buzztr/last_gate_failure.txt\")."
         );
     }
 

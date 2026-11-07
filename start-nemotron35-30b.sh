@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start llama-server with NVIDIA Nemotron 3.5 Lightning 30B-A3B for miniswe.
+# Start llama-server with NVIDIA Nemotron 3.5 Lightning 30B-A3B for buzztr.
 #
 # Released 2026-08-11. Hybrid Mamba-Transformer MoE: 30B total, ~3B ACTIVE per
 # token, agentic-trained ("self-healing tool calling"), up to 1M context.
@@ -18,21 +18,21 @@
 #   with all experts on CPU, GPU holds only attention + KV + active path
 #   → VRAM footprint drops to a few GB, leaving lots of room for "X"
 #
-# The knob (MINISWE_NCMOE): number of layers whose MoE experts live on CPU.
+# The knob (BUZZTR_NCMOE): number of layers whose MoE experts live on CPU.
 #   Default 99 = ALL experts on CPU (llama.cpp caps it at the real layer
 #   count). Safest: guaranteed to fit the 20 GB budget with headroom, starts
 #   reliably regardless of the exact layer geometry, relies on the fast CPU +
 #   3B-active for decode speed.
-#   To go FASTER: LOWER MINISWE_NCMOE to pull expert layers back onto the GPU,
+#   To go FASTER: LOWER BUZZTR_NCMOE to pull expert layers back onto the GPU,
 #   watching `nvidia-smi` on load until you approach your 20 GB budget. Each
 #   layer you pull off CPU costs VRAM but speeds decode.
-#     Override:  MINISWE_NCMOE=24 ./start-nemotron35-30b.sh
+#     Override:  BUZZTR_NCMOE=24 ./start-nemotron35-30b.sh
 #
 # Expected speed on this box: decode should land well above the dense 31B's
 # 8.6 tok/s (only ~3B active vs 30.7B dense) — likely in the 26B-MoE ballpark.
 # Measure on first run and tune NCMOE from there.
 #
-# Optional MTP speculative decoding (MINISWE_MTP=1): the UD GGUF ships with a
+# Optional MTP speculative decoding (BUZZTR_MTP=1): the UD GGUF ships with a
 # Multi-Token-Prediction draft head; --spec-type draft-mtp uses it as a
 # built-in draft model (~1.3-1.5x decode, no separate draft model). Requires a
 # recent llama.cpp build (b10362+) AND an MTP-enabled GGUF (NOT the *-noMTP-*
@@ -51,7 +51,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/Nemotron-3.5-Lightning-30B-A3B-GGUF}"
+MODEL_DIR="${BUZZTR_MODEL_DIR:-$HOME/models/Nemotron-3.5-Lightning-30B-A3B-GGUF}"
 
 # Chat-template fix: the GGUF's shipped template (identical to NVIDIA's HF
 # original) prefills `<|im_start|>assistant\n<think></think>` with NO newline
@@ -61,15 +61,15 @@ MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/Nemotron-3.5-Lightning-30B-A3B-GGUF
 # exact bench-request replays; +1 newline = 0/8 and instant clean tool calls).
 # The patched copy adds that single newline and nothing else.
 TEMPLATE_FIX="${SCRIPT_DIR}/scripts/templates/nemotron35-lightning-think-nl-fix.jinja"
-PORT="${MINISWE_PORT:-8464}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-60000}"
-THREADS="${MINISWE_THREADS:-16}"      # physical cores, for the CPU-resident experts
-NCMOE="${MINISWE_NCMOE:-99}"          # layers whose MoE experts sit on CPU (99 = all).
+PORT="${BUZZTR_PORT:-8464}"
+CTX_SIZE="${BUZZTR_CTX_SIZE:-60000}"
+THREADS="${BUZZTR_THREADS:-16}"      # physical cores, for the CPU-resident experts
+NCMOE="${BUZZTR_NCMOE:-99}"          # layers whose MoE experts sit on CPU (99 = all).
                                       # LOWER it to pull experts onto the GPU for speed
                                       # as VRAM allows; RAISE (or keep 99) to stay within
                                       # the 20 GB budget / leave room for other work.
 
-MODEL="${MINISWE_MODEL:-}"
+MODEL="${BUZZTR_MODEL:-}"
 if [ -z "$MODEL" ]; then
     MODEL=$(ls "$MODEL_DIR"/*Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL*.gguf 2>/dev/null | grep -v -- '-00002-of-' | head -1 || true)
     [ -z "$MODEL" ] && MODEL=$(ls "$MODEL_DIR"/*Nemotron-3.5-Lightning-30B-A3B-Q4_K_M*.gguf 2>/dev/null | head -1 || true)
@@ -119,12 +119,12 @@ ARGS=(
 )
 
 MTP_NOTE="off"
-if [ "${MINISWE_MTP:-0}" = "1" ]; then
+if [ "${BUZZTR_MTP:-0}" = "1" ]; then
     ARGS+=(--spec-type draft-mtp)
     MTP_NOTE="on (--spec-type draft-mtp)"
 fi
 
-echo "Starting NVIDIA Nemotron 3.5 Lightning 30B-A3B (MoE) for miniswe..."
+echo "Starting NVIDIA Nemotron 3.5 Lightning 30B-A3B (MoE) for buzztr..."
 echo "  Model:     $MODEL"
 echo "  Context:   $CTX_SIZE tokens"
 echo "  KV:        q4_0"

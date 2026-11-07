@@ -2,12 +2,12 @@
 #
 # Each variant runs in its own container with:
 #   - Fresh code checkout (no stale target/)
-#   - miniswe binary from HEAD (pre-built)
+#   - buzztr binary from HEAD (pre-built)
 #   - Cargo/Rust toolchain for validation (cargo check/build/test)
 #   - No shared state between variants
 #
 # Build once:
-#   docker build -f scripts/Dockerfile.benchmark -t miniswe-bench .
+#   docker build -f scripts/Dockerfile.benchmark -t buzztr-bench .
 #
 # The run-benchmark-docker.sh script handles per-variant containers.
 
@@ -17,8 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev git curl ca-certificates maven \
     && rm -rf /var/lib/apt/lists/*
 
-# Pre-install rust-analyzer into miniswe's own cache, using the EXACT artifact
-# miniswe would fetch at runtime (same GitHub releases/latest URL, same file).
+# Pre-install rust-analyzer into buzztr's own cache, using the EXACT artifact
+# buzztr would fetch at runtime (same GitHub releases/latest URL, same file).
 # ensure_binary() returns it at the cache check, so no benchmark run touches
 # the network for it. One run in 38 had this download fail at startup and spent
 # the whole session with no LSP and no refactor tools; nothing in the results
@@ -29,21 +29,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # which would quietly change LSP behaviour across the whole comparison set.
 # The trailing --version is the real check: a broken pipe or truncated body
 # would otherwise leave a corrupt file that looks like a valid cache entry.
-RUN mkdir -p /root/.miniswe/lsp-servers \
+RUN mkdir -p /root/.buzztr/lsp-servers \
     && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
         https://github.com/rust-lang/rust-analyzer/releases/latest/download/rust-analyzer-x86_64-unknown-linux-gnu.gz \
-      | gunzip > /root/.miniswe/lsp-servers/rust-analyzer \
-    && chmod +x /root/.miniswe/lsp-servers/rust-analyzer \
-    && /root/.miniswe/lsp-servers/rust-analyzer --version
+      | gunzip > /root/.buzztr/lsp-servers/rust-analyzer \
+    && chmod +x /root/.buzztr/lsp-servers/rust-analyzer \
+    && /root/.buzztr/lsp-servers/rust-analyzer --version
 
 WORKDIR /build
 
-# Copy source and build miniswe from HEAD
+# Copy source and build buzztr from HEAD
 COPY . .
 RUN cargo build --release
 
-# Install miniswe binary
-RUN cp /build/target/release/miniswe /usr/local/bin/miniswe
+# Install buzztr binary
+RUN cp /build/target/release/buzztr /usr/local/bin/buzztr
 
 # Pre-download cargo registry (speeds up validation builds)
 # but do NOT pre-build the benchmark target code

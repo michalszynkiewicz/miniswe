@@ -1,6 +1,6 @@
 #!/bin/bash
 # Start llama-server with Qwen3-Coder-30B-A3B-Instruct (MoE, 30B total / 3B active)
-# for the miniswe benchmark.
+# for the buzztr benchmark.
 #
 # Released April 2026; benchmark-leading on SWE-Bench / LiveCodeBench among
 # open-weight models that fit on 24 GB.
@@ -37,7 +37,7 @@ if [ ! -f "$MODEL_FILE" ]; then
 fi
 
 # Sampling defaults follow the Qwen team's recommendations for
-# Qwen3-Coder-30B-A3B-Instruct. The miniswe benchmark scripts override
+# Qwen3-Coder-30B-A3B-Instruct. The buzztr benchmark scripts override
 # `temperature` and other knobs per-request; these only apply when a
 # client doesn't specify them.
 exec "$(dirname "$0")/scripts/run-llama-cuda.sh" \

@@ -1,6 +1,8 @@
-# miniswe
+# buzztr
 
 A lightweight CLI coding agent for local LLMs.
+
+> Formerly **miniswe**. Config now lives in `~/.buzztr/` and `.buzztr/`, and env vars use the `BUZZTR_` prefix; rename any old `~/.miniswe` / `.miniswe` dirs and `MINISWE_*` vars by hand.
 
 Optimized for quantized small LLMs running locally via llama.cpp, Ollama, or vLLM. Works with any OpenAI-compatible API.
 
@@ -10,13 +12,13 @@ Optimized for quantized small LLMs running locally via llama.cpp, Ollama, or vLL
 
 ## What it does
 
-miniswe is built around one principle: **give the model the right tools and let it decide what context it needs.** Instead of stuffing the repo into the prompt, it exposes a compact set of tools the model calls on demand:
+buzztr is built around one principle: **give the model the right tools and let it decide what context it needs.** Instead of stuffing the repo into the prompt, it exposes a compact set of tools the model calls on demand:
 
 - **Pull-based context** — the model fetches a repo map, project profile, or architecture notes when it needs them.
 - **AST-aware code intelligence** — tree-sitter parsing (19 languages) with a PageRank dependency graph for the repo map.
 - **LSP diagnostics + navigation** — auto-downloads the right language server (rust-analyzer, pyright, gopls, …) for fast diagnostics and `goto_definition` / `find_references`.
 - **Line-level edits with per-edit feedback** — edits produce AST + LSP feedback and a revision table; regressions roll back with `revert`.
-- **Context compression** — when the conversation grows past budget, older turns are LLM-summarized and archived to `.miniswe/session_archive.md`.
+- **Context compression** — when the conversation grows past budget, older turns are LLM-summarized and archived to `.buzztr/session_archive.md`.
 - **MCP support** — connect any MCP server via `.mcp.json` (Claude Code compatible).
 - **Permission model** — path jailing, shell approval, per-query web access, MCP approval.
 - **Skills** — guided multi-step workflows from `.ai/skills/<name>/SKILL.md` (project) or `~/.ai/skills/` (global): a router picks the right skill for the task and the harness walks the model through its steps.
@@ -27,18 +29,18 @@ miniswe is built around one principle: **give the model the right tools and let 
 
 Grab a prebuilt binary, or build from source.
 
-**Option A — download a release.** Go to the [releases page](https://github.com/michalszynkiewicz/miniswe/releases), download the tarball for your platform (linux x86_64 musl, macOS x86_64, or macOS arm64), then:
+**Option A — download a release.** Go to the [releases page](https://github.com/buzztr-ai/buzztr/releases), download the tarball for your platform (linux x86_64 musl, macOS x86_64, or macOS arm64), then:
 
 ```bash
-tar xzf miniswe-*.tar.gz
-# move the `miniswe` binary to a directory on your PATH, or add its location to PATH
+tar xzf buzztr-*.tar.gz
+# move the `buzztr` binary to a directory on your PATH, or add its location to PATH
 ```
 
 **Option B — build from source** (needs Rust 1.85+, edition 2024):
 
 ```bash
-git clone https://github.com/michalszynkiewicz/miniswe.git
-cd miniswe
+git clone https://github.com/buzztr-ai/buzztr.git
+cd buzztr
 cargo install --path .            # installs into ~/.cargo/bin
 ```
 
@@ -56,20 +58,20 @@ You need an OpenAI-compatible LLM endpoint. The bundled `start-*.sh` scripts lau
 Then, in your project:
 
 ```bash
-miniswe init                                 # index, profile, graph
-miniswe                                       # interactive REPL
-miniswe "fix the bug in auth.rs"             # single-shot
-miniswe -y "add error handling to main.rs"   # headless (auto-approve)
-miniswe plan "how should I refactor auth?"   # plan mode (read-only)
+buzztr init                                 # index, profile, graph
+buzztr                                       # interactive REPL
+buzztr "fix the bug in auth.rs"             # single-shot
+buzztr -y "add error handling to main.rs"   # headless (auto-approve)
+buzztr plan "how should I refactor auth?"   # plan mode (read-only)
 ```
 
-Other commands: `miniswe info` (project/index stats), `miniswe config` (show current configuration).
+Other commands: `buzztr info` (project/index stats), `buzztr config` (show current configuration).
 
 In the REPL, `/new` clears history+scratchpad+plan, `/clear` clears history, `/help` lists commands, `Ctrl+O` toggles the detail viewer, `Ctrl+C` interrupts generation, `Ctrl+D` exits.
 
 ## Hosted models
 
-`miniswe` also speaks OpenRouter, OpenAI, and Anthropic (via its OpenAI-compatibility layer) directly, alongside any local llama.cpp / Ollama / vLLM server. Set `provider` and `model` in `[model]`, and give it an API key via `api_key`, `api_key_env`, or just export the provider's conventional environment variable (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`):
+`buzztr` also speaks OpenRouter, OpenAI, and Anthropic (via its OpenAI-compatibility layer) directly, alongside any local llama.cpp / Ollama / vLLM server. Set `provider` and `model` in `[model]`, and give it an API key via `api_key`, `api_key_env`, or just export the provider's conventional environment variable (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`):
 
 ```toml
 [model]
@@ -79,9 +81,9 @@ api_key_env = "OPENROUTER_API_KEY"  # or set `api_key` directly, or just export 
 thinking = true                     # maps to each provider's own knob: `reasoning.effort` (OpenRouter), `reasoning_effort` (OpenAI), `thinking.budget_tokens` (Anthropic)
 ```
 
-Keys belong in `~/.miniswe/config.toml` or the environment — never in a project's `.miniswe/config.toml`, which a project may not gitignore. `miniswe init` never writes one, and `miniswe config` / `miniswe info` show only where a key came from (inline / env var / unset), never its value.
+Keys belong in `~/.buzztr/config.toml` or the environment — never in a project's `.buzztr/config.toml`, which a project may not gitignore. `buzztr init` never writes one, and `buzztr config` / `buzztr info` show only where a key came from (inline / env var / unset), never its value.
 
-Token usage is logged per LLM call and totaled at session end (see `.miniswe/logs/*.log`); set `runtime.max_session_input_tokens` (0 = disabled, the default) to stop a turn once cumulative input tokens cross a budget rather than letting an unattended session run up a hosted bill.
+Token usage is logged per LLM call and totaled at session end (see `.buzztr/logs/*.log`); set `runtime.max_session_input_tokens` (0 = disabled, the default) to stop a turn once cumulative input tokens cross a budget rather than letting an unattended session run up a hosted bill.
 
 See `docs/hosted-providers.md` for the full per-provider wire-format decision table.
 
@@ -98,13 +100,13 @@ The model sees five grouped tools plus a few editing primitives (and `mcp_use` w
 
 ## Configuration
 
-Settings come from `~/.miniswe/config.toml`, with `.miniswe/config.toml` in the project overriding it key by key. `miniswe init` writes the project file with every setting commented out, so a fresh project uses your global config; uncomment a key to override it there. `miniswe config` shows the live values. (A project initialized before this change has a project file with every key set, which masks the global config; delete the sections you don't mean to override.) Key sections: `[model]` (provider, endpoint, model, context window, temperature, `api_key`/`api_key_env` for hosted providers — see [Hosted models](#hosted-models)), `[context]` (repo map budget, round limits), `[tools]` (web, plan), `[lsp]`, `[web]` (search/fetch backends), `[runtime]` (e.g. `max_session_input_tokens`, an opt-in token-budget guard).
+Settings come from `~/.buzztr/config.toml`, with `.buzztr/config.toml` in the project overriding it key by key. `buzztr init` writes the project file with every setting commented out, so a fresh project uses your global config; uncomment a key to override it there. `buzztr config` shows the live values. (A project initialized before this change has a project file with every key set, which masks the global config; delete the sections you don't mean to override.) Key sections: `[model]` (provider, endpoint, model, context window, temperature, `api_key`/`api_key_env` for hosted providers — see [Hosted models](#hosted-models)), `[context]` (repo map budget, round limits), `[tools]` (web, plan), `[lsp]`, `[web]` (search/fetch backends), `[runtime]` (e.g. `max_session_input_tokens`, an opt-in token-budget guard).
 
-For web search, put a Serper key in `~/.miniswe/serper.key`; without it, `web(search)` falls back to GitHub repository search.
+For web search, put a Serper key in `~/.buzztr/serper.key`; without it, `web(search)` falls back to GitHub repository search.
 
 ## Languages
 
-Default (tier 1): Rust, Python, JavaScript, TypeScript, Go, YAML. Opt-in (tier 2, build with `--features all-languages`): Java, C, C++, Ruby, PHP, C#, Kotlin, Swift, Scala, Zig, Elixir, Haskell, Lua. Language servers auto-download to `~/.miniswe/lsp-servers/` on first use.
+Default (tier 1): Rust, Python, JavaScript, TypeScript, Go, YAML. Opt-in (tier 2, build with `--features all-languages`): Java, C, C++, Ruby, PHP, C#, Kotlin, Swift, Scala, Zig, Elixir, Haskell, Lua. Language servers auto-download to `~/.buzztr/lsp-servers/` on first use.
 
 ## Contributing
 

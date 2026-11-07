@@ -6,7 +6,7 @@ use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use miniswe::tools::edit_file;
+use buzztr::tools::edit_file;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer};
 
@@ -51,7 +51,7 @@ async fn execute_preplan_repair_after_failed_plan() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "a\nb\nc\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change first block"});
     let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
@@ -118,7 +118,7 @@ async fn execute_preplan_repair_can_inspect_with_search_and_read() {
     )
     .unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({"path": "main.rs", "task": "change first block"});
     let result = edit_file::execute(&args, &config, &router, None, None, None, None, None)
         .await
@@ -184,7 +184,7 @@ async fn execute_preplans_bulk_edit_into_regions() {
     )
     .unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "update all call sites",
@@ -249,7 +249,7 @@ async fn execute_preplan_can_inspect_with_search_and_read() {
     )
     .unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "update all call sites",
@@ -310,7 +310,7 @@ async fn execute_preplan_can_handle_multiple_inspection_commands_in_one_response
     )
     .unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "update all call sites",
@@ -364,7 +364,7 @@ async fn execute_preplan_uses_literal_replacements_before_smart_edits() {
     )
     .unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "update all call sites",
@@ -423,7 +423,7 @@ async fn execute_preplan_rejects_literal_replace_without_old_and_recovers() {
     )
     .unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "rewrite middle two lines",
@@ -477,7 +477,7 @@ async fn execute_preplan_literal_step_bubbles_up_when_no_relocation_candidate() 
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "call(None)\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "update all calls",
@@ -530,7 +530,7 @@ async fn execute_literal_replace_recovers_from_whitespace_drift_with_confirmatio
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.html"), "<div>hello</div>\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.html",
         "task": "change hello to world",
@@ -585,7 +585,7 @@ async fn execute_literal_replace_recovers_from_single_char_typo_via_fuzzy() {
     )
     .unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "upgrade handler registration",
@@ -640,7 +640,7 @@ async fn execute_literal_replace_with_whitespace_drift_rejected_bails_to_plan_re
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.html"), "<div>hello</div>\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.html",
         "task": "change hello to world",
@@ -694,7 +694,7 @@ async fn execute_preplan_repairs_whole_plan_after_literal_failure() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "call(None)\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "update all calls",
@@ -749,7 +749,7 @@ async fn execute_preplan_repair_attempt_includes_structured_repair_context() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "call(None)\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "update all calls",
@@ -839,7 +839,7 @@ async fn execute_preplan_needs_clarification_short_circuits_with_question() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "println!(\"hi\");\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "remove the auth middleware",
@@ -908,7 +908,7 @@ async fn execute_preplan_needs_clarification_without_question_uses_placeholder()
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "println!(\"hi\");\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "ambiguous task",
@@ -963,7 +963,7 @@ async fn execute_preplan_needs_clarification_during_repair_short_circuits() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "call(None)\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "update all calls",
@@ -1030,7 +1030,7 @@ async fn execute_preplan_missing_target_is_not_treated_as_clarification_and_retr
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "original();\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "rename original to foo",
@@ -1067,7 +1067,7 @@ async fn execute_preplan_parse_failure_returns_error() {
     helpers::config_with_mock_endpoint(&mut config, &mock_server.uri());
     fs::write(config.project_root.join("main.rs"), "old();\n").unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "update all calls",
@@ -1124,7 +1124,7 @@ async fn execute_preplan_overlapping_steps_apply_first_and_report_rest_failed() 
     )
     .unwrap();
 
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let args = serde_json::json!({
         "path": "main.rs",
         "task": "rewrite the file",

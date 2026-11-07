@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # docker-entrypoint.sh — Run one or both benchmark tasks.
-# Usage: docker run ... miniswe-bench [B|C|all] [--runs N] [--timeout S] ...
+# Usage: docker run ... buzztr-bench [B|C|all] [--runs N] [--timeout S] ...
 set -euo pipefail
 
 TASK="${1:-all}"

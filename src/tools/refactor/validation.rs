@@ -19,7 +19,7 @@ pub struct ArgSchema<'a> {
 }
 
 /// A validation failure: `message` is the complete, byte-identical text
-/// miniswe's own agent loop has always seen for this failure (including the
+/// buzztr's own agent loop has always seen for this failure (including the
 /// grouped `refactor(action=...)` example syntax); `missing`/`bad_type`/
 /// `unknown` are the same facts as plain data, for a consumer with a
 /// different tool surface (e.g. an MCP server exposing flat tools) to build

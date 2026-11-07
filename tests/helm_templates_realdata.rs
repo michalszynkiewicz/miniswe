@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use miniswe::tools::fast::parse_check;
+use buzztr::tools::fast::parse_check;
 
 /// Templates that really are broken upstream, so a failure there is the
 /// checker being right. Each renders invalid YAML (or a duplicate key) in

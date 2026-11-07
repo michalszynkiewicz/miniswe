@@ -8,7 +8,7 @@
 #   3. Wait for /v1/models to respond. Bail if it takes too long.
 #   4. Warm-up ping (one tiny completion) so the first agent doesn't
 #      eat the cold-cache penalty.
-#   5. Run miniswe bench → benchmark_results/comparison_<ts>/${MODEL}/miniswe/
+#   5. Run buzztr bench → benchmark_results/comparison_<ts>/${MODEL}/buzztr/
 #   6. Run aider bench   → benchmark_results/comparison_<ts>/${MODEL}/aider/
 #   7. Stop llama-server, confirm port 8464 is free.
 # Then aggregate a summary.tsv.
@@ -133,12 +133,12 @@ run_model() {
     fi
     warmup_completion
 
-    # ── miniswe bench ────────────────────────────────────────────────────
-    local miniswe_results_root_before
-    miniswe_results_root_before=$(ls -1d "${REPO_DIR}/benchmark_results/docker_"* 2>/dev/null | wc -l)
+    # ── buzztr bench ────────────────────────────────────────────────────
+    local buzztr_results_root_before
+    buzztr_results_root_before=$(ls -1d "${REPO_DIR}/benchmark_results/docker_"* 2>/dev/null | wc -l)
 
     echo ""
-    echo "── miniswe ──"
+    echo "── buzztr ──"
     "${REPO_DIR}/scripts/run-benchmark-docker.sh" \
         --timeout "${TIMEOUT}" \
         --max-rounds 600 \
@@ -146,13 +146,13 @@ run_model() {
         --model "${model}" \
         || true
 
-    # The miniswe bench writes to its own timestamped dir. Move the latest
+    # The buzztr bench writes to its own timestamped dir. Move the latest
     # one under our comparison dir so everything is in one place.
-    local newest_miniswe
-    newest_miniswe=$(ls -1td "${REPO_DIR}/benchmark_results/docker_"* 2>/dev/null | head -1)
-    if [ -n "${newest_miniswe}" ] && \
-       [ "$(ls -1d "${REPO_DIR}/benchmark_results/docker_"* 2>/dev/null | wc -l)" -gt "${miniswe_results_root_before}" ]; then
-        mv "${newest_miniswe}" "${model_dir}/miniswe"
+    local newest_buzztr
+    newest_buzztr=$(ls -1td "${REPO_DIR}/benchmark_results/docker_"* 2>/dev/null | head -1)
+    if [ -n "${newest_buzztr}" ] && \
+       [ "$(ls -1d "${REPO_DIR}/benchmark_results/docker_"* 2>/dev/null | wc -l)" -gt "${buzztr_results_root_before}" ]; then
+        mv "${newest_buzztr}" "${model_dir}/buzztr"
     fi
 
     # ── aider bench ──────────────────────────────────────────────────────
@@ -177,7 +177,7 @@ run_model() {
     stop_llama_server
 
     # ── record into summary.tsv ──────────────────────────────────────────
-    for agent in miniswe aider; do
+    for agent in buzztr aider; do
         local agent_dir="${model_dir}/${agent}/00_baseline"
         [ -d "${agent_dir}" ] || continue
         local container_log="${agent_dir}/container.log"

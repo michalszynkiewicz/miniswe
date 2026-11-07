@@ -3,7 +3,7 @@
 #
 # Aider's design is "user tells the agent which files to edit"; in fully
 # autonomous --message mode it tends to read the repo map, suggest files,
-# and ask the user to add them. That makes a head-to-head with miniswe
+# and ask the user to add them. That makes a head-to-head with buzztr
 # (which discovers files via its tool surface) unfair to aider —
 # measuring its discovery loop instead of its editing.
 #
@@ -14,10 +14,10 @@
 # experiments, this one is for the practical comparison.
 #
 # Honest framing for any writeup: this comparison is "aider's editing on
-# a pre-scoped file set vs miniswe's full agent loop including
+# a pre-scoped file set vs buzztr's full agent loop including
 # discovery." Not apples-to-apples on every axis; that's intentional.
 #
-# Validation suite is identical to the miniswe bench (6 checks). Same
+# Validation suite is identical to the buzztr bench (6 checks). Same
 # pinned baseline SHA, same Docker isolation, same endpoint.
 #
 # Usage:
@@ -27,11 +27,11 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-IMAGE_NAME="miniswe-aider-bench"
+IMAGE_NAME="buzztr-aider-bench"
 RESULTS_PREFIX="aider_scoped"
 
 # Canonical file set for the --system-prompt-override task. These are the
-# files miniswe touches across its 6/6 runs. Pre-loaded into aider's chat
+# files buzztr touches across its 6/6 runs. Pre-loaded into aider's chat
 # context so it can edit them without asking the user to add them.
 SCOPED_FILES=(
     src/main.rs
@@ -116,7 +116,7 @@ echo ""
 run_variant() {
     local name="$1"
     local variant_dir="${RESULTS_DIR}/${name}"
-    local container_name="miniswe-aider-${name}-$$"
+    local container_name="buzztr-aider-${name}-$$"
     mkdir -p "${variant_dir}"
     echo "--- ${name} ---"
 
@@ -246,7 +246,7 @@ $(grep -E '^error(\[|:)|^\s*-->|^\s*\|' /output/cargo_check.txt | head -60)"
 
     # 2. cargo build
     TOTAL=$((TOTAL + 1))
-    BINARY="./target/debug/miniswe"
+    BINARY="./target/debug/buzztr"
     if [ "$PASS" -ge 1 ]; then
         if RUSTFLAGS="-A warnings" cargo build 2> /output/cargo_build.txt; then
             echo "build:PASS"; PASS=$((PASS + 1))

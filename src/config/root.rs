@@ -39,7 +39,7 @@ pub struct Config {
     pub project_root: PathBuf,
     /// Id of this process's session (not serialized). Session working
     /// state — `plan.md`, `scratchpad.md` — lives under
-    /// `.miniswe/sessions/<session_id>/` so concurrent or nested miniswe
+    /// `.buzztr/sessions/<session_id>/` so concurrent or nested buzztr
     /// runs in one project can't clobber each other. See `config::session`.
     #[serde(skip)]
     pub session_id: String,
@@ -62,7 +62,7 @@ pub struct LogConfig {
     /// - debug: full interactions — LLM messages, tool args/results, file changes
     /// - trace: everything + context assembly stats, token counts, masking decisions
     pub level: String,
-    /// Whether to write session logs to .miniswe/logs/
+    /// Whether to write session logs to .buzztr/logs/
     pub enabled: bool,
 }
 
@@ -249,15 +249,15 @@ impl Default for RuntimeConfig {
 }
 
 impl Config {
-    /// Path to the global config directory (`~/.miniswe/`).
+    /// Path to the global config directory (`~/.buzztr/`).
     pub fn global_dir() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".miniswe"))
+        dirs::home_dir().map(|h| h.join(".buzztr"))
     }
 
     /// Load config with layered resolution:
     /// 1. Built-in defaults
-    /// 2. `~/.miniswe/config.toml` — global settings (API keys, model, hardware)
-    /// 3. `.miniswe/config.toml` in cwd — per-project overrides (optional)
+    /// 2. `~/.buzztr/config.toml` — global settings (API keys, model, hardware)
+    /// 3. `.buzztr/config.toml` in cwd — per-project overrides (optional)
     ///
     /// Project root is always the current working directory.
     pub fn load() -> Result<Self> {
@@ -277,7 +277,7 @@ impl Config {
             Some(path) => Some(read_toml_table(path)?),
             None => None,
         };
-        let project_config_path = project_root.join(".miniswe").join("config.toml");
+        let project_config_path = project_root.join(".buzztr").join("config.toml");
         let project = if project_config_path.exists() {
             Some(read_toml_table(&project_config_path)?)
         } else {
@@ -313,19 +313,19 @@ impl Config {
         Ok(config)
     }
 
-    /// Path to the `.miniswe/` data directory in the project.
-    pub fn miniswe_dir(&self) -> PathBuf {
-        self.project_root.join(".miniswe")
+    /// Path to the `.buzztr/` data directory in the project.
+    pub fn buzztr_dir(&self) -> PathBuf {
+        self.project_root.join(".buzztr")
     }
 
-    /// Path to a specific file within the project's `.miniswe/`.
-    pub fn miniswe_path(&self, relative: &str) -> PathBuf {
-        self.miniswe_dir().join(relative)
+    /// Path to a specific file within the project's `.buzztr/`.
+    pub fn buzztr_path(&self, relative: &str) -> PathBuf {
+        self.buzztr_dir().join(relative)
     }
 
     /// Directory holding every session's state directory.
     pub fn sessions_dir(&self) -> PathBuf {
-        self.miniswe_dir().join("sessions")
+        self.buzztr_dir().join("sessions")
     }
 
     /// This session's private state directory.
@@ -345,9 +345,9 @@ impl Config {
         std::fs::create_dir_all(self.session_dir())
     }
 
-    /// Check if this project has been initialized (`miniswe init` was run).
+    /// Check if this project has been initialized (`buzztr init` was run).
     pub fn is_initialized(&self) -> bool {
-        self.miniswe_dir().is_dir()
+        self.buzztr_dir().is_dir()
     }
 
     /// Max characters for a single tool result.
@@ -423,7 +423,7 @@ mod tests {
         write(&global, GLOBAL_OPENROUTER);
         let project = tmp.path().join("proj");
         write(
-            &project.join(".miniswe/config.toml"),
+            &project.join(".buzztr/config.toml"),
             "[model]\ntemperature = 0.5\n\n[context]\nmax_rounds = 7\n",
         );
 
@@ -441,7 +441,7 @@ mod tests {
         write(&global, GLOBAL_OPENROUTER);
         let project = tmp.path().join("proj");
         write(
-            &project.join(".miniswe/config.toml"),
+            &project.join(".buzztr/config.toml"),
             "[model]\nmodel = \"openai/gpt-5\"\n",
         );
 

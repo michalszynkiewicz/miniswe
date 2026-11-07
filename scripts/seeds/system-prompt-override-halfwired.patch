@@ -40,8 +40,8 @@ index bb0a106..9af8f39 100644
          }
          Some(Command::Plan { message }) => {
              let config = Config::load()?;
--            miniswe::cli::commands::run::run(config, &message, true, cli.yes).await?;
-+            miniswe::cli::commands::run::run(
+-            buzztr::cli::commands::run::run(config, &message, true, cli.yes).await?;
++            buzztr::cli::commands::run::run(
 +                config,
 +                &message,
 +                true,
@@ -51,13 +51,13 @@ index bb0a106..9af8f39 100644
 +            .await?;
          }
          Some(Command::Docs { subcommand }) => {
-             miniswe::cli::commands::docs::run(subcommand).await?;
+             buzztr::cli::commands::docs::run(subcommand).await?;
 @@ -37,7 +44,14 @@ async fn main() -> Result<()> {
              let config = Config::load()?;
              if let Some(message) = cli.message {
                  // Single-shot mode
--                miniswe::cli::commands::run::run(config, &message, false, cli.yes).await?;
-+                miniswe::cli::commands::run::run(
+-                buzztr::cli::commands::run::run(config, &message, false, cli.yes).await?;
++                buzztr::cli::commands::run::run(
 +                    config,
 +                    &message,
 +                    false,
@@ -67,4 +67,4 @@ index bb0a106..9af8f39 100644
 +                .await?;
              } else {
                  // Interactive REPL
-                 miniswe::cli::commands::repl::run(config, cli.yes).await?;
+                 buzztr::cli::commands::repl::run(config, cli.yes).await?;

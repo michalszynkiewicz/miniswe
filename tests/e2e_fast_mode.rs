@@ -9,13 +9,13 @@ mod helpers;
 use std::fs;
 use std::path::PathBuf;
 
-use miniswe::tools;
-use miniswe::tools::permissions::PermissionManager;
+use buzztr::tools;
+use buzztr::tools::permissions::PermissionManager;
 use serde_json::json;
 
 fn setup() -> (
     tempfile::TempDir,
-    miniswe::config::Config,
+    buzztr::config::Config,
     tools::RevisionStore,
 ) {
     let (tmp, config) = helpers::create_test_project();

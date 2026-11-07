@@ -1,14 +1,14 @@
-//! Renders `miniswe::tools::ToolDetail` into text appropriate for an MCP
+//! Renders `buzztr::tools::ToolDetail` into text appropriate for an MCP
 //! client (Claude Code), instead of reusing `ToolResult::content` verbatim —
-//! that string is written for miniswe's own agent loop and, for some
-//! failures, names miniswe-only tools (`file(...)`, `refactor(...)`) that
-//! don't exist in an MCP client's tool list. See docs/miniswe-mcp.md.
+//! that string is written for buzztr's own agent loop and, for some
+//! failures, names buzztr-only tools (`file(...)`, `refactor(...)`) that
+//! don't exist in an MCP client's tool list. See docs/buzztr-mcp.md.
 
-use miniswe::tools::ToolDetail;
+use buzztr::tools::ToolDetail;
 
 /// The MCP-facing example for a `refactor` action, in the flat tool syntax
 /// this server actually exposes (see `toolset::list_tools`) — the shared
-/// `ToolDetail::InvalidArgs.action` names the grouped miniswe action
+/// `ToolDetail::InvalidArgs.action` names the grouped buzztr action
 /// (`add_param`/`drop_param`), which this maps to our own tool names.
 fn mcp_example(action: &'static str) -> &'static str {
     match action {

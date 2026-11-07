@@ -1,6 +1,6 @@
-# Demo video scenario: miniswe
+# Demo video scenario: buzztr
 
-A ~5-minute walkthrough showing miniswe solving a real coding task on a
+A ~5-minute walkthrough showing buzztr solving a real coding task on a
 local LLM, running entirely on a single machine with no cloud API calls.
 
 ---
@@ -10,9 +10,9 @@ local LLM, running entirely on a single machine with no cloud API calls.
 **What to show:**
 - Terminal: `./start-devstral-small-2.sh` launching llama.cpp
 - The GPU activity (nvidia-smi or a system monitor widget showing VRAM usage)
-- Quick shot of the config: `cat ~/.miniswe/config.toml` — endpoint is localhost
+- Quick shot of the config: `cat ~/.buzztr/config.toml` — endpoint is localhost
 
-**Narration:** "miniswe is a coding agent that runs entirely on your local
+**Narration:** "buzztr is a coding agent that runs entirely on your local
 hardware. No API keys, no cloud. I'm running Devstral Small 2 quantized
 on a single RTX 3090. Let's give it a real task."
 
@@ -22,7 +22,7 @@ on a single RTX 3090. Let's give it a real task."
 
 ```
 $ cd ~/projects/sample-web-api
-$ miniswe
+$ buzztr
 ```
 
 **What to show:**
@@ -30,7 +30,7 @@ $ miniswe
 - The prompt appears at the bottom: `you>`
 - Point out: tree-sitter indexing the project, LSP connecting
 
-**Narration:** "miniswe indexes the project with tree-sitter, starts
+**Narration:** "buzztr indexes the project with tree-sitter, starts
 rust-analyzer for real-time diagnostics, and builds a repo map using
 PageRank. The model sees the structure before I even type."
 
@@ -137,11 +137,11 @@ the model can use real documentation, not hallucinated APIs."
 **What to show:**
 - `git diff` showing all the changes
 - Final `cargo test` passing
-- The MINISWE_DEBUG=1 output showing token usage and KV cache stats
+- The BUZZTR_DEBUG=1 output showing token usage and KV cache stats
 
 **Narration:** "All of this ran on a single GPU, with 50K context, no
 cloud calls. The edits are real, the tests pass, and the whole session
-used about 30K tokens. miniswe — a coding agent that respects your
+used about 30K tokens. buzztr — a coding agent that respects your
 hardware and your privacy."
 
 ---

@@ -1,4 +1,4 @@
-# miniswe agent design — evidence-distilled (local models)
+# buzztr agent design — evidence-distilled (local models)
 
 Status: design, no code yet. Supersedes all earlier drafts of this file.
 Date: 2026-05-18. Basis: a multi-arm probe (`scripts/simple-tier-probe.py`,
@@ -169,9 +169,9 @@ Methodological takeaways now baked in: always error-audit before
 concluding; never compare across harness versions; confirm root causes
 from logs, not inference.
 
-## The design (what to change in miniswe)
+## The design (what to change in buzztr)
 
-miniswe already uses tool-calls — so this is mostly *subtraction*.
+buzztr already uses tool-calls — so this is mostly *subtraction*.
 
 1. **Config:** `agent.ceremony = "off"` (default) vs `"strict"`
    (legacy plan-gate, opt-in escape hatch only). No model-family
@@ -217,7 +217,7 @@ per-family machinery.
 Implement the subtractions behind `agent.tier`, then run the **real**
 `scripts/run-agent-comparison.sh` (real task + validation suite) vs
 aider, on Gemma + Qwen + Devstral. Gate: deceremonialized tool agent
-≥ current miniswe and ≥ aider on all three. That is the next evidence
+≥ current buzztr and ≥ aider on all three. That is the next evidence
 — not another probe.
 
 ## Caveats

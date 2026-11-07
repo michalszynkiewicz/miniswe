@@ -9,8 +9,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use miniswe::lsp::{LspClient, LspServer};
-use miniswe::tools;
+use buzztr::lsp::{LspClient, LspServer};
+use buzztr::tools;
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer};
@@ -195,7 +195,7 @@ async fn add_param_updates_signature_and_callsites() {
         .await;
 
     let lsp = spawn_lsp_for(&config.project_root).await;
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
 
     // The function `assemble` is on line 1 of src/lib.rs, with the name
     // starting at column 8 (1-based: "pub fn assemble" — `a` of `assemble`
@@ -276,7 +276,7 @@ async fn add_param_reports_failure_when_model_skips() {
         .await;
 
     let lsp = spawn_lsp_for(&config.project_root).await;
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
 
     let args = json!({
         "action": "add_param",
@@ -357,7 +357,7 @@ async fn rename_via_lsp_updates_definition_and_callers() {
         "name": "assemble",
         "new_name": "build_context",
     });
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let result =
         tools::execute_refactor_tool(&args, &config, &router, Some(&lsp), None, None, None)
             .await
@@ -428,7 +428,7 @@ async fn drop_param_updates_signature_and_callsites() {
         .await;
 
     let lsp = spawn_lsp_for(&config.project_root).await;
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
 
     if !wait_for_references(
         &lsp,
@@ -494,7 +494,7 @@ async fn drop_param_updates_signature_and_callsites() {
 #[tokio::test]
 async fn refactor_help_returns_usage() {
     let (_tmp, config) = helpers::create_test_project();
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
 
     let result = tools::execute_refactor_tool(
         &json!({"action": "help"}),
@@ -516,7 +516,7 @@ async fn refactor_help_returns_usage() {
 #[tokio::test]
 async fn refactor_without_lsp_returns_clear_error() {
     let (_tmp, config) = helpers::create_test_project();
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
 
     let args = json!({
         "action": "add_param",
@@ -548,7 +548,7 @@ async fn rename_without_lsp_returns_clear_error() {
         "name": "assemble",
         "new_name": "foo",
     });
-    let router = miniswe::llm::ModelRouter::new(&config);
+    let router = buzztr::llm::ModelRouter::new(&config);
     let result = tools::execute_refactor_tool(&args, &config, &router, None, None, None, None)
         .await
         .unwrap();

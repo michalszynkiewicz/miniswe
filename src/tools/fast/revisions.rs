@@ -107,9 +107,9 @@ struct Inner {
 }
 
 impl RevisionStore {
-    /// Create a new store. `_miniswe_dir` is accepted so on-disk storage can
+    /// Create a new store. `_buzztr_dir` is accepted so on-disk storage can
     /// be added later without changing call sites; v1 ignores it.
-    pub fn new(_miniswe_dir: &Path) -> Result<Self> {
+    pub fn new(_buzztr_dir: &Path) -> Result<Self> {
         Ok(Self {
             inner: Mutex::new(Inner {
                 per_file: HashMap::new(),

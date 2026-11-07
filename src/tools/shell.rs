@@ -62,7 +62,7 @@ pub async fn execute(args: &Value, config: &Config) -> Result<ToolResult> {
 pub fn start(args: &Value, config: &Config) -> Result<RunningShellCommand> {
     let command = super::args::require_str(args, "command").map_err(|e| anyhow!(e))?;
 
-    let temp_dir = config.miniswe_dir().join("shell_tmp");
+    let temp_dir = config.buzztr_dir().join("shell_tmp");
     std::fs::create_dir_all(&temp_dir)?;
     let unique = format!(
         "{}_{}",
@@ -203,12 +203,12 @@ pub(crate) fn render_finished_result(
     let mut result = format!("[shell: exit {exit_code}");
 
     if truncated {
-        let cache_dir = config.miniswe_dir().join("shell_output");
+        let cache_dir = config.buzztr_dir().join("shell_output");
         let _ = std::fs::create_dir_all(&cache_dir);
         let filename = format!("cmd_{}.txt", chrono::Local::now().format("%H%M%S"));
         let cache_path = cache_dir.join(&filename);
         let _ = std::fs::write(&cache_path, &combined);
-        let rel_path = format!(".miniswe/shell_output/{filename}");
+        let rel_path = format!(".buzztr/shell_output/{filename}");
 
         result.push_str(&format!(
             ", showing last {} of {} lines",
@@ -252,7 +252,7 @@ pub(crate) fn render_finished_result(
         if needs_interactive_input(&stderr) {
             result.push_str(
                 "\n[This command needs interactive input (a password/tty prompt), which \
-                 miniswe does not support. Do NOT retry it — ask the user to run it \
+                 buzztr does not support. Do NOT retry it — ask the user to run it \
                  themselves in a separate terminal and tell you when it's done.]",
             );
         }

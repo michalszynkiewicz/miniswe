@@ -5,7 +5,7 @@
 # in-container.
 #
 # Build:
-#   docker build -f scripts/Dockerfile.opencode -t miniswe-opencode-bench .
+#   docker build -f scripts/Dockerfile.opencode -t buzztr-opencode-bench .
 
 FROM rust:1.89-bookworm
 
@@ -24,12 +24,12 @@ RUN npm install -g opencode-ai@latest
 WORKDIR /build
 
 # Bring the repo in so we have a .git for `git archive ${BASELINE_SHA}`.
-# Unlike the miniswe image we do NOT build a binary here — opencode runs
+# Unlike the buzztr image we do NOT build a binary here — opencode runs
 # against the freshly-archived /work tree at execution time.
 COPY . .
 RUN cd /build && cargo fetch
 
-# Keep the repo for git archive — same convention as the miniswe/aider images.
+# Keep the repo for git archive — same convention as the buzztr/aider images.
 RUN mkdir /repo && cp -r /build/.git /repo/.git
 
 # Clean source tree — each variant starts from a fresh git-archive.

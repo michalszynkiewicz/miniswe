@@ -13,7 +13,7 @@ version of the seed experiment (no inflated 5/6 floor, no idealized one-link gap
     `{messages, tools, model, temperature}`. `messages` is the full
     system+history (with the real observation-masking applied) — i.e. the
     context the agent carried into its first fix.
-  - `tree/` — the working tree at that round, exported from miniswe's
+  - `tree/` — the working tree at that round, exported from buzztr's
     `shadow-git` (which commits "round N — before round N" every round).
   - `manifest.json` — source run, dump, shadow commit, round, previews.
   Verified on `docker_20260617_170328`: clean original-task context (no reset
@@ -38,10 +38,10 @@ version of the seed experiment (no inflated 5/6 floor, no idealized one-link gap
 A Docker-isolated harness (sibling of `run-benchmark-docker.sh`) that:
 1. Copies `fixture/tree/` into `/work` (the exact half-built code state).
 2. `git init` + baseline commit (so diff capture + shadow-git work as usual).
-3. Runs miniswe **seeded with the captured conversation** instead of a fresh
+3. Runs buzztr **seeded with the captured conversation** instead of a fresh
    task, then applies the same 6-check validation + best-of-N as the other benches.
 
-The one miniswe-core addition needed: a way to **start the agent loop from a
+The one buzztr-core addition needed: a way to **start the agent loop from a
 given conversation history** rather than a fresh `assemble()`. Options:
 
 - **(A) `--replay-context <context.json>` flag (preferred).** `run()` loads the
@@ -51,10 +51,10 @@ given conversation history** rather than a fresh `assemble()`. Options:
   participates normally so we observe whether it recovers.
   - Touch points: `src/cli/mod.rs` (flag), `src/cli/commands/run.rs` (when set,
     skip the fresh `context::assemble` and instead seed `messages` from the
-    file; map the JSON roles → `llm::Message`). The dumps are miniswe's own
+    file; map the JSON roles → `llm::Message`). The dumps are buzztr's own
     serialization, so the mapping is round-trippable (watch tool_call ids +
     tool-result pairing).
-- **(B) session-restore.** Translate `context.json` into a `.miniswe` session
+- **(B) session-restore.** Translate `context.json` into a `.buzztr` session
   file and use `--continue`. Avoids a new flag but couples to the session
   format; (A) is cleaner and more explicit.
 

@@ -24,14 +24,14 @@ pub struct ContextConfig {
 ///
 /// All strategies fire at the **same** trigger threshold (`raw_budget`, see
 /// `compressor::needs_compression`); they differ only in the *action* taken,
-/// so they can be A/B'd cleanly. `Unified` is miniswe's production behavior;
+/// so they can be A/B'd cleanly. `Unified` is buzztr's production behavior;
 /// the others are canonical baselines used for benchmarking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionStrategy {
-    /// miniswe production: rolling LLM summary anchored on the plan, keeping
+    /// buzztr production: rolling LLM summary anchored on the plan, keeping
     /// recent turns raw, with the full pre-compression text archived to
-    /// `.miniswe/session_archive.md` (and a pointer to it in the summary).
+    /// `.buzztr/session_archive.md` (and a pointer to it in the summary).
     Unified,
     /// Pure truncation: drop the oldest turns, keep the most-recent turns
     /// within budget. No summary, no LLM call, no archive.

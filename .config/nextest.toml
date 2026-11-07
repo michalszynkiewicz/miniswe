@@ -21,5 +21,5 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 lsp = { max-threads = 2 }
 
 [[profile.ci.overrides]]
-filter = 'binary_id(miniswe::e2e_lsp) + binary_id(miniswe::e2e_refactor) + binary_id(miniswe::e2e_refactor_replay) + binary_id(miniswe::e2e_edit_file)'
+filter = 'binary_id(buzztr::e2e_lsp) + binary_id(buzztr::e2e_refactor) + binary_id(buzztr::e2e_refactor_replay) + binary_id(buzztr::e2e_edit_file)'
 test-group = 'lsp'

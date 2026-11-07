@@ -1,7 +1,7 @@
 //! E2E tests for LSP integration.
 //!
 //! These tests spawn a real LSP server (rust-analyzer) against a temp project.
-//! rust-analyzer is auto-downloaded to ~/.miniswe/lsp-servers/ if not found.
+//! rust-analyzer is auto-downloaded to ~/.buzztr/lsp-servers/ if not found.
 //!
 //! Tests are skipped if download fails (no network, unsupported platform).
 
@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use miniswe::lsp::{LspClient, LspServer};
+use buzztr::lsp::{LspClient, LspServer};
 use serde_json::json;
 
 /// Try to ensure rust-analyzer is available (downloads if needed).
@@ -264,7 +264,7 @@ async fn lsp_auto_check_integration() {
         .await;
     eprintln!("[trace] pre-warm complete");
 
-    let perms = miniswe::tools::permissions::PermissionManager::headless(&config);
+    let perms = buzztr::tools::permissions::PermissionManager::headless(&config);
 
     // Write a file with a type error via the tool system
     let args = json!({
@@ -274,7 +274,7 @@ async fn lsp_auto_check_integration() {
     eprintln!("[trace] calling execute_tool(write_file) with LSP client");
     let result = match tokio::time::timeout(
         Duration::from_secs(60),
-        miniswe::tools::execute_tool("write_file", &args, &config, &perms, Some(&client)),
+        buzztr::tools::execute_tool("write_file", &args, &config, &perms, Some(&client)),
     )
     .await
     {

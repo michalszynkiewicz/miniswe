@@ -12,12 +12,12 @@ use std::sync::atomic::AtomicBool;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use miniswe::config::Config;
-use miniswe::llm::{
+use buzztr::config::Config;
+use buzztr::llm::{
     ChatRequest, LlmClient, Message, TRUNCATED_TOOL_CALL_MARKER, is_context_truncated_response,
     is_truncated_tool_call_error,
 };
-use miniswe::tools::{self, PermissionManager};
+use buzztr::tools::{self, PermissionManager};
 
 fn perms(config: &Config) -> PermissionManager {
     PermissionManager::headless(config)
@@ -122,7 +122,7 @@ async fn llm_client_chat_tool_call() {
     let client = LlmClient::new(config.model.clone());
     let request = ChatRequest {
         messages: vec![Message::user("read main.rs")],
-        tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
+        tools: Some(tools::tool_definitions(buzztr::config::EditMode::Smart)),
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
@@ -247,7 +247,7 @@ async fn llm_client_stream_tool_call() {
     let client = LlmClient::new(config.model.clone());
     let request = ChatRequest {
         messages: vec![Message::user("write a file")],
-        tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
+        tools: Some(tools::tool_definitions(buzztr::config::EditMode::Smart)),
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
@@ -661,7 +661,7 @@ async fn single_tool_call_flow_reads_file() {
             Message::system("You are a test agent."),
             Message::user("Read hello.txt"),
         ],
-        tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
+        tools: Some(tools::tool_definitions(buzztr::config::EditMode::Smart)),
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
@@ -707,7 +707,7 @@ async fn write_file_flow_creates_file_on_disk() {
 
     let request = ChatRequest {
         messages: vec![Message::user("create output.txt")],
-        tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
+        tools: Some(tools::tool_definitions(buzztr::config::EditMode::Smart)),
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
@@ -769,7 +769,7 @@ async fn invalid_json_args_from_llm() {
 
     let request = ChatRequest {
         messages: vec![Message::user("do something")],
-        tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
+        tools: Some(tools::tool_definitions(buzztr::config::EditMode::Smart)),
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
@@ -870,7 +870,7 @@ async fn llm_chat_does_not_retry_truncated_tool_call_500() {
     let client = LlmClient::new(config.model.clone());
     let request = ChatRequest {
         messages: vec![Message::user("hi")],
-        tools: Some(tools::tool_definitions(miniswe::config::EditMode::Smart)),
+        tools: Some(tools::tool_definitions(buzztr::config::EditMode::Smart)),
         tool_choice: None,
         max_tokens_override: None,
         chat_template_kwargs: None,
@@ -1080,7 +1080,7 @@ fn message_factories_produce_correct_roles() {
 
 #[test]
 fn tool_definitions_are_valid() {
-    let defs = tools::tool_definitions(miniswe::config::EditMode::Smart);
+    let defs = tools::tool_definitions(buzztr::config::EditMode::Smart);
 
     // Should have the expected grouped tools
     let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();

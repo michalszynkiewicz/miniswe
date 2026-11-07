@@ -48,7 +48,7 @@ yaml-language-server (schema validation for pack.yaml etc.) is a later opt-in.
   `charts/*/Chart.yaml`, the PKG `**/chart/Chart.yaml` layout).
 - Binary: GitHub release asset `helm_ls_{linux,darwin}_{amd64,arm64}`
   (`servers/download.rs`, same shape as rust-analyzer/clangd), cached as
-  `~/.miniswe/lsp-servers/helm_ls`; PATH lookup first like the others; start
+  `~/.buzztr/lsp-servers/helm_ls`; PATH lookup first like the others; start
   with `serve`, verify with `version`.
 - `language_id`: `helm` for `templates/**/*.yaml|*.tpl`, `yaml` for other
   `.yaml/.yml` (helm-ls handles `values*.yaml` under that id).

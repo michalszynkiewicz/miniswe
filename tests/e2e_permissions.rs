@@ -4,9 +4,9 @@ mod helpers;
 
 use std::fs;
 
-use miniswe::config::Config;
-use miniswe::tools;
-use miniswe::tools::permissions::{Action, PermissionManager};
+use buzztr::config::Config;
+use buzztr::tools;
+use buzztr::tools::permissions::{Action, PermissionManager};
 use serde_json::json;
 
 fn perms(config: &Config) -> PermissionManager {
@@ -171,8 +171,8 @@ fn resolve_path_allows_new_file_in_existing_dir() {
 }
 
 /// Regression: paths that resolve through a symlink inside the project root
-/// (e.g. docker benches where `.miniswe/` is a symlink to a bind-mounted
-/// volume, or users who alias `.miniswe/` onto a different disk) must not be
+/// (e.g. docker benches where `.buzztr/` is a symlink to a bind-mounted
+/// volume, or users who alias `.buzztr/` onto a different disk) must not be
 /// rejected. The jail check cares about `..` traversal, not about whether the
 /// model followed a symlink the operator placed.
 #[test]
@@ -312,35 +312,35 @@ fn headless_auto_approves_web() {
 
 #[test]
 fn project_root_is_cwd() {
-    use miniswe::config::Config;
+    use buzztr::config::Config;
 
     let tmp = tempfile::TempDir::new().unwrap();
     let project = tmp.path().join("myproject");
     fs::create_dir_all(&project).unwrap();
 
-    // is_initialized checks for .miniswe/ directory
+    // is_initialized checks for .buzztr/ directory
     let mut config = Config::default();
     config.project_root = project.clone();
-    assert!(!config.is_initialized(), "no .miniswe/ dir yet");
+    assert!(!config.is_initialized(), "no .buzztr/ dir yet");
 
-    // Create .miniswe/ — now initialized
-    fs::create_dir_all(project.join(".miniswe")).unwrap();
+    // Create .buzztr/ — now initialized
+    fs::create_dir_all(project.join(".buzztr")).unwrap();
     assert!(
         config.is_initialized(),
-        "should be initialized with .miniswe/ dir"
+        "should be initialized with .buzztr/ dir"
     );
 }
 
 #[test]
 fn global_config_dir_is_in_home() {
-    use miniswe::config::Config;
+    use buzztr::config::Config;
 
     let global = Config::global_dir();
     assert!(global.is_some(), "should resolve home dir");
     let path = global.unwrap();
     assert!(
-        path.ends_with(".miniswe"),
-        "global dir should be ~/.miniswe, got {}",
+        path.ends_with(".buzztr"),
+        "global dir should be ~/.buzztr, got {}",
         path.display()
     );
 }

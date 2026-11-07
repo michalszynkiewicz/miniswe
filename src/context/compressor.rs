@@ -171,7 +171,7 @@ fn emit_compaction_metric(
 
 /// Compress old messages when raw history exceeds budget.
 ///
-/// Dispatches to the configured [`CompactionStrategy`]. `Unified` is miniswe's
+/// Dispatches to the configured [`CompactionStrategy`]. `Unified` is buzztr's
 /// production behavior; the others are canonical baselines for benchmarking.
 /// All strategies share the same `raw_budget` trigger (see [`budgets`]).
 pub async fn maybe_compress(
@@ -663,7 +663,7 @@ fn refresh_current_state(messages: &mut [Message], config: &Config, mode: StateR
 #[cfg(test)]
 mod current_state_tests;
 
-/// miniswe production strategy: rolling LLM summary anchored on the plan, with
+/// buzztr production strategy: rolling LLM summary anchored on the plan, with
 /// the full pre-compression text archived to disk and a pointer in the summary.
 ///
 /// If the plan tool is enabled, first asks the model to update its plan; the
@@ -767,7 +767,7 @@ async fn compact_unified(
     messages.truncate(compress_start);
 
     messages.push(Message::user(&format!(
-        "{UNIFIED_SUMMARY_HEADER}\n{summary}\n[Details: file(action='read', path='.miniswe/session_archive.md'). Continue from where you left off.]"
+        "{UNIFIED_SUMMARY_HEADER}\n{summary}\n[Details: file(action='read', path='.buzztr/session_archive.md'). Continue from where you left off.]"
     )));
 
     messages.extend(after_split);
@@ -1075,7 +1075,7 @@ async fn compact_tiered(
     }
 }
 
-/// Summarization prompt flavor. `Structured` is miniswe's production
+/// Summarization prompt flavor. `Structured` is buzztr's production
 /// per-file-changes format (anchored on actions); `Neutral` is the textbook
 /// "summarize the conversation so far" prose used by the rolling-summary arm.
 #[derive(Clone, Copy)]
@@ -1278,15 +1278,15 @@ fn heuristic_summarize(messages: &[&Message]) -> String {
         summary.push_str(&format!("Errors: {}\n", errors.join("; ")));
     }
     if summary.is_empty() {
-        summary.push_str("(earlier session activity — use file(action='read', path='.miniswe/session_archive.md') for details)");
+        summary.push_str("(earlier session activity — use file(action='read', path='.buzztr/session_archive.md') for details)");
     }
 
     summary
 }
 
-/// Archive compressed messages to `.miniswe/session_archive.md`.
+/// Archive compressed messages to `.buzztr/session_archive.md`.
 fn archive_messages(messages: &[&Message], config: &Config) {
-    let archive_path = config.miniswe_dir().join("session_archive.md");
+    let archive_path = config.buzztr_dir().join("session_archive.md");
     let mut archive = match std::fs::read_to_string(&archive_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),

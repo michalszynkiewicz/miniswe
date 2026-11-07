@@ -57,7 +57,7 @@
 
 ## LoRA fine-tuning
 
-Devstral can be LoRA fine-tuned on the RTX 3090 via QLoRA + Unsloth (~18-20GB VRAM, ~1-2 hours for 50 examples). Session logs in `.miniswe/logs/` have full conversations. Convert successful sessions to chat format and fine-tune on correct tool usage patterns. LoRA adapter is ~50-100MB, loads on top of the same GGUF.
+Devstral can be LoRA fine-tuned on the RTX 3090 via QLoRA + Unsloth (~18-20GB VRAM, ~1-2 hours for 50 examples). Session logs in `.buzztr/logs/` have full conversations. Convert successful sessions to chat format and fine-tune on correct tool usage patterns. LoRA adapter is ~50-100MB, loads on top of the same GGUF.
 
 ## Architecture improvements
 

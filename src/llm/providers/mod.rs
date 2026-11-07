@@ -1,6 +1,6 @@
 //! Provider dialect layer.
 //!
-//! Every provider miniswe speaks to except Anthropic shares the OpenAI
+//! Every provider buzztr speaks to except Anthropic shares the OpenAI
 //! chat-completions wire protocol at the top level; this module is the single place that decides
 //! the per-provider differences (default endpoint, auth headers, which
 //! fields go in the request body, output-cap field name, thinking/reasoning

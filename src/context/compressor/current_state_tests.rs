@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::llm::Message;
 
 fn config_in(dir: &std::path::Path) -> Config {
-    std::fs::create_dir_all(dir.join(".miniswe")).unwrap();
+    std::fs::create_dir_all(dir.join(".buzztr")).unwrap();
     let mut config = Config::default();
     config.project_root = dir.to_path_buf();
     config.ensure_session_dir().unwrap();

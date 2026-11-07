@@ -66,7 +66,7 @@ def parse_cell(cell_dir):
     if fm:
         pass_n, total_n, attempts = (int(fm[-1].group(1)), int(fm[-1].group(2)), int(fm[-1].group(3)))
     rounds = 0
-    for lf in glob.glob(os.path.join(cell_dir, "miniswe_state", "logs", "*.log")):
+    for lf in glob.glob(os.path.join(cell_dir, "buzztr_state", "logs", "*.log")):
         rounds += read_text(lf).count("[round ")
     wall = read_text(os.path.join(cell_dir, "wall_s.txt")).strip() or "?"
     return dict(events=events, pass_n=pass_n, total_n=total_n, attempts=attempts,

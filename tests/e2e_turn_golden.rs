@@ -15,8 +15,8 @@ use std::fs;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use miniswe::cli::commands::run::run;
-use miniswe::config::Config;
+use buzztr::cli::commands::run::run;
+use buzztr::config::Config;
 
 /// Test project + config pointed at the mock server, with the LSP disabled
 /// so nothing tries to spawn rust-analyzer in the throwaway directory.
@@ -57,9 +57,9 @@ fn request_tool_names(body: &str) -> Vec<String> {
 
 /// Contents of the (single) session log the run wrote.
 fn session_log(config: &Config) -> String {
-    let logs_dir = config.project_root.join(".miniswe/logs");
+    let logs_dir = config.project_root.join(".buzztr/logs");
     let mut entries: Vec<_> = fs::read_dir(&logs_dir)
-        .expect("run() should have created .miniswe/logs")
+        .expect("run() should have created .buzztr/logs")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .collect();
@@ -471,7 +471,7 @@ async fn golden_done_gate_debugger_two_fire_report() {
 
     // The raw gate-failure output the debugger's note points readers at is
     // the MOST RECENT (gadget) failure.
-    let raw = fs::read_to_string(config.miniswe_path("last_gate_failure.txt")).unwrap();
+    let raw = fs::read_to_string(config.buzztr_path("last_gate_failure.txt")).unwrap();
     assert!(
         raw.contains("missing gadget wiring"),
         "last_gate_failure.txt should hold the most recent check output:\n{raw}"
@@ -634,13 +634,13 @@ async fn golden_debugger_judge_scrap_restarts_then_already_reset_on_second_vote(
         reqs[9]
     );
 
-    // The session log lives at project_root/.miniswe/logs/<ts>.log — INSIDE
-    // the tree SCRAP whole-tree-reverts. The shadow git excludes `/.miniswe/`
+    // The session log lives at project_root/.buzztr/logs/<ts>.log — INSIDE
+    // the tree SCRAP whole-tree-reverts. The shadow git excludes `/.buzztr/`
     // entirely (src/tools/snapshots.rs `info/exclude`) precisely so the
     // revert never rewinds the log file out from under `SessionLog`'s single
     // append handle (src/logging.rs). Regression guard: lines from BOTH
     // sides of the SCRAP survive — the round-2 plan call and the final end
-    // marker. (This repo's own root .gitignore has `.miniswe/`, which hid
+    // marker. (This repo's own root .gitignore has `.buzztr/`, which hid
     // the bug from every bench run; the test project has no .gitignore.)
     let log = session_log(&config);
     assert!(

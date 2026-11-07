@@ -1,4 +1,4 @@
-//! `miniswe init` — Initialize the project knowledge base.
+//! `buzztr init` — Initialize the project knowledge base.
 
 use std::fs;
 
@@ -14,37 +14,37 @@ use crate::tui;
 pub async fn run() -> Result<()> {
     let root = std::env::current_dir()?;
 
-    tui::print_header("Initializing miniswe");
+    tui::print_header("Initializing buzztr");
 
     // Check if already initialized
-    let miniswe_dir = root.join(".miniswe");
-    if miniswe_dir.exists() {
+    let buzztr_dir = root.join(".buzztr");
+    if buzztr_dir.exists() {
         tui::print_status("Project already initialized. Re-indexing...");
     }
 
     // Create directory structure
-    tui::print_status("Creating .miniswe/ directory structure...");
-    fs::create_dir_all(miniswe_dir.join("index"))?;
-    fs::create_dir_all(miniswe_dir.join("snippets"))?;
-    fs::create_dir_all(miniswe_dir.join("sessions"))?;
+    tui::print_status("Creating .buzztr/ directory structure...");
+    fs::create_dir_all(buzztr_dir.join("index"))?;
+    fs::create_dir_all(buzztr_dir.join("snippets"))?;
+    fs::create_dir_all(buzztr_dir.join("sessions"))?;
 
     // Detect project and generate profile
     tui::print_status("Detecting project configuration...");
     let info = profile::detect_project(&root)?;
     let profile_content = profile::generate_profile(&info);
-    let profile_path = miniswe_dir.join("profile.md");
+    let profile_path = buzztr_dir.join("profile.md");
     fs::write(&profile_path, &profile_content)?;
     tui::print_status(&format!("  Generated profile: {}", info.name));
 
     // Create default config if it doesn't exist
-    let config_path = miniswe_dir.join("config.toml");
+    let config_path = buzztr_dir.join("config.toml");
     if !config_path.exists() {
         fs::write(&config_path, default_config_template()?)?;
         tui::print_status("  Created config.toml (all settings commented out)");
     }
 
     // Create guide.md if it doesn't exist
-    let guide_path = miniswe_dir.join("guide.md");
+    let guide_path = buzztr_dir.join("guide.md");
     if !guide_path.exists() {
         fs::write(
             &guide_path,
@@ -56,7 +56,7 @@ pub async fn run() -> Result<()> {
     }
 
     // Create lessons.md if it doesn't exist, seeded with language-specific tips
-    let lessons_path = miniswe_dir.join("lessons.md");
+    let lessons_path = buzztr_dir.join("lessons.md");
     if !lessons_path.exists() {
         let lessons = String::from("# Lessons\n\n");
 
@@ -73,7 +73,7 @@ pub async fn run() -> Result<()> {
     }
 
     // Load previous index for incremental reindexing
-    let previous = crate::knowledge::ProjectIndex::load(&miniswe_dir).ok();
+    let previous = crate::knowledge::ProjectIndex::load(&buzztr_dir).ok();
 
     // Run indexer (incremental if previous index exists)
     tui::print_status("Indexing project files...");
@@ -85,16 +85,16 @@ pub async fn run() -> Result<()> {
     let dep_graph = DependencyGraph::build(&index);
     let edge_count: usize = dep_graph.edges.values().map(|v| v.len()).sum();
 
-    index.save(&miniswe_dir)?;
-    dep_graph.save(&miniswe_dir)?;
+    index.save(&buzztr_dir)?;
+    dep_graph.save(&buzztr_dir)?;
 
     tui::print_complete(&format!(
         "Indexed {} files, {} symbols, {} cross-references",
         index.total_files, index.total_symbols, edge_count
     ));
 
-    // Create .gitignore for .miniswe/
-    let gitignore_path = miniswe_dir.join(".gitignore");
+    // Create .gitignore for .buzztr/
+    let gitignore_path = buzztr_dir.join(".gitignore");
     if !gitignore_path.exists() {
         fs::write(
             &gitignore_path,
@@ -138,13 +138,13 @@ pub async fn run() -> Result<()> {
 
 /// The project `config.toml` written by `init`: every default setting,
 /// commented out. A project file only overrides the keys it sets, so writing
-/// live defaults here would mask `~/.miniswe/config.toml` (e.g. a hosted
+/// live defaults here would mask `~/.buzztr/config.toml` (e.g. a hosted
 /// `[model]`) for every initialized project.
 fn default_config_template() -> Result<String> {
     let defaults = toml::to_string_pretty(&Config::default())?;
     let mut out = String::from(
-        "# Per-project overrides for miniswe. Uncomment a key to override it for this\n\
-         # project only; everything left commented falls back to ~/.miniswe/config.toml,\n\
+        "# Per-project overrides for buzztr. Uncomment a key to override it for this\n\
+         # project only; everything left commented falls back to ~/.buzztr/config.toml,\n\
          # then to the built-in defaults shown here. Keep API keys out of this file.\n\n",
     );
     for line in defaults.lines() {
@@ -189,7 +189,7 @@ mod tests {
         let toml_str = toml::to_string_pretty(&config).unwrap();
         assert!(
             !toml_str.contains("api_key"),
-            "miniswe init must never write api_key(s) to a project config:\n{toml_str}"
+            "buzztr init must never write api_key(s) to a project config:\n{toml_str}"
         );
     }
 }

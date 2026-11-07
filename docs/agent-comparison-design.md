@@ -1,15 +1,15 @@
-# Agent comparison harness: miniswe vs aider
+# Agent comparison harness: buzztr vs aider
 
 ## Goal
 
 For each local model M in `{qwen3-coder-next, devstral-small-2, gemma-4-26B-A4B}`,
-run the same SWE task through **miniswe** and through **aider**, against the
+run the same SWE task through **buzztr** and through **aider**, against the
 same local llama-server, with the same validation suite, and emit a single
 unified results table.
 
 We want to answer:
 
-- Does miniswe's tool surface (plan, refactor, spawn_agents, etc.) outperform
+- Does buzztr's tool surface (plan, refactor, spawn_agents, etc.) outperform
   aider's simpler search/replace patch model on local LLMs?
 - Does that gap depend on the model? (Hypothesis: agents with richer tool
   surfaces help weaker models more than stronger ones — strong models can
@@ -48,7 +48,7 @@ Checks:
 
 1. `cargo check` passes
 2. `cargo build` passes
-3. `miniswe --help` shows a `--*prompt*` flag
+3. `buzztr --help` shows a `--*prompt*` flag
 4. The flag parses without error
 5. `cargo test` passes
 6. Smoke test: the binary, invoked with the new flag and prompt
@@ -59,7 +59,7 @@ attempt.
 
 ### Task
 
-Same task as recent miniswe runs:
+Same task as recent buzztr runs:
 
 > Add a CLI flag `--system-prompt-override` (short: `-s`) that takes a
 > string and replaces the default system prompt with the provided text.
@@ -75,19 +75,19 @@ Pinned baseline SHA: `cc34d2626faf32c1b6dd1b8b33af693fb936b098` (current
 Each agent runs inside its own Docker container against the same
 `--network=host` so they share the same llama-server endpoint.
 
-#### miniswe (existing)
+#### buzztr (existing)
 
 Uses `scripts/run-benchmark-docker.sh` as-is. Already does:
 - Fresh checkout at pinned SHA
 - Generates `config.toml`
-- Runs `miniswe --yes "${TASK}"` with timeout
+- Runs `buzztr --yes "${TASK}"` with timeout
 - Captures stdout/stderr, diff, LLM dumps
 - Runs validation, writes pass/fail to `container.log`
 
 #### aider (new)
 
 New script `scripts/run-aider-bench.sh`, mirroring the structure of the
-miniswe one. Differences:
+buzztr one. Differences:
 
 - Uses a separate Docker image with `aider` installed (`pip install aider-chat`)
   on top of the same base (Rust toolchain + llama-server CLI tools).
@@ -103,7 +103,7 @@ miniswe one. Differences:
   ```
   - `--yes` auto-confirms edits
   - `--auto-test` re-runs `cargo check` after each edit batch (analogous
-    to miniswe's compile gate)
+    to buzztr's compile gate)
   - `--message` runs in non-interactive one-shot mode
 - After aider exits, run the same 6-check validation on the resulting
   working tree.
@@ -131,7 +131,7 @@ Constraints:
   `LLAMA_CONTAINER_NAME` so we can `docker stop` it deterministically.
 - Server must be fully loaded before benches start. Poll `/v1/models` and
   also do a tiny `/v1/chat/completions` ping to verify weights are ready.
-- Aider and miniswe runs are sequential (not parallel) — both need
+- Aider and buzztr runs are sequential (not parallel) — both need
   exclusive access to the GPU.
 
 ### Results layout
@@ -139,13 +139,13 @@ Constraints:
 ```
 benchmark_results/comparison_<timestamp>/
 ├── qwen3-coder-next/
-│   ├── miniswe/    # same structure as today's miniswe bench results
+│   ├── buzztr/    # same structure as today's buzztr bench results
 │   └── aider/      # symmetrical layout for aider
 ├── devstral-small-2/
-│   ├── miniswe/
+│   ├── buzztr/
 │   └── aider/
 ├── gemma-4-26B-A4B/
-│   ├── miniswe/
+│   ├── buzztr/
 │   └── aider/
 └── summary.tsv     # one row per (model, agent), columns below
 ```
@@ -181,7 +181,7 @@ taken at the start and end of each agent run.
 
 5. **Time budget.** Per model:
    - server load: ~30–60s
-   - miniswe bench: up to 3 × 3400s = ~2.8h
+   - buzztr bench: up to 3 × 3400s = ~2.8h
    - aider bench: similar timeout
    - server unload: ~10s
    Three models × ~6h ≈ **18h of wall time** for a full comparison.
@@ -199,5 +199,5 @@ taken at the start and end of each agent run.
    over models, starts/stops the server, runs both agents, aggregates
    results.
 5. Minor refactor: extract the 6-check validation into a shared shell
-   function (or shared inline script blob) so miniswe and aider scripts
+   function (or shared inline script blob) so buzztr and aider scripts
    stay in sync.

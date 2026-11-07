@@ -184,16 +184,16 @@ impl DependencyGraph {
         scores
     }
 
-    /// Save the graph to `.miniswe/index/graph.json`.
-    pub fn save(&self, miniswe_dir: &Path) -> anyhow::Result<()> {
-        let path = miniswe_dir.join("index").join("graph.json");
+    /// Save the graph to `.buzztr/index/graph.json`.
+    pub fn save(&self, buzztr_dir: &Path) -> anyhow::Result<()> {
+        let path = buzztr_dir.join("index").join("graph.json");
         std::fs::write(path, serde_json::to_string_pretty(self)?)?;
         Ok(())
     }
 
-    /// Load the graph from `.miniswe/index/graph.json`.
-    pub fn load(miniswe_dir: &Path) -> anyhow::Result<Self> {
-        let path = miniswe_dir.join("index").join("graph.json");
+    /// Load the graph from `.buzztr/index/graph.json`.
+    pub fn load(buzztr_dir: &Path) -> anyhow::Result<Self> {
+        let path = buzztr_dir.join("index").join("graph.json");
         if path.exists() {
             Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
         } else {

@@ -2,7 +2,7 @@
 # run-aider-bench.sh — aider bench rooted at the repo with no file hints.
 #
 # Aider is invoked with `.` as its single positional arg, mirroring
-# miniswe's setup: both agents see the same working tree and have to
+# buzztr's setup: both agents see the same working tree and have to
 # figure out which files to touch. This is the closest "apples-to-apples"
 # we can get — aider runs autonomously off its repo-map, no pre-loaded
 # files. For the pre-loaded-files version (aider's design sweet spot),
@@ -30,7 +30,7 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-IMAGE_NAME="miniswe-aider-bench"
+IMAGE_NAME="buzztr-aider-bench"
 
 LLAMA_ENDPOINT="${LLAMA_ENDPOINT:-http://localhost:8464}"
 MODEL_TAG="$(
@@ -118,7 +118,7 @@ echo ""
 run_variant() {
     local name="$1"
     local variant_dir="${RESULTS_DIR}/${name}"
-    local container_name="miniswe-aider-${name}-$$"
+    local container_name="buzztr-aider-${name}-$$"
     mkdir -p "${variant_dir}"
     echo "--- ${name} ---"
 
@@ -180,7 +180,7 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
     echo "=== ATTEMPT ${ATTEMPT}/${MAX_ATTEMPTS} (${REMAINING}s remaining) ==="
 
     # Aider in one-shot mode, rooted at the repo root via a single `.`
-    # positional arg. This is the closest mirror of miniswe's setup —
+    # positional arg. This is the closest mirror of buzztr's setup —
     # both agents see the same working tree and have to figure out which
     # files matter. Caveat: in --message mode aider's "please add these
     # files" suggestions can't be acted on by the human; if aider asks
@@ -255,7 +255,7 @@ $(grep -E '^error(\[|:)|^\s*-->|^\s*\|' /output/cargo_check.txt | head -60)"
 
     # 2. cargo build
     TOTAL=$((TOTAL + 1))
-    BINARY="./target/debug/miniswe"
+    BINARY="./target/debug/buzztr"
     if [ "$PASS" -ge 1 ]; then
         if RUSTFLAGS="-A warnings" cargo build 2> /output/cargo_build.txt; then
             echo "build:PASS"; PASS=$((PASS + 1))

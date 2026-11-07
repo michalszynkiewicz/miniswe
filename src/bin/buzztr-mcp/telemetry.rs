@@ -1,9 +1,9 @@
 //! Per-project MCP telemetry: an append-only JSONL event log plus running
 //! success/error counts per tool.
 //!
-//! Written to `~/.miniswe/projects/<slug>/mcp.log` (not the project's own
-//! `.miniswe/`) so usage across many different project directories collects
-//! in one place — one `miniswe-mcp` config in Claude Code can serve any repo,
+//! Written to `~/.buzztr/projects/<slug>/mcp.log` (not the project's own
+//! `.buzztr/`) so usage across many different project directories collects
+//! in one place — one `buzztr-mcp` config in Claude Code can serve any repo,
 //! and this keeps their logs findable without knowing which repo you were in.
 //! `<slug>` is the project's absolute path with path separators replaced by
 //! `-`, matching the convention already used for this project's other
@@ -108,7 +108,7 @@ fn log_path(project_root: &Path) -> Result<PathBuf> {
     let home = dirs::home_dir().context("could not determine home directory")?;
     let slug = project_root.to_string_lossy().replace(['/', '\\'], "-");
     Ok(home
-        .join(".miniswe")
+        .join(".buzztr")
         .join("projects")
         .join(slug)
         .join("mcp.log"))

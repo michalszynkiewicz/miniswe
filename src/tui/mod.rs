@@ -1,4 +1,4 @@
-//! Terminal UI for miniswe.
+//! Terminal UI for buzztr.
 //!
 //! Two modes:
 //! - Non-interactive (run.rs): uses print_* functions with ANSI codes
@@ -14,7 +14,7 @@ use std::io::{self, Write};
 
 /// Print a styled header.
 pub fn print_header(text: &str) {
-    eprintln!("\x1b[1;36m┌─ miniswe ─────────────────────────────────────────┐\x1b[0m");
+    eprintln!("\x1b[1;36m┌─ buzztr ─────────────────────────────────────────┐\x1b[0m");
     eprintln!("\x1b[1;36m│\x1b[0m {:<49}\x1b[1;36m│\x1b[0m", text);
     eprintln!("\x1b[1;36m└─────────────────────────────────────────────────────┘\x1b[0m");
 }

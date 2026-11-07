@@ -5,10 +5,10 @@ mod helpers;
 
 use std::fs;
 
-use miniswe::config::Config;
-use miniswe::llm::Message;
-use miniswe::tools;
-use miniswe::tools::permissions::PermissionManager;
+use buzztr::config::Config;
+use buzztr::llm::Message;
+use buzztr::tools;
+use buzztr::tools::permissions::PermissionManager;
 use serde_json::json;
 
 /// Create a headless PermissionManager for the test config.
@@ -816,7 +816,7 @@ async fn get_project_info_returns_profile() {
     let (_tmp, config) = helpers::create_test_project();
 
     fs::write(
-        config.miniswe_path("profile.md"),
+        config.buzztr_path("profile.md"),
         "# Test\n## Overview\n- Name: test-proj\n- Language: Rust\n",
     )
     .unwrap();
@@ -880,7 +880,7 @@ async fn get_architecture_notes_returns_content() {
 
 #[test]
 fn tools_config_disables_web() {
-    let mut defs = miniswe::tools::tool_definitions(miniswe::config::EditMode::Smart);
+    let mut defs = buzztr::tools::tool_definitions(buzztr::config::EditMode::Smart);
     // Filter like run.rs does
     defs.retain(|t| t.function.name != "web");
 
@@ -892,14 +892,14 @@ fn tools_config_disables_web() {
 
 #[test]
 fn tools_config_all_enabled_by_default() {
-    let config = miniswe::config::Config::default();
+    let config = buzztr::config::Config::default();
     assert!(config.tools.context_tools);
     assert!(config.tools.web_tools);
 }
 
 #[test]
 fn tools_has_grouped_tools() {
-    let defs = miniswe::tools::tool_definitions(miniswe::config::EditMode::Smart);
+    let defs = buzztr::tools::tool_definitions(buzztr::config::EditMode::Smart);
     let names: Vec<&str> = defs.iter().map(|t| t.function.name.as_str()).collect();
     assert!(names.contains(&"file"), "should have file");
     assert!(names.contains(&"code"), "should have code");
@@ -918,7 +918,7 @@ fn tools_has_grouped_tools() {
 
 #[test]
 fn tool_output_budget_scales_with_context() {
-    let mut config = miniswe::config::Config::default();
+    let mut config = buzztr::config::Config::default();
 
     config.model.context_window = Some(32000);
     assert_eq!(config.tool_output_budget_chars(), 3200);
@@ -1025,8 +1025,8 @@ async fn shell_large_output_saved_to_file() {
     );
 
     // Verify the file was actually created
-    let shell_dir = config.miniswe_dir().join("shell_output");
-    assert!(shell_dir.exists(), ".miniswe/shell_output should exist");
+    let shell_dir = config.buzztr_dir().join("shell_output");
+    assert!(shell_dir.exists(), ".buzztr/shell_output should exist");
     let files: Vec<_> = fs::read_dir(&shell_dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -1052,7 +1052,7 @@ fn compressor_no_op_when_under_budget() {
     let total_tokens: usize = messages
         .iter()
         .filter(|m| m.role != "system")
-        .map(|m| miniswe::context::estimate_tokens(m.content.as_deref().unwrap_or("")))
+        .map(|m| buzztr::context::estimate_tokens(m.content.as_deref().unwrap_or("")))
         .sum();
     let budget = config.model.context_window() / 4;
 
@@ -1140,12 +1140,12 @@ async fn get_repo_map_response_shows_symbols() {
     .unwrap();
 
     // Index the project
-    let miniswe_dir = config.miniswe_dir();
-    fs::create_dir_all(&miniswe_dir).ok();
-    let index = miniswe::knowledge::indexer::index_project(&config.project_root, None).unwrap();
-    index.save(&miniswe_dir).unwrap();
-    let graph = miniswe::knowledge::graph::DependencyGraph::build(&index);
-    graph.save(&miniswe_dir).unwrap();
+    let buzztr_dir = config.buzztr_dir();
+    fs::create_dir_all(&buzztr_dir).ok();
+    let index = buzztr::knowledge::indexer::index_project(&config.project_root, None).unwrap();
+    index.save(&buzztr_dir).unwrap();
+    let graph = buzztr::knowledge::graph::DependencyGraph::build(&index);
+    graph.save(&buzztr_dir).unwrap();
 
     let args = json!({"action": "repo_map"});
     let result = tools::execute_tool("code", &args, &config, &perms(&config), None)
@@ -1166,7 +1166,7 @@ async fn revert_tool_through_execute() {
 
     // revert goes through run.rs dispatch, not execute_tool
     // but we can test the SnapshotManager directly
-    let mut snap = miniswe::tools::snapshots::SnapshotManager::init(&config.project_root).unwrap();
+    let mut snap = buzztr::tools::snapshots::SnapshotManager::init(&config.project_root).unwrap();
 
     fs::write(helpers::project_path(&config, "code.rs"), "original").unwrap();
     snap.begin_round(1).unwrap();

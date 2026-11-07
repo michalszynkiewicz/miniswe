@@ -1,12 +1,12 @@
 //! E2E tests for context assembly — verifies the real context pipeline
-//! with actual .miniswe/ files.
+//! with actual .buzztr/ files.
 
 mod helpers;
 
 use std::fs;
 
-use miniswe::context;
-use miniswe::llm::Message;
+use buzztr::context;
+use buzztr::llm::Message;
 
 // ── Basic assembly ──────────────────────────────────────────────────
 
@@ -21,11 +21,11 @@ fn basic_assembly_includes_system_prompt() {
     assert_eq!(assembled.messages[0].role, "system");
     let system = assembled.messages[0].content.as_deref().unwrap();
     assert!(
-        system.contains("miniswe"),
-        "system prompt should mention miniswe"
+        system.contains("buzztr"),
+        "system prompt should mention buzztr"
     );
     assert!(
-        system.contains("miniswe"),
+        system.contains("buzztr"),
         "system prompt should identify the agent"
     );
 
@@ -60,7 +60,7 @@ fn assembly_includes_profile() {
 
     // Write a profile (compress_profile converts "- Key: Value" to "key=value|")
     fs::write(
-        config.miniswe_path("profile.md"),
+        config.buzztr_path("profile.md"),
         "# Test Project\n## Overview\n- Name: test-project\n- Language: Rust\n- Framework: tokio\n",
     )
     .unwrap();
@@ -82,7 +82,7 @@ fn assembly_includes_guide() {
     config.context.providers.guide = true;
 
     fs::write(
-        config.miniswe_path("guide.md"),
+        config.buzztr_path("guide.md"),
         "Always use snake_case for variables.\nPrefer iterators over loops.\n",
     )
     .unwrap();
@@ -103,7 +103,7 @@ fn assembly_skips_template_guide() {
 
     // Write the template placeholder (should be skipped)
     fs::write(
-        config.miniswe_path("guide.md"),
+        config.buzztr_path("guide.md"),
         "<!-- Add project-specific instructions here -->\n",
     )
     .unwrap();
@@ -229,7 +229,7 @@ fn relevant_lessons_included() {
     config.context.providers.lessons = true;
 
     fs::write(
-        config.miniswe_path("lessons.md"),
+        config.buzztr_path("lessons.md"),
         "## Testing\nAlways run cargo test before committing.\n\n## Deployment\nUse docker compose.\n",
     )
     .unwrap();
@@ -343,7 +343,7 @@ fn compress_history_noop_when_short() {
 
 #[test]
 fn compress_history_summarizes_old_tool_results() {
-    use miniswe::llm::{FunctionCall, ToolCall};
+    use buzztr::llm::{FunctionCall, ToolCall};
 
     let history = vec![
         Message::user("read main.rs"),
@@ -398,7 +398,7 @@ fn sanitize_merges_consecutive_user_messages() {
 
 #[test]
 fn sanitize_inserts_assistant_bridge_between_tool_and_user() {
-    use miniswe::llm::{FunctionCall, ToolCall};
+    use buzztr::llm::{FunctionCall, ToolCall};
 
     let mut messages = vec![
         Message::system("sys"),
@@ -432,7 +432,7 @@ fn sanitize_inserts_assistant_bridge_between_tool_and_user() {
 
 #[test]
 fn sanitize_drops_dangling_assistant_tool_calls_before_user() {
-    use miniswe::llm::{FunctionCall, ToolCall};
+    use buzztr::llm::{FunctionCall, ToolCall};
 
     let mut messages = vec![
         Message::system("sys"),
@@ -489,7 +489,7 @@ fn sanitize_makes_debugger_final_report_shape_alternate() {
     // ended on tool results, then a user nudge asking for the report.
     // Sent raw, Devstral rejects it (tool→user == user→user to its
     // template); after sanitize it must satisfy the alternation rule.
-    use miniswe::llm::{FunctionCall, ToolCall};
+    use buzztr::llm::{FunctionCall, ToolCall};
     let tc = |id: &str| ToolCall {
         id: id.into(),
         r#type: "function".into(),

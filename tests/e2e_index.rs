@@ -10,13 +10,13 @@ mod helpers;
 
 use std::fs;
 
-use miniswe::config::Config;
-use miniswe::knowledge::ProjectIndex;
-use miniswe::knowledge::graph::{DependencyGraph, populate_symbol_deps};
-use miniswe::knowledge::indexer;
-use miniswe::knowledge::repo_map;
-use miniswe::tools;
-use miniswe::tools::permissions::PermissionManager;
+use buzztr::config::Config;
+use buzztr::knowledge::ProjectIndex;
+use buzztr::knowledge::graph::{DependencyGraph, populate_symbol_deps};
+use buzztr::knowledge::indexer;
+use buzztr::knowledge::repo_map;
+use buzztr::tools;
+use buzztr::tools::permissions::PermissionManager;
 use serde_json::json;
 
 fn perms(config: &Config) -> PermissionManager {
@@ -449,7 +449,7 @@ async fn reindex_after_write_file_updates_symbols() {
     .unwrap();
 
     let index = indexer::index_project(&config.project_root, None).unwrap();
-    index.save(&config.miniswe_dir()).unwrap();
+    index.save(&config.buzztr_dir()).unwrap();
 
     // Verify original symbol exists
     assert!(!index.lookup("original").is_empty());
@@ -466,7 +466,7 @@ async fn reindex_after_write_file_updates_symbols() {
     assert!(result.success);
 
     // Phase 3: check the index was updated
-    let updated_index = ProjectIndex::load(&config.miniswe_dir()).unwrap();
+    let updated_index = ProjectIndex::load(&config.buzztr_dir()).unwrap();
     assert!(
         !updated_index.lookup("replacement").is_empty(),
         "Index should contain the new symbol after write_file reindex"

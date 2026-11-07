@@ -23,7 +23,7 @@ mod helpers;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer};
 
-use miniswe::config::CeremonyMode;
+use buzztr::config::CeremonyMode;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shell_promotion_and_jobs_wait_end_to_end() {
@@ -71,7 +71,7 @@ async fn shell_promotion_and_jobs_wait_end_to_end() {
 
     // The whole scripted run should take ~4s; a stuck promotion (the old
     // continue/kill stdin prompt) would hang forever — bound it.
-    let run = miniswe::cli::commands::run::run(
+    let run = buzztr::cli::commands::run::run(
         config,
         "run the fake deploy and confirm it completes",
         false, // plan_only
@@ -127,19 +127,19 @@ async fn shell_promotion_and_jobs_wait_end_to_end() {
 /// A `shell` call that puts the command text in `action` instead of the
 /// literal verb must get the corrected call back verbatim, not a list of
 /// verb names. Regression test for the schema collapse in
-/// demo-e2e-task-demo-skills-miniswe-20260830-214306 attempt 0, where 32 of
+/// demo-e2e-task-demo-skills-buzztr-20260830-214306 attempt 0, where 32 of
 /// 88 shell calls were malformed and the model responded to the old
 /// "Use 'run' (command)" wording by adding `command` while leaving the
 /// command text in `action`.
 #[tokio::test]
 async fn shell_action_holding_command_text_echoes_the_corrected_call() {
     let (_tmp, config) = helpers::create_test_project();
-    let perms = miniswe::tools::permissions::PermissionManager::headless(&config);
-    let registry = miniswe::tools::jobs::JobRegistry::default();
+    let perms = buzztr::tools::permissions::PermissionManager::headless(&config);
+    let registry = buzztr::tools::jobs::JobRegistry::default();
 
     // Quotes and shell metacharacters must survive into the example.
     let cmd = r#"ls -la chart/ && echo "done" 2>/dev/null"#;
-    let result = miniswe::tools::jobs::execute(
+    let result = buzztr::tools::jobs::execute(
         &serde_json::json!({ "action": cmd, "timeout": 10 }),
         &config,
         &perms,
@@ -162,7 +162,7 @@ async fn shell_action_holding_command_text_echoes_the_corrected_call() {
 
     // A missing `action` has no command to echo — it must not suggest an
     // empty one.
-    let missing = miniswe::tools::jobs::execute(
+    let missing = buzztr::tools::jobs::execute(
         &serde_json::json!({ "timeout": 10 }),
         &config,
         &perms,

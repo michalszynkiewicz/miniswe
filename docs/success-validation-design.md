@@ -58,7 +58,7 @@ This is the reflexion/block-the-exit mechanism; it reuses the premature-exit plu
 ### 3.2 Source of the check (tiered)
 There is no universal behavioral check, so resolve it in priority order:
 
-1. **User-stated** in the request ("…and `miniswe --foo` should print X") → use directly.
+1. **User-stated** in the request ("…and `buzztr --foo` should print X") → use directly.
 2. **Propose-then-confirm (interactive REPL only)** → the model proposes a concrete check ("I'll verify by running … expecting …"); user confirms/edits. One cheap round; the model does the thinking (which forces it to make the definition-of-done explicit).
 3. **Auto-derived (headless / `-y` / bench)** → run the project's test suite, or a configured `behavioral_check` command, or a derived run (invoke the binary, diff observable output). **No user available**, so this path must exist or the gate is a no-op headless.
 

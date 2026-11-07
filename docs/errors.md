@@ -79,8 +79,8 @@ Task: Add --system-prompt-override CLI flag
 | Archive re-archives every round | HIGH | `archived_indices` HashSet |
 | `set -e` kills Docker retry loop | HIGH | Remove `set -e` from container script |
 | Stale target/ between variants | HIGH | `rm -rf target/` + Docker isolation |
-| Empty repo map (LFS .gitignore) | HIGH | Fix LFS pointer + `miniswe init` fail-fast |
-| miniswe init panic (UTF-8 in indexer) | HIGH | `truncate_chars()` in indexer |
+| Empty repo map (LFS .gitignore) | HIGH | Fix LFS pointer + `buzztr init` fail-fast |
+| buzztr init panic (UTF-8 in indexer) | HIGH | `truncate_chars()` in indexer |
 | LSP not in Docker (rustup proxy) | MEDIUM | `verify_binary()` + auto-download fallback |
 | Smoke test off-by-one | MEDIUM | Better round counting |
 | Loop detection hangs forever | MEDIUM | `consecutive_loops >= 3` → break |

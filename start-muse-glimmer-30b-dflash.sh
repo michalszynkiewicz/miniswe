@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start llama-server with Muse Glimmer-30B + the DFlash drafter (speculative
-# decoding) for miniswe.
+# decoding) for buzztr.
 #
 # This is start-muse-glimmer-30b.sh with ONE variable changed: the drafter is
 # loaded. Model, quant, context, KV type, flash-attn, threads, sampling,
@@ -23,19 +23,19 @@
 # which a drafter predicts well, and it makes the fewest edits in the field so
 # there is little thrash to mispredict.
 #
-# CONTEXT SIZING — why 80000 and not 60000. miniswe's `context_window` is
+# CONTEXT SIZING — why 80000 and not 60000. buzztr's `context_window` is
 # 60000 but `estimate_tokens` is `text.len() / 4` (src/context/mod.rs:297), a
 # chars-per-token heuristic, not a tokenizer. Measured against llama-server's
 # real counts on the three Glimmer slots of round_20260905_160709:
 #
-#   slot          miniswe estimate   server real   ratio
+#   slot          buzztr estimate   server real   ratio
 #   06-glimmer              29,249        36,668   1.25x
 #   13-glimmer              28,324        35,818   1.26x
 #   20-glimmer              24,459        30,651   1.25x
 #
-# So miniswe's 60000 budget is ~75,000 REAL tokens at the server. A server
-# --ctx-size of 60000 is overflowed by any run that fills miniswe's own
-# budget, and the server truncates silently — miniswe has no idea it happened.
+# So buzztr's 60000 budget is ~75,000 REAL tokens at the server. A server
+# --ctx-size of 60000 is overflowed by any run that fills buzztr's own
+# budget, and the server truncates silently — buzztr has no idea it happened.
 # This is not hypothetical: in that same round, every slot that recorded a
 # `truncated = 1` event was running at ctx 50176 or 60160 (gemma x4,
 # laguna-xs x3, north x4, devstral x1), and all three Glimmer slots at 131072
@@ -70,12 +70,12 @@
 #   CUDA ctx + compute buffers                ~1.0-1.5 GB
 #   total                                   ~20.6-21.1 GB of 24 GB
 #
-# That leaves ~3 GB spare. NO CPU OFFLOAD IS NEEDED: keep MINISWE_NGL=99 (all
-# 52 target layers) and MINISWE_DRAFT_NGL=99 (all 5 draft layers). A
+# That leaves ~3 GB spare. NO CPU OFFLOAD IS NEEDED: keep BUZZTR_NGL=99 (all
+# 52 target layers) and BUZZTR_DRAFT_NGL=99 (all 5 draft layers). A
 # CPU-resident layer costs ~5 ms/token and would swamp any gain the drafter
 # makes, so offload is the wrong lever even if you are tight — shrink the main
-# KV with MINISWE_KV_TYPE=q8_0 (~1.14 GB -> ~0.6 GB) before touching layers.
-# MINISWE_DRAFT_KV_TYPE exists for symmetry but saves ~20 MB; it is not a lever.
+# KV with BUZZTR_KV_TYPE=q8_0 (~1.14 GB -> ~0.6 GB) before touching layers.
+# BUZZTR_DRAFT_KV_TYPE exists for symmetry but saves ~20 MB; it is not a lever.
 #
 # NOTE: dflash.target_layers means this is an EAGLE-style drafter that reads
 # the target model's hidden states, not a standalone small model. It is
@@ -130,32 +130,32 @@
 
 set -euo pipefail
 
-MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/Muse-Glimmer-30B-GGUF}"
-PORT="${MINISWE_PORT:-8464}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-80000}"     # see the CONTEXT SIZING note above; do NOT drop to 60000
-KV_TYPE="${MINISWE_KV_TYPE:-f16}"       # f16 fits; q8_0 if VRAM is tight
-THREADS="${MINISWE_THREADS:-16}"        # physical cores; used for CPU-resident tensors
-NGL="${MINISWE_NGL:-99}"                # GPU layers of 52 (99 = all)
-REASONING_STRENGTH="${MINISWE_REASONING_STRENGTH:-medium}"   # low|medium|high|xhigh
-REASONING_BUDGET="${MINISWE_REASONING_BUDGET:-2000}"         # think tokens before forced close; -1 = unlimited
+MODEL_DIR="${BUZZTR_MODEL_DIR:-$HOME/models/Muse-Glimmer-30B-GGUF}"
+PORT="${BUZZTR_PORT:-8464}"
+CTX_SIZE="${BUZZTR_CTX_SIZE:-80000}"     # see the CONTEXT SIZING note above; do NOT drop to 60000
+KV_TYPE="${BUZZTR_KV_TYPE:-f16}"       # f16 fits; q8_0 if VRAM is tight
+THREADS="${BUZZTR_THREADS:-16}"        # physical cores; used for CPU-resident tensors
+NGL="${BUZZTR_NGL:-99}"                # GPU layers of 52 (99 = all)
+REASONING_STRENGTH="${BUZZTR_REASONING_STRENGTH:-medium}"   # low|medium|high|xhigh
+REASONING_BUDGET="${BUZZTR_REASONING_BUDGET:-2000}"         # think tokens before forced close; -1 = unlimited
 
 # --- speculative decoding knobs (this script's reason to exist) -------------
-DRAFT_NGL="${MINISWE_DRAFT_NGL:-99}"      # drafter GPU layers; a CPU drafter defeats the purpose
-DRAFT_MAX="${MINISWE_DRAFT_MAX:-15}"      # tokens drafted per step; block_size - 1 is the hard ceiling
-DRAFT_MIN="${MINISWE_DRAFT_MIN:-0}"       # upstream default; a shorter draft than this is dropped entirely
-DRAFT_P_MIN="${MINISWE_DRAFT_P_MIN:-0}"   # upstream default: draft the whole block, let the target verify it.
+DRAFT_NGL="${BUZZTR_DRAFT_NGL:-99}"      # drafter GPU layers; a CPU drafter defeats the purpose
+DRAFT_MAX="${BUZZTR_DRAFT_MAX:-15}"      # tokens drafted per step; block_size - 1 is the hard ceiling
+DRAFT_MIN="${BUZZTR_DRAFT_MIN:-0}"       # upstream default; a shorter draft than this is dropped entirely
+DRAFT_P_MIN="${BUZZTR_DRAFT_P_MIN:-0}"   # upstream default: draft the whole block, let the target verify it.
                                           # Above 0 the block is truncated at the first position whose top-1
                                           # probability falls below it. That saves drafter work but not target
                                           # work — one verify pass costs about the same for 4 tokens as for 15
                                           # — so it trades away accepted tokens for nothing. Leave it at 0.
-DRAFT_KV_TYPE="${MINISWE_DRAFT_KV_TYPE:-}"  # empty = server default; saves only ~20 MB, not a real lever
+DRAFT_KV_TYPE="${BUZZTR_DRAFT_KV_TYPE:-}"  # empty = server default; saves only ~20 MB, not a real lever
 
 case "$REASONING_STRENGTH" in
     low|medium|high|xhigh) ;;
-    *) echo "MINISWE_REASONING_STRENGTH must be low|medium|high|xhigh (got '$REASONING_STRENGTH')" >&2; exit 1 ;;
+    *) echo "BUZZTR_REASONING_STRENGTH must be low|medium|high|xhigh (got '$REASONING_STRENGTH')" >&2; exit 1 ;;
 esac
 
-MODEL="${MINISWE_MODEL:-}"
+MODEL="${BUZZTR_MODEL:-}"
 if [ -z "$MODEL" ]; then
     for pat in 'Muse-Glimmer-30B-KQuant-17GB-Q4_K_M' 'Muse-Glimmer-30B-Q4_K_M' 'Muse-Glimmer-30B-UD-Q4_K_M'; do
         MODEL=$(ls "$MODEL_DIR"/${pat}*.gguf 2>/dev/null | grep -v -- '-00002-of-' | head -1 || true)
@@ -173,7 +173,7 @@ if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
     exit 1
 fi
 
-DRAFT_MODEL="${MINISWE_DRAFT_MODEL:-}"
+DRAFT_MODEL="${BUZZTR_DRAFT_MODEL:-}"
 if [ -z "$DRAFT_MODEL" ]; then
     DRAFT_MODEL=$(ls "$MODEL_DIR"/dflash-Muse-Glimmer-30B*.gguf 2>/dev/null | head -1 || true)
 fi
@@ -223,14 +223,14 @@ if [ -n "$DRAFT_KV_TYPE" ]; then
     ARGS+=(--spec-draft-type-k "$DRAFT_KV_TYPE" --spec-draft-type-v "$DRAFT_KV_TYPE")
 fi
 
-echo "Starting Muse Glimmer-30B + DFlash drafter (speculative decoding) for miniswe..."
+echo "Starting Muse Glimmer-30B + DFlash drafter (speculative decoding) for buzztr..."
 echo "  Model:      $MODEL"
 echo "  Draft:      $DRAFT_MODEL"
 echo "  Context:    $CTX_SIZE tokens, KV $KV_TYPE (13 global layers cache full context)"
 echo "  Layers:     $NGL/52 on GPU, drafter $DRAFT_NGL (99 = all)"
 echo "  Spec:       n-max=$DRAFT_MAX n-min=$DRAFT_MIN p-min=$DRAFT_P_MIN${DRAFT_KV_TYPE:+, draft KV $DRAFT_KV_TYPE} (draft ctx inherits the target's)"
 echo "  Reasoning:  strength=$REASONING_STRENGTH, budget=$REASONING_BUDGET tokens (cannot be disabled)"
-echo "  Sampling:   temp 1.0, top-p 0.95, top-k 64 (miniswe overrides temp per request)"
+echo "  Sampling:   temp 1.0, top-p 0.95, top-k 64 (buzztr overrides temp per request)"
 echo "  Port:       $PORT"
 echo ""
 echo "  Budget: ~20.6-21.1 GB of 24 GB (draft KV is window-capped at ~42 MB)."

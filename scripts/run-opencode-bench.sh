@@ -3,7 +3,7 @@
 #
 # Mirrors run-aider-bench.sh: opencode is invoked in its own fresh Docker
 # container, on the SAME pinned baseline SHA, SAME task, and SAME 6-check
-# validation suite as run-benchmark-docker.sh (miniswe) and run-aider-bench.sh
+# validation suite as run-benchmark-docker.sh (buzztr) and run-aider-bench.sh
 # (aider) — the closest apples-to-apples comparison across all three agents.
 #
 # opencode needs a config file (not just env vars, unlike aider) to talk to
@@ -20,7 +20,7 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-IMAGE_NAME="miniswe-opencode-bench"
+IMAGE_NAME="buzztr-opencode-bench"
 
 LLAMA_ENDPOINT="${LLAMA_ENDPOINT:-http://localhost:8464}"
 
@@ -130,7 +130,7 @@ JSON
 run_variant() {
     local name="$1"
     local variant_dir="${RESULTS_DIR}/${name}"
-    local container_name="miniswe-opencode-${name}-$$"
+    local container_name="buzztr-opencode-${name}-$$"
     mkdir -p "${variant_dir}"
     echo "--- ${name} ---"
 
@@ -177,7 +177,7 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
     echo "=== ATTEMPT ${ATTEMPT}/${MAX_ATTEMPTS} (${REMAINING}s remaining) ==="
 
     # opencode in one-shot mode, rooted at /work via --dir. --auto
-    # auto-approves permissions (mirrors miniswe's --yes / aider's
+    # auto-approves permissions (mirrors buzztr's --yes / aider's
     # --yes-always) so the run doesn't hang on a confirmation prompt.
     timeout "${REMAINING}" opencode run "${CURRENT_TASK}" \
         --model "${MODEL_REF}" \
@@ -212,7 +212,7 @@ $(grep -E '^error(\[|:)|^\s*-->|^\s*\|' /output/cargo_check.txt | head -60)"
 
     # 2. cargo build
     TOTAL=$((TOTAL + 1))
-    BINARY="./target/debug/miniswe"
+    BINARY="./target/debug/buzztr"
     if [ "$PASS" -ge 1 ]; then
         if RUSTFLAGS="-A warnings" cargo build 2> /output/cargo_build.txt; then
             echo "build:PASS"; PASS=$((PASS + 1))

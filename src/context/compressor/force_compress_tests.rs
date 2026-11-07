@@ -9,7 +9,7 @@ use std::sync::Arc;
 /// summarization fails instantly (connection refused) and falls back to
 /// the heuristic summary — tests never touch a live server.
 fn config_in(dir: &std::path::Path, strategy: CompactionStrategy) -> Config {
-    std::fs::create_dir_all(dir.join(".miniswe")).unwrap();
+    std::fs::create_dir_all(dir.join(".buzztr")).unwrap();
     let mut config = Config::default();
     config.project_root = dir.to_path_buf();
     config.ensure_session_dir().unwrap();
@@ -24,7 +24,7 @@ fn config_in(dir: &std::path::Path, strategy: CompactionStrategy) -> Config {
 /// with tool_def_tokens=0): 20 tool results of 5K chars ≈ 25K tokens.
 fn over_budget_messages() -> Vec<Message> {
     let mut msgs = vec![
-        Message::system("You are miniswe."),
+        Message::system("You are buzztr."),
         Message::user("do the task"),
     ];
     for i in 0..20 {
@@ -78,7 +78,7 @@ async fn force_compress_lazy_shrinks_via_unified_path() {
         "history should shrink"
     );
     // The unified path archives what it elided.
-    assert!(config.miniswe_path("session_archive.md").exists());
+    assert!(config.buzztr_path("session_archive.md").exists());
 }
 
 #[tokio::test]
@@ -108,7 +108,7 @@ async fn force_compress_reports_false_when_nothing_to_free() {
     // `false` here to avoid resending a request that will fail
     // identically.
     let mut messages = vec![
-        Message::system("You are miniswe."),
+        Message::system("You are buzztr."),
         Message::user("hi"),
         Message::assistant("hello"),
     ];
@@ -143,7 +143,7 @@ fn estimated_context_tokens_counts_system_and_tools() {
 fn strip_summary_envelope_keeps_only_content() {
     let injected = format!(
         "{}\n- run.rs: threaded the new param\n- mod.rs: added flag\n\
-         [Details: file(action='read', path='.miniswe/session_archive.md'). Continue from where you left off.]",
+         [Details: file(action='read', path='.buzztr/session_archive.md'). Continue from where you left off.]",
         super::UNIFIED_SUMMARY_HEADER
     );
     let stripped = super::strip_summary_envelope(&injected);

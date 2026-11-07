@@ -3,7 +3,7 @@
 # state (run2: providers:bool deleted is_enabled, breaks context/mod.rs:322).
 #
 # Arms (each resumes the SAME fixture: clean tree + corruption applied via
-# miniswe --replay-apply, so revert_to_green has a clean round-0 to return to):
+# buzztr --replay-apply, so revert_to_green has a clean round-0 to return to):
 #   control      temp 0.2, no extras           (baseline recovery rate)
 #   temp00       temp 0.0                       (greedy — commit vs thrash)
 #   temp035      temp 0.35                      (break the fixation loop)
@@ -24,8 +24,8 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # GPU telemetry + llama-server provenance (docs/gpu-hardening.md items 2, 5)
 source "${REPO_DIR}/scripts/bench-gpu.sh"
-IMAGE_NAME="miniswe-bench"
-GEMMA_NAME="miniswe-bench-gemma"
+IMAGE_NAME="buzztr-bench"
+GEMMA_NAME="buzztr-bench-gemma"
 # The original task — passed to the replay as the message/goal so gate_replan can
 # re-anchor on it (the captured context has the task compacted away, and replay's
 # default message is the useless placeholder "[replay]").
@@ -138,7 +138,7 @@ $tools_extra
 level = "trace"
 enabled = true
 [validation]
-command = "out=\$(cargo build 2>&1) || { echo \"DOES NOT COMPILE:\"; echo \"\$out\" | tail -20; exit 1; }; run=\$(MINISWE_SKIP_VALIDATION=1 ./target/debug/miniswe --system-prompt-override 'Respond only with TOKEN_XYZ and nothing else' --yes hello 2>&1); echo \"\$run\" | grep -q TOKEN_XYZ || { echo \"COMPILES but override NOT consumed. Expected TOKEN_XYZ, GOT: \$run\"; exit 1; }"
+command = "out=\$(cargo build 2>&1) || { echo \"DOES NOT COMPILE:\"; echo \"\$out\" | tail -20; exit 1; }; run=\$(BUZZTR_SKIP_VALIDATION=1 ./target/debug/buzztr --system-prompt-override 'Respond only with TOKEN_XYZ and nothing else' --yes hello 2>&1); echo \"\$run\" | grep -q TOKEN_XYZ || { echo \"COMPILES but override NOT consumed. Expected TOKEN_XYZ, GOT: \$run\"; exit 1; }"
 timeout_secs = 180
 max_retries = $MAX_RETRIES
 TOML
@@ -153,23 +153,23 @@ TASK="$2"
 FROM_SCRATCH="$3"
 cd /work
 cp -a /fixture/tree/. /work/           # CLEAN baseline tree
-rm -rf target .miniswe
-echo -e "target/\n.miniswe\n*.log" > .gitignore
-mkdir -p /output/miniswe_state
-ln -sfn /output/miniswe_state .miniswe
-cp /config/config.toml .miniswe/config.toml
-miniswe init 2>/output/miniswe_init.txt || { echo "init failed"; cat /output/miniswe_init.txt; exit 1; }
-mkdir -p .miniswe/logs
+rm -rf target .buzztr
+echo -e "target/\n.buzztr\n*.log" > .gitignore
+mkdir -p /output/buzztr_state
+ln -sfn /output/buzztr_state .buzztr
+cp /config/config.toml .buzztr/config.toml
+buzztr init 2>/output/buzztr_init.txt || { echo "init failed"; cat /output/buzztr_init.txt; exit 1; }
+mkdir -p .buzztr/logs
 git config --global --add safe.directory /work
 git init -q && git add -A && git commit -q -m baseline 2>/dev/null
 
 if [ "$FROM_SCRATCH" = "1" ]; then
   echo "=== FROM-SCRATCH (clean baseline + task, no replay/corruption) ==="
-  timeout "$TIMEOUT" miniswe --yes "$TASK" \
+  timeout "$TIMEOUT" buzztr --yes "$TASK" \
       > /output/stdout.txt 2> /output/stderr.txt || true
 else
   echo "=== REPLAY (resume from captured context; corruption applied post-snapshot) ==="
-  timeout "$TIMEOUT" miniswe --yes "$TASK" \
+  timeout "$TIMEOUT" buzztr --yes "$TASK" \
       --replay-context /fixture/context.json \
       --replay-apply /fixture/corruption.patch \
       > /output/stdout.txt 2> /output/stderr.txt || true
@@ -179,13 +179,13 @@ git diff > /output/diff.patch 2>/dev/null || true
 git diff --name-only > /output/changed_files.txt 2>/dev/null || true
 
 # === 6-check validation (identical to the bench) ===
-PASS=0; TOTAL=0; BINARY=./target/debug/miniswe; FLAG=""
+PASS=0; TOTAL=0; BINARY=./target/debug/buzztr; FLAG=""
 TOTAL=$((TOTAL+1)); if RUSTFLAGS="-A warnings" cargo check 2>/output/cargo_check.txt; then echo compile:PASS; PASS=$((PASS+1)); else echo compile:FAIL; fi
 TOTAL=$((TOTAL+1)); if [ "$PASS" -ge 1 ] && RUSTFLAGS="-A warnings" cargo build 2>/output/cargo_build.txt; then echo build:PASS; PASS=$((PASS+1)); else echo "build:$([ "$PASS" -ge 1 ] && echo FAIL || echo SKIP)"; fi
 TOTAL=$((TOTAL+1)); if [ -f "$BINARY" ]; then "$BINARY" --help >/output/help_output.txt 2>&1 || true; if grep -qiE -- '--[a-z-]*prompt[a-z-]*' /output/help_output.txt; then FLAG=$(grep -oE -- '--[a-z-]*prompt[a-z-]*' /output/help_output.txt | head -1); echo "help:PASS($FLAG)"; PASS=$((PASS+1)); else echo help:FAIL; fi; fi
 TOTAL=$((TOTAL+1)); if [ -f "$BINARY" ] && [ -n "$FLAG" ] && "$BINARY" $FLAG test --help >/output/parse_output.txt 2>&1; then echo parse:PASS; PASS=$((PASS+1)); else echo parse:FAIL; fi
 TOTAL=$((TOTAL+1)); if [ "$PASS" -ge 2 ] && RUSTFLAGS="-A warnings" cargo test >/output/cargo_test.txt 2>&1; then echo test:PASS; PASS=$((PASS+1)); else echo test:FAIL; fi
-TOTAL=$((TOTAL+1)); if [ -f "$BINARY" ] && [ -n "$FLAG" ] && [ "$PASS" -ge 4 ]; then OUT=$(MINISWE_SKIP_VALIDATION=1 timeout 120 "$BINARY" $FLAG 'You must respond with exactly the text PONG_42 and nothing else.' --yes ping 2>/output/smoke_stderr.txt || true); echo "$OUT">/output/smoke_output.txt; if echo "$OUT" | grep -q PONG_42; then echo smoke:PASS; PASS=$((PASS+1)); else echo smoke:FAIL; fi; fi
+TOTAL=$((TOTAL+1)); if [ -f "$BINARY" ] && [ -n "$FLAG" ] && [ "$PASS" -ge 4 ]; then OUT=$(BUZZTR_SKIP_VALIDATION=1 timeout 120 "$BINARY" $FLAG 'You must respond with exactly the text PONG_42 and nothing else.' --yes ping 2>/output/smoke_stderr.txt || true); echo "$OUT">/output/smoke_output.txt; if echo "$OUT" | grep -q PONG_42; then echo smoke:PASS; PASS=$((PASS+1)); else echo smoke:FAIL; fi; fi
 echo "=== FINAL: ${PASS}/${TOTAL} ==="
 SCRIPT
 )
@@ -195,7 +195,7 @@ run_one() {  # $1=arm $2=run
     local vdir="$RESULTS_DIR/$arm/run${idx}"
     mkdir -p "$vdir"
     gen_config "$arm" > "$vdir/config.toml"
-    local cname="miniswe-replay-${arm}-${idx}-$$"
+    local cname="buzztr-replay-${arm}-${idx}-$$"
     ACTIVE_CONTAINER="$cname"
     local tmp; tmp=$(mktemp); echo "$CONTAINER_SCRIPT" > "$tmp"; chmod +x "$tmp"
     local t0; t0=$(date +%s)
@@ -205,7 +205,7 @@ run_one() {  # $1=arm $2=run
         -v "$vdir/config.toml:/config/config.toml:ro" \
         -v "$FIXTURE:/fixture:ro" \
         -v "$tmp:/run.sh:ro" \
-        -e MINISWE_LLM_DUMP_DIR=/output/llm_dumps \
+        -e BUZZTR_LLM_DUMP_DIR=/output/llm_dumps \
         --name "$cname" "$IMAGE_NAME" \
         bash /run.sh "$TIMEOUT" "$TASK" "$FROM_SCRATCH" > "$vdir/container.log" 2>&1 || true
     echo $(( $(date +%s) - t0 )) > "$vdir/wall_s.txt"

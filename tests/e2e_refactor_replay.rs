@@ -7,7 +7,7 @@
 //! matrices), forcing the model to abandon the atomic tool and fall back to
 //! a manual single-file edit that skipped every callsite.
 //!
-//! Requires a live LLM at MINISWE_TEST_ENDPOINT (default
+//! Requires a live LLM at BUZZTR_TEST_ENDPOINT (default
 //! http://localhost:8464) and real rust-analyzer. `#[ignore]`d — not part
 //! of the default `cargo test` run; invoke with
 //! `cargo test --test e2e_refactor_replay -- --ignored --nocapture`.
@@ -18,8 +18,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use miniswe::lsp::{LspClient, LspServer};
-use miniswe::tools;
+use buzztr::lsp::{LspClient, LspServer};
+use buzztr::tools;
 use serde_json::json;
 
 async fn ensure_rust_analyzer() -> bool {
@@ -59,7 +59,7 @@ async fn spawn_lsp_for(root: &Path, target_file: &Path) -> LspClient {
     }
     assert!(client.is_ready(), "LSP did not become ready in 120s");
 
-    // This fixture is the full miniswe codebase (not a toy 2-file project),
+    // This fixture is the full buzztr codebase (not a toy 2-file project),
     // so first-time indexing (crate graph, cargo metadata) takes a while.
     // Force analysis by opening the target file and waiting for diagnostics
     // on it, same as e2e_refactor.rs's spawn_lsp_for — without this,
@@ -73,11 +73,11 @@ async fn spawn_lsp_for(root: &Path, target_file: &Path) -> LspClient {
     client
 }
 
-fn real_gemma_config(project_root: std::path::PathBuf) -> miniswe::config::Config {
-    let mut config = miniswe::config::Config::default();
+fn real_gemma_config(project_root: std::path::PathBuf) -> buzztr::config::Config {
+    let mut config = buzztr::config::Config::default();
     config.project_root = project_root;
     let endpoint =
-        std::env::var("MINISWE_TEST_ENDPOINT").unwrap_or_else(|_| "http://localhost:8464".into());
+        std::env::var("BUZZTR_TEST_ENDPOINT").unwrap_or_else(|_| "http://localhost:8464".into());
     config.model.provider = "llama-cpp".into();
     config.model.endpoint = endpoint;
     config.model.model = "gemma-4-26B-A4B-it".into();
@@ -156,15 +156,15 @@ async fn replay_historical_add_param_failures() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().to_path_buf();
         copy_dir_all(&fixture_tree(), &root);
-        fs::create_dir_all(root.join(".miniswe/index")).unwrap();
-        fs::write(root.join(".miniswe/index/symbols.json"), "{}").unwrap();
-        fs::write(root.join(".miniswe/index/summaries.json"), "{}").unwrap();
-        fs::write(root.join(".miniswe/index/file_tree.txt"), "").unwrap();
-        fs::write(root.join(".miniswe/index/mtimes.json"), "{}").unwrap();
+        fs::create_dir_all(root.join(".buzztr/index")).unwrap();
+        fs::write(root.join(".buzztr/index/symbols.json"), "{}").unwrap();
+        fs::write(root.join(".buzztr/index/summaries.json"), "{}").unwrap();
+        fs::write(root.join(".buzztr/index/file_tree.txt"), "").unwrap();
+        fs::write(root.join(".buzztr/index/mtimes.json"), "{}").unwrap();
         fs::write(root.join(".mcp.json"), r#"{"servers":{}}"#).unwrap();
 
         let config = real_gemma_config(root.clone());
-        let router = miniswe::llm::ModelRouter::new(&config);
+        let router = buzztr::llm::ModelRouter::new(&config);
 
         eprintln!("\n=== REPLAY: {} ({}) ===", case.label, case.source);
         eprintln!("args: {}", case.args);

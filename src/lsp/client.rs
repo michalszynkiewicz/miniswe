@@ -615,7 +615,7 @@ impl LspClient {
     /// produced; the caller is responsible for applying it.
     ///
     /// `textDocument/rename` is part of the standard LSP and is supported
-    /// by every server miniswe ships against (rust-analyzer, gopls,
+    /// by every server buzztr ships against (rust-analyzer, gopls,
     /// ts-language-server, pyright, clangd, jdtls). When it isn't supported
     /// the server returns null, which surfaces here as `Ok(None)`.
     async fn rename_raw(
@@ -791,7 +791,7 @@ async fn initialize(transport: &LspTransport, project_root: &Path) -> Result<()>
         "initialize",
         serde_json::json!({
             "processId": std::process::id(),
-            "clientInfo": { "name": "miniswe", "version": "0.1.0" },
+            "clientInfo": { "name": "buzztr", "version": "0.1.0" },
             "rootUri": root_uri,
             "capabilities": {
                 "workspace": {

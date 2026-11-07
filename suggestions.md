@@ -1,7 +1,7 @@
-# miniswe: Rust-Specific Improvements
+# buzztr: Rust-Specific Improvements
 
 ## Problem
-miniswe struggles when working on Rust projects (specifically: building a REST framework library). Three root causes: (1) the repo map discards `impl` block information that is critical for understanding Rust code, (2) there is no automatic compiler feedback after file edits, (3) the `edit` tool is hidden but `write_file` fails in practice because devstral-small-2 refuses to output complete files — it writes partial content and stops.
+buzztr struggles when working on Rust projects (specifically: building a REST framework library). Three root causes: (1) the repo map discards `impl` block information that is critical for understanding Rust code, (2) there is no automatic compiler feedback after file edits, (3) the `edit` tool is hidden but `write_file` fails in practice because devstral-small-2 refuses to output complete files — it writes partial content and stops.
 
 ## Change 1: Enhance tree-sitter extraction to capture impl blocks with their methods
 
@@ -70,9 +70,9 @@ miniswe struggles when working on Rust projects (specifically: building a REST f
 
 ## Change 5: Add a default Rust lesson
 
-**Files:** `.miniswe/lessons.md` (template), `src/cli/commands/init.rs` (if lessons template is generated there)
+**Files:** `.buzztr/lessons.md` (template), `src/cli/commands/init.rs` (if lessons template is generated there)
 
-- When the project is detected as Rust (Cargo.toml present), seed `.miniswe/lessons.md` with:
+- When the project is detected as Rust (Cargo.toml present), seed `.buzztr/lessons.md` with:
   ```markdown
   ## Rust
   - Always return Result<T, E> in library code, never unwrap
@@ -90,7 +90,7 @@ miniswe struggles when working on Rust projects (specifically: building a REST f
 
 **Files:** `src/knowledge/profile.rs`
 
-- During `miniswe init`, if `Cargo.toml` contains `[workspace]`: parse the workspace members list and include a "Workspace" section in the generated profile showing the crate dependency DAG
+- During `buzztr init`, if `Cargo.toml` contains `[workspace]`: parse the workspace members list and include a "Workspace" section in the generated profile showing the crate dependency DAG
 - Example addition to profile:
   ```
   ## Workspace

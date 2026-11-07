@@ -84,8 +84,8 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
     // Same structure as the one in run.rs — see its comment for rationale.
     let fast_revisions: Option<Arc<tools::RevisionStore>> =
         if config.tools.edit_mode == EditMode::Fast {
-            let miniswe_dir = config.miniswe_path("revisions");
-            tools::RevisionStore::new(&miniswe_dir).ok().map(Arc::new)
+            let buzztr_dir = config.buzztr_path("revisions");
+            tools::RevisionStore::new(&buzztr_dir).ok().map(Arc::new)
         } else {
             None
         };
@@ -127,7 +127,7 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
     // Initialize MCP
     let mcp_config = McpConfig::load(&config.project_root)?;
     let mcp_registry = if mcp_config.has_servers() {
-        let cache_dir = config.miniswe_path("mcp");
+        let cache_dir = config.buzztr_path("mcp");
         match McpRegistry::connect(&mcp_config, &cache_dir) {
             Ok(registry) => {
                 if registry.has_servers() {
@@ -157,7 +157,7 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
 
     // Set up app state
     let mut app = App::new();
-    let history_file = config.miniswe_path("sessions/repl_history.txt");
+    let history_file = config.buzztr_path("sessions/repl_history.txt");
     app.load_history(&history_file);
 
     // Welcome message — probe what the server is actually serving rather
@@ -165,7 +165,7 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
     // llama-swap/llama-cpp in front of the endpoint is loading a
     // different gguf than named in config.
     for line in router.startup_summary().await {
-        app.push_output(&format!("miniswe — {line}"), LineStyle::Status);
+        app.push_output(&format!("buzztr — {line}"), LineStyle::Status);
     }
     if let Some(ref mcp) = mcp_registry {
         let guard = mcp.lock();

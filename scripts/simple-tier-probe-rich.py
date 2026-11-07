@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Arms C and D: miniswe's ACTUAL rich surface (grouped tools + plan gate),
+Arms C and D: buzztr's ACTUAL rich surface (grouped tools + plan gate),
 holding handlers identical, varying ONLY the invocation modality.
 
   C — bare-verb text grammar  (READ / PLAN SET / REFACTOR / REPLACE_RANGE ...)
-  D — OpenAI tool_calls over the same grouped schema (≈ real miniswe)
+  D — OpenAI tool_calls over the same grouped schema (≈ real buzztr)
 
 Same task / crate / cargo-check+behavioral oracle as arms A/B (imported
 from harness.py) so all four arms are directly comparable.
@@ -63,7 +63,7 @@ def dispatch(op, a, d):
         ok, out = H.cargo_check(d)
         return (f"step {a.get('step','?')}: cargo check {'PASS' if ok else 'FAIL'}\n"
                 + ("" if ok else out)), False
-    # ---- edit ops: plan-gated, exactly like real miniswe ----
+    # ---- edit ops: plan-gated, exactly like real buzztr ----
     if op in ("REFACTOR", "REPLACE_RANGE", "INSERT_AT", "WRITE_FILE"):
         if not NO_GATE and not plan_exists(d):
             return GATE_MSG, False
@@ -138,7 +138,7 @@ def dispatch(op, a, d):
 # ── arm C: bare-verb text parser ───────────────────────────────────────────
 BODY_VERBS = {"REPLACE_RANGE", "INSERT_AT", "WRITE_FILE"}
 
-# Control-token leakage hygiene — mirrors the spirit of miniswe's
+# Control-token leakage hygiene — mirrors the spirit of buzztr's
 # strip_xml_tool_blocks / has_tool_call_leak. Gemma, handed a tool-shaped
 # surface in prose, leaks `<|channel>` / `<|tool_call>call:VERB ...<tool_call|>`
 # and fakes tool-call JSON. A real agent sanitizes this; so must a fair probe.

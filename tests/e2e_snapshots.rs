@@ -2,7 +2,7 @@
 
 mod helpers;
 
-use miniswe::tools::snapshots::SnapshotManager;
+use buzztr::tools::snapshots::SnapshotManager;
 use std::fs;
 
 #[test]
@@ -12,7 +12,7 @@ fn snapshot_init_creates_shadow_git() {
 
     let snap = SnapshotManager::init(&config.project_root).unwrap();
 
-    assert!(config.project_root.join(".miniswe/shadow-git").exists());
+    assert!(config.project_root.join(".buzztr/shadow-git").exists());
     let snapshots = snap.list_snapshots().unwrap();
     assert!(
         snapshots.contains("round 0"),

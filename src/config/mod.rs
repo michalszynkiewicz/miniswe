@@ -1,10 +1,10 @@
-//! Configuration management for miniswe.
+//! Configuration management for buzztr.
 //!
 //! Global settings (model, hardware, API keys) live in
-//! `~/.miniswe/config.toml`; an optional project `.miniswe/config.toml` is
+//! `~/.buzztr/config.toml`; an optional project `.buzztr/config.toml` is
 //! deep-merged over it. Project root is always the current working directory.
-//! Per-project data (index, scratchpad, profile) lives in `.miniswe/` in the
-//! project directory — created by `miniswe init`.
+//! Per-project data (index, scratchpad, profile) lives in `.buzztr/` in the
+//! project directory — created by `buzztr init`.
 
 pub mod session;
 

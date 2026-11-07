@@ -72,7 +72,7 @@ jobs:
       - name: Strip binary
         shell: bash
         run: |
-          BIN="target/${{ matrix.target }}/release/miniswe"
+          BIN="target/${{ matrix.target }}/release/buzztr"
           if [ -f "$BIN" ]; then strip "$BIN"; fi
 
       - name: Package tarball + checksum
@@ -80,16 +80,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          name="miniswe-${{ github.ref_name }}-${{ matrix.target }}"
+          name="buzztr-${{ github.ref_name }}-${{ matrix.target }}"
           tar -czf "dist/${name}.tar.gz" \
-            -C "target/${{ matrix.target }}/release" miniswe
+            -C "target/${{ matrix.target }}/release" buzztr
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
           ls -lh dist
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: miniswe-${{ matrix.name }}
+          name: buzztr-${{ matrix.name }}
           path: dist/*
           retention-days: 7
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Laguna S 2.1 (poolside) — 118B total / 8B active MoE, for miniswe.
+# Laguna S 2.1 (poolside) — 118B total / 8B active MoE, for buzztr.
 #
 # SIZE. Near-twin of Mistral Small 4 (119B-A6B): UD-Q4_K_XL is 73.4 GB vs
 # Mistral's 70 GB. The difference that matters is ACTIVE params — 8B vs 6B,
@@ -49,21 +49,21 @@
 # anonymous memory the page cache cannot evict. Costs a slower cold start (a
 # real 69 GB read) and shows up as ~69 GB anon rather than as page cache --
 # budget that against the k3d cluster the pkg-mcp e2e deploys on the same box.
-# MINISWE_LOAD_MODE=mmap+mlock pins the mmap instead (run-llama-cuda.sh already
+# BUZZTR_LOAD_MODE=mmap+mlock pins the mmap instead (run-llama-cuda.sh already
 # passes --ulimit memlock=-1 --cap-add IPC_LOCK); =auto restores pre-08-30.
 #
 # THINKING: same chat-template contract as Laguna XS — the template keys on
 # the `enable_thinking` kwarg (default false -> prefills `</think>` so the
-# model answers directly). miniswe sends the kwarg per request. CAVEAT:
+# model answers directly). buzztr sends the kwarg per request. CAVEAT:
 # Laguna is trained with "preserved thinking" and expects prior turns'
-# reasoning echoed back in `reasoning_content`; miniswe discards reasoning,
+# reasoning echoed back in `reasoning_content`; buzztr discards reasoning,
 # so a thinking arm runs slightly off-distribution. Run instruct first.
-# NOTE: miniswe's thinking flag also raises temperature 0.2 -> 0.6.
+# NOTE: buzztr's thinking flag also raises temperature 0.2 -> 0.6.
 #
 # TOOL CALLS use the GLM-style <tool_call> format, parsed natively by
 # llama.cpp (same as Laguna XS 2.1).
 #
-# SAMPLING per the model card: temp 1.0, top-k 20, top-p 1.0. miniswe
+# SAMPLING per the model card: temp 1.0, top-k 20, top-p 1.0. buzztr
 # overrides temperature per request; these are the server-side defaults.
 #
 # Download (~73 GB, 3 shards):
@@ -71,15 +71,15 @@
 #       --local-dir ~/models/Laguna-S-2.1-GGUF
 set -euo pipefail
 
-MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/Laguna-S-2.1-GGUF}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-60000}"
-KV_TYPE="${MINISWE_KV_TYPE:-q8_0}"
-NCMOE="${MINISWE_NCMOE:-40}"
-LOAD_MODE="${MINISWE_LOAD_MODE:-none}"
-THREADS="${MINISWE_THREADS:-16}"
-PORT="${MINISWE_PORT:-8464}"
+MODEL_DIR="${BUZZTR_MODEL_DIR:-$HOME/models/Laguna-S-2.1-GGUF}"
+CTX_SIZE="${BUZZTR_CTX_SIZE:-60000}"
+KV_TYPE="${BUZZTR_KV_TYPE:-q8_0}"
+NCMOE="${BUZZTR_NCMOE:-40}"
+LOAD_MODE="${BUZZTR_LOAD_MODE:-none}"
+THREADS="${BUZZTR_THREADS:-16}"
+PORT="${BUZZTR_PORT:-8464}"
 
-MODEL="${MINISWE_MODEL:-}"
+MODEL="${BUZZTR_MODEL:-}"
 if [ -z "$MODEL" ]; then
     MODEL=$(find "$MODEL_DIR" -maxdepth 2 -name '*UD-Q4_K_XL*00001-of-*.gguf' 2>/dev/null | head -1 || true)
     [ -z "$MODEL" ] && MODEL=$(find "$MODEL_DIR" -maxdepth 2 -name '*.gguf' 2>/dev/null | grep -v -- '-0000[2-9]-of-' | head -1 || true)
@@ -91,7 +91,7 @@ if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
     exit 1
 fi
 
-echo "Starting Laguna S 2.1 (118B-A8B MoE) for miniswe..."
+echo "Starting Laguna S 2.1 (118B-A8B MoE) for buzztr..."
 echo "  Model:     $MODEL"
 echo "  Context:   $CTX_SIZE tokens, KV $KV_TYPE (12 of 48 layers cache full context)"
 echo "  Experts:   $NCMOE/48 MoE layers' experts on CPU (0 = all on GPU)"

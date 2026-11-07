@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start llama-server with Qwen3.8-27B (dense) for miniswe.
+# Start llama-server with Qwen3.8-27B (dense) for buzztr.
 #
 # Qwen3.8 (2026-08) builds on the Qwen3.5 architecture: model_type qwen3_5,
 # 64 layers in a 3:1 hybrid — 48 Gated-DeltaNet (linear attention) layers and
@@ -21,16 +21,16 @@
 #   total                ~18 GB   → fully resident, ~2 GB under the budget
 #
 #   UD-Q4_K_XL (17.6 GB) is ~19.2 GB total — right at the line. Try it with
-#   MINISWE_MODEL=... and watch nvidia-smi; if it spills, lower MINISWE_NGL.
+#   BUZZTR_MODEL=... and watch nvidia-smi; if it spills, lower BUZZTR_NGL.
 #
 # Expected decode: weights-bandwidth-bound at ~17 GB/token → ~20-25 tok/s
 # fully resident. Each layer pushed to CPU costs roughly 5 ms/token.
 #
-# The knob (MINISWE_NGL): layers on the GPU, of 64. Default 999 = all.
-#   OOM at load, or VRAM over budget → MINISWE_NGL=60 (each CPU layer ≈ 0.27 GB).
+# The knob (BUZZTR_NGL): layers on the GPU, of 64. Default 999 = all.
+#   OOM at load, or VRAM over budget → BUZZTR_NGL=60 (each CPU layer ≈ 0.27 GB).
 #
 # THINKING: Qwen3.8's chat template thinks by default (reasoning_effort=xhigh).
-# miniswe sends `chat_template_kwargs: {"enable_thinking": false}` on
+# buzztr sends `chat_template_kwargs: {"enable_thinking": false}` on
 # instruct requests (and `true` when `model.thinking` is on), which the
 # template honors: false prefills `<think>\n</think>\n\n`, true leaves
 # `<think>\n` open. The server-side default below covers clients that send
@@ -39,12 +39,12 @@
 # tuning for the thinking arm is `{"enable_thinking": true, "reasoning_effort": "low"}`.
 #
 # SAMPLING follows Qwen's instruct-mode recommendation (temp 0.7, top-p 0.8,
-# top-k 20, min-p 0). miniswe overrides `temperature` per request (bench
+# top-k 20, min-p 0). buzztr overrides `temperature` per request (bench
 # config uses 0.2); top-p/top-k/penalties come from these flags. Qwen also
 # recommends presence_penalty 1.5 in instruct mode to curb repetition; it is
 # OFF here by default so A/B runs stay comparable with the other launchers
 # (none use it) and structured tool-call output isn't biased against
-# repeated identifiers. Enable it with MINISWE_PRESENCE_PENALTY=1.5.
+# repeated identifiers. Enable it with BUZZTR_PRESENCE_PENALTY=1.5.
 #
 # Download the model first (~16.5 GB):
 #   mkdir -p $HOME/models
@@ -59,14 +59,14 @@
 
 set -euo pipefail
 
-MODEL_DIR="${MINISWE_MODEL_DIR:-$HOME/models/Qwen3.8-27B-GGUF}"
-PORT="${MINISWE_PORT:-8464}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-60000}"
-THREADS="${MINISWE_THREADS:-16}"      # physical cores; used for CPU-resident tensors
-NGL="${MINISWE_NGL:-999}"             # GPU layers of 64 (999 = all). Lower if VRAM spills.
-PRESENCE_PENALTY="${MINISWE_PRESENCE_PENALTY:-0}"
+MODEL_DIR="${BUZZTR_MODEL_DIR:-$HOME/models/Qwen3.8-27B-GGUF}"
+PORT="${BUZZTR_PORT:-8464}"
+CTX_SIZE="${BUZZTR_CTX_SIZE:-60000}"
+THREADS="${BUZZTR_THREADS:-16}"      # physical cores; used for CPU-resident tensors
+NGL="${BUZZTR_NGL:-999}"             # GPU layers of 64 (999 = all). Lower if VRAM spills.
+PRESENCE_PENALTY="${BUZZTR_PRESENCE_PENALTY:-0}"
 
-MODEL="${MINISWE_MODEL:-}"
+MODEL="${BUZZTR_MODEL:-}"
 if [ -z "$MODEL" ]; then
     # Preference order: the budget-safe K_M, then K_XL, then the smaller quants.
     for pat in 'Qwen3.8-27B-UD-Q4_K_M' 'Qwen3.8-27B-UD-Q4_K_XL' 'Qwen3.8-27B-UD-Q4_K_S' 'Qwen3.8-27B-UD-IQ4_XS' 'Qwen3.8-27B-Q4_K_M'; do
@@ -105,7 +105,7 @@ ARGS=(
     --metrics
 )
 
-echo "Starting Qwen3.8-27B (dense, GDN/attention hybrid) for miniswe..."
+echo "Starting Qwen3.8-27B (dense, GDN/attention hybrid) for buzztr..."
 echo "  Model:     $MODEL"
 echo "  Context:   $CTX_SIZE tokens"
 echo "  KV:        q4_0 (only the 16 attention layers cache KV)"

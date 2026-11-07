@@ -55,7 +55,7 @@ pub fn is_file_write(tool_name: &str) -> bool {
 /// list stays wide even if `plan.md` later goes away. Only a SCRAP, which
 /// throws the whole context out and reassembles it, restarts the ceremony.
 ///
-/// (Before per-session state directories, a nested miniswe run deleting the
+/// (Before per-session state directories, a nested buzztr run deleting the
 /// parent's `plan.md` retracted these tools mid-run — 3-18% of rounds across
 /// three benchmark runs, each flip costing a full re-prefill.)
 pub fn visible_tool_defs(

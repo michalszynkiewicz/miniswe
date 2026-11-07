@@ -118,7 +118,7 @@ Every critic's "cheapest decisive experiment" needs instrumentation you don't ha
 |---|---|---|
 | `compressor-consistent-token-measure` | **Promising** | Real bug: trigger counts tool-call args, the keep/split (`compressor.rs:96,111`) doesn't → "successful" compression overshoots budget. Reshape: fix `needs_compression` too; **drop** the "fewer truncated_tool_call retries" claim (output-side, wrong mechanism). |
 | `gate-spawn-agents-on-concurrency` | **Promising** | `spawn_agents` ships unconditionally but is **never invoked in any stored bench run**; ~177 tok/round + most complex tool shape, useless at `concurrency=1`. Gate behind `>1`. Frame as hygiene (flat pass rate, fewer tokens). |
-| `lsp-honest-pending-vs-OK` (half of #7) | **Needs-scoping → ship this half** | High value *on this bench specifically*: target is the 32K-LOC miniswe repo, where flycheck exceeds the 2 s budget, so the false-`OK` is the *common* case. Thread the discarded `wait_for_idle` bool out, emit `[lsp] pending` vs `[lsp] OK`. Your old cargo-check design did this (`suggestions.md:51`); the LSP migration dropped it. **Promoted — see §2: directly tests the "feedback masking" hypothesis.** |
+| `lsp-honest-pending-vs-OK` (half of #7) | **Needs-scoping → ship this half** | High value *on this bench specifically*: target is the 32K-LOC buzztr repo, where flycheck exceeds the 2 s budget, so the false-`OK` is the *common* case. Thread the discarded `wait_for_idle` bool out, emit `[lsp] pending` vs `[lsp] OK`. Your old cargo-check design did this (`suggestions.md:51`); the LSP migration dropped it. **Promoted — see §2: directly tests the "feedback masking" hypothesis.** |
 | `dedup-refactor-and-edit-guidance` | (not vetted) | Theme #1; cut the 3× duplication, keep substance once. The *safe* simplification. |
 | `wire-or-delete-context-budget-knobs` | (not vetted) | `history_budget`/`scratchpad_budget` etc. referenced only by display code, never by `src/context`. Dead config — wire or delete. |
 | `search-output-budget` | **Needs-scoping** | Real: `search.rs:93` is the one result path with no byte/line cap. But ~0 bench impact (Rust repo has no minified lines). Merge as **hygiene via a unit test**, not as a coding win. |
@@ -317,7 +317,7 @@ spot-checked before acting.
 ### 14. Centralize over-budget store-and-preview in execute_tool
 `centralize-output-truncation` · impact **Med** · effort M · risk Low
 
-**What:** Wrap the ToolResult from dispatch.rs:execute_tool: if content exceeds tool_output_budget_chars(), spill full content to .miniswe/tool_output/ and replace with preview + read-back pointer (the pattern shell.rs:194 / web.rs:324 already use). Keep per-tool truncation as a fast path. Superset of the search-specific cap; also bounds find_references/goto which currently emit one uncapped line per ref.
+**What:** Wrap the ToolResult from dispatch.rs:execute_tool: if content exceeds tool_output_budget_chars(), spill full content to .buzztr/tool_output/ and replace with preview + read-back pointer (the pattern shell.rs:194 / web.rs:324 already use). Keep per-tool truncation as a fast path. Superset of the search-specific cap; also bounds find_references/goto which currently emit one uncapped line per ref.
 
 **Why:** Budget is re-implemented per tool and thus easy to forget (search.rs is the live proof; find_references/goto are unbounded too). A single gate at the dispatch boundary makes over-budget results structurally impossible regardless of which tool produced them — exactly what improvements.md:66 asks for. The read-back pointer lets the model pull the rest deliberately instead of drowning. Closes the bug class rather than one instance.
 
@@ -463,7 +463,7 @@ spot-checked before acting.
 
 **What:** Pass --continue on attempts 2+ in run-benchmark-docker.sh (as bench-common.sh:321-326 already does) and stop wiping logs/state between attempts; keep the compiler-error retry message but let the model resume with prior plan/scratchpad intact.
 
-**Why:** Each retry restarts miniswe cold with only a bash-composed error string, discarding 12+ rounds of codebase understanding the model spent its budget building (experiment-results-20260405.md:66 shows it then timing out re-deriving from scratch). For a small model, re-establishing context is the expensive part; preserving plan+scratchpad lets attempt 2 spend its budget on the actual fix — directly improving the documented weakest link (test call-site fixes not completed within remaining time). Note: also makes the docker harness match the non-docker one, removing a silent divergence.
+**Why:** Each retry restarts buzztr cold with only a bash-composed error string, discarding 12+ rounds of codebase understanding the model spent its budget building (experiment-results-20260405.md:66 shows it then timing out re-deriving from scratch). For a small model, re-establishing context is the expensive part; preserving plan+scratchpad lets attempt 2 spend its budget on the actual fix — directly improving the documented weakest link (test call-site fixes not completed within remaining time). Note: also makes the docker harness match the non-docker one, removing a silent divergence.
 
 **Validate:** A/B with/without --continue at N>=5 on Devstral (times out on retries). Compare attempt-2 pass-rate and wall time; use bench-peek.sh trajectory to catch the risk that stale plan/scratchpad causes thrash.
 
@@ -508,7 +508,7 @@ spot-checked before acting.
 
 **What:** Trim the web tool description (definitions.rs:128, ~68 tok of Serper-key setup) to a one-liner pointing at web(action='help'), which already carries the setup text; audit other schemas (code group provider listings) for similar dead-weight config advice.
 
-**Why:** Setup advice the model can't act on mid-task ('put your key in ~/.miniswe/serper.key') is dead weight in every round across the 12-tool list. web is rarely on the coding critical path, so moving it to on-demand help keeps it discoverable while reclaiming per-round attention budget. Token saving is deterministic (count the assembled JSON), so it can be validated without a model.
+**Why:** Setup advice the model can't act on mid-task ('put your key in ~/.buzztr/serper.key') is dead weight in every round across the 12-tool list. web is rarely on the coding critical path, so moving it to on-demand help keeps it discoverable while reclaiming per-round attention budget. Token saving is deterministic (count the assembled JSON), so it can be validated without a model.
 
 **Validate:** Token-count assembled tool JSON before/after to confirm the saving, then run the bench to confirm pass rate flat. Regression risk minimal (help text unchanged, still reachable).
 
@@ -578,7 +578,7 @@ spot-checked before acting.
 ### 43. Expose an EXPLORE-equivalent flag on run.rs so the router thesis becomes benchable
 `explore-mode-bench-flag` · impact **Low** · effort M · risk Low
 
-**What:** Expose the EXPLORE config (plan=false, ceremony=Off, read-only tools, investigation directive) as a one-shot mode/flag on run::run, and add a bench variant running the read/explain subset through it. Today the router lives only in repl::run and is structurally invisible to the bench (which calls miniswe --yes -> run.rs).
+**What:** Expose the EXPLORE config (plan=false, ceremony=Off, read-only tools, investigation directive) as a one-shot mode/flag on run::run, and add a bench variant running the read/explain subset through it. Today the router lives only in repl::run and is structurally invisible to the bench (which calls buzztr --yes -> run.rs).
 
 **Why:** The routing/read-only thesis is currently untestable on the metric the project trusts — it was validated only by a standalone classifier-accuracy probe, never end-to-end, and CANNOT be with the current entry-point split. A flag lets you measure whether read-only+no-ceremony actually lowers tokens/rounds for investigation-shaped tasks vs the full coding path, turning an unvalidated feature into an empirical one (and is a prerequisite for the explore-mode-runtime-readonly-guard's git-diff-empty assertion). Low coding-impact directly; its value is unblocking measurement.
 

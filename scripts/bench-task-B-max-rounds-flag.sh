@@ -2,7 +2,7 @@
 # bench-task-B — Benchmark: "Add --system-prompt-override CLI flag"
 #
 # Validates by building, running, and checking predictable output.
-# On failure, feeds errors back to miniswe for a retry.
+# On failure, feeds errors back to buzztr for a retry.
 #
 # Validation:
 #   1. cargo check — compiles?
@@ -39,7 +39,7 @@ validate_result() {
     local passed=0
     local checks=0
     local details=""
-    local binary="${work_dir}/target/debug/miniswe"
+    local binary="${work_dir}/target/debug/buzztr"
     local flag_name=""
 
     # Check 1: cargo check
@@ -110,7 +110,7 @@ ${help_output}"
         else
             details="${details}parse:FAIL "
             errors="${errors}
-'miniswe ${flag_name} \"test prompt\" --help' exited with code ${flag_exit}."
+'buzztr ${flag_name} \"test prompt\" --help' exited with code ${flag_exit}."
         fi
     else
         details="${details}parse:SKIP "

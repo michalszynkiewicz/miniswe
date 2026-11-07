@@ -1,4 +1,4 @@
-//! Tool system for miniswe.
+//! Tool system for buzztr.
 //!
 //! Top-level tools for grouped file/code/web operations plus focused editors.
 //! action-based dispatch for grouped tools. All file access is jailed
@@ -52,11 +52,11 @@ pub struct ToolResult {
     pub success: bool,
     /// Structured facts behind certain failures, alongside `content` (not
     /// instead of it). `content` is always the complete, ready-to-use
-    /// message for miniswe's own agent loop — some of it is probe-validated
+    /// message for buzztr's own agent loop — some of it is probe-validated
     /// wording (see `refactor::add_param`) that must not be reworded.
     /// `detail` lets a *different* consumer (e.g. an MCP server exposing a
     /// different tool surface) render its own next-step guidance from the
-    /// same facts instead of reusing miniswe-specific tool-name references
+    /// same facts instead of reusing buzztr-specific tool-name references
     /// (`file(...)`, `refactor(...)`) that don't apply to it.
     pub detail: Option<ToolDetail>,
 }

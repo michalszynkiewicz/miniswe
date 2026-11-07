@@ -4,7 +4,7 @@
 # server down, repeat.
 #
 # The point of a "round" is comparability: every run in it uses the same
-# miniswe binary, the same shipped defaults, a fresh llama-server, and the
+# buzztr binary, the same shipped defaults, a fresh llama-server, and the
 # same task/timeout. That is what makes a headline table honest. Anything
 # that would break that (a dirty tree mid-round, a dead GPU, the wrong model
 # answering on 8464) aborts instead of quietly producing a row.
@@ -54,7 +54,7 @@ ENDPOINT="${LLAMA_ENDPOINT:-http://localhost:8464}"
 # tier:     promising = earns the multi-run treatment (has produced 6/6)
 #           other     = on the bench to confirm a known negative
 # thinking: the arm this row runs. Most models get exactly one arm, because a
-#           thinking/instruct split is a SECOND variable (miniswe raises
+#           thinking/instruct split is a SECOND variable (buzztr raises
 #           temperature to 0.6 with thinking, src/config/model.rs:236) — but
 #           gemma4 and Laguna XS are the only two models where BOTH arms are
 #           known-good, so they are the only place that question can be
@@ -75,7 +75,7 @@ MODELS=(
 "glim-dflash | promising | ./start-muse-glimmer-30b-dflash.sh | true | Muse-Glimmer-30B  | 600  |"
 "laguna-s    | promising | ./start-laguna-s.sh         | false | Laguna-S-2.1           | 1800 |"
 "gpt-oss     | other     | ./start-gpt-oss-20b.sh      | false | gpt-oss-20b            | 600  |"
-"north       | other     | ./start-north-mini-code.sh  | true  | North-Mini-Code        | 900  | MINISWE_REASONING=true"
+"north       | other     | ./start-north-mini-code.sh  | true  | North-Mini-Code        | 900  | BUZZTR_REASONING=true"
 "nemotron    | other     | ./start-nemotron35-30b.sh   | false | Nemotron-3.5-Lightning | 900  |"
 "mistral4    | other     | ./start-mistral-small-4.sh  | false | Mistral-Small-4        | 1800 |"
 )
@@ -99,8 +99,8 @@ MODELS=(
 #              should be statistically indistinguishable and only wall time
 #              should move. It is tier=promising, so a plain full round now
 #              runs it 3x — pass --skip glim-dflash for the old field.
-#   north    — instruct scored 0/6 (235 reads, zero edits). MINISWE_REASONING
-#              is the launcher's template kwarg; THINKING is miniswe's own
+#   north    — instruct scored 0/6 (235 reads, zero edits). BUZZTR_REASONING
+#              is the launcher's template kwarg; THINKING is buzztr's own
 #              flag. Both are needed; neither alone switches the model.
 #   nemotron — instruct only. The patched chat template that stops the
 #              newline flood exists for the non-thinking branch; the one
@@ -390,7 +390,7 @@ for key in "${QUEUE[@]}"; do
     # if it moves.
     build_log="${slotdir}/build.log"
     if ! docker build -f "${REPO_DIR}/scripts/Dockerfile.benchmark" \
-            -t miniswe-bench "${REPO_DIR}" > "$build_log" 2>&1; then
+            -t buzztr-bench "${REPO_DIR}" > "$build_log" 2>&1; then
         echo "[round] docker build FAILED; tail of ${build_log}:" >&2
         tail -20 "$build_log" >&2
         printf '%s\t%s\t%s\t%s\t%s\t-\tBUILD-FAIL\t-\t-\t-\t-\n' \
@@ -398,7 +398,7 @@ for key in "${QUEUE[@]}"; do
         render_round_md
         continue
     fi
-    binsha="$(docker run --rm miniswe-bench sha256sum /usr/local/bin/miniswe 2>/dev/null | awk '{print $1}')"
+    binsha="$(docker run --rm buzztr-bench sha256sum /usr/local/bin/buzztr 2>/dev/null | awk '{print $1}')"
     echo "${binsha}" > "${slotdir}/binary.sha256"
     if [[ -z "${ROUND_BINARY}" ]]; then
         ROUND_BINARY="$binsha"

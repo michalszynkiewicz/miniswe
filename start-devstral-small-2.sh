@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start llama.cpp server with Devstral Small 2 for miniswe.
+# Start llama.cpp server with Devstral Small 2 for buzztr.
 #
 # Hardware target: RTX 3090 (24GB VRAM, ~21GB usable) + 128GB RAM
 # Model: UD-Q4_K_XL (~15GB) + Q8_0 KV cache (~3.1GB at 50K ctx) = ~18GB VRAM
@@ -12,10 +12,10 @@
 
 set -euo pipefail
 
-MODEL="${MINISWE_MODEL:-$HOME/models/devstral-small-2/Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL.gguf}"
-PORT="${MINISWE_PORT:-8464}"
-CTX_SIZE="${MINISWE_CTX_SIZE:-50000}"
-THREADS="${MINISWE_THREADS:-8}"
+MODEL="${BUZZTR_MODEL:-$HOME/models/devstral-small-2/Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL.gguf}"
+PORT="${BUZZTR_PORT:-8464}"
+CTX_SIZE="${BUZZTR_CTX_SIZE:-50000}"
+THREADS="${BUZZTR_THREADS:-8}"
 
 if [ ! -f "$MODEL" ]; then
     echo "Model not found: $MODEL"
@@ -26,11 +26,11 @@ if [ ! -f "$MODEL" ]; then
     echo "    --include 'Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL.gguf' \\"
     echo "    --local-dir models/"
     echo ""
-    echo "Or set MINISWE_MODEL to point to your GGUF file."
+    echo "Or set BUZZTR_MODEL to point to your GGUF file."
     exit 1
 fi
 
-echo "Starting Devstral Small 2 for miniswe..."
+echo "Starting Devstral Small 2 for buzztr..."
 echo "  Model:   $MODEL"
 echo "  Context: $CTX_SIZE tokens"
 echo "  KV:      Q8_0"

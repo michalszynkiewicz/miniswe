@@ -131,7 +131,7 @@ avoid. Suggested order within that one piece of work:
   `def`, TypeScript function overload signatures, Java method annotations
   (`@Override`), Go interface method declarations, deeply nested generics.
 - **Differential check against `syn`**: for a handful of real function
-  definitions/call sites pulled from miniswe's own `src/` tree (a real,
+  definitions/call sites pulled from buzztr's own `src/` tree (a real,
   large, honestly-formatted Rust corpus we already have on disk), confirm
   the extracted span is exactly what a human would select — spot-check by
   eye is probably enough for the plan; a stronger version would feed the

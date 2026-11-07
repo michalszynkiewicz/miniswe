@@ -370,10 +370,10 @@ pub async fn execute(
     let succeeded = report.len();
     let mut out = String::new();
     if callsite_failures.is_empty() {
-        // A/B knob: MINISWE_ADDPARAM_LEGACY_MSG=1 restores the old "✓ COMPLETE"
+        // A/B knob: BUZZTR_ADDPARAM_LEGACY_MSG=1 restores the old "✓ COMPLETE"
         // wording so the honest-stub message can be benchmarked against it.
         let legacy_msg = matches!(
-            std::env::var("MINISWE_ADDPARAM_LEGACY_MSG").as_deref(),
+            std::env::var("BUZZTR_ADDPARAM_LEGACY_MSG").as_deref(),
             Ok("1")
         );
         if legacy_msg {

@@ -1,16 +1,16 @@
-//! miniswe-mcp — exposes miniswe's LSP-backed code intelligence and
+//! buzztr-mcp — exposes buzztr's LSP-backed code intelligence and
 //! structural refactor tools as an MCP server over stdio.
 //!
-//! Built on miniswe's existing public library API (`Config`,
+//! Built on buzztr's existing public library API (`Config`,
 //! `PermissionManager`, `LspClient`, `ModelRouter`, `execute_tool`,
 //! `execute_refactor_tool`). The only production-crate changes this binary
 //! required were additive: `ToolResult::detail` (see `errors` and
-//! `miniswe::tools::ToolDetail`) lets this server render its own next-step
-//! guidance for certain failures instead of reusing miniswe's own tool-name
+//! `buzztr::tools::ToolDetail`) lets this server render its own next-step
+//! guidance for certain failures instead of reusing buzztr's own tool-name
 //! references (`file(...)`, `refactor(...)`) that don't exist in an MCP
-//! client's tool list. See docs/miniswe-mcp.md.
+//! client's tool list. See docs/buzztr-mcp.md.
 //!
-//! Run from within a project directory (mirrors `miniswe` itself): the
+//! Run from within a project directory (mirrors `buzztr` itself): the
 //! project root is resolved from the process's current working directory.
 
 mod errors;
@@ -24,10 +24,10 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use miniswe::config::Config;
-use miniswe::llm::ModelRouter;
-use miniswe::lsp::LspClient;
-use miniswe::tools::PermissionManager;
+use buzztr::config::Config;
+use buzztr::llm::ModelRouter;
+use buzztr::lsp::LspClient;
+use buzztr::tools::PermissionManager;
 
 use telemetry::Telemetry;
 use toolset::Context;
@@ -104,7 +104,7 @@ async fn run_stdio_loop(ctx: &Context, telemetry: &mut Telemetry) -> anyhow::Res
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
                     "serverInfo": {
-                        "name": "miniswe-mcp",
+                        "name": "buzztr-mcp",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                 });
@@ -169,7 +169,7 @@ fn record_call(
                 .and_then(|t| t.as_str())
         })
         .flatten()
-        .map(|text| miniswe::truncate_chars(text, 200));
+        .map(|text| buzztr::truncate_chars(text, 200));
 
     telemetry.record_call(tool, !is_error, duration, detail.as_deref());
 }
