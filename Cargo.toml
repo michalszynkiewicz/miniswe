@@ -111,7 +111,7 @@ parking_lot = "0.13"
 [dev-dependencies]
 portable-pty = "0.9.0"
 tempfile = "3"
-avt = "0.18"
+avt = "0.20"
 wiremock = "0.6"
 serde_json = "1"
 
