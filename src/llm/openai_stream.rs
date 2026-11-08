@@ -27,6 +27,8 @@ pub(super) struct OpenAiStream {
     // `is_context_truncated_response`.
     finish_reason: Option<String>,
     usage: Option<Usage>,
+    /// Fallback when the server sends no `usage` (llama.cpp).
+    timings_usage: Option<Usage>,
 }
 
 impl OpenAiStream {
@@ -38,6 +40,7 @@ impl OpenAiStream {
             warned_missing_index: false,
             finish_reason: None,
             usage: None,
+            timings_usage: None,
         }
     }
 }
@@ -57,6 +60,9 @@ impl StreamParser for OpenAiStream {
             };
             if let Some(u) = parsed.usage {
                 self.usage = Some(u);
+            }
+            if let Some(t) = &parsed.timings {
+                self.timings_usage = Some(t.to_usage());
             }
             if let Some(choice) = parsed.choices.first() {
                 if let Some(fr) = &choice.finish_reason {
@@ -166,7 +172,7 @@ impl StreamParser for OpenAiStream {
                 // that never emit it.
                 finish_reason: Some(self.finish_reason.unwrap_or_else(|| "stop".into())),
             }],
-            usage: self.usage,
+            usage: self.usage.or(self.timings_usage),
         };
         normalize_xml_tool_calls(&mut resp, self.tool_call_format);
         Ok(resp)
@@ -175,7 +181,66 @@ impl StreamParser for OpenAiStream {
     fn finish_body(self, body: &[u8]) -> Result<ChatResponse> {
         let mut resp: ChatResponse =
             serde_json::from_slice(body).context("Failed to parse LLM response")?;
+        if resp.usage.is_none()
+            && let Ok(v) = serde_json::from_slice::<serde_json::Value>(body)
+            && let Some(t) = v.get("timings")
+            && let Ok(t) = serde_json::from_value::<LlamaTimings>(t.clone())
+        {
+            resp.usage = Some(t.to_usage());
+        }
         normalize_xml_tool_calls(&mut resp, self.tool_call_format);
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TIMINGS: &str = r#""timings":{"cache_n":3,"prompt_n":55,"prompt_ms":20.1,"predicted_n":20,"predicted_ms":200.0,"extra":1}"#;
+
+    fn run(events: &[String]) -> ChatResponse {
+        let mut s = OpenAiStream::new(ToolCallFormat::default());
+        for e in events {
+            s.feed_event(e, &mut |_| {}).unwrap();
+        }
+        s.finish().unwrap()
+    }
+
+    fn ev(extra: &str) -> String {
+        format!(r#"data: {{"choices":[{{"finish_reason":"stop","index":0,"delta":{{}}}}]{extra}}}"#)
+    }
+
+    #[test]
+    fn timings_only_synthesizes_usage() {
+        let u = run(&[ev(&format!(",{TIMINGS}"))]).usage.unwrap();
+        assert_eq!(u.prompt_tokens, 58);
+        assert_eq!(u.completion_tokens, 20);
+        assert_eq!(u.total_tokens, 78);
+        assert_eq!(u.prompt_tokens_details.unwrap().cached_tokens, 3);
+    }
+
+    #[test]
+    fn real_usage_wins_over_timings() {
+        let usage = r#","usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}"#;
+        let u = run(&[ev(&format!("{usage},{TIMINGS}"))]).usage.unwrap();
+        assert_eq!(u.prompt_tokens, 7);
+        assert_eq!(u.completion_tokens, 2);
+        assert!(u.prompt_tokens_details.is_none());
+    }
+
+    #[test]
+    fn neither_usage_nor_timings_is_none() {
+        assert!(run(&[ev("")]).usage.is_none());
+    }
+
+    #[test]
+    fn non_streaming_body_falls_back_to_timings() {
+        let body = format!(
+            r#"{{"choices":[{{"message":{{"role":"assistant","content":"x"}},"finish_reason":"stop"}}],{TIMINGS}}}"#
+        );
+        let s = OpenAiStream::new(ToolCallFormat::default());
+        let u = s.finish_body(body.as_bytes()).unwrap().usage.unwrap();
+        assert_eq!(u.prompt_tokens, 58);
     }
 }
