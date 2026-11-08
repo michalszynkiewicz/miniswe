@@ -52,7 +52,7 @@ To continue work from a previous session, you can:
 - **Ctrl+O** — toggle detail viewer (full content of last tool result)
 - **Ctrl+C** — interrupt current LLM generation
 - **Ctrl+D** — quit
-- **↑/↓** — scroll output when input is empty; otherwise navigate input history
+- **↑/↓** — navigate input history
 - **PgUp/PgDn** — scroll output
 - **Home/End** — move cursor in input
 - **Ctrl+Home/End** — scroll to top/bottom of output

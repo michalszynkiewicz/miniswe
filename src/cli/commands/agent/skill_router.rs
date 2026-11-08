@@ -104,9 +104,16 @@ async fn ask(
     messages: Vec<Message>,
     cancelled: &Arc<AtomicBool>,
 ) -> String {
-    // Skill names are short; thinking disabled like the explore router.
-    ask_with_budget(llm_worker, messages, cancelled, 24).await
+    // Skill names are short, but a reasoning model spends the budget
+    // thinking first (see ROUTER_MAX_TOKENS).
+    ask_with_budget(llm_worker, messages, cancelled, ROUTER_MAX_TOKENS).await
 }
+
+/// Output budget for the one-word pre-turn routers (skill pick, explore vs
+/// coding). Reasoning tokens count against it, and some models reason even
+/// with `enable_thinking: false`, so a word-sized budget returns empty
+/// content and the router silently falls back to its default.
+pub const ROUTER_MAX_TOKENS: u64 = 512;
 
 async fn ask_with_budget(
     llm_worker: &LlmWorkerHandle,

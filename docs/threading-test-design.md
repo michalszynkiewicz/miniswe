@@ -362,7 +362,7 @@ Type:
 - REPL state-machine test
 
 Assertions:
-- `PageUp/PageDown` and `Up/Down` with empty input still scroll during active LLM wait
+- `PageUp/PageDown` and `Ctrl+Home/End` still scroll during active LLM wait (`Up/Down` are input history and do not scroll)
 
 Status:
 - should pass now
