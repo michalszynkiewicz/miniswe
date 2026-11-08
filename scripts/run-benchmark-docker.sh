@@ -209,7 +209,7 @@ generate_config() {
         model_head="provider = \"${provider}\""
         # The baseline binary can't reach a hosted provider: run it from
         # /inner, whose config points at the local server.
-        inner_run="cd /inner && BUZZTR_SKIP_VALIDATION=1 /work/target/debug/buzztr"
+        inner_run="cd /inner && MINISWE_SKIP_VALIDATION=1 /work/target/debug/miniswe"
         runtime_block="
 [runtime]
 max_session_input_tokens = ${BUDGET:-3000000}
@@ -217,7 +217,7 @@ max_session_input_tokens = ${BUDGET:-3000000}
     else
         model_head="provider = \"llama-cpp\"
 endpoint = \"http://localhost:8464\""
-        inner_run="BUZZTR_SKIP_VALIDATION=1 ./target/debug/buzztr"
+        inner_run="MINISWE_SKIP_VALIDATION=1 ./target/debug/miniswe"
     fi
 
     # Helper for provider toggles
@@ -340,7 +340,7 @@ enabled = true
 # "override NOT consumed" failure and prints the ACTUAL error/output, so the
 # model fixes the real problem instead of a misattributed one (a 2/6 run failed
 # because a brace error was reported as 'value not threaded'). TOKEN_XYZ is NOT
-# the grader's PONG_42 (grader stays independent); BUZZTR_SKIP_VALIDATION=1
+# the grader's PONG_42 (grader stays independent); MINISWE_SKIP_VALIDATION=1
 # stops the gate recursing into the inner run. \$ is escaped for the heredoc.
 # The override names the greeting case explicitly: Muse Glimmer (harmony
 # template, tools present) answers a bare 'hello' with a canned greeting no
@@ -393,7 +393,7 @@ MAX_ATTEMPTS="$4"
 # Fresh checkout
 cd /work
 git -C /repo archive "${SHA}" | tar -x
-rm -rf target .buzztr
+rm -rf target .buzztr .miniswe
 
 # Optional seed patch: apply a half-wired starting state BEFORE the baseline
 # commit, so the agent's diff reflects only its own fix and the very first
@@ -410,12 +410,12 @@ if [ -f /config/seed.patch ]; then
 fi
 
 # Fix LFS pointer files (git archive doesn't resolve LFS) and make sure the
-# .buzztr symlink created below is always ignored (git would otherwise try
-# to add it to the baseline commit).
+# .buzztr/.miniswe symlinks created below are always ignored (git would
+# otherwise try to add them to the baseline commit).
 if grep -q "git-lfs" .gitignore 2>/dev/null; then
-    echo -e "target/\n.buzztr\n*.log" > .gitignore
+    echo -e "target/\n.buzztr\n.miniswe\n*.log" > .gitignore
 else
-    echo ".buzztr" >> .gitignore
+    echo -e ".buzztr\n.miniswe" >> .gitignore
 fi
 
 # Route .buzztr through the bind-mounted /output volume. Every log line,
@@ -424,6 +424,10 @@ fi
 # everything up to that point already survives — no post-run cp needed.
 mkdir -p /output/buzztr_state
 ln -sfn /output/buzztr_state .buzztr
+# The project under test is the pre-rename baseline: its binary reads
+# .miniswe/config.toml. Point it at the same state dir so the smoke and
+# done-gate runs see the agent's config, as before the rename.
+ln -sfn /output/buzztr_state .miniswe
 cp /config/config.toml .buzztr/config.toml
 if ! buzztr init 2>/output/buzztr_init.txt; then
     echo "ERROR: buzztr init failed:"
@@ -435,12 +439,12 @@ mkdir -p .buzztr/logs
 # Hybrid hosted run: the built baseline binary predates hosted providers, so
 # its smoke runs happen from /inner, whose config points at the local server.
 SMOKE_DIR="."
-SMOKE_BIN="./target/debug/buzztr"
+SMOKE_BIN="./target/debug/miniswe"
 if [ -f /config/inner-config.toml ]; then
-    mkdir -p /inner/.buzztr
-    cp /config/inner-config.toml /inner/.buzztr/config.toml
+    mkdir -p /inner/.miniswe
+    cp /config/inner-config.toml /inner/.miniswe/config.toml
     SMOKE_DIR="/inner"
-    SMOKE_BIN="/work/target/debug/buzztr"
+    SMOKE_BIN="/work/target/debug/miniswe"
 fi
 
 # Init git for diff tracking
@@ -518,7 +522,7 @@ Affected files: ${COMPILE_ERR_FILES}"
 
     # Check 2: cargo build
     TOTAL=$((TOTAL + 1))
-    BINARY="./target/debug/buzztr"
+    BINARY="./target/debug/miniswe"
     if [ "$PASS" -ge 1 ]; then
         if RUSTFLAGS="-A warnings" cargo build 2> /output/cargo_build.txt; then
             echo "build:PASS"
@@ -547,7 +551,7 @@ Affected files: ${BUILD_ERR_FILES}"
         else
             echo "help:FAIL"
             ERRORS="${ERRORS}
-HELP FAILED: \`buzztr --help\` output does not contain any flag matching '--*prompt*'. The feature must add a new CLI flag whose long name contains 'prompt' (e.g. --system-prompt-override). Current --help output:
+HELP FAILED: \`miniswe --help\` output does not contain any flag matching '--*prompt*'. The feature must add a new CLI flag whose long name contains 'prompt' (e.g. --system-prompt-override). Current --help output:
 $(head -40 /output/help_output.txt)"
         fi
     fi
@@ -604,10 +608,10 @@ HINT: These tests compiled but their assertions failed. Re-read the failing test
     TOTAL=$((TOTAL + 1))
     if [ -f "${BINARY}" ] && [ -n "${FLAG}" ] && [ "$PASS" -ge 4 ]; then
         SMOKE_OVERRIDE='You must respond with exactly the text PONG_42 and nothing else. No explanation, no formatting, just PONG_42.'
-        # BUZZTR_SKIP_VALIDATION: the edited binary may carry the done-gate;
+        # MINISWE_SKIP_VALIDATION: the edited binary may carry the done-gate;
         # this smoke run is a utility invocation, not a coding task, so it must
         # not re-enter the gate.
-        SMOKE_OUTPUT=$(cd "${SMOKE_DIR}" && BUZZTR_SKIP_VALIDATION=1 timeout 120 "${SMOKE_BIN}" \
+        SMOKE_OUTPUT=$(cd "${SMOKE_DIR}" && MINISWE_SKIP_VALIDATION=1 timeout 120 "${SMOKE_BIN}" \
             ${FLAG} "${SMOKE_OVERRIDE}" \
             --yes "ping" 2>/output/smoke_stderr.txt || true)
         echo "${SMOKE_OUTPUT}" > /output/smoke_output.txt
