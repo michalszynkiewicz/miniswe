@@ -11,7 +11,10 @@
 #
 # The run-benchmark-docker.sh script handles per-variant containers.
 
-FROM rust:1.89-bookworm
+# Same toolchain as local dev. Must be >= the highest dependency MSRV
+# (parking_lot 0.13 needs 1.95). It's also the compiler the agent works
+# against, so a bump changes the error/test output runs see: re-baseline.
+FROM rust:1.98-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev git curl ca-certificates maven \
