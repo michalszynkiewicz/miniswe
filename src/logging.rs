@@ -30,6 +30,35 @@ impl LogLevel {
     }
 }
 
+/// How a turn ended, as recorded in the `[end]` log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatus {
+    Ok,
+    Error,
+    Interrupted,
+}
+
+impl SessionStatus {
+    /// Combine the log-only flags. Precedence: error > interrupted > ok.
+    pub fn from_flags(errored: bool, interrupted: bool) -> Self {
+        if errored {
+            Self::Error
+        } else if interrupted {
+            Self::Interrupted
+        } else {
+            Self::Ok
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
 /// Session logger that writes to a per-session log file.
 pub struct SessionLog {
     file: Mutex<Option<File>>,
@@ -117,9 +146,26 @@ impl SessionLog {
     }
 
     /// Log agent completion or error (info level).
-    pub fn session_end(&self, rounds: usize, had_error: bool) {
-        let status = if had_error { "error" } else { "ok" };
-        self.write(&format!("[end] {rounds} rounds, status={status}"));
+    pub fn session_end(&self, rounds: usize, status: SessionStatus) {
+        self.write(&format!(
+            "[end] {rounds} rounds, status={}",
+            status.as_str()
+        ));
+    }
+
+    /// Log the REPL's per-turn routing decision: `explore` or `coding`.
+    pub fn route(&self, route: &str) {
+        self.write(&format!("[route] {route}"));
+    }
+
+    /// Log that the skill router picked a skill for this turn.
+    pub fn route_skill(&self, skill: &str) {
+        self.write(&format!("[route] skill={skill}"));
+    }
+
+    /// Log the partial assistant text of an interrupted generation.
+    pub fn interrupted_partial(&self, partial: &str) {
+        self.llm_response(&format!("(interrupted) {partial}"));
     }
 
     /// Log one LLM call's token usage (info level). Called after a
@@ -304,5 +350,48 @@ fn truncate(s: &str, max_chars: usize) -> String {
     } else {
         let truncated: String = flat.chars().take(max_chars).collect();
         format!("{truncated}...({}B total)", s.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_strings() {
+        assert_eq!(SessionStatus::Ok.as_str(), "ok");
+        assert_eq!(SessionStatus::Error.as_str(), "error");
+        assert_eq!(SessionStatus::Interrupted.as_str(), "interrupted");
+    }
+
+    #[test]
+    fn status_precedence_error_over_interrupted_over_ok() {
+        assert_eq!(SessionStatus::from_flags(false, false), SessionStatus::Ok);
+        assert_eq!(
+            SessionStatus::from_flags(false, true),
+            SessionStatus::Interrupted
+        );
+        assert_eq!(SessionStatus::from_flags(true, false), SessionStatus::Error);
+        assert_eq!(SessionStatus::from_flags(true, true), SessionStatus::Error);
+    }
+
+    #[test]
+    fn session_end_and_route_lines_are_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.project_root = dir.path().to_path_buf();
+        config.logging.enabled = true;
+        let log = SessionLog::new(&config);
+        log.route("explore");
+        log.route_skill("scaffold");
+        log.session_end(3, SessionStatus::Interrupted);
+        log.session_end(1, SessionStatus::Error);
+        log.session_end(2, SessionStatus::Ok);
+        let text = fs::read_to_string(log.path()).unwrap();
+        assert!(text.contains("[route] explore"));
+        assert!(text.contains("[route] skill=scaffold"));
+        assert!(text.contains("[end] 3 rounds, status=interrupted"));
+        assert!(text.contains("[end] 1 rounds, status=error"));
+        assert!(text.contains("[end] 2 rounds, status=ok"));
     }
 }

@@ -12,6 +12,9 @@ use super::{debugger, loop_detector, spiral, stuck_check, validation};
 pub(crate) struct TurnState {
     /// Whether the user chose to continue past a pause-after-N checkpoint.
     pub(crate) user_continued: bool,
+    /// Log-only: the LLM call took its interrupted branch this turn (feeds
+    /// the `[end] status=interrupted` line; never affects control flow).
+    pub(crate) interrupted: bool,
     /// Per-turn loop-detection state (see the field docs).
     pub(crate) loops: loop_detector::LoopTracker,
     /// Per-turn behavioral-gate state (see the field docs).

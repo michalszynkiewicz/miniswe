@@ -71,15 +71,25 @@ fn refresh_plan_panel(app: &mut App, config: &Config, round: usize) {
     if app.plan_task.is_none() {
         return;
     }
-    app.plan_steps = tools::plan::parsed_steps(config)
+    app.apply_fresh_plan(parsed_plan_view(config));
+    app.round = round;
+}
+
+/// `plan.md` as panel view-models.
+pub(super) fn parsed_plan_view(config: &Config) -> Vec<PlanStepView> {
+    tools::plan::parsed_steps(config)
         .into_iter()
         .map(|(checked, checked_round, text)| PlanStepView {
             checked,
             checked_round,
             text,
         })
-        .collect();
-    app.round = round;
+        .collect()
+}
+
+/// The status line shown after a fatal LLM error, naming the endpoint.
+pub(super) fn endpoint_hint_line(endpoint: &str) -> String {
+    format!("  endpoint: {endpoint} (set [model].endpoint in .buzztr/config.toml)")
 }
 
 impl AgentUi for TuiUi<'_> {
@@ -117,8 +127,11 @@ impl AgentUi for TuiUi<'_> {
                     LineStyle::Status,
                 );
             }
-            // The REPL's stream_llm/error lines already said everything.
-            UiEvent::LlmErrorEndpointHint { .. } => {}
+            UiEvent::LlmErrorEndpointHint { endpoint } => {
+                self.app
+                    .push_output(&endpoint_hint_line(&endpoint), LineStyle::Status);
+            }
+            UiEvent::GenerationInterrupted => self.app.note_interrupt(),
             UiEvent::TruncatedArgs {
                 name,
                 original_chars,
@@ -236,7 +249,12 @@ impl AgentUi for TuiUi<'_> {
     fn spawning_subagents(&mut self, _count: usize) {}
 
     fn notify_interrupted(&mut self) {
-        self.app.push_output("(interrupted)", LineStyle::Status);
+        self.app.note_interrupt();
+    }
+
+    fn take_partial_assistant_text(&mut self) -> Option<String> {
+        let text = std::mem::take(&mut self.rendered_assistant_text);
+        (!text.trim().is_empty()).then_some(text)
     }
 
     fn after_tool_call(&mut self) {
@@ -309,7 +327,7 @@ impl AgentUi for TuiUi<'_> {
                         }
                         Some(AppEvent::Key(key)) if event::is_ctrl_c(&key) => {
                             cancelled.store(true, Ordering::Relaxed);
-                            app.push_output("(interrupted)", LineStyle::Status);
+                            app.note_interrupt();
                             let _ = terminal.draw(|frame| ui::draw(frame, app));
                         }
                         Some(AppEvent::Mouse(_)) => {}

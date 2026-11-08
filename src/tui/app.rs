@@ -34,7 +34,7 @@ pub enum LineStyle {
 /// One step of the live plan, as a pure view-model. The REPL parses
 /// `.buzztr/plan.md` (the single source of truth) and feeds these in via
 /// [`App::set_plan`]; the TUI never reads plan state itself.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlanStepView {
     pub checked: bool,
     pub checked_round: Option<usize>,
@@ -94,6 +94,14 @@ pub struct App {
     pub plan_steps: Vec<PlanStepView>,
     /// Current agent round (panel stall signal). 0 = idle.
     pub round: usize,
+    /// The previous turn's fully-checked plan, still on disk in `plan.md`.
+    /// Hidden from the panel until the plan actually changes (display-only;
+    /// `plan.md` itself is untouched).
+    pub stale_plan: Option<Vec<PlanStepView>>,
+    /// `note_interrupt` already pushed `(interrupted)` this turn.
+    interrupt_noted: bool,
+    /// Drop tokens still in flight after Ctrl+C.
+    suppress_tokens: bool,
 }
 
 impl Default for App {
@@ -125,7 +133,66 @@ impl App {
             plan_task: None,
             plan_steps: Vec::new(),
             round: 0,
+            stale_plan: None,
+            interrupt_noted: false,
+            suppress_tokens: false,
         }
+    }
+
+    /// Reset per-turn flags. Call at the start of every turn.
+    pub fn begin_turn(&mut self) {
+        self.interrupt_noted = false;
+        self.suppress_tokens = false;
+    }
+
+    /// Make a freshly submitted turn visible immediately, while the routing
+    /// LLM calls (skill router, classifier) are still running.
+    pub fn begin_routing(&mut self) {
+        self.begin_turn();
+        self.is_thinking = true;
+        self.set_active_job("routing");
+    }
+
+    /// Record a user interrupt: flush the streamed fragment, note
+    /// `(interrupted)` once per turn, and drop tokens still in flight.
+    pub fn note_interrupt(&mut self) {
+        self.flush_tokens();
+        if !self.interrupt_noted {
+            self.interrupt_noted = true;
+            self.push_output("(interrupted)", LineStyle::Status);
+        }
+        self.suppress_tokens = true;
+    }
+
+    /// Show `fresh` plan steps in the panel, honoring `stale_plan`: while
+    /// the on-disk plan is still the previous turn's finished one, show
+    /// nothing; once it differs, show it and forget the stale copy.
+    pub fn apply_fresh_plan(&mut self, fresh: Vec<PlanStepView>) {
+        if self
+            .stale_plan
+            .as_ref()
+            .is_some_and(|stale| *stale == fresh)
+        {
+            self.plan_steps.clear();
+            return;
+        }
+        self.stale_plan = None;
+        self.plan_steps = fresh;
+    }
+
+    /// Mark the on-disk plan as stale for display if it is non-empty and
+    /// fully checked (an unfinished plan is legitimately carried over).
+    pub fn mark_stale_if_complete(&mut self, current: Vec<PlanStepView>) {
+        self.stale_plan = if !current.is_empty() && current.iter().all(|s| s.checked) {
+            Some(current)
+        } else {
+            None
+        };
+    }
+
+    /// Undo the history entry `submit_input` just pushed (used for `quit`).
+    pub fn forget_last_history(&mut self) {
+        self.history.pop();
     }
 
     /// Update the live-plan view-model. Called by the REPL each round after
@@ -202,6 +269,8 @@ impl App {
 
     /// Add a line to output.
     pub fn push_output(&mut self, text: &str, style: LineStyle) {
+        // A pending streamed fragment always lands before what follows.
+        self.flush_tokens();
         self.output.push(OutputLine {
             text: text.to_string(),
             style,
@@ -212,6 +281,9 @@ impl App {
 
     /// Append streaming token to the current line.
     pub fn push_token(&mut self, token: &str) {
+        if self.suppress_tokens {
+            return;
+        }
         self.token_buffer.push_str(token);
 
         // Split on newlines — each completed line becomes an output line
@@ -427,6 +499,93 @@ mod tests {
     #[test]
     fn current_is_first_when_none_checked() {
         assert_eq!(app_with(&[false, false]).current_plan_step(), Some(0));
+    }
+
+    fn texts(a: &App) -> Vec<&str> {
+        a.output.iter().map(|l| l.text.as_str()).collect()
+    }
+
+    #[test]
+    fn interrupt_lands_after_streamed_fragment() {
+        let mut a = App::new();
+        a.push_token("partial answ");
+        a.note_interrupt();
+        assert_eq!(texts(&a), vec!["partial answ", "(interrupted)"]);
+    }
+
+    #[test]
+    fn second_interrupt_adds_nothing_and_tokens_are_dropped() {
+        let mut a = App::new();
+        a.push_token("x");
+        a.note_interrupt();
+        a.note_interrupt();
+        a.push_token("late tokens\nmore");
+        assert_eq!(texts(&a), vec!["x", "(interrupted)"]);
+        assert!(a.token_buffer.is_empty());
+    }
+
+    #[test]
+    fn begin_turn_rearms_interrupt() {
+        let mut a = App::new();
+        a.note_interrupt();
+        a.begin_turn();
+        a.push_token("fresh");
+        a.note_interrupt();
+        assert_eq!(texts(&a), vec!["(interrupted)", "fresh", "(interrupted)"]);
+    }
+
+    #[test]
+    fn push_output_flushes_pending_tokens_first() {
+        let mut a = App::new();
+        a.push_token("half a line");
+        a.push_output("next", LineStyle::Status);
+        assert_eq!(texts(&a), vec!["half a line", "next"]);
+        assert!(a.token_buffer.is_empty());
+    }
+
+    #[test]
+    fn begin_routing_makes_the_turn_visible() {
+        let mut a = App::new();
+        a.begin_routing();
+        assert!(a.is_thinking);
+        assert_eq!(a.active_job.as_deref(), Some("routing"));
+    }
+
+    #[test]
+    fn stale_complete_plan_is_hidden_until_it_changes() {
+        let mut a = App::new();
+        let old = vec![step(true), step(true)];
+        a.mark_stale_if_complete(old.clone());
+        a.apply_fresh_plan(old.clone());
+        assert!(a.plan_steps.is_empty());
+        assert!(a.stale_plan.is_some());
+        let changed = vec![step(false), step(false), step(false)];
+        a.apply_fresh_plan(changed.clone());
+        assert_eq!(a.plan_steps, changed);
+        assert!(a.stale_plan.is_none());
+    }
+
+    #[test]
+    fn incomplete_carried_over_plan_is_shown() {
+        let mut a = App::new();
+        let carried = vec![step(true), step(false)];
+        a.mark_stale_if_complete(carried.clone());
+        assert!(a.stale_plan.is_none());
+        a.apply_fresh_plan(carried.clone());
+        assert_eq!(a.plan_steps, carried);
+        a.mark_stale_if_complete(Vec::new());
+        assert!(a.stale_plan.is_none());
+    }
+
+    #[test]
+    fn forget_last_history_pops_submitted_input() {
+        let mut a = App::new();
+        a.history.push("earlier".into());
+        a.input = "quit".into();
+        let input = a.submit_input();
+        assert_eq!(input, "quit");
+        a.forget_last_history();
+        assert_eq!(a.history, vec!["earlier".to_string()]);
     }
 
     #[test]

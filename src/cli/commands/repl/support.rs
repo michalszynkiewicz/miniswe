@@ -133,7 +133,7 @@ pub(super) async fn await_tool_job_ui(
                     }
                     Some(AppEvent::Key(key)) if event::is_ctrl_c(&key) => {
                         cancelled.store(true, Ordering::Relaxed);
-                        app.push_output("(interrupted)", LineStyle::Status);
+                        app.note_interrupt();
                         let _ = terminal.draw(|frame| ui::draw(frame, app));
                     }
                     Some(AppEvent::Mouse(_)) => {}
@@ -309,7 +309,7 @@ pub(super) async fn await_shell_job_repl(
                     }
                     Some(AppEvent::Key(key)) if event::is_ctrl_c(&key) => {
                         cancelled.store(true, Ordering::Relaxed);
-                        app.push_output("(interrupted)", LineStyle::Status);
+                        app.note_interrupt();
                         let _ = terminal.draw(|frame| ui::draw(frame, app));
                     }
                     Some(AppEvent::Mouse(_)) => {}

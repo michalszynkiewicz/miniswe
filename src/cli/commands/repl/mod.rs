@@ -1,14 +1,17 @@
 //! Interactive REPL mode with ratatui TUI.
 
 mod agent_turn;
+mod commands;
 mod explore;
 mod session;
+mod stderr_redirect;
 mod support;
 #[cfg(test)]
 mod tests;
 mod tui_ui;
 
 pub use session::run;
+pub use stderr_redirect::{StderrRedirect, restore_stderr};
 
 use std::io;
 use std::sync::Arc;
@@ -58,6 +61,7 @@ use crate::cli::commands::agent::permissions::permission_action;
 use crate::tools::permissions::Action;
 
 use agent_turn::*;
+use commands::*;
 use explore::*;
 use support::*;
 use tui_ui::*;

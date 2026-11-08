@@ -118,6 +118,9 @@ impl AgentUi for HeadlessUi {
             UiEvent::WriteBlockedNoPlan { name } => {
                 tui::print_tool_result(&name, false, "blocked: no plan");
             }
+            UiEvent::GenerationInterrupted => {
+                tui::print_status("Generation interrupted.");
+            }
         }
     }
 
