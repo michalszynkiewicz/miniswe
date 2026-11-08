@@ -162,7 +162,7 @@ impl ModelRouter {
                         };
                     lines.push(format!(
                         "Model: {} @ {endpoint} — context {n} ({source})",
-                        probe.model
+                        display_model_id(&probe.model)
                     ));
                 }
                 Err(e) => lines.push(format!("Model: (probe failed: {e}) @ {endpoint}")),
@@ -210,5 +210,39 @@ impl ModelRouter {
             ModelRole::Plan => &self.routing_plan,
             ModelRole::Fast => &self.routing_fast,
         }
+    }
+}
+
+/// Display form of a model id: llama.cpp reports the GGUF path, so show just
+/// the file name for absolute paths; hosted ids pass through unchanged.
+fn display_model_id(model: &str) -> &str {
+    let path = std::path::Path::new(model);
+    if path.is_absolute() {
+        path.file_name().and_then(|n| n.to_str()).unwrap_or(model)
+    } else {
+        model
+    }
+}
+
+#[cfg(test)]
+mod display_model_id_tests {
+    use super::display_model_id;
+
+    #[test]
+    fn absolute_path_shows_file_name() {
+        assert_eq!(
+            display_model_id("/home/u/models/Muse-GGUF/Muse-Q4_K_M.gguf"),
+            "Muse-Q4_K_M.gguf"
+        );
+    }
+
+    #[test]
+    fn hosted_ids_unchanged() {
+        assert_eq!(
+            display_model_id("anthropic/claude-sonnet-5-5"),
+            "anthropic/claude-sonnet-5-5"
+        );
+        assert_eq!(display_model_id("openai/gpt-x"), "openai/gpt-x");
+        assert_eq!(display_model_id("model.gguf"), "model.gguf");
     }
 }
