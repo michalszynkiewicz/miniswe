@@ -14,8 +14,8 @@ use serde_json::Value;
 use crate::config::ModelConfig;
 
 use super::errors::{
-    has_tool_call_leak, is_retryable_llm_error, retry_after_from_message, retry_after_secs,
-    with_retry_after_marker,
+    connect_root_cause, has_tool_call_leak, is_connection_refused, is_retryable_llm_error,
+    retry_after_from_message, retry_after_secs, with_retry_after_marker,
 };
 use super::openai_stream::OpenAiStream;
 use super::providers::anthropic::{self, AnthropicStream, ModelCaps};
@@ -528,7 +528,11 @@ impl LlmClient {
                     self.record_usage(&resp);
                     return Ok(resp);
                 }
-                Err(err) if attempt < max_retries && is_retryable_llm_error(&err) => {
+                Err(err)
+                    if attempt < max_retries
+                        && is_retryable_llm_error(&err)
+                        && !(attempt >= 1 && is_connection_refused(&err.to_string())) =>
+                {
                     let msg = err.to_string();
                     // A 429's Retry-After is authoritative where present —
                     // it reflects the server's actual rate-limit state,
@@ -590,10 +594,10 @@ impl LlmClient {
             if let Some(beta) = &request.beta {
                 builder = builder.header("anthropic-beta", beta);
             }
-            builder
-                .send()
-                .await
-                .with_context(|| format!("Failed to connect to LLM at {url}"))
+            builder.send().await.map_err(|e| {
+                let root = connect_root_cause(&e);
+                anyhow::Error::new(e).context(format!("Failed to connect to LLM at {url}: {root}"))
+            })
         };
 
         let response = match cancelled {
@@ -860,7 +864,10 @@ impl LlmClient {
                     return Ok(resp);
                 }
                 Err(err)
-                    if !had_progress && attempt < max_retries && is_retryable_llm_error(&err) =>
+                    if !had_progress
+                        && attempt < max_retries
+                        && is_retryable_llm_error(&err)
+                        && !(attempt >= 1 && is_connection_refused(&err.to_string())) =>
                 {
                     let msg = err.to_string();
                     let delay = retry_after_from_message(&msg)

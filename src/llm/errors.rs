@@ -102,6 +102,30 @@ pub(super) fn has_tool_call_leak(resp: &ChatResponse) -> bool {
     false
 }
 
+/// Root cause of a failed send, for the "Failed to connect" message:
+/// `connection refused` if any error in the source chain is an
+/// `io::ErrorKind::ConnectionRefused`, else the innermost error's Display.
+pub(super) fn connect_root_cause(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut innermost = err;
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::ConnectionRefused
+        {
+            return "connection refused".into();
+        }
+        innermost = e;
+        cur = e.source();
+    }
+    innermost.to_string()
+}
+
+/// True when a message is a refused connection (see [`connect_root_cause`]).
+/// Nothing is listening, so the retry ladder is pointless: retry once only.
+pub(super) fn is_connection_refused(msg: &str) -> bool {
+    msg.contains("Failed to connect to LLM") && msg.contains(": connection refused")
+}
+
 pub(super) fn is_retryable_llm_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     if is_truncated_tool_call_error(&msg) {
@@ -187,6 +211,25 @@ pub(super) fn retry_after_from_message(msg: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_refused_helper() {
+        assert!(is_connection_refused(
+            "Failed to connect to LLM at http://x/v1: connection refused"
+        ));
+        assert!(!is_connection_refused(
+            "Failed to connect to LLM at http://x/v1: dns error"
+        ));
+        assert!(!is_connection_refused("connection refused"));
+    }
+
+    #[test]
+    fn root_cause_detects_refused_in_chain() {
+        let io = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(connect_root_cause(&io), "connection refused");
+        let other = std::io::Error::other("boom");
+        assert_eq!(connect_root_cause(&other), "boom");
+    }
 
     #[test]
     fn context_exceeded_detects_openai_pattern() {

@@ -235,6 +235,38 @@ pub struct StreamChunk {
     /// carries real numbers; absent chunks leave it `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// llama.cpp's final chunk always carries `timings`, even without
+    /// `stream_options.include_usage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<LlamaTimings>,
+}
+
+/// The token counts of llama.cpp's `timings` object (other fields ignored).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LlamaTimings {
+    #[serde(default)]
+    pub prompt_n: usize,
+    #[serde(default)]
+    pub cache_n: usize,
+    #[serde(default)]
+    pub predicted_n: usize,
+}
+
+impl LlamaTimings {
+    /// Synthesize a [`Usage`]: `prompt_n` is newly evaluated tokens,
+    /// `cache_n` those reused from the KV cache.
+    pub fn to_usage(&self) -> Usage {
+        let prompt = self.prompt_n + self.cache_n;
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: self.predicted_n,
+            total_tokens: prompt + self.predicted_n,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: self.cache_n,
+                cache_write_tokens: 0,
+            }),
+        }
+    }
 }
 
 /// A streaming choice.
