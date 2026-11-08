@@ -4,6 +4,8 @@
 
 use super::*;
 
+/// Mid-turn keys: transcript scrolling only. Up/Down are input history
+/// (idle only), so they don't scroll here either.
 pub(super) fn handle_background_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
     match key.code {
         KeyCode::PageUp => {
@@ -12,14 +14,6 @@ pub(super) fn handle_background_key(app: &mut App, key: &crossterm::event::KeyEv
         }
         KeyCode::PageDown => {
             app.scroll_down(10);
-            true
-        }
-        KeyCode::Up if app.input.is_empty() => {
-            app.scroll_up(1);
-            true
-        }
-        KeyCode::Down if app.input.is_empty() => {
-            app.scroll_down(1);
             true
         }
         KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {

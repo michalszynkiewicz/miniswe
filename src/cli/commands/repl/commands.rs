@@ -25,6 +25,6 @@ pub(super) fn help_lines() -> Vec<&'static str> {
         "quit   — exit",
         "Enter: send · Ctrl+C: interrupt · Ctrl+D or quit: exit",
         "Ctrl+O: tool-result details · PgUp/PgDn, Ctrl+Home/End: scroll",
-        "Up/Down: scroll (empty input) / history (while typing)",
+        "Up/Down: input history",
     ]
 }

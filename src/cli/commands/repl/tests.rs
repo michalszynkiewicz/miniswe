@@ -312,7 +312,7 @@ fn help_lists_commands_then_keys() {
     let quit = pos("quit   — exit").expect("commands present");
     let enter = pos("Enter: send · Ctrl+C: interrupt · Ctrl+D or quit: exit").unwrap();
     let ctrl_o = pos("Ctrl+O: tool-result details · PgUp/PgDn, Ctrl+Home/End: scroll").unwrap();
-    let arrows = pos("Up/Down: scroll (empty input) / history (while typing)").unwrap();
+    let arrows = pos("Up/Down: input history").unwrap();
     assert!(quit < enter && enter < ctrl_o && ctrl_o < arrows);
 }
 
@@ -353,4 +353,39 @@ fn endpoint_hint_line_names_endpoint_and_config_key() {
         endpoint_hint_line("http://localhost:8080"),
         "  endpoint: http://localhost:8080 (set [model].endpoint in .buzztr/config.toml)"
     );
+}
+
+fn plain_key(code: KeyCode) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers: KeyModifiers::empty(),
+        kind: KeyEventKind::Press,
+        state: KeyEventState::empty(),
+    }
+}
+
+#[test]
+fn up_on_empty_input_recalls_history_and_down_restores_it() {
+    let mut app = App::new();
+    app.history = vec!["first".into(), "second".into()];
+    app.history_up();
+    assert_eq!(app.input, "second");
+    app.history_up();
+    assert_eq!(app.input, "first");
+    app.history_down();
+    app.history_down();
+    assert_eq!(app.input, "");
+}
+
+#[test]
+fn arrows_do_not_scroll_mid_turn_but_page_keys_do() {
+    let mut app = App::new();
+    for i in 0..50 {
+        app.push_output(&format!("line {i}"), LineStyle::Normal);
+    }
+    assert!(!handle_background_key(&mut app, &plain_key(KeyCode::Up)));
+    assert!(!handle_background_key(&mut app, &plain_key(KeyCode::Down)));
+    assert_eq!(app.scroll_offset, 0);
+    assert!(handle_background_key(&mut app, &plain_key(KeyCode::PageUp)));
+    assert!(app.scroll_offset > 0);
 }

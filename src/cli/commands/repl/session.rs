@@ -642,20 +642,11 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                             KeyCode::Backspace => app.delete_char(),
                             KeyCode::Left => app.cursor_left(),
                             KeyCode::Right => app.cursor_right(),
-                            KeyCode::Up => {
-                                if app.input.is_empty() {
-                                    app.scroll_up(1);
-                                } else {
-                                    app.history_up();
-                                }
-                            }
-                            KeyCode::Down => {
-                                if app.input.is_empty() {
-                                    app.scroll_down(1);
-                                } else {
-                                    app.history_down();
-                                }
-                            }
+                            // Shell convention: arrows are input history,
+                            // always; the transcript scrolls on PgUp/PgDn
+                            // and Ctrl+Home/End.
+                            KeyCode::Up => app.history_up(),
+                            KeyCode::Down => app.history_down(),
                             KeyCode::PageUp => app.scroll_up(10),
                             KeyCode::PageDown => app.scroll_down(10),
                             KeyCode::Home => {

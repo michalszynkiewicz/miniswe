@@ -2,6 +2,7 @@
 //! tool surface.
 
 use super::*;
+use crate::cli::commands::agent::skill_router::ROUTER_MAX_TOKENS;
 
 /// Per-turn intent router (REPL only). One isolated, tool-less LLM
 /// round-trip — NOT added to conversation history — classifying the
@@ -37,7 +38,12 @@ pub(super) async fn classify_is_explore(
         messages: vec![Message::system(sys), Message::user(user_message)],
         tools: None,
         tool_choice: None,
-        max_tokens_override: Some(8),
+        // Not 8: reasoning models (Glimmer) think despite enable_thinking:
+        // false, and reasoning counts against max_tokens — 8 and 64 both came
+        // back with empty content (finish=length), 512 answered after ~140
+        // tokens. Non-reasoning models stop after one word, so it costs them
+        // nothing.
+        max_tokens_override: Some(ROUTER_MAX_TOKENS),
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
         temperature_override: None,
         cache_prompt: None,
