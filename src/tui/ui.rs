@@ -45,10 +45,15 @@ fn draw_normal(frame: &mut Frame, app: &App) {
     // auto-sizes to the plan (task line + steps + borders), capped so the
     // output pane always keeps room; long plans window around the current step.
     let plan_height: u16 = if app.plan_task.is_some() {
-        let steps = app.plan_steps.len().max(1) as u16; // ≥1 for the "exploring" line
+        let steps = app.plan_steps.len().max(1) as u16; // ≥1 for the "preparing" line
         let want = steps + 1 /*task*/ + 2 /*borders*/;
         let cap = (area.height / 2).max(4); // never eat more than half the screen
-        want.clamp(4, cap.min(16))
+        let cap = if area.height < 30 {
+            cap.min(4)
+        } else {
+            cap.min(16)
+        };
+        want.clamp(4, cap)
     } else {
         0
     };
@@ -111,6 +116,7 @@ fn draw_plan_panel(frame: &mut Frame, app: &App, area: Rect) {
         );
 
     let inner_h = area.height.saturating_sub(2) as usize; // minus borders
+    let inner_w = area.width.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
 
     // Task line.
@@ -118,7 +124,7 @@ fn draw_plan_panel(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled("Task: ", Style::default().fg(TEXT_MUTED)),
             Span::styled(
-                crate::truncate_chars(task, area.width.saturating_sub(8) as usize),
+                ellipsize(task, inner_w.saturating_sub(6)), // "Task: " = 6 cols
                 Style::default().fg(TEXT_SOFT),
             ),
         ]));
@@ -126,7 +132,7 @@ fn draw_plan_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.plan_steps.is_empty() {
         lines.push(Line::from(Span::styled(
-            "(exploring — no plan set yet)",
+            "(preparing the plan…)",
             Style::default()
                 .fg(TEXT_MUTED)
                 .add_modifier(Modifier::ITALIC),
@@ -138,7 +144,7 @@ fn draw_plan_panel(frame: &mut Frame, app: &App, area: Rect) {
         let start = if total_steps <= budget {
             0
         } else {
-            let cur = current.unwrap_or(0);
+            let cur = current.unwrap_or(total_steps - 1); // all done -> show the tail
             cur.saturating_sub(budget / 2).min(total_steps - budget)
         };
         let end = (start + budget).min(total_steps);
@@ -161,11 +167,12 @@ fn draw_plan_panel(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 String::new()
             };
-            let text_budget = area.width.saturating_sub(8 + suffix.len() as u16) as usize;
+            // prefix " ✓  1 " = 6 cols; the suffix must always stay intact.
+            let text_budget = inner_w.saturating_sub(6 + suffix.chars().count());
             lines.push(Line::from(vec![
                 Span::styled(format!(" {marker} {num} "), Style::default().fg(color)),
                 Span::styled(
-                    crate::truncate_chars(&step.text, text_budget.max(8)),
+                    ellipsize(&step.text, text_budget),
                     Style::default().fg(color),
                 ),
                 Span::styled(suffix, Style::default().fg(TEXT_MUTED)),
@@ -213,15 +220,93 @@ fn draw_topbar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(widget, area);
 }
 
+fn char_cols(c: char) -> usize {
+    Span::raw(c.to_string()).width()
+}
+
+fn str_cols(s: &str) -> usize {
+    Span::raw(s).width()
+}
+
+/// Shorten `s` to at most `max` display columns, ending in a single `…`
+/// when anything was cut.
+fn ellipsize(s: &str, max: usize) -> String {
+    if str_cols(s) <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = char_cols(c);
+        if w + cw > max - 1 {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// Word-wrap `text` to `width` columns; continuation rows get `indent`
+/// spaces. Words longer than a row are hard-broken.
+fn wrap_hanging(text: &str, width: usize, indent: usize) -> Vec<String> {
+    if width == 0 || str_cols(text) <= width {
+        return vec![text.to_string()];
+    }
+    let lead = text.len() - text.trim_start_matches(' ').len();
+    let mut rows = Vec::new();
+    let mut cur = " ".repeat(lead);
+    let mut cur_w = lead;
+    let mut base = lead; // columns of non-content prefix on this row
+    for word in text.split(' ').filter(|w| !w.is_empty()) {
+        let ww = str_cols(word);
+        let sep = usize::from(cur_w > base);
+        if cur_w + sep + ww <= width {
+            if sep == 1 {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+            cur_w += sep + ww;
+            continue;
+        }
+        if cur_w > base {
+            rows.push(std::mem::replace(&mut cur, " ".repeat(indent)));
+            cur_w = indent;
+            base = indent;
+        }
+        if cur_w + ww <= width {
+            cur.push_str(word);
+            cur_w += ww;
+            continue;
+        }
+        for ch in word.chars() {
+            let cw = char_cols(ch);
+            if cur_w + cw > width && cur_w > base {
+                rows.push(std::mem::replace(&mut cur, " ".repeat(indent)));
+                cur_w = indent;
+                base = indent;
+            }
+            cur.push(ch);
+            cur_w += cw;
+        }
+    }
+    rows.push(cur);
+    rows
+}
+
 /// Draw the scrollable output pane.
 fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
     let inner_height = area.height.saturating_sub(2) as usize; // minus borders
+    let inner_width = area.width.saturating_sub(2);
 
     // Convert output lines to ratatui Lines with styles
-    let styled_lines: Vec<Line> = app
-        .output
-        .iter()
-        .map(|ol| {
+    let mut styled_lines: Vec<Line> = Vec::new();
+    for ol in app.output.iter() {
+        {
             let style = match ol.style {
                 LineStyle::Normal => Style::default().fg(USER_LINE).bg(BG_PANEL),
                 LineStyle::Assistant => Style::default().fg(TEXT_PRIMARY).bg(BG_PANEL),
@@ -239,9 +324,22 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
                     .bg(BG_PANEL)
                     .add_modifier(Modifier::ITALIC),
             };
-            Line::from(Span::styled(&ol.text, style))
-        })
-        .collect();
+            match ol.style {
+                LineStyle::Separator => {
+                    styled_lines.push(Line::from(Span::styled(
+                        "─".repeat(inner_width as usize),
+                        style,
+                    )));
+                }
+                LineStyle::ToolCall | LineStyle::ToolOk | LineStyle::ToolErr => {
+                    for row in wrap_hanging(&ol.text, inner_width as usize, 4) {
+                        styled_lines.push(Line::from(Span::styled(row, style)));
+                    }
+                }
+                _ => styled_lines.push(Line::from(Span::styled(&ol.text, style))),
+            }
+        }
+    }
 
     // Add thinking indicator if active
     let mut lines = styled_lines;
@@ -303,7 +401,6 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
     // `line_count(width)` wraps at the content width (area.width − 2 for the
     // left/right borders) and adds top+bottom border space (+2) to the
     // result, so we subtract it back out to get pure content rows.
-    let inner_width = area.width.saturating_sub(2);
     let total = paragraph.line_count(inner_width).saturating_sub(2);
 
     let scroll = if app.scroll_offset == 0 {
@@ -319,7 +416,10 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
 
     // Scrollbar
     if total > inner_height {
-        let mut scrollbar_state = ScrollbarState::new(total).position(scroll);
+        // ratatui: content_length = number of scroll positions.
+        let mut scrollbar_state = ScrollbarState::new(total - inner_height + 1)
+            .position(scroll)
+            .viewport_content_length(inner_height);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("↑"))
@@ -487,8 +587,8 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
 
-    use super::{centered_rect, draw, visible_input_window};
-    use crate::tui::app::App;
+    use super::{centered_rect, draw, ellipsize, str_cols, visible_input_window, wrap_hanging};
+    use crate::tui::app::{App, LineStyle};
 
     #[test]
     fn visible_input_window_keeps_short_input_unchanged() {
@@ -613,6 +713,132 @@ mod tests {
         let second_text = buffer_text(&second);
         assert!(!second_text.contains("Permission Required"));
         assert!(!second_text.contains("Allow shell command?"));
+    }
+
+    fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    fn render(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn ellipsize_fits_and_cuts() {
+        assert_eq!(ellipsize("abc", 3), "abc");
+        assert_eq!(ellipsize("abcdef", 4), "abc…");
+        assert_eq!(ellipsize("abcdef", 0), "");
+        assert_eq!(ellipsize("abcdef", 1), "…");
+    }
+
+    #[test]
+    fn plan_placeholder_says_preparing() {
+        let mut app = App::new();
+        app.plan_task = Some("t".into());
+        let text = buffer_text(&render(&app, 80, 40));
+        assert!(text.contains("(preparing the plan…)"));
+        assert!(!text.contains("exploring"));
+    }
+
+    #[test]
+    fn separator_spans_full_inner_width() {
+        for w in [100u16, 40] {
+            let mut app = App::new();
+            app.push_output("x".repeat(48).as_str(), LineStyle::Separator);
+            let buf = render(&app, w, 20);
+            let rows: Vec<String> = (0..20).map(|y| row_text(&buf, y)).collect();
+            let sep: Vec<&String> = rows
+                .iter()
+                .filter(|r| r.contains('─') && r.starts_with('│'))
+                .collect();
+            assert_eq!(sep.len(), 1, "w={w}: {rows:#?}");
+            let inner: String = sep[0].chars().skip(1).take(w as usize - 2).collect();
+            assert_eq!(inner, "─".repeat(w as usize - 2));
+        }
+    }
+
+    #[test]
+    fn scrollbar_thumb_touches_bottom_at_tail_and_top_when_scrolled() {
+        let mut app = App::new();
+        for i in 0..200 {
+            app.push_output(&format!("line {i}"), LineStyle::Normal);
+        }
+        let find = |buf: &ratatui::buffer::Buffer, sym: &str| {
+            (0..buf.area.height)
+                .find(|&y| buf[(59, y)].symbol() == sym)
+                .unwrap()
+        };
+        let buf = render(&app, 60, 24);
+        let (up, down) = (find(&buf, "↑"), find(&buf, "↓"));
+        assert_eq!(buf[(59, down - 1)].symbol(), "█", "tail: thumb must hug ↓");
+        assert_ne!(buf[(59, up + 1)].symbol(), "█");
+
+        app.scroll_offset = 10_000;
+        let buf = render(&app, 60, 24);
+        assert_eq!(buf[(59, up + 1)].symbol(), "█", "top: thumb must hug ↑");
+        assert_ne!(buf[(59, down - 1)].symbol(), "█");
+    }
+
+    #[test]
+    fn plan_panel_narrow_keeps_suffix_and_ellipsizes_task() {
+        let mut app = App::new();
+        app.plan_task = Some("t".repeat(120));
+        app.plan_steps = vec![crate::tui::app::PlanStepView {
+            checked: true,
+            checked_round: Some(4),
+            text: "s".repeat(120),
+        }];
+        let buf = render(&app, 60, 20);
+        let rows: Vec<String> = (0..20).map(|y| row_text(&buf, y)).collect();
+        let task = rows.iter().find(|r| r.contains("Task:")).unwrap();
+        assert!(task.trim_end().ends_with("…│"), "{task}");
+        let step = rows.iter().find(|r| r.contains("(r4)")).unwrap();
+        assert!(step.contains("…  (r4)"), "{step}");
+        // panel is 4 rows: top border, task, step, bottom border
+        let top = rows.iter().position(|r| r.contains("Plan")).unwrap();
+        assert!(rows[top + 3].starts_with('└'), "{rows:#?}");
+    }
+
+    #[test]
+    fn plan_panel_all_done_shows_last_step() {
+        let mut app = App::new();
+        app.plan_task = Some("task".into());
+        app.plan_steps = (1..=3)
+            .map(|i| crate::tui::app::PlanStepView {
+                checked: true,
+                checked_round: Some(i),
+                text: format!("step-{i}"),
+            })
+            .collect();
+        let text = buffer_text(&render(&app, 60, 20));
+        assert!(text.contains("step-3"));
+        assert!(!text.contains("step-1"));
+    }
+
+    #[test]
+    fn wrapped_tool_line_has_hanging_indent() {
+        let mut app = App::new();
+        app.push_output(
+            "  ✓ insert_at: insert_at src/lib.rs after L50: rev_3 applied (+12 -0) and some more words to force wrapping",
+            LineStyle::ToolOk,
+        );
+        let buf = render(&app, 60, 20);
+        let rows: Vec<String> = (0..20).map(|y| row_text(&buf, y)).collect();
+        let first = rows.iter().position(|r| r.contains("✓ insert_at")).unwrap();
+        let cont: String = rows[first + 1].chars().skip(1).take(4).collect();
+        assert_eq!(cont, "    ", "{rows:#?}");
+        assert!(rows[first + 1].chars().nth(5).is_some_and(|c| c != ' '));
+    }
+
+    #[test]
+    fn wrap_hanging_hard_breaks_long_words() {
+        let rows = wrap_hanging(&format!("  → {}", "x".repeat(30)), 10, 4);
+        assert!(rows.iter().all(|r| str_cols(r) <= 10), "{rows:?}");
+        assert!(rows[1..].iter().all(|r| r.starts_with("    ")));
     }
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
