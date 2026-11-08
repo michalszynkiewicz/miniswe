@@ -3,20 +3,56 @@
 
 use super::*;
 
-struct ReplTerminalGuard;
+/// True while a `ReplTerminalGuard` owns the terminal (gates the panic hook).
+static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct ReplTerminalGuard {
+    /// Held for its lifetime; `drop` restores stderr explicitly (and
+    /// idempotently) before leaving the alternate screen.
+    _stderr: Option<StderrRedirect>,
+}
 
 impl ReplTerminalGuard {
-    fn enter() -> Result<Self> {
+    /// Enter the alternate screen and point fd 2 at `stderr_log`, so stray
+    /// `eprintln!`s / subprocess stderr cannot corrupt the frame.
+    fn enter(stderr_log: &std::path::Path) -> Result<Self> {
         terminal::enable_raw_mode()?;
         io::stdout().execute(EnterAlternateScreen)?;
-        Ok(Self)
+        let stderr = StderrRedirect::to_file(stderr_log).ok();
+        TERMINAL_ACTIVE.store(true, Ordering::SeqCst);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if TERMINAL_ACTIVE.swap(false, Ordering::SeqCst) {
+                restore_stderr();
+                let _ = terminal::disable_raw_mode();
+                let _ = io::stdout().execute(LeaveAlternateScreen);
+            }
+            previous(info);
+        }));
+        Ok(Self { _stderr: stderr })
     }
 }
 
 impl Drop for ReplTerminalGuard {
     fn drop(&mut self) {
-        let _ = terminal::disable_raw_mode();
-        let _ = io::stdout().execute(LeaveAlternateScreen);
+        // Restore stderr BEFORE leaving the alternate screen so anything
+        // printed after exit reaches the terminal.
+        restore_stderr();
+        if TERMINAL_ACTIVE.swap(false, Ordering::SeqCst) {
+            let _ = terminal::disable_raw_mode();
+            let _ = io::stdout().execute(LeaveAlternateScreen);
+        }
+    }
+}
+
+/// Where fd 2 goes while the TUI is up: the session log if there is one,
+/// else `.buzztr/logs/stderr.log`.
+fn stderr_log_path(config: &Config, log: &SessionLog) -> std::path::PathBuf {
+    let p = log.path();
+    if p.as_os_str().is_empty() {
+        config.buzztr_path("logs/stderr.log")
+    } else {
+        p.clone()
     }
 }
 
@@ -151,7 +187,7 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
         context::estimate_tokens(&serde_json::to_string(&tool_defs).unwrap_or_default());
 
     // Set up terminal
-    let _terminal_guard = ReplTerminalGuard::enter()?;
+    let _terminal_guard = ReplTerminalGuard::enter(&stderr_log_path(&config, &log))?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
@@ -238,7 +274,7 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                         if event::is_ctrl_c(&key) {
                             if app.is_thinking {
                                 cancelled.store(true, Ordering::Relaxed);
-                                app.push_output("(interrupted)", LineStyle::Status);
+                                app.note_interrupt();
                                 app.is_thinking = false;
                             }
                             continue;
@@ -262,8 +298,15 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                 }
 
                                 // Handle commands
-                                if input == "quit" || input == "exit" || input == "/quit" {
+                                if is_quit_command(&input) {
+                                    // Exiting is not worth recalling with Up.
+                                    app.forget_last_history();
                                     break;
+                                }
+
+                                // Built-in commands echo like a normal turn.
+                                if is_builtin_command(&input) {
+                                    app.push_output(&format!("you> {input}"), LineStyle::Normal);
                                 }
 
                                 if input == "/clear" || input == "/new" {
@@ -288,24 +331,9 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                 }
 
                                 if input == "/help" {
-                                    app.push_output(
-                                        "/clear — clear conversation history",
-                                        LineStyle::Status,
-                                    );
-                                    app.push_output(
-                                        "/new   — clear history + scratchpad + plan",
-                                        LineStyle::Status,
-                                    );
-                                    app.push_output(
-                                        "/skills list       — list available skills",
-                                        LineStyle::Status,
-                                    );
-                                    app.push_output(
-                                        "/skills <name> help — show skill details",
-                                        LineStyle::Status,
-                                    );
-                                    app.push_output("/help  — show this help", LineStyle::Status);
-                                    app.push_output("quit   — exit", LineStyle::Status);
+                                    for line in help_lines() {
+                                        app.push_output(line, LineStyle::Status);
+                                    }
                                     continue;
                                 }
 
@@ -408,6 +436,17 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                     (input.clone(), None)
                                 };
 
+                                // The turn is real from here: make it visible
+                                // NOW (spinner, "routing" job, log line) — the
+                                // routers below are LLM calls that can take a
+                                // while, and nothing redraws until they return.
+                                // Every path from here reaches the turn-end
+                                // `finish_completed_turn`, which clears
+                                // `is_thinking`.
+                                app.begin_routing();
+                                log.user_message(&input);
+                                let _ = terminal.draw(|f| ui::draw(f, &app));
+
                                 // Per-turn intent router (fail-safe to
                                 // CODING). EXPLORE turns run a read-only,
                                 // no-plan, Q&A-directed variant; the proven
@@ -430,6 +469,7 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                     .await
                                     {
                                         Some(skill) => {
+                                            log.route_skill(&skill);
                                             app.push_output(
                                                 &format!("  · task routed to skill '{skill}'"),
                                                 LineStyle::Status,
@@ -448,6 +488,8 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                 let is_explore =
                                     classify_is_explore(&llm_worker, &user_message, &cancelled)
                                         .await;
+                                app.clear_active_job();
+                                log.route(if is_explore { "explore" } else { "coding" });
                                 let turn_cfg = if is_explore {
                                     let mut c = config.clone();
                                     c.tools.plan = false;
@@ -505,7 +547,6 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                     );
                                 }
 
-                                app.is_thinking = true;
                                 // Live plan panel: show it for coding turns
                                 // (it fills in as the model sets/checks steps).
                                 // Suppressed for read-only Q&A (no plan there).
@@ -515,13 +556,19 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                     Some(input.clone())
                                 };
                                 app.plan_steps.clear();
+                                // plan.md persists across turns: a finished
+                                // plan from the previous turn must not show
+                                // under this turn's task (display-only).
+                                if is_explore {
+                                    app.stale_plan = None;
+                                } else {
+                                    app.mark_stale_if_complete(parsed_plan_view(&config));
+                                }
 
                                 let max_rounds = config.context.max_rounds;
                                 let perms_ref = &perms;
                                 let mcp_ref = &mcp_registry;
                                 let conv_ref = &mut conversation_history;
-
-                                log.user_message(&input);
 
                                 // Fresh snapshot baseline for THIS turn: SCRAP's
                                 // revert-to-round-0 must only undo this turn's

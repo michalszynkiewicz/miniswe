@@ -304,3 +304,53 @@ async fn permission_prompt_accepts_raw_carriage_return_as_enter() {
     assert!(app.input.is_empty());
     assert_eq!(app.cursor, 0);
 }
+
+#[test]
+fn help_lists_commands_then_keys() {
+    let lines = help_lines();
+    let pos = |needle: &str| lines.iter().position(|l| l.contains(needle));
+    let quit = pos("quit   — exit").expect("commands present");
+    let enter = pos("Enter: send · Ctrl+C: interrupt · Ctrl+D or quit: exit").unwrap();
+    let ctrl_o = pos("Ctrl+O: tool-result details · PgUp/PgDn, Ctrl+Home/End: scroll").unwrap();
+    let arrows = pos("Up/Down: scroll (empty input) / history (while typing)").unwrap();
+    assert!(quit < enter && enter < ctrl_o && ctrl_o < arrows);
+}
+
+#[test]
+fn builtin_command_classification() {
+    for c in [
+        "/help",
+        "/clear",
+        "/new",
+        "/skills",
+        "/skills list",
+        "/skills foo help",
+    ] {
+        assert!(is_builtin_command(c), "{c}");
+    }
+    for c in ["hello", "/foo", "/skills foo"] {
+        assert!(!is_builtin_command(c), "{c}");
+    }
+    assert!(is_quit_command("quit") && is_quit_command("/quit") && is_quit_command("exit"));
+    assert!(!is_quit_command("quitting"));
+}
+
+#[test]
+fn submitting_quit_leaves_history_unchanged() {
+    let mut app = App::new();
+    app.history.push("earlier".into());
+    app.input = "quit".into();
+    let input = app.submit_input();
+    if is_quit_command(&input) {
+        app.forget_last_history();
+    }
+    assert_eq!(app.history, vec!["earlier".to_string()]);
+}
+
+#[test]
+fn endpoint_hint_line_names_endpoint_and_config_key() {
+    assert_eq!(
+        endpoint_hint_line("http://localhost:8080"),
+        "  endpoint: http://localhost:8080 (set [model].endpoint in .buzztr/config.toml)"
+    );
+}

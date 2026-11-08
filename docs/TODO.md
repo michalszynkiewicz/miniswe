@@ -349,3 +349,15 @@ budget go through `Config::model_for_role(ModelRole::Default)`), and run the
 probe before the router clones its configs so the Fast/Plan slots see their own
 probed window. Add a test that loads a `[models]` config with a window on the
 main slot only and asserts `needs_compression` uses it.
+
+## REPL: input during a turn
+
+While a turn runs, only scrolling and Ctrl+C work. Ctrl+O (tool-result
+details), Ctrl+D and typed text are ignored, and any keys queued during the
+turn are thrown away when it ends (`drain_stale_key_events` in
+`src/cli/commands/repl/support.rs`). That drain guards a real bug: a paste
+during the turn used to replay into the fresh input box and submit itself.
+So type-ahead needs an explicit "queued" state (shown, editable, not
+auto-submitted) rather than just skipping the drain. The most useful part, and
+the cheapest, is opening the details view mid-turn. Found in the UX loop
+(F6 in `.tmp/ux/findings.md`).

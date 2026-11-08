@@ -11,7 +11,7 @@ use crate::cli::commands::agent::turn_state::{SkillTurnState, TurnState};
 use crate::cli::commands::agent::ui::AgentUi;
 use crate::config::CeremonyMode;
 use crate::llm::{Message, ModelRouter};
-use crate::logging::SessionLog;
+use crate::logging::{SessionLog, SessionStatus};
 
 use super::{
     AdmitFlow, CallFlow, LlmFlow, Prunable, RoundFlow, TurnCtx, TurnOptions, call_gate, dispatch,
@@ -60,6 +60,10 @@ pub(crate) async fn run_turn<U: AgentUi>(
 
     let mut round = 0;
     let mut had_error = false;
+    // Log-only: set by every EndTurn { error: true } regardless of
+    // `fatal_marks_error`, so the REPL's [end] line still says error.
+    let mut logged_error = false;
+    let mut logged_interrupted = false;
 
     'round: loop {
         if had_error {
@@ -69,6 +73,7 @@ pub(crate) async fn run_turn<U: AgentUi>(
         // headless loop has never consumed the cancel flag here.
         if opts.interrupt_checkpoints && consume_interrupt(ctx.cancelled) {
             ui.notify_interrupted();
+            logged_interrupted = true;
             break;
         }
 
@@ -91,6 +96,7 @@ pub(crate) async fn run_turn<U: AgentUi>(
                     "Session input-token budget exceeded ({used} >= {budget} tokens) — stopping."
                 ));
                 had_error = true;
+                logged_error = true;
                 break;
             }
         }
@@ -113,6 +119,7 @@ pub(crate) async fn run_turn<U: AgentUi>(
         match preamble::begin_round(ctx, state, ui, messages, round).await {
             RoundFlow::Continue => {}
             RoundFlow::EndTurn { error } => {
+                logged_error |= error;
                 if opts.fatal_marks_error {
                     had_error |= error;
                 }
@@ -125,6 +132,7 @@ pub(crate) async fn run_turn<U: AgentUi>(
                 LlmFlow::Ready(msg) => msg,
                 LlmFlow::Retry => continue,
                 LlmFlow::EndTurn { error } => {
+                    logged_error |= error;
                     if opts.fatal_marks_error {
                         had_error |= error;
                     }
@@ -149,7 +157,10 @@ pub(crate) async fn run_turn<U: AgentUi>(
             .await
             {
                 RoundFlow::Continue => continue,
-                RoundFlow::EndTurn { .. } => break,
+                RoundFlow::EndTurn { error } => {
+                    logged_error |= error;
+                    break;
+                }
             },
         };
 
@@ -189,6 +200,7 @@ pub(crate) async fn run_turn<U: AgentUi>(
             // Check cancellation between tool calls. REPL only.
             if opts.interrupt_checkpoints && consume_interrupt(ctx.cancelled) {
                 ui.notify_interrupted();
+                logged_interrupted = true;
                 break 'round;
             }
             let admitted = match call_gate::admit(
@@ -207,6 +219,7 @@ pub(crate) async fn run_turn<U: AgentUi>(
                 AdmitFlow::NextCall => continue,
                 AdmitFlow::StopCalls { error } => {
                     had_error |= error;
+                    logged_error |= error;
                     break;
                 }
                 AdmitFlow::RestartRound => continue 'round,
@@ -276,7 +289,13 @@ pub(crate) async fn run_turn<U: AgentUi>(
     }
 
     log.usage_total(&router.usage_totals());
-    log.session_end(round, had_error);
+    log.session_end(
+        round,
+        SessionStatus::from_flags(
+            had_error || logged_error,
+            logged_interrupted || state.interrupted,
+        ),
+    );
 
     TurnResult {
         rounds: round,

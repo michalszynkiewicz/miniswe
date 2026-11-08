@@ -127,7 +127,11 @@ pub(crate) async fn generate(
                 if opts.clear_cancel_on_interrupt {
                     ctx.cancelled.store(false, Ordering::Relaxed);
                 }
-                ui.status("Generation interrupted.");
+                state.interrupted = true;
+                if let Some(partial) = ui.take_partial_assistant_text() {
+                    ctx.log.interrupted_partial(&partial);
+                }
+                ui.event(UiEvent::GenerationInterrupted);
                 return LlmFlow::EndTurn { error: false };
             }
             // The server rejected the request outright: prompt alone

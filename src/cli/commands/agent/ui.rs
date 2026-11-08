@@ -130,6 +130,9 @@ pub(crate) enum UiEvent {
     ExploreBlocked { name: String },
     /// A write tool was blocked: strict ceremony requires a plan first.
     WriteBlockedNoPlan { name: String },
+    /// The LLM call ended because the user interrupted it (headless prints
+    /// "Generation interrupted."; the TUI notes the interrupt once).
+    GenerationInterrupted,
 }
 
 /// Everything an agent round loop needs from its frontend: line output,
@@ -169,6 +172,11 @@ pub(crate) trait AgentUi {
     /// The user interrupted the turn (REPL ctrl-c checkpoints; the headless
     /// loop has no interrupt checkpoints and never calls this).
     fn notify_interrupted(&mut self);
+    /// The assistant text streamed so far this round, for logging an
+    /// interrupted generation's partial answer. Default: none.
+    fn take_partial_assistant_text(&mut self) -> Option<String> {
+        None
+    }
     /// Re-render after a tool result landed — the TUI redraws its frame so
     /// the result shows before the next call starts; no-op headless.
     fn after_tool_call(&mut self);
