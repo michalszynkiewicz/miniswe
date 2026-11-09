@@ -216,14 +216,13 @@ impl AgentUi for TuiUi<'_> {
     }
 
     fn tool_result(&mut self, name: &str, ok: bool, first_line: &str) {
-        let icon = if ok { "✓" } else { "✗" };
         let style = if ok {
             LineStyle::ToolOk
         } else {
             LineStyle::ToolErr
         };
         self.app
-            .push_output(&format!("  {icon} {name}: {first_line}"), style);
+            .push_output(&tool_result_line(name, ok, first_line), style);
     }
 
     fn store_tool_result(&mut self, name: &str, content: &str) {
@@ -502,4 +501,20 @@ impl AgentUi for TuiUi<'_> {
             Ok(None) => PreflightPermission::Allowed,
         }
     }
+}
+
+/// Display line for a tool result. Tools often echo their own name (and an
+/// icon) at the start of their first output line; drop those repeats so the
+/// row reads `  ✓ name: summary`. Display only: the session log and the model
+/// both get the untouched first line.
+pub(super) fn tool_result_line(name: &str, ok: bool, first_line: &str) -> String {
+    let icon = if ok { "✓" } else { "✗" };
+    let mut rest = first_line;
+    if let Some(r) = rest.strip_prefix(name).and_then(|r| r.strip_prefix(' ')) {
+        rest = r;
+    }
+    if let Some(r) = rest.strip_prefix(icon).and_then(|r| r.strip_prefix(' ')) {
+        rest = r;
+    }
+    format!("  {icon} {name}: {rest}")
 }

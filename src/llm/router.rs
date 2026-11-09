@@ -215,7 +215,7 @@ impl ModelRouter {
 
 /// Display form of a model id: llama.cpp reports the GGUF path, so show just
 /// the file name for absolute paths; hosted ids pass through unchanged.
-fn display_model_id(model: &str) -> &str {
+pub(crate) fn display_model_id(model: &str) -> &str {
     let path = std::path::Path::new(model);
     if path.is_absolute() {
         path.file_name().and_then(|n| n.to_str()).unwrap_or(model)

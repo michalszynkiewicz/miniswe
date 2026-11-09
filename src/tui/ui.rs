@@ -11,6 +11,7 @@ use ratatui::widgets::{
 };
 
 use super::app::{App, AppMode, LineStyle};
+use super::markdown::{self, MdState, MdTheme};
 
 const BG_MAIN: Color = Color::Rgb(18, 22, 28);
 const BG_PANEL: Color = Color::Rgb(24, 29, 36);
@@ -27,6 +28,15 @@ const WARNING: Color = Color::Rgb(255, 190, 90);
 const ERROR: Color = Color::Rgb(255, 95, 95);
 const USER_LINE: Color = Color::Rgb(95, 165, 255);
 const CMD_LINE: Color = Color::Rgb(140, 220, 170);
+const CODE: Color = Color::Rgb(175, 205, 235);
+
+/// What the previous transcript row was, for tool/prose spacing.
+#[derive(Clone, Copy, PartialEq)]
+enum Prev {
+    Tool,
+    Prose,
+    Other,
+}
 
 /// Render the full UI.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -58,7 +68,7 @@ fn draw_normal(frame: &mut Frame, app: &App) {
         0
     };
 
-    let mut constraints = vec![Constraint::Length(3)]; // top bar
+    let mut constraints = vec![Constraint::Length(1)]; // top bar
     if plan_height > 0 {
         constraints.push(Constraint::Length(plan_height)); // plan panel
     }
@@ -185,39 +195,90 @@ fn draw_plan_panel(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_topbar(frame: &mut Frame, app: &App, area: Rect) {
-    let status = if let Some(active_job) = &app.active_job {
-        format!("working: {active_job}")
-    } else if app.is_thinking {
-        "working".to_string()
+    let width = area.width as usize;
+    let working = app.is_thinking || app.active_job.is_some();
+    let status = if working {
+        let mut s = format!("{} working", spinner_frame());
+        if let Some(job) = &app.active_job {
+            s.push_str(&format!(": {job}"));
+        }
+        if app.is_thinking
+            && let Some(start) = app.turn_started
+        {
+            s.push_str(&format!(" · {}", format_elapsed(start.elapsed().as_secs())));
+        }
+        s
     } else {
-        "ready".to_string()
+        " ready ".to_string()
     };
+    // The status always wins: it keeps one column of margin on the right and
+    // is only cut when the whole row is narrower than it.
+    let status = ellipsize(&status, width.saturating_sub(1));
+    let status_w = str_cols(&status);
 
-    let line = Line::from(vec![
-        Span::styled(
-            "buzztr",
-            Style::default()
-                .fg(TEXT_PRIMARY)
-                .bg(BG_PANEL)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" ".repeat(area.width.saturating_sub(44) as usize)),
-        Span::styled(
-            format!(" {status} "),
-            Style::default()
-                .fg(ACCENT_PURPLE)
-                .bg(BG_PANEL)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
+    // Whatever is left (minus one gap column) goes to the left side.
+    let left_budget = width.saturating_sub(status_w + 1 + 1);
+    let name_style = Style::default()
+        .fg(TEXT_PRIMARY)
+        .bg(BG_PANEL)
+        .add_modifier(Modifier::BOLD);
+    let mut spans: Vec<Span> = Vec::new();
+    let mut left_w = 0;
+    if left_budget >= 6 {
+        spans.push(Span::styled("buzztr", name_style));
+        left_w = 6;
+        // two spaces + at least ~8 columns of label, else drop the label
+        let label_budget = left_budget - 6;
+        if let Some(label) = &app.model_label
+            && label_budget >= 2 + 8
+        {
+            let label = ellipsize(label, label_budget - 2);
+            left_w += 2 + str_cols(&label);
+            spans.push(Span::styled("  ", Style::default().bg(BG_PANEL)));
+            spans.push(Span::styled(
+                label,
+                Style::default().fg(TEXT_MUTED).bg(BG_PANEL),
+            ));
+        }
+    } else if left_budget > 0 {
+        let cut = ellipsize("buzztr", left_budget);
+        left_w = str_cols(&cut);
+        spans.push(Span::styled(cut, name_style));
+    }
+    let pad = width.saturating_sub(left_w + status_w + 1);
+    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(BG_PANEL)));
+    spans.push(Span::styled(
+        status,
+        Style::default()
+            .fg(ACCENT_PURPLE)
+            .bg(BG_PANEL)
+            .add_modifier(Modifier::BOLD),
+    ));
 
-    let widget = Paragraph::new(line).block(
-        Block::default()
-            .borders(Borders::LEFT | Borders::RIGHT | Borders::TOP | Borders::BOTTOM)
-            .border_style(Style::default().fg(BORDER))
-            .style(Style::default().bg(BG_PANEL)),
-    );
+    let widget = Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_PANEL));
     frame.render_widget(widget, area);
+}
+
+/// Current braille spinner frame (advances every 80 ms).
+fn spinner_frame() -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let idx = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        / 80) as usize
+        % FRAMES.len();
+    FRAMES[idx]
+}
+
+/// `m:ss`, or `h:mm:ss` from one hour.
+fn format_elapsed(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, secs % 3600 / 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 fn char_cols(c: char) -> usize {
@@ -304,9 +365,32 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
     let inner_width = area.width.saturating_sub(2);
 
     // Convert output lines to ratatui Lines with styles
+    let theme = MdTheme {
+        text: TEXT_PRIMARY,
+        heading: ACCENT_CYAN,
+        code: CODE,
+        muted: TEXT_MUTED,
+        bg: BG_PANEL,
+    };
+    let spacer = || Line::styled("", Style::default().bg(BG_PANEL));
+    let mut md = MdState::default();
+    let mut prev = Prev::Other;
     let mut styled_lines: Vec<Line> = Vec::new();
     for ol in app.output.iter() {
         {
+            if ol.style != LineStyle::Assistant {
+                md = MdState::default();
+            }
+            let is_tool = matches!(
+                ol.style,
+                LineStyle::ToolCall | LineStyle::ToolOk | LineStyle::ToolErr
+            );
+            if is_tool && prev == Prev::Prose {
+                styled_lines.push(spacer());
+            }
+            if ol.style != LineStyle::Assistant {
+                prev = if is_tool { Prev::Tool } else { Prev::Other };
+            }
             let style = match ol.style {
                 LineStyle::Normal => Style::default().fg(USER_LINE).bg(BG_PANEL),
                 LineStyle::Assistant => Style::default().fg(TEXT_PRIMARY).bg(BG_PANEL),
@@ -336,46 +420,45 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
                         styled_lines.push(Line::from(Span::styled(row, style)));
                     }
                 }
+                LineStyle::Assistant => {
+                    if let Some(line) =
+                        markdown::render_line(&ol.text, &mut md, inner_width as usize, &theme)
+                    {
+                        let blank = ol.text.trim().is_empty();
+                        if prev == Prev::Tool && !blank {
+                            styled_lines.push(spacer());
+                        }
+                        styled_lines.push(line);
+                        prev = if blank { Prev::Other } else { Prev::Prose };
+                    }
+                }
                 _ => styled_lines.push(Line::from(Span::styled(&ol.text, style))),
             }
         }
     }
 
-    // Add thinking indicator if active
+    // Also show the in-progress line. It is rendered on a copy of the markdown
+    // state so the partial line never changes how later lines are styled.
     let mut lines = styled_lines;
-    if app.is_thinking {
-        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let frame_idx = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            / 80) as usize
-            % frames.len();
-        lines.push(Line::from(Span::styled(
-            format!("{} thinking...", frames[frame_idx]),
-            Style::default()
-                .fg(TEXT_MUTED)
-                .bg(BG_PANEL)
-                .add_modifier(Modifier::ITALIC),
-        )));
-    }
-
-    // Also show the token buffer if it has content
     if !app.token_buffer.is_empty() {
-        lines.push(Line::from(Span::styled(
+        let mut partial = md;
+        if let Some(line) = markdown::render_line(
             &app.token_buffer,
-            Style::default().fg(TEXT_PRIMARY).bg(BG_PANEL),
-        )));
+            &mut partial,
+            inner_width as usize,
+            &theme,
+        ) {
+            if prev == Prev::Tool && !app.token_buffer.trim().is_empty() {
+                lines.push(spacer());
+            }
+            lines.push(line);
+        }
     }
 
     let title = if app.scroll_offset > 0 {
-        " transcript (scrolled) ".to_string()
-    } else if let Some(active_job) = &app.active_job {
-        format!(" transcript ({active_job}) ")
-    } else if app.is_thinking {
-        " transcript (working) ".to_string()
+        " transcript (scrolled) "
     } else {
-        " transcript ".to_string()
+        " transcript "
     };
 
     // Build the paragraph first so we can ask it for the true wrapped-row
@@ -439,22 +522,9 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     if app.is_thinking {
-        // Greyed out, show working indicator
-        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let frame_idx = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            / 80) as usize
-            % frames.len();
-        let input_text = format!("{} working...", frames[frame_idx]);
-        let input_widget = Paragraph::new(input_text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(style)
-                    .title(" working — Ctrl+C to interrupt "),
-            )
+        // Greyed out; the single "working" indicator lives in the top bar.
+        let input_widget = Paragraph::new("Ctrl+C to interrupt")
+            .block(Block::default().borders(Borders::ALL).border_style(style))
             .style(Style::default().fg(TEXT_MUTED).bg(BG_INPUT));
         frame.render_widget(input_widget, area);
         // Hide cursor while working
@@ -624,7 +694,7 @@ mod tests {
     #[test]
     fn wrapped_lines_do_not_push_tail_below_viewport() {
         // Narrow terminal: 30 cols total → ~28 cols content width.
-        // Output pane gets ~14 rows in this layout (3 topbar, 3 input).
+        // Output pane gets ~16 rows in this layout (1 topbar, 3 input).
         // Push a mix of short lines and a long one that wraps. The last
         // logical line ("TAIL_MARKER") must stay visible at the bottom.
         let backend = TestBackend::new(30, 20);
@@ -841,6 +911,323 @@ mod tests {
         assert!(rows[1..].iter().all(|r| r.starts_with("    ")));
     }
 
+    fn rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buf.area.height).map(|y| row_text(buf, y)).collect()
+    }
+
+    fn assistant(app: &mut App, text: &str) {
+        app.push_output(text, LineStyle::Assistant);
+    }
+
+    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+    // ---- markdown in the transcript ----
+
+    #[test]
+    fn transcript_renders_markdown_for_assistant_lines_only() {
+        let mut app = App::new();
+        assistant(&mut app, "```rust");
+        assistant(&mut app, "let a = **x**; // * y");
+        assistant(&mut app, "#[derive(Debug)]");
+        assistant(&mut app, "```");
+        assistant(&mut app, "## Title");
+        assistant(&mut app, "use `foo` and **bold**");
+        assistant(&mut app, "cents * 100 and 2 ** 3 ** 4");
+        assistant(&mut app, "* item");
+        assistant(&mut app, "---");
+        app.push_output("**user** `raw`", LineStyle::Normal);
+        let buf = render(&app, 60, 24);
+        let text = buffer_text(&buf);
+        assert!(!text.contains("```"), "{text}");
+        assert!(text.contains("  rust"));
+        assert!(text.contains("let a = **x**; // * y"));
+        assert!(text.contains("#[derive(Debug)]"));
+        assert!(!text.contains("## Title") && text.contains("Title"));
+        assert!(text.contains("use foo and bold"));
+        assert!(text.contains("cents * 100 and 2 ** 3 ** 4"));
+        assert!(text.contains("• item"));
+        assert!(text.contains(&"─".repeat(58)));
+        assert!(text.contains("**user** `raw`"), "non-assistant untouched");
+
+        let r = rows(&buf);
+        let y = r
+            .iter()
+            .position(|l| l.contains("use foo and bold"))
+            .unwrap() as u16;
+        let x = r[y as usize].find("use foo").unwrap();
+        // chars before are ASCII ('│' is 1 char, 3 bytes) -> count chars.
+        let col = r[y as usize][..x].chars().count() as u16;
+        assert_eq!(buf[(col + 4, y)].style().fg, Some(super::CODE)); // 'f' of foo
+        let bx = col + "use foo and ".len() as u16;
+        assert!(
+            buf[(bx, y)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        let ty = r.iter().position(|l| l.contains("Title")).unwrap() as u16;
+        let tx = r[ty as usize].find("Title").unwrap();
+        let tcol = r[ty as usize][..tx].chars().count() as u16;
+        assert_eq!(buf[(tcol, ty)].style().fg, Some(super::ACCENT_CYAN));
+    }
+
+    #[test]
+    fn fence_state_resets_at_non_assistant_line() {
+        let mut app = App::new();
+        assistant(&mut app, "```");
+        app.push_output("  ✓ tool: ok", LineStyle::ToolOk);
+        assistant(&mut app, "after **bold**");
+        let text = buffer_text(&render(&app, 60, 20));
+        assert!(text.contains("after bold"), "{text}");
+    }
+
+    #[test]
+    fn partial_token_buffer_is_styled_without_mutating_state() {
+        let mut app = App::new();
+        assistant(&mut app, "```");
+        app.token_buffer = "x = **1**".into();
+        let buf = render(&app, 60, 20);
+        let r = rows(&buf);
+        let y = r.iter().position(|l| l.contains("x = **1**")).unwrap() as u16;
+        let col = r[y as usize][..r[y as usize].find("x = ").unwrap()]
+            .chars()
+            .count() as u16;
+        assert_eq!(buf[(col, y)].style().fg, Some(super::CODE));
+
+        // The partial line does not close/open fences for what follows: the
+        // next committed line is still inside the block.
+        app.token_buffer = "```".into();
+        let text = buffer_text(&render(&app, 60, 20));
+        assert!(!text.contains("```"));
+        app.token_buffer.clear();
+        assistant(&mut app, "still **code**");
+        let text = buffer_text(&render(&app, 60, 20));
+        assert!(text.contains("still **code**"), "{text}");
+    }
+
+    #[test]
+    fn hidden_fence_in_token_buffer_pushes_nothing() {
+        let mut app = App::new();
+        app.token_buffer = "```".into();
+        let r = rows(&render(&app, 40, 12));
+        assert!(r.iter().all(|l| !l.contains("```")));
+    }
+
+    // ---- single working indicator ----
+
+    #[test]
+    fn working_shows_one_spinner_and_no_thinking_row() {
+        let mut app = App::new();
+        app.begin_routing();
+        app.set_active_job("llm");
+        app.token_buffer = "partial".into();
+        let text = buffer_text(&render(&app, 100, 20));
+        assert!(!text.contains("thinking..."), "{text}");
+        assert!(!text.contains("(llm)") && !text.contains("(working)"));
+        assert!(text.contains("transcript"));
+        assert!(text.contains("Ctrl+C to interrupt"));
+        assert!(!text.contains("working —"));
+        let n: usize = SPINNER.iter().map(|g| text.matches(g).count()).sum();
+        assert_eq!(n, 1, "{text}");
+    }
+
+    // ---- top bar ----
+
+    #[test]
+    fn topbar_is_one_row_and_ready_is_right_aligned() {
+        for w in [120u16, 60] {
+            let mut app = App::new();
+            app.model_label = Some("model.gguf".into());
+            let buf = render(&app, w, 20);
+            let top = row_text(&buf, 0);
+            assert!(top.starts_with("buzztr  model.gguf"), "{top}");
+            assert!(top.ends_with(" ready  "), "w={w}: {top:?}");
+            let chars: Vec<char> = top.chars().collect();
+            assert_eq!(chars[w as usize - 2], ' ');
+            assert_eq!(chars[w as usize - 3], 'y');
+            // Row 1 is the transcript border, not more top bar.
+            assert!(row_text(&buf, 1).starts_with('┌'));
+        }
+    }
+
+    #[test]
+    fn topbar_status_wins_over_long_model_label() {
+        let mut app = App::new();
+        app.begin_routing();
+        app.set_active_job("llm");
+        app.model_label = Some("m".repeat(200));
+        let top = row_text(&render(&app, 30, 12), 0);
+        assert!(top.contains("working: llm · 0:0"), "{top}");
+        assert_eq!(str_cols(&top), 30);
+        assert!(top.trim_end().ends_with("0:00") || top.contains("0:0"));
+    }
+
+    #[test]
+    fn topbar_working_without_job_and_label_dropped_when_tight() {
+        let mut app = App::new();
+        app.is_thinking = true;
+        app.model_label = Some("some-model-name.gguf".into());
+        let top = row_text(&render(&app, 80, 12), 0);
+        assert!(top.contains("working"));
+        assert!(!top.contains("working:"));
+        assert!(!top.contains(" · "), "no timer without turn_started: {top}");
+        // Barely room for the name: the label is dropped, not squeezed.
+        let top = row_text(&render(&app, 20, 12), 0);
+        assert!(!top.contains("some"), "{top}");
+        assert!(top.contains("working"));
+    }
+
+    #[test]
+    fn topbar_survives_tiny_widths() {
+        for w in [1u16, 2, 5, 20] {
+            let mut app = App::new();
+            app.begin_routing();
+            app.model_label = Some("model".into());
+            let _ = render(&app, w, 10);
+            app.is_thinking = false;
+            let _ = render(&app, w, 10);
+        }
+    }
+
+    #[test]
+    fn elapsed_format() {
+        use super::format_elapsed;
+        assert_eq!(format_elapsed(0), "0:00");
+        assert_eq!(format_elapsed(7), "0:07");
+        assert_eq!(format_elapsed(83), "1:23");
+        assert_eq!(format_elapsed(725), "12:05");
+        assert_eq!(format_elapsed(3600), "1:00:00");
+        assert_eq!(format_elapsed(3725), "1:02:05");
+    }
+
+    // ---- tool/prose spacing ----
+
+    fn spacing_rows(app: &App) -> Vec<String> {
+        // Inner transcript content only: strip the border columns.
+        let buf = render(app, 40, 14);
+        rows(&buf)
+            .into_iter()
+            .map(|r| {
+                r.chars()
+                    .skip(1)
+                    .take(38)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn pos(rows: &[String], needle: &str) -> usize {
+        rows.iter().position(|r| r.contains(needle)).unwrap()
+    }
+
+    #[test]
+    fn spacer_between_tool_and_prose_both_ways() {
+        let mut app = App::new();
+        assistant(&mut app, "before");
+        app.push_output("  → read(a)", LineStyle::ToolCall);
+        app.push_output("  ✓ read: ok", LineStyle::ToolOk);
+        assistant(&mut app, "after");
+        let r = spacing_rows(&app);
+        assert_eq!(pos(&r, "→ read") - pos(&r, "before"), 2, "{r:#?}");
+        assert_eq!(pos(&r, "✓ read") - pos(&r, "→ read"), 1, "no tool/tool gap");
+        assert_eq!(pos(&r, "after") - pos(&r, "✓ read"), 2, "{r:#?}");
+    }
+
+    #[test]
+    fn spacer_before_streaming_buffer_and_never_doubled() {
+        let mut app = App::new();
+        app.push_output("  → read(a)", LineStyle::ToolCall);
+        app.token_buffer = "streaming".into();
+        let r = spacing_rows(&app);
+        assert_eq!(pos(&r, "streaming") - pos(&r, "→ read"), 2, "{r:#?}");
+
+        let mut app = App::new();
+        app.push_output("  → read(a)", LineStyle::ToolCall);
+        assistant(&mut app, "");
+        assistant(&mut app, "text");
+        assistant(&mut app, "");
+        app.push_output("  → read(b)", LineStyle::ToolCall);
+        let r = spacing_rows(&app);
+        assert_eq!(pos(&r, "text") - pos(&r, "→ read(a)"), 2, "{r:#?}");
+        assert_eq!(pos(&r, "→ read(b)") - pos(&r, "text"), 2, "{r:#?}");
+    }
+
+    #[test]
+    fn no_spacer_around_status_lines() {
+        let mut app = App::new();
+        app.push_output("  → read(a)", LineStyle::ToolCall);
+        app.push_output("note", LineStyle::Status);
+        app.push_output("you> hi", LineStyle::Normal);
+        let r = spacing_rows(&app);
+        assert_eq!(pos(&r, "note") - pos(&r, "→ read"), 1);
+        assert_eq!(pos(&r, "you> hi") - pos(&r, "note"), 1);
+    }
+
+    // ---- detail view ----
+
+    fn detail_app(n: usize) -> App {
+        let mut app = App::new();
+        app.mode = crate::tui::app::AppMode::Detail;
+        app.detail_title = "shell".into();
+        app.detail_content = (1..=n).map(|i| format!("row-{i}\n")).collect();
+        app
+    }
+
+    #[test]
+    fn detail_scroll_zero_shows_first_and_scrolled_shows_later() {
+        let mut app = detail_app(100);
+        let text = buffer_text(&render(&app, 60, 12));
+        assert!(text.contains("row-1\n") || text.contains("row-1 "));
+        assert!(!text.contains("row-50"));
+        assert!(text.contains("shell: 1-10/100"), "{text}");
+
+        app.detail_scroll = 40;
+        let text = buffer_text(&render(&app, 60, 12));
+        assert!(
+            text.contains("row-41 ") && text.contains("row-50 "),
+            "{text}"
+        );
+        assert!(!text.contains("row-1 "));
+        assert!(text.contains("shell: 41-50/100"), "{text}");
+    }
+
+    #[test]
+    fn detail_scroll_is_clamped_and_scrollbar_drawn() {
+        let mut app = detail_app(100);
+        let area = Rect::new(0, 0, 60, 12);
+        assert_eq!(super::detail_max_scroll(&app, area), 90);
+        app.detail_scroll = u16::MAX;
+        let buf = render(&app, 60, 12);
+        let text = buffer_text(&buf);
+        assert!(text.contains("row-100"), "{text}");
+        assert!(text.contains("shell: 91-100/100"), "{text}");
+        assert!((0..12).any(|y| buf[(59, y)].symbol() == "↑"));
+    }
+
+    #[test]
+    fn detail_max_scroll_counts_wrapped_rows() {
+        let mut app = App::new();
+        app.mode = crate::tui::app::AppMode::Detail;
+        app.detail_content = "w".repeat(200);
+        // 200 chars at inner width 18 -> 12 rows; inner height 4.
+        assert_eq!(super::detail_max_scroll(&app, Rect::new(0, 0, 20, 6)), 8);
+        let short = detail_app(3);
+        assert_eq!(super::detail_max_scroll(&short, Rect::new(0, 0, 60, 12)), 0);
+    }
+
+    #[test]
+    fn detail_empty_content_is_fine() {
+        let mut app = App::new();
+        app.mode = crate::tui::app::AppMode::Detail;
+        app.detail_scroll = 5;
+        let text = buffer_text(&render(&app, 60, 10));
+        assert!(text.contains("0-0/0"), "{text}");
+        let _ = render(&app, 1, 1);
+        assert_eq!(super::detail_max_scroll(&app, Rect::new(0, 0, 0, 0)), 0);
+    }
+
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
         let mut out = String::new();
         for y in 0..buffer.area.height {
@@ -853,20 +1240,11 @@ mod tests {
     }
 }
 
-/// Detail viewer: full-screen view of tool result content.
-fn draw_detail(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    frame.render_widget(Block::default().style(Style::default().bg(BG_MAIN)), area);
-
-    let lines: Vec<Line> = app
-        .detail_content
-        .lines()
-        .map(|l| Line::from(l.to_string()))
-        .collect();
-
-    let title = format!(" {} (Ctrl+O or Esc to close) ", app.detail_title);
-
-    let detail_widget = Paragraph::new(lines)
+/// The detail paragraph, shared by `draw_detail` and `detail_max_scroll` so
+/// the two can never disagree about wrapping or borders.
+fn detail_paragraph(app: &App, title: String) -> Paragraph<'_> {
+    let lines: Vec<Line> = app.detail_content.lines().map(Line::from).collect();
+    Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -875,7 +1253,60 @@ fn draw_detail(frame: &mut Frame, app: &App) {
                 .style(Style::default().bg(BG_PANEL)),
         )
         .wrap(Wrap { trim: false })
-        .style(Style::default().fg(TEXT_PRIMARY).bg(BG_PANEL));
+        .style(Style::default().fg(TEXT_PRIMARY).bg(BG_PANEL))
+}
 
-    frame.render_widget(detail_widget, area);
+/// Wrapped content rows of the detail view when drawn in `area`.
+fn detail_total_rows(app: &App, area: Rect) -> usize {
+    let inner_w = area.width.saturating_sub(2);
+    if inner_w == 0 {
+        return 0;
+    }
+    detail_paragraph(app, String::new())
+        .line_count(inner_w)
+        .saturating_sub(2)
+}
+
+/// Largest useful `detail_scroll` for a detail view drawn in `area`.
+pub fn detail_max_scroll(app: &App, area: Rect) -> u16 {
+    let inner_h = area.height.saturating_sub(2) as usize;
+    detail_total_rows(app, area)
+        .saturating_sub(inner_h)
+        .min(u16::MAX as usize) as u16
+}
+
+/// Detail viewer: full-screen, scrollable view of tool result content.
+fn draw_detail(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    frame.render_widget(Block::default().style(Style::default().bg(BG_MAIN)), area);
+
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let total = detail_total_rows(app, area);
+    let max = detail_max_scroll(app, area);
+    let scroll = app.detail_scroll.min(max);
+
+    let (first, last) = if total == 0 {
+        (0, 0)
+    } else {
+        (scroll as usize + 1, (scroll as usize + inner_h).min(total))
+    };
+    let title = format!(
+        " {}: {first}-{last}/{total} (↑↓ PgUp/PgDn Home/End, Esc to close) ",
+        app.detail_title
+    );
+
+    frame.render_widget(detail_paragraph(app, title).scroll((scroll, 0)), area);
+
+    if total > inner_h {
+        let mut scrollbar_state = ScrollbarState::new(total - inner_h + 1)
+            .position(scroll as usize)
+            .viewport_content_length(inner_h);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("↑"))
+                .end_symbol(Some("↓")),
+            area,
+            &mut scrollbar_state,
+        );
+    }
 }

@@ -66,6 +66,8 @@ pub struct App {
     pub detail_content: String,
     /// Detail viewer title
     pub detail_title: String,
+    /// Detail viewer scroll offset in wrapped rows (clamped at draw time).
+    pub detail_scroll: u16,
     /// Input history
     pub history: Vec<String>,
     /// Current position in history (for up/down navigation)
@@ -78,6 +80,10 @@ pub struct App {
     pub is_thinking: bool,
     /// Current active job description, if any
     pub active_job: Option<String>,
+    /// When the current turn began (drives the top-bar timer while thinking).
+    pub turn_started: Option<std::time::Instant>,
+    /// Display label of the served model, if the probe succeeded.
+    pub model_label: Option<String>,
     /// Current streaming token buffer (accumulated between newlines)
     pub token_buffer: String,
     /// Tool results for Ctrl+O detail viewer (tool_name → full content)
@@ -120,12 +126,15 @@ impl App {
             mode: AppMode::Normal,
             detail_content: String::new(),
             detail_title: String::new(),
+            detail_scroll: 0,
             history: Vec::new(),
             history_pos: None,
             saved_input: String::new(),
             should_quit: false,
             is_thinking: false,
             active_job: None,
+            turn_started: None,
+            model_label: None,
             token_buffer: String::new(),
             tool_results: Vec::new(),
             pending_permission: None,
@@ -150,6 +159,7 @@ impl App {
     pub fn begin_routing(&mut self) {
         self.begin_turn();
         self.is_thinking = true;
+        self.turn_started = Some(std::time::Instant::now());
         self.set_active_job("routing");
     }
 
@@ -424,6 +434,7 @@ impl App {
         if let Some((name, content)) = self.tool_results.last() {
             self.detail_title = name.clone();
             self.detail_content = content.clone();
+            self.detail_scroll = 0;
             self.mode = AppMode::Detail;
         }
     }

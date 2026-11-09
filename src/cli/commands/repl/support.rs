@@ -75,6 +75,27 @@ pub(super) fn reconcile_streamed_assistant_content(
     ))
 }
 
+/// Keep the top bar's spinner and timer moving during a pre-turn await that
+/// has no UI of its own. Doesn't touch the event channel, so queued keys are
+/// handled exactly as before.
+pub(super) async fn redraw_while<T>(
+    fut: impl std::future::Future<Output = T>,
+    terminal: &mut Terminal<impl Backend>,
+    app: &App,
+) -> T {
+    let mut fut = std::pin::pin!(fut);
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(80));
+    loop {
+        tokio::select! {
+            biased;
+            value = &mut fut => break value,
+            _ = tick.tick() => {
+                let _ = terminal.draw(|frame| ui::draw(frame, app));
+            }
+        }
+    }
+}
+
 pub(super) fn finish_completed_turn(
     app: &mut App,
     terminal: &mut Terminal<impl Backend>,

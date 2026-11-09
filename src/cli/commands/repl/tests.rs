@@ -260,6 +260,32 @@ fn finish_completed_turn_appends_missing_suffix_before_separator() {
 }
 
 #[tokio::test]
+async fn redraw_while_ticks_the_timer_during_a_router_await() {
+    let mut app = App::new();
+    app.is_thinking = true;
+    app.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(65));
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    let value = redraw_while(
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            7
+        },
+        &mut terminal,
+        &app,
+    )
+    .await;
+
+    assert_eq!(value, 7);
+    let buffer = terminal.backend().buffer();
+    let top_row: String = (0..buffer.area.width)
+        .map(|x| buffer[(x, 0)].symbol())
+        .collect();
+    assert!(top_row.contains("1:05"), "top row was: {top_row}");
+}
+
+#[tokio::test]
 async fn permission_prompt_accepts_single_key_without_enter() {
     let mut app = App::new();
     app.pending_permission = Some("Allow shell command?".into());
@@ -388,4 +414,39 @@ fn arrows_do_not_scroll_mid_turn_but_page_keys_do() {
     assert_eq!(app.scroll_offset, 0);
     assert!(handle_background_key(&mut app, &plain_key(KeyCode::PageUp)));
     assert!(app.scroll_offset > 0);
+}
+
+#[test]
+fn tool_result_line_drops_repeated_name_and_icon() {
+    use super::tui_ui::tool_result_line;
+    assert_eq!(
+        tool_result_line(
+            "insert_at",
+            true,
+            "insert_at src/lib.rs after L50: rev_3 applied (+12 -0)"
+        ),
+        "  ✓ insert_at: src/lib.rs after L50: rev_3 applied (+12 -0)"
+    );
+    assert_eq!(
+        tool_result_line("plan", true, "✓ Step 1 checked off at round 5"),
+        "  ✓ plan: Step 1 checked off at round 5"
+    );
+    // Name and icon together, failure icon.
+    assert_eq!(
+        tool_result_line("shell", false, "shell ✗ exit 1"),
+        "  ✗ shell: exit 1"
+    );
+    // The other result's icon, a trailing/inner icon, a longer tool name
+    // sharing the prefix, and a bare name are all left alone.
+    assert_eq!(tool_result_line("plan", true, "✗ nope"), "  ✓ plan: ✗ nope");
+    assert_eq!(
+        tool_result_line("plan", true, "done ✓ ok ✓"),
+        "  ✓ plan: done ✓ ok ✓"
+    );
+    assert_eq!(
+        tool_result_line("read", true, "read_file ok"),
+        "  ✓ read: read_file ok"
+    );
+    assert_eq!(tool_result_line("plan", true, "plan"), "  ✓ plan: plan");
+    assert_eq!(tool_result_line("x", false, "denied"), "  ✗ x: denied");
 }

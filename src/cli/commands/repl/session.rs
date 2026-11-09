@@ -68,6 +68,9 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
     // run.rs for rationale).
     let probe = router.probe_default().await.ok();
     config.model.probed_model = probe.as_ref().map(|p| p.model.clone());
+    let model_label = probe
+        .as_ref()
+        .map(|p| crate::llm::router::display_model_id(&p.model).to_string());
     config.model.probed_context_window = probe.and_then(|p| p.context_window);
     let llm_worker = LlmWorkerHandle::new(router.clone(), config.runtime.llm_concurrency);
     let perms = Arc::new(if headless {
@@ -193,6 +196,7 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
 
     // Set up app state
     let mut app = App::new();
+    app.model_label = model_label;
     let history_file = config.buzztr_path("sessions/repl_history.txt");
     app.load_history(&history_file);
 
@@ -258,12 +262,30 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
             AppEvent::Key(key) => {
                 match app.mode {
                     AppMode::Detail => {
-                        // In detail view: Esc, Ctrl+O, or q closes it
+                        // In detail view: Esc, Ctrl+O, or q closes it;
+                        // arrows / PgUp / PgDn / Home / End scroll.
                         if key.code == KeyCode::Esc
                             || event::is_ctrl_o(&key)
                             || key.code == KeyCode::Char('q')
                         {
                             app.close_detail();
+                        } else {
+                            let size = terminal.size()?;
+                            let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                            let max = ui::detail_max_scroll(&app, area);
+                            let page = size.height.saturating_sub(2).saturating_sub(1).max(1);
+                            // Clamp first so End then Up moves at once.
+                            let cur = app.detail_scroll.min(max);
+                            app.detail_scroll = match key.code {
+                                KeyCode::Up => cur.saturating_sub(1),
+                                KeyCode::Down => cur.saturating_add(1),
+                                KeyCode::PageUp => cur.saturating_sub(page),
+                                KeyCode::PageDown => cur.saturating_add(page),
+                                KeyCode::Home => 0,
+                                KeyCode::End => max,
+                                _ => cur,
+                            }
+                            .min(max);
                         }
                     }
                     AppMode::Normal => {
@@ -439,7 +461,8 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                 // The turn is real from here: make it visible
                                 // NOW (spinner, "routing" job, log line) — the
                                 // routers below are LLM calls that can take a
-                                // while, and nothing redraws until they return.
+                                // while, so `redraw_while` keeps the spinner and
+                                // timer moving until they return.
                                 // Every path from here reaches the turn-end
                                 // `finish_completed_turn`, which clears
                                 // `is_thinking`.
@@ -460,11 +483,15 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                 // user already invoked a skill via /name). See
                                 // agent::skill_router — probe: adoption 0/8 -> 8/8.
                                 let user_message = if active_skill_reminder.is_none() {
-                                    match crate::cli::commands::agent::skill_router::route_task_to_skill(
-                                        &llm_worker,
-                                        &config.project_root,
-                                        &user_message,
-                                        &cancelled,
+                                    match redraw_while(
+                                        crate::cli::commands::agent::skill_router::route_task_to_skill(
+                                            &llm_worker,
+                                            &config.project_root,
+                                            &user_message,
+                                            &cancelled,
+                                        ),
+                                        &mut terminal,
+                                        &app,
                                     )
                                     .await
                                     {
@@ -485,9 +512,12 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                     user_message
                                 };
 
-                                let is_explore =
-                                    classify_is_explore(&llm_worker, &user_message, &cancelled)
-                                        .await;
+                                let is_explore = redraw_while(
+                                    classify_is_explore(&llm_worker, &user_message, &cancelled),
+                                    &mut terminal,
+                                    &app,
+                                )
+                                .await;
                                 app.clear_active_job();
                                 log.route(if is_explore { "explore" } else { "coding" });
                                 let turn_cfg = if is_explore {

@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod event;
+mod markdown;
 pub mod ui;
 
 use std::io::{self, Write};
