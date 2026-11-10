@@ -24,6 +24,8 @@ pub(crate) struct TurnResult {
     pub rounds: usize,
     /// The headless `had_error` exit flag (REPL callers ignore it).
     pub had_error: bool,
+    /// The turn ended on a user interrupt (Ctrl+C), checked or mid-stream.
+    pub interrupted: bool,
 }
 
 /// Consume the interrupt flag: `true` and resets it if it was armed, `false`
@@ -300,6 +302,7 @@ pub(crate) async fn run_turn<U: AgentUi>(
     TurnResult {
         rounds: round,
         had_error,
+        interrupted: logged_interrupted || state.interrupted,
     }
 }
 

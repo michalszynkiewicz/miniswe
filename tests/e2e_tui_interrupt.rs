@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tempfile::TempDir;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const COLS: u16 = 120;
@@ -237,4 +237,48 @@ async fn ctrl_c_during_routing_still_interrupts_the_turn() {
     assert!(repl.screen().contains("(interrupted)"), "{}", repl.screen());
     let log = repl.log();
     assert!(log.contains("status=interrupted"), "{log}");
+}
+
+/// A prompt interrupted before the model answered used to stay in the history
+/// with no reply, and the next message was merged into it, so the model
+/// answered both.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupted_prompt_is_not_sent_with_the_next_one() {
+    let server = fake_llm(helpers::mock_sse_text_response("PONG")).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("CANCELLED-ASK"))
+        // Only the agent call carries tools; the routers answer at once, so the
+        // interrupt lands on the main request.
+        .and(body_string_contains("\"tools\""))
+        .respond_with(helpers::mock_sse_text_response("ESSAY").set_delay(Duration::from_secs(120)))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let mut repl = Repl::start(&server.uri());
+    repl.wait_ready();
+
+    repl.submit("write CANCELLED-ASK");
+    repl.wait_working();
+    std::thread::sleep(Duration::from_millis(300));
+    repl.send(CTRL_C);
+    repl.wait_ready();
+
+    repl.submit("say pong");
+    repl.wait_for("the reply", |screen| {
+        screen
+            .lines()
+            .any(|l| l.contains("PONG") && !l.contains("you>"))
+    });
+    repl.wait_ready();
+
+    let requests = server.received_requests().await.unwrap();
+    let last = String::from_utf8_lossy(&requests.last().unwrap().body).into_owned();
+    assert!(last.contains("say pong"), "{last}");
+    assert!(!last.contains("CANCELLED-ASK"), "{last}");
+    assert!(
+        repl.log().contains("[interrupt] history withdrawn"),
+        "{}",
+        repl.log()
+    );
 }

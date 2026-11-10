@@ -559,6 +559,7 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                     false,
                                     mcp_summary_clone.as_deref(),
                                 );
+                                let history_before = conversation_history.len();
                                 conversation_history.push(Message::user(&user_message));
 
                                 // Inject skill reminder into system prompt so every LLM call
@@ -621,7 +622,7 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                 // Context compaction now happens EVERY round inside
                                 // the turn driver (matching run.rs) rather than once
                                 // per turn out here.
-                                run_agent_turn(
+                                let interrupted = run_agent_turn(
                                     &mut app,
                                     &mut rx,
                                     &mut terminal,
@@ -648,6 +649,19 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                     &job_registry,
                                 )
                                 .await;
+
+                                // An interrupted prompt left without a reply
+                                // would merge into the next message.
+                                if interrupted {
+                                    let settled = settle_interrupted_turn(
+                                        &mut conversation_history,
+                                        history_before,
+                                    );
+                                    log.interrupt_settled(match settled {
+                                        InterruptSettle::Withdrawn => "withdrawn",
+                                        InterruptSettle::Closed => "closed",
+                                    });
+                                }
 
                                 // The agent loop may exit via early-break
                                 // paths (empty choices, errors) that skip

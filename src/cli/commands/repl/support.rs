@@ -345,3 +345,65 @@ pub(super) async fn await_shell_job_repl(
         }
     }
 }
+
+/// What [`settle_interrupted_turn`] did to the history.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum InterruptSettle {
+    /// Nothing ran after the prompt, so the prompt was taken back out.
+    Withdrawn,
+    /// Work was recorded; it stays and the turn is marked as interrupted.
+    Closed,
+}
+
+/// The reply the history gets for a tool call that the interrupt skipped.
+pub(super) const NOT_RUN_RESULT: &str = "Not run: the user interrupted the turn.";
+/// The assistant note that ends an interrupted turn which did some work.
+pub(super) const INTERRUPTED_NOTE: &str = "(Interrupted by the user before finishing.)";
+
+/// Leave the history in a shape the next turn can build on after a Ctrl+C.
+///
+/// An interrupted prompt with no reply used to sit in the history, and
+/// `sanitize_messages` merged it into the next user message, so the model
+/// answered both. `before` is the history length before the prompt was
+/// pushed.
+pub(super) fn settle_interrupted_turn(
+    history: &mut Vec<Message>,
+    before: usize,
+) -> InterruptSettle {
+    if history.len() == before + 1 && history[before].role == "user" {
+        history.truncate(before);
+        return InterruptSettle::Withdrawn;
+    }
+
+    // Answer every call of the last tool batch that has no result yet, so the
+    // next request never carries a dangling tool call.
+    let batch = history.iter().rposition(|m| {
+        m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
+    });
+    if let Some(at) = batch
+        && history[at + 1..].iter().all(|m| m.role == "tool")
+    {
+        let answered: Vec<String> = history[at + 1..]
+            .iter()
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        let missing: Vec<String> = history[at]
+            .tool_calls
+            .iter()
+            .flatten()
+            .map(|c| c.id.clone())
+            .filter(|id| !answered.contains(id))
+            .collect();
+        for id in missing {
+            history.push(Message::tool_result(&id, NOT_RUN_RESULT));
+        }
+    }
+
+    let ended_with_answer = history.last().is_some_and(|m| {
+        m.role == "assistant" && m.tool_calls.as_ref().is_none_or(|c| c.is_empty())
+    });
+    if !ended_with_answer {
+        history.push(Message::assistant(INTERRUPTED_NOTE));
+    }
+    InterruptSettle::Closed
+}

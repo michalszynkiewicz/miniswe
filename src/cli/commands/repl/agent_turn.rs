@@ -37,7 +37,7 @@ pub(super) async fn run_agent_turn(
     goal: &str,
     // Session-scoped background-job registry (file shell background=true).
     job_registry: &Arc<tools::jobs::JobRegistry>,
-) {
+) -> bool {
     // Fed into `TurnCtx` but never read on this side — `opts.stuck_tracking`
     // is always false in the REPL, so the headless-only `tools.stuck_check`
     // fire in `postamble::finish_round` never evaluates it.
@@ -97,9 +97,9 @@ pub(super) async fn run_agent_turn(
         session_start,
     };
 
-    // The REPL never reads `had_error`/`rounds` after the loop — the turn's
-    // completion is already reflected live in `app`.
-    let _ = turn::driver::run_turn(
+    // The REPL only needs `interrupted` (to settle the history); the turn's
+    // rounds and errors are already reflected live in `app`.
+    turn::driver::run_turn(
         ctx,
         opts,
         &mut state,
@@ -110,5 +110,6 @@ pub(super) async fn run_agent_turn(
         router,
         &log,
     )
-    .await;
+    .await
+    .interrupted
 }

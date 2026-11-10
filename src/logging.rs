@@ -168,6 +168,12 @@ impl SessionLog {
         self.llm_response(&format!("(interrupted) {partial}"));
     }
 
+    /// Log how the REPL settled the history after an interrupted turn:
+    /// `withdrawn` (prompt removed) or `closed` (work kept, turn marked).
+    pub fn interrupt_settled(&self, outcome: &str) {
+        self.write(&format!("[interrupt] history {outcome}"));
+    }
+
     /// Log one LLM call's token usage (info level). Called after a
     /// successful response that carries a `usage` block — hosted providers
     /// and llama.cpp both send one; a bare OpenAI-compatible stub may not,

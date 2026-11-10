@@ -450,3 +450,122 @@ fn tool_result_line_drops_repeated_name_and_icon() {
     assert_eq!(tool_result_line("plan", true, "plan"), "  ✓ plan: plan");
     assert_eq!(tool_result_line("x", false, "denied"), "  ✗ x: denied");
 }
+
+fn tool_calls(ids: &[&str]) -> Message {
+    Message::assistant_tool_calls(
+        ids.iter()
+            .map(|id| crate::llm::ToolCall {
+                id: (*id).into(),
+                r#type: "function".into(),
+                function: crate::llm::FunctionCall {
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+            })
+            .collect(),
+    )
+}
+
+fn earlier_turn() -> Vec<Message> {
+    vec![Message::user("first"), Message::assistant("first answer")]
+}
+
+#[test]
+fn interrupt_before_any_work_withdraws_the_prompt() {
+    let mut history = earlier_turn();
+    let before = history.len();
+    history.push(Message::user("write a long essay"));
+
+    assert_eq!(
+        settle_interrupted_turn(&mut history, before),
+        InterruptSettle::Withdrawn
+    );
+    assert_eq!(history.len(), before);
+    assert_eq!(history[1].content.as_deref(), Some("first answer"));
+}
+
+#[test]
+fn interrupt_after_tools_keeps_the_work_and_closes_the_turn() {
+    let mut history = earlier_turn();
+    let before = history.len();
+    history.push(Message::user("fix it"));
+    history.push(tool_calls(&["a"]));
+    history.push(Message::tool_result("a", "contents"));
+
+    assert_eq!(
+        settle_interrupted_turn(&mut history, before),
+        InterruptSettle::Closed
+    );
+    assert_eq!(history.len(), before + 4);
+    assert_eq!(history[before].content.as_deref(), Some("fix it"));
+    let last = history.last().unwrap();
+    assert_eq!(last.role, "assistant");
+    assert_eq!(last.content.as_deref(), Some(INTERRUPTED_NOTE));
+}
+
+#[test]
+fn interrupt_mid_batch_answers_the_skipped_calls() {
+    let mut history = earlier_turn();
+    let before = history.len();
+    history.push(Message::user("fix it"));
+    history.push(tool_calls(&["a", "b", "c"]));
+    history.push(Message::tool_result("a", "contents"));
+
+    settle_interrupted_turn(&mut history, before);
+
+    let results: Vec<(&str, &str)> = history[before + 2..]
+        .iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| {
+            (
+                m.tool_call_id.as_deref().unwrap(),
+                m.content.as_deref().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        results,
+        [
+            ("a", "contents"),
+            ("b", NOT_RUN_RESULT),
+            ("c", NOT_RUN_RESULT)
+        ]
+    );
+    assert_eq!(
+        history.last().unwrap().content.as_deref(),
+        Some(INTERRUPTED_NOTE)
+    );
+}
+
+#[test]
+fn interrupt_after_a_final_answer_adds_no_note() {
+    let mut history = earlier_turn();
+    let before = history.len();
+    history.push(Message::user("fix it"));
+    history.push(tool_calls(&["a"]));
+    history.push(Message::tool_result("a", "contents"));
+    history.push(Message::assistant("done"));
+
+    settle_interrupted_turn(&mut history, before);
+
+    assert_eq!(history.len(), before + 4);
+    assert_eq!(history.last().unwrap().content.as_deref(), Some("done"));
+}
+
+#[test]
+fn interrupt_settle_leaves_a_rewritten_history_alone() {
+    // Compaction can rewrite the history mid-turn; the prompt is then no
+    // longer at `before`, so nothing is truncated.
+    let mut history = vec![Message::user("summary of earlier work")];
+    let before = 5;
+
+    assert_eq!(
+        settle_interrupted_turn(&mut history, before),
+        InterruptSettle::Closed
+    );
+    assert_eq!(
+        history[0].content.as_deref(),
+        Some("summary of earlier work")
+    );
+    assert_eq!(history.len(), 2);
+}
