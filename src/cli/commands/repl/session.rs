@@ -466,6 +466,13 @@ pub async fn run(mut config: Config, headless: bool, continue_session: bool) -> 
                                 // Every path from here reaches the turn-end
                                 // `finish_completed_turn`, which clears
                                 // `is_thinking`.
+                                //
+                                // The key reader arms the cancel flag on every
+                                // Ctrl+C, including at the idle prompt. Disarm a
+                                // stale one here, before the routers, so it can't
+                                // kill this turn while a Ctrl+C from now on still
+                                // counts.
+                                cancelled.store(false, Ordering::Relaxed);
                                 app.begin_routing();
                                 log.user_message(&input);
                                 let _ = terminal.draw(|f| ui::draw(f, &app));
